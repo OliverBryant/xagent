@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -74,7 +74,28 @@ class PublicMCPAppBase(BaseModel):
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
-    pass
+    # Validator lives on the write model only, not PublicMCPAppBase — otherwise
+    # PublicMCPAppResponse would inherit it and re-run on response serialization,
+    # turning one legacy/partial DB row into a full-list 500 on read.
+    @model_validator(mode="after")
+    def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
+        # Reuse the single source of truth (classify_app_auth) rather than
+        # re-deriving the rule here. Reject an entry that declares a partial
+        # launch_config (command or required_env) yet still classifies as
+        # "unconnectable" — the write-time constraint issue #764 asked for. This
+        # covers both asymmetric shapes: command-without-required_env and
+        # required_env-without-command.
+        from ..mcp_apps import classify_app_auth
+
+        launch = self.launch_config or {}
+        if (launch.get("command") or launch.get("required_env")) and (
+            classify_app_auth(self.transport, self.launch_config) == "unconnectable"
+        ):
+            raise ValueError(
+                "A key-based catalog app must declare both launch_config.command "
+                "and launch_config.required_env, otherwise it cannot be connected."
+            )
+        return self
 
 
 class PublicMCPAppResponse(PublicMCPAppBase):

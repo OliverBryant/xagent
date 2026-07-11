@@ -44,7 +44,17 @@ if TYPE_CHECKING:
     from ..services.task_setup_snapshot import TaskSetupSnapshot
 
 from ...core.file_storage.keys import build_task_output_storage_key
-from ..services.chat_history_service import get_latest_waiting_question
+from ..services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    UserMessageDeliveryClaim,
+    claim_user_message_delivery,
+    get_latest_waiting_question,
+    inspect_user_message_delivery,
+    mark_user_message_delivery,
+    mark_user_message_delivery_sync,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -128,6 +138,39 @@ def _task_error_payload(
     if task_payload is not None:
         payload["task"] = task_payload
     return payload
+
+
+def _client_message_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", normalized):
+        return None
+    return normalized
+
+
+async def _send_message_delivery(
+    websocket: WebSocket,
+    *,
+    client_message_id: str | None,
+    turn_id: str,
+    accepted: bool,
+    message: str | None = None,
+    retry_with_new_id: bool = False,
+) -> None:
+    if client_message_id is None:
+        return
+    payload: dict[str, Any] = {
+        "type": "message_accepted" if accepted else "message_rejected",
+        "client_message_id": client_message_id,
+        "turn_id": turn_id,
+        "timestamp": datetime.now(timezone.utc).timestamp(),
+    }
+    if message:
+        payload["message"] = message
+    if retry_with_new_id:
+        payload["retry_with_new_id"] = True
+    await manager.send_personal_message(payload, websocket)
 
 
 def _terminal_task_error_payload(
@@ -1512,7 +1555,21 @@ async def execute_task_background(
                 # bug for callers that never acquired the lease: the
                 # filter didn't match, so status was silently never
                 # written either (a quiet "stuck RUNNING" outcome).
-                if result.get("status") == "waiting_for_user":
+                task_agent_config: dict[str, Any] = (
+                    task_updated.agent_config
+                    if isinstance(task_updated.agent_config, dict)
+                    else {}
+                )
+                # A2A cancellation is durable even when the cancelled coroutine
+                # ignores cancellation and produces a result after the timeout.
+                if task_agent_config.get("a2a_state") == "TASK_STATE_CANCELED":
+                    waiting_for_control = True
+                    logger.info(
+                        "Task %s was canceled while execution was in flight; "
+                        "ignoring the late result",
+                        task_id,
+                    )
+                elif result.get("status") == "waiting_for_user":
                     task_updated.status = TaskStatus.WAITING_FOR_USER
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
                     db_new.commit()
@@ -1551,6 +1608,7 @@ async def execute_task_background(
                         "(pending commit with assistant message)"
                     )
                 else:
+                    waiting_for_control = True
                     logger.info(
                         f"Task {task_id} is paused, not updating status to {result.get('success')}"
                     )
@@ -1775,11 +1833,48 @@ async def execute_task_background(
             pass
 
 
+def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
+    agent_result = result.get("agent_result")
+    if not isinstance(agent_result, dict):
+        return None
+    context = agent_result.get("context")
+    messages = (
+        context.get("messages")
+        if isinstance(context, dict)
+        else getattr(context, "messages", None)
+    )
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "user":
+            continue
+        metadata = (
+            message.get("metadata")
+            if isinstance(message, dict)
+            else getattr(message, "metadata", None)
+        )
+        if isinstance(metadata, dict):
+            turn_id = metadata.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                return turn_id
+    return None
+
+
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
     task_owner_user_id: int | None,
     previous_task: Optional[asyncio.Task] = None,
+    pending_user_message: Optional[Dict[str, Any]] = None,
+    delivery_turn_id: str | None = None,
+    delivery_already_dispatched: bool = False,
+    delivery_websocket: WebSocket | None = None,
+    delivery_client_message_id: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -1805,6 +1900,34 @@ async def execute_resume_background(
     task_agent_id: int | None = None
     agent_name: str | None = None
     agent_logo_url: str | None = None
+    delivery_was_dispatched = delivery_already_dispatched
+
+    async def notify_deferred_delivery(
+        accepted: bool,
+        message: str | None = None,
+        *,
+        retry_with_new_id: bool = False,
+    ) -> None:
+        if delivery_websocket is None or delivery_client_message_id is None:
+            return
+        try:
+            await _send_message_delivery(
+                delivery_websocket,
+                client_message_id=delivery_client_message_id,
+                turn_id=delivery_turn_id or delivery_client_message_id,
+                accepted=accepted,
+                message=message,
+                retry_with_new_id=retry_with_new_id,
+            )
+        except Exception:
+            # Delivery state is durable; a disconnected client will retry the
+            # same id and recover the result from that state.
+            logger.warning(
+                "Could not send deferred delivery acknowledgement for task %s",
+                task_id,
+                exc_info=True,
+            )
+
     try:
         if previous_task is not None and not previous_task.done():
             try:
@@ -1813,6 +1936,11 @@ async def execute_resume_background(
                 logger.warning(
                     f"Previous background task {task_id} ended before resume: {e}"
                 )
+
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+        background_task_manager.promote_resume_task(task_id, current_task)
 
         db_gen = get_db()
         db_lease = next(db_gen)
@@ -1847,18 +1975,83 @@ async def execute_resume_background(
             logger.info(
                 "Task %s resume skipped; another runner owns the lease", task_id
             )
+            if delivery_turn_id is not None and not delivery_was_dispatched:
+                await asyncio.to_thread(
+                    mark_user_message_delivery_sync,
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_FAILED,
+                )
+                await notify_deferred_delivery(
+                    False,
+                    "The deferred message could not be delivered. Please retry.",
+                    retry_with_new_id=True,
+                )
+            await manager.broadcast_to_task(
+                {
+                    "type": "agent_error",
+                    "message": "Task is already running on another worker.",
+                    "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
+                task_id,
+            )
             return
         lease_stop_event = asyncio.Event()
         lease_heartbeat_task = asyncio.create_task(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
 
+        # The task row can become RUNNING before the original AgentRunner has
+        # created a context/checkpoint. Retry an early failed injection only
+        # after that original execution has settled and persisted its state.
+        # Acquire the execution lease first: otherwise a non-owner worker could
+        # persist the injection and acknowledge it, then discover that it is
+        # not allowed to run the resume.
+        if pending_user_message is not None:
+            posted = await agent_service.post_user_message(
+                str(task_id),
+                execution_message=pending_user_message.get("execution_message"),
+                display_message=pending_user_message.get("display_message"),
+                files=pending_user_message.get("files"),
+                turn_id=pending_user_message.get("turn_id"),
+                request_interrupt=False,
+                reason="deferred websocket user message",
+            )
+            if not posted:
+                raise RuntimeError(
+                    "The user message was saved, but no resumable execution "
+                    "checkpoint became available."
+                )
+            delivery_was_dispatched = True
+            if delivery_turn_id is not None:
+                await asyncio.to_thread(
+                    mark_user_message_delivery_sync,
+                    task_id,
+                    delivery_turn_id,
+                    DELIVERY_DISPATCHED,
+                )
+            await notify_deferred_delivery(True)
+
+        # Resume is now durable: lease acquisition committed RUNNING. Do not
+        # announce it earlier from the WebSocket request handler.
+        await manager.broadcast_to_task(
+            {
+                "type": "task_resumed",
+                "task_id": task_id,
+                "message": "Task resumed",
+                "timestamp": datetime.now(timezone.utc).timestamp(),
+            },
+            task_id,
+        )
+
         with UserContext(task_owner_user_id), turn_execution_scope(task_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
         if result is None:
-            logger.warning(f"No resumable agent execution found for task {task_id}")
-            return
+            raise RuntimeError(
+                f"No resumable execution checkpoint was found for task {task_id}."
+            )
 
         status = str(result.get("status") or "")
         success = bool(result.get("success", False))
@@ -1909,6 +2102,27 @@ async def execute_resume_background(
                     final_task_status = TaskStatus.COMPLETED
                 else:
                     final_task_status = TaskStatus.FAILED
+
+                if success and output.strip() and task_owner_user_id is not None:
+                    from ..services.chat_history_service import (
+                        persist_assistant_message_no_commit,
+                    )
+
+                    persist_assistant_message_no_commit(
+                        db_new,
+                        task_id=task_id,
+                        user_id=int(task_owner_user_id),
+                        content=output,
+                        message_type="final_answer",
+                        turn_id=_latest_result_user_turn_id(result),
+                    )
+                    orm_task_updated = cast(Any, task_updated)
+                    orm_task_updated.output = output
+                    orm_task_updated.error_message = None
+                elif final_task_status == TaskStatus.FAILED:
+                    orm_task_updated = cast(Any, task_updated)
+                    orm_task_updated.output = None
+                    orm_task_updated.error_message = output or "Task execution failed."
                 lease_released = release_current_runner_task_lease_with_workforce_sync(
                     db_new, task_id, status=final_task_status
                 )
@@ -1916,6 +2130,14 @@ async def execute_resume_background(
                 final_status = task_updated.status.value
         finally:
             db_new.close()
+
+        if delivery_turn_id is not None:
+            await asyncio.to_thread(
+                mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_COMPLETED,
+            )
 
         if status in {"interrupted", "waiting_for_user"}:
             await manager.broadcast_to_task(
@@ -1957,14 +2179,43 @@ async def execute_resume_background(
         )
     except asyncio.CancelledError:
         logger.info(f"V2 resume background task {task_id} cancelled")
+        if delivery_turn_id is not None and not delivery_was_dispatched:
+            await asyncio.to_thread(
+                mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_FAILED,
+            )
+            await notify_deferred_delivery(
+                False,
+                "The deferred message was cancelled. Please retry.",
+                retry_with_new_id=True,
+            )
         raise
     except Exception as e:
         logger.error(f"V2 resume background task {task_id} failed: {e}", exc_info=True)
+        error_message = str(e)
+        if delivery_turn_id is not None and not delivery_was_dispatched:
+            await asyncio.to_thread(
+                mark_user_message_delivery_sync,
+                task_id,
+                delivery_turn_id,
+                DELIVERY_FAILED,
+            )
+            await notify_deferred_delivery(
+                False,
+                error_message,
+                retry_with_new_id=True,
+            )
         await manager.broadcast_to_task(
             {
-                "type": "task_error",
+                **_terminal_task_error_payload(
+                    task_id,
+                    error_message,
+                    event_type="task_error",
+                ),
                 "task_id": task_id,
-                "error": str(e),
+                "error": error_message,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
             },
             task_id,
@@ -1991,6 +2242,12 @@ class BackgroundTaskManager:
     def __init__(self) -> None:
         # task_id -> asyncio.Task
         self.running_tasks: Dict[int, asyncio.Task] = {}
+        # Resume coordinators are deliberately tracked separately while they
+        # wait for the current execution. Replacing ``running_tasks[task_id]``
+        # too early creates a cycle: the original execution waits for the new
+        # resume task while that resume task waits for the original execution.
+        self.resume_tasks: Dict[int, asyncio.Task] = {}
+        self._resume_reservations: set[int] = set()
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -2016,20 +2273,65 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
+    def reserve_resume(self, task_id: int) -> bool:
+        """Atomically reserve the single live-control resume slot."""
+
+        # Keep this check-and-add block synchronous: asyncio task switches can
+        # only happen at ``await``, so it is the in-process atomic guard.
+        existing = self.resume_tasks.get(task_id)
+        if task_id in self._resume_reservations or (
+            existing is not None and not existing.done()
+        ):
+            return False
+        self._resume_reservations.add(task_id)
+        return True
+
+    def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
+        if task_id not in self._resume_reservations:
+            raise RuntimeError(f"Task {task_id} has no reserved resume slot")
+        self._resume_reservations.discard(task_id)
+        self.resume_tasks[task_id] = task
+        logger.info("Registered resume coordinator for task %s", task_id)
+
+    def release_resume_reservation(self, task_id: int) -> None:
+        self._resume_reservations.discard(task_id)
+
+    def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
+        existing = self.resume_tasks.get(task_id)
+        if existing is not task:
+            raise RuntimeError(
+                f"Task {task_id} resume coordinator is not registered or no longer current"
+            )
+        self.running_tasks[task_id] = task
+        logger.info("Promoted resume coordinator for task %s", task_id)
+
     def cleanup_task(self, task_id: int) -> None:
         """Clean up completed background task"""
-        if task_id in self.running_tasks:
-            task = self.running_tasks[task_id]
-            if task.done():
-                del self.running_tasks[task_id]
-                logger.info(f"Cleaned up background task for task {task_id}")
+        current = asyncio.current_task()
+        task = self.running_tasks.get(task_id)
+        if task is not None and (task.done() or task is current):
+            self.running_tasks.pop(task_id, None)
+            logger.info(f"Cleaned up background task for task {task_id}")
+        resume_task = self.resume_tasks.get(task_id)
+        if resume_task is not None and (resume_task.done() or resume_task is current):
+            self.resume_tasks.pop(task_id, None)
+            logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(self, task_id: int, timeout_seconds: float = 0.5) -> None:
-        task = self.running_tasks.get(task_id)
-        if not task:
+        tasks = {
+            task
+            for task in (
+                self.running_tasks.get(task_id),
+                self.resume_tasks.get(task_id),
+            )
+            if task is not None
+        }
+        if not tasks:
             return
 
-        if not task.done():
+        for task in tasks:
+            if task.done():
+                continue
             task.cancel()
             try:
                 await asyncio.wait_for(task, timeout=timeout_seconds)
@@ -2049,6 +2351,8 @@ class BackgroundTaskManager:
                 )
 
         self.running_tasks.pop(task_id, None)
+        self.resume_tasks.pop(task_id, None)
+        self._resume_reservations.discard(task_id)
 
 
 # Global background task manager
@@ -2497,6 +2801,71 @@ async def handle_chat_message(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
     """Handle chat message"""
+    client_message_id = _client_message_id(message_data.get("client_message_id"))
+    turn_id = client_message_id or str(uuid.uuid4())
+    delivery_finished = False
+    delivery_dispatched = False
+    delivery_claimed = False
+
+    async def finish_delivery(
+        accepted: bool,
+        message: str | None = None,
+        *,
+        retry_with_new_id: bool = False,
+    ) -> None:
+        nonlocal delivery_finished
+        if delivery_finished:
+            return
+        delivery_finished = True
+        await _send_message_delivery(
+            websocket,
+            client_message_id=client_message_id,
+            turn_id=turn_id,
+            accepted=accepted,
+            message=message,
+            retry_with_new_id=retry_with_new_id,
+        )
+
+    async def finish_delivery_failure(message: str) -> None:
+        """Reject pre-dispatch failures; never confuse persistence with delivery."""
+
+        if delivery_finished:
+            return
+        if delivery_claimed and not delivery_dispatched:
+            await asyncio.to_thread(
+                mark_user_message_delivery_sync,
+                task_id,
+                turn_id,
+                DELIVERY_FAILED,
+            )
+        await finish_delivery(
+            delivery_dispatched,
+            None if delivery_dispatched else message,
+        )
+
+    async def finish_existing_delivery(
+        claim: UserMessageDeliveryClaim,
+    ) -> None:
+        if not claim.payload_matches:
+            await finish_delivery(
+                False,
+                "Message id was already used for different content or files.",
+                retry_with_new_id=True,
+            )
+        elif claim.failed:
+            await finish_delivery(
+                False,
+                "The previous delivery attempt failed. Please retry the draft.",
+                retry_with_new_id=True,
+            )
+        elif claim.pending:
+            await finish_delivery(
+                False,
+                "The message is still being applied. Please retry shortly.",
+            )
+        else:
+            await finish_delivery(True)
+
     try:
         user_message = message_data.get("message", "")
 
@@ -2794,6 +3163,27 @@ async def handle_chat_message(
                 context["display_message"] = display_user_message
                 context["files"] = display_file_refs
 
+                persisted_attachments = _normalize_attachments_for_persistence(
+                    file_info_list
+                )
+
+                # Retry inspection happens after file normalization so the
+                # same text with different attachments cannot alias an older
+                # durable turn. Legacy rows with no delivery status are
+                # treated as delivered; failed handoffs are explicitly
+                # rejected so the frontend can retry with a fresh id.
+                if client_message_id is not None:
+                    existing_delivery = inspect_user_message_delivery(
+                        db,
+                        task_id,
+                        display_user_message,
+                        attachments=persisted_attachments or None,
+                        turn_id=turn_id,
+                    )
+                    if existing_delivery is not None:
+                        await finish_existing_delivery(existing_delivery)
+                        return
+
                 # DAG plan-execute will automatically send user_message trace event
 
                 # The user message is persisted inside
@@ -2845,6 +3235,19 @@ async def handle_chat_message(
                     logger.info(f"Using continuation for running task {task_id}")
                     assert dag_pattern is not None  # for mypy type checking
 
+                    delivery_claim = claim_user_message_delivery(
+                        db,
+                        task_id=task_id,
+                        user_id=int(task.user_id),
+                        content=display_user_message,
+                        attachments=persisted_attachments or None,
+                        turn_id=turn_id,
+                    )
+                    if not delivery_claim.claimed:
+                        await finish_existing_delivery(delivery_claim)
+                        return
+                    delivery_claimed = True
+
                     # Immediately send trace_user_message to display user message on interface
                     if hasattr(dag_pattern, "tracer") and hasattr(
                         dag_pattern, "task_id"
@@ -2854,6 +3257,7 @@ async def handle_chat_message(
                             "pattern": "DAG Plan-Execute Continuation",
                             "continuation": "true",
                             "files": display_file_refs,
+                            "turn_id": turn_id,
                         }
                         # Surface uploaded files at the top level so the
                         # frontend user-message renderer can show clickable
@@ -2872,6 +3276,17 @@ async def handle_chat_message(
                         )
 
                     dag_pattern.request_continuation(user_message_for_llm, context)
+                    mark_user_message_delivery(
+                        db,
+                        task_id=task_id,
+                        turn_id=turn_id,
+                        status=DELIVERY_DISPATCHED,
+                    )
+                    # The existing DAG worker owns terminal execution and has
+                    # no per-continuation completion callback. For this path,
+                    # DISPATCHED is the terminal delivery state: it means the
+                    # continuation was accepted, not that the whole DAG ended.
+                    delivery_dispatched = True
 
                     # If previously PAUSED/WAITING_FOR_USER, update status to RUNNING
                     if task.status in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
@@ -2885,6 +3300,7 @@ async def handle_chat_message(
                                 },
                                 websocket,
                             )
+                            await finish_delivery(True)
                             return
                         db.refresh(task)
                         if sync_workforce_run_status(db, task, task.status):
@@ -2928,10 +3344,18 @@ async def handle_chat_message(
                         logger.info(f"Task {task_id} status updated to RUNNING")
 
                     # Continuation will be handled by old task, return directly
+                    await finish_delivery(True)
                     return
                 if task_uses_live_control and supports_live_control:
                     logger.info(f"Using agent message control for task {task_id}")
                     assert agent_service is not None
+                    if not background_task_manager.reserve_resume(task_id):
+                        await finish_delivery(
+                            False,
+                            "A previous guidance message is still being applied. "
+                            "Please wait for it to finish.",
+                        )
+                        return
                     # Pass the user-typed bubble text + display-safe file refs
                     # alongside the LLM-augmented execution text. The runner
                     # persists them onto Message.metadata so its tracing
@@ -2946,30 +3370,88 @@ async def handle_chat_message(
                     # bubble twice in the live UI. The DAG Plan-Execute
                     # continuation path above is a separate code path and
                     # keeps its own immediate trace.
-                    posted = await agent_service.post_user_message(
-                        str(task_id),
-                        execution_message=user_message_for_llm,
-                        display_message=display_user_message,
-                        files=display_file_refs,
-                        request_interrupt=task.status == TaskStatus.RUNNING,
-                        reason="new websocket user message",
-                    )
-                    if not posted:
-                        logger.warning(
-                            f"agent execution {task_id} was not live; attempting resume from checkpoint"
-                        )
-
-                    previous_task = background_task_manager.running_tasks.get(task_id)
-                    bg_task = asyncio.create_task(
-                        execute_resume_background(
+                    bg_task: asyncio.Task[None] | None = None
+                    try:
+                        delivery_claim = claim_user_message_delivery(
+                            db,
                             task_id=task_id,
-                            agent_service=agent_service,
-                            task_owner_user_id=int(task.user_id),
-                            previous_task=previous_task,
+                            user_id=int(task.user_id),
+                            content=display_user_message,
+                            attachments=persisted_attachments or None,
+                            turn_id=turn_id,
                         )
-                    )
-                    background_task_manager.register_task(task_id, bg_task)
+                        if not delivery_claim.claimed:
+                            background_task_manager.release_resume_reservation(task_id)
+                            await finish_existing_delivery(delivery_claim)
+                            return
+                        delivery_claimed = True
 
+                        posted = await agent_service.post_user_message(
+                            str(task_id),
+                            execution_message=user_message_for_llm,
+                            display_message=display_user_message,
+                            files=display_file_refs,
+                            turn_id=turn_id,
+                            request_interrupt=task.status == TaskStatus.RUNNING,
+                            reason="new websocket user message",
+                        )
+                        if not posted:
+                            logger.warning(
+                                "Agent execution %s was not live; deferring the "
+                                "durable user message until its checkpoint is ready",
+                                task_id,
+                            )
+                        else:
+                            mark_user_message_delivery(
+                                db,
+                                task_id=task_id,
+                                turn_id=turn_id,
+                                status=DELIVERY_DISPATCHED,
+                            )
+                        # ``post_user_message`` has already durably injected the
+                        # turn when it returns True. Preserve that fact even if
+                        # the resume reservation is concurrently withdrawn
+                        # before the coordinator can be registered.
+                        delivery_dispatched = posted
+
+                        previous_task = background_task_manager.running_tasks.get(
+                            task_id
+                        )
+                        bg_task = asyncio.create_task(
+                            execute_resume_background(
+                                task_id=task_id,
+                                agent_service=agent_service,
+                                task_owner_user_id=int(task.user_id),
+                                previous_task=previous_task,
+                                pending_user_message=(
+                                    None
+                                    if posted
+                                    else {
+                                        "execution_message": user_message_for_llm,
+                                        "display_message": display_user_message,
+                                        "files": display_file_refs,
+                                        "turn_id": turn_id,
+                                    }
+                                ),
+                                delivery_turn_id=turn_id,
+                                delivery_already_dispatched=posted,
+                                delivery_websocket=None if posted else websocket,
+                                delivery_client_message_id=(
+                                    None if posted else client_message_id
+                                ),
+                            )
+                        )
+                        background_task_manager.register_reserved_resume(
+                            task_id, bg_task
+                        )
+                    except BaseException:
+                        if bg_task is not None:
+                            bg_task.cancel()
+                        background_task_manager.release_resume_reservation(task_id)
+                        raise
+
+                    if posted:
+                        await finish_delivery(True)
                     return
                 elif task_uses_live_control and not has_continuation:
                     # Task is running but doesn't support continuation (shouldn't happen)
@@ -2982,6 +3464,9 @@ async def handle_chat_message(
                             "message": "Task does not support message continuation",
                         },
                         websocket,
+                    )
+                    await finish_delivery(
+                        False, "Task does not support message continuation."
                     )
                     return
                 else:
@@ -3016,6 +3501,10 @@ async def handle_chat_message(
                                     "timestamp": datetime.now(timezone.utc).timestamp(),
                                 },
                                 task_id,
+                            )
+                            await finish_delivery(
+                                False,
+                                "Task pause is still being applied; please retry shortly.",
                             )
                             return
                         _clear_task_pause_accepted(task_id)
@@ -3117,13 +3606,11 @@ async def handle_chat_message(
                     # Strip absolute filesystem paths before the row hits
                     # disk — the attachments column is exposed to historical-
                     # replay clients, so paths must not leak.
-                    persisted_attachments = _normalize_attachments_for_persistence(
-                        file_info_list
-                    )
                     payload = TaskTurnPayload(
                         transcript_message=display_user_message,
                         execution_message=user_message_for_llm,
                         attachments=persisted_attachments or None,
+                        turn_id=turn_id,
                     )
                     # WS path has these legal entries into begin_turn:
                     #   PENDING                  → CREATE
@@ -3165,6 +3652,9 @@ async def handle_chat_message(
                             },
                             task_id,
                         )
+                        await finish_delivery(
+                            False, "Internal dispatch error; please retry."
+                        )
                         return
 
                     try:
@@ -3184,6 +3674,7 @@ async def handle_chat_message(
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
+                        await finish_delivery(True)
                     except TaskTurnNotFoundError:
                         # Task vanished or changed ownership between the
                         # resolve above and the atomic claim — surface it the
@@ -3204,6 +3695,7 @@ async def handle_chat_message(
                             },
                             task_id,
                         )
+                        await finish_delivery(False, "Task is no longer available.")
                     except TaskTurnError as busy_err:
                         # begin_turn's atomic transaction rolls back on
                         # bg_inflight / busy — neither the status flip
@@ -3231,6 +3723,11 @@ async def handle_chat_message(
                             },
                             task_id,
                         )
+                        await finish_delivery(
+                            False,
+                            "Task is currently busy; please wait for the previous "
+                            "turn to finish before sending another message.",
+                        )
 
             finally:
                 db.close()
@@ -3239,6 +3736,7 @@ async def handle_chat_message(
             # Data validation and format error
             message = f"Data validation error: {str(e)}"
             logger.error(f"Data validation error in agent execution: {e}")
+            await finish_delivery_failure(message)
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 await manager.broadcast_to_task(
@@ -3261,6 +3759,7 @@ async def handle_chat_message(
             # Runtime error
             message = f"Runtime error: {str(e)}"
             logger.error(f"Runtime error in agent execution: {e}")
+            await finish_delivery_failure(message)
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 await manager.broadcast_to_task(
@@ -3282,11 +3781,13 @@ async def handle_chat_message(
         except Exception as e:
             # Other unknown errors, re-raise
             logger.error(f"Unexpected error in agent execution: {e}")
+            await finish_delivery_failure(str(e))
             raise
 
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
         logger.error(f"Message format error: {e}")
+        await finish_delivery_failure(f"Message format error: {str(e)}")
         await manager.send_personal_message(
             {"type": "error", "message": f"Message format error: {str(e)}"}, websocket
         )
@@ -3297,6 +3798,7 @@ async def handle_chat_message(
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error handling chat message: {e}")
+        await finish_delivery_failure(str(e))
         raise
 
 
@@ -4169,6 +4671,7 @@ async def handle_pause_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
     """Handle task pause request"""
+    db: Session | None = None
     try:
         logger.info(f"🔘 handle_pause_task called for task {task_id}")
         user = message_data.get("user")
@@ -4231,17 +4734,20 @@ async def handle_pause_task(
             logger.info("Agent pause_execution completed")
             _mark_task_pause_accepted(task_id)
 
-            # Send pause confirmation
+            # This confirms only that the control request was accepted. The
+            # frontend deliberately waits for the later durable ``task_info``
+            # PAUSED state before changing its pause UI; treating this event
+            # as ``task_paused`` would reintroduce the optimistic-state bug.
             await manager.broadcast_to_task(
                 {
-                    "type": "task_paused",
+                    "type": "task_pause_requested",
                     "task_id": task_id,
-                    "message": "Task paused",
+                    "message": "Task pause requested",
                     "timestamp": datetime.now(timezone.utc).timestamp(),
                 },
                 task_id,
             )
-            logger.info(f"Task {task_id} paused successfully")
+            logger.info(f"Task {task_id} pause requested successfully")
         else:
             # If pause not supported, send error message
             await manager.send_personal_message(
@@ -4272,6 +4778,9 @@ async def handle_pause_task(
         # Other errors, re-raise
         logger.error(f"Unexpected error pausing task {task_id}: {e}")
         raise
+    finally:
+        if db is not None:
+            db.close()
 
 
 async def handle_resume_task(
@@ -4330,25 +4839,43 @@ async def handle_resume_task(
             return
 
         if getattr(agent_service, "supports_live_control", lambda: False)():
-            await manager.broadcast_to_task(
-                {
-                    "type": "task_resumed",
-                    "task_id": task_id,
-                    "message": "Task resumed",
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
-            )
-            previous_task = background_task_manager.running_tasks.get(task_id)
-            bg_task = asyncio.create_task(
-                execute_resume_background(
-                    task_id=task_id,
-                    agent_service=agent_service,
-                    task_owner_user_id=int(task.user_id),
-                    previous_task=previous_task,
+            if task.status not in {TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER}:
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "Task is not paused and cannot be resumed.",
+                        "task": {"id": task_id, "status": task.status.value},
+                    },
+                    websocket,
                 )
-            )
-            background_task_manager.register_task(task_id, bg_task)
+                return
+            if not background_task_manager.reserve_resume(task_id):
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "Task resume is already in progress.",
+                        "task": {"id": task_id, "status": task.status.value},
+                    },
+                    websocket,
+                )
+                return
+            previous_task = background_task_manager.running_tasks.get(task_id)
+            bg_task: asyncio.Task[None] | None = None
+            try:
+                bg_task = asyncio.create_task(
+                    execute_resume_background(
+                        task_id=task_id,
+                        agent_service=agent_service,
+                        task_owner_user_id=int(task.user_id),
+                        previous_task=previous_task,
+                    )
+                )
+                background_task_manager.register_reserved_resume(task_id, bg_task)
+            except BaseException:
+                if bg_task is not None:
+                    bg_task.cancel()
+                background_task_manager.release_resume_reservation(task_id)
+                raise
             logger.info(f"Task {task_id} v2 resume scheduled")
             return
 

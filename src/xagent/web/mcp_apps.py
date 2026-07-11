@@ -11,6 +11,23 @@ from sqlalchemy.orm import Session
 from .models.public_mcp import PublicMCPApp
 
 
+def classify_app_auth(transport: Any, launch_config: Any) -> str:
+    """Single source of truth for how a catalog app is connected.
+
+    Derived from the entry's own fields so the backend connect gate and both
+    frontend dialogs can't drift apart. Values:
+        - "builtin_oauth": provider redirect flow (transport == "oauth")
+        - "api_key": static key, connected via /api/mcp/apps/{id}/connect
+        - "unconnectable": neither oauth nor a launchable key-based command
+    """
+    if str(transport or "").lower() == "oauth":
+        return "builtin_oauth"
+    launch = launch_config if isinstance(launch_config, dict) else {}
+    if launch.get("required_env") and launch.get("command"):
+        return "api_key"
+    return "unconnectable"
+
+
 def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     return {
         "id": app.app_id,
@@ -23,6 +40,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
         "oauth_scopes": app.oauth_scopes or [],
         "is_visible_in_connector": bool(app.is_visible_in_connector),
         "launch_config": app.launch_config or {},
+        "auth_type": classify_app_auth(app.transport, app.launch_config),
     }
 
 

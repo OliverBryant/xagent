@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
+from ...core.execution_scope import (
+    ExecutionScope,
+    get_execution_scope,
+    resolve_execution_scope,
+)
 from ...core.file_storage import (
     FsspecFileStorage,
     ScopedFileStorage,
@@ -128,8 +133,34 @@ class ManagedFileRef:
 
     record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
+    execution_scope: ExecutionScope | None = None
+    _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Resolve the active scope once, at construction, so the bound handle
+        # and any key written through it (see ``sync_to_durable``) agree even
+        # if the ambient scope changes later or the ref outlives the turn.
+        #
+        # Precedence mirrors ``AgentServiceManager.get_agent_for_task``:
+        # explicit arg -> ambient turn contextvar -> the per-task
+        # resolver/snapshot keyed on the record's ``task_id``. The last step
+        # matters on off-turn paths (bot/builder-chat handlers never enter
+        # ``turn_execution_scope``, so the contextvar is None): a workforce
+        # sub-task carries its scope only in the persisted snapshot, and
+        # without recovering it here ``sync_to_durable`` would write the file
+        # under the owner root instead of the sub-task's scoped subtree.
+        # Passing ``execution_scope=None`` is equivalent to omitting it — there
+        # is no way to force owner-root over an active ambient/persisted scope.
+        scope = self.execution_scope
+        if scope is None:
+            scope = get_execution_scope()
+        if scope is None:
+            task_id = getattr(self.record, "task_id", None)
+            if task_id is not None:
+                scope = resolve_execution_scope(task_id)
+        self._scope_segments = (
+            scope.durable_storage_segments if scope is not None else ()
+        )
         if self.storage is None:
             user_id = self.record.user_id
             if user_id is None:
@@ -137,7 +168,9 @@ class ManagedFileRef:
                     "Record user_id is required to bind user-scoped storage; "
                     "pass an explicit storage handle for records without an owner"
                 )
-            self.storage = get_user_file_storage(int(user_id))
+            self.storage = get_user_file_storage(
+                int(user_id), scope_segments=self._scope_segments
+            )
 
     @property
     def local_path(self) -> Path:
@@ -261,6 +294,7 @@ class ManagedFileRef:
                 int(self.record.user_id),
                 str(self.record.file_id),
                 self.filename or path.name,
+                scope_segments=self._scope_segments,
             )
         )
         try:

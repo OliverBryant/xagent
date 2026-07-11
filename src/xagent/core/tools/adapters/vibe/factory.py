@@ -104,6 +104,7 @@ class ToolRegistry:
         try:
             # Import tool modules in priority order - these imports trigger @register_tool decorators
             from . import (  # noqa: F401 - imports trigger @register_tool decorators
+                a2a_agent_tool,
                 agent_tool,
                 ask_user_tool,
                 audio_tool,
@@ -515,52 +516,99 @@ class ToolFactory:
     ) -> List[Tool]:
         """Create MCP tools from configurations."""
         try:
-            from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_adapter import UnavailableMCPTool, load_mcp_tools_as_agent_tools
 
-            # Convert configs to connection format
-            connections = {}
+            unavailable_tools: List[Tool] = []
+            normal_configs: List[Dict[str, Any]] = []
 
             for config in mcp_configs:
-                connection_config = {
-                    "transport": config["transport"],
-                    **config["config"],
-                }
-                for runtime_key in (
-                    "runtime_bindings",
-                    "runtime_input_schema",
-                    "connector_runtime",
-                    "allow_delegated_authorization",
-                ):
-                    if runtime_key in config:
-                        connection_config[runtime_key] = config[runtime_key]
-
-                # Fix args field if it's a string instead of list
-                if "args" in connection_config and isinstance(
-                    connection_config["args"], str
-                ):
-                    # Split args string into list, handling quoted arguments
-                    import shlex
-
+                inner_config = config.get("config")
+                if isinstance(inner_config, dict) and inner_config.get("unavailable"):
                     try:
-                        connection_config["args"] = shlex.split(
-                            connection_config["args"]
-                        )
-                        logger.info(
-                            f"Converted args string to list: {connection_config['args']}"
+                        server_name = config.get("name")
+                        allow_users = config.get("allow_users")
+                        unavailable_tools.append(
+                            UnavailableMCPTool(
+                                server_name=server_name
+                                if isinstance(server_name, str)
+                                else "",
+                                server_id=inner_config.get("server_id"),
+                                allow_users=allow_users
+                                if isinstance(allow_users, list)
+                                else None,
+                            )
                         )
                     except Exception as e:
-                        logger.warning(f"Failed to parse args string: {e}")
-                        # Fallback to simple split
-                        connection_config["args"] = connection_config["args"].split()
+                        logger.warning(
+                            "Failed to create unavailable MCP tool for server '%s': %s",
+                            config.get("name", "<unknown>"),
+                            type(e).__name__,
+                        )
+                    continue
+                normal_configs.append(config)
 
-                connections[config["name"]] = connection_config
+            normal_tools: List[Tool] = []
+            if normal_configs:
+                try:
+                    # Convert configs to connection format
+                    connections = {}
 
-            # Load MCP tools
-            mcp_tools = await load_mcp_tools_as_agent_tools(
-                connections,
-                sandbox=sandbox,
-            )  # type: ignore[arg-type]
-            return mcp_tools if mcp_tools else []  # type: ignore[return-value]
+                    for config in normal_configs:
+                        inner_config = config.get("config")
+                        if not isinstance(inner_config, dict):
+                            raise ValueError(
+                                "MCP server config 'config' field for server "
+                                f"'{config.get('name', '<unknown>')}' must be a "
+                                f"dictionary, got {type(inner_config).__name__}"
+                            )
+                        connection_config = {
+                            "transport": config["transport"],
+                            **inner_config,
+                        }
+                        for runtime_key in (
+                            "runtime_bindings",
+                            "runtime_input_schema",
+                            "connector_runtime",
+                            "allow_delegated_authorization",
+                        ):
+                            if runtime_key in config:
+                                connection_config[runtime_key] = config[runtime_key]
+
+                        # Fix args field if it's a string instead of list
+                        if "args" in connection_config and isinstance(
+                            connection_config["args"], str
+                        ):
+                            # Split args string to list, handling quoted arguments
+                            import shlex
+
+                            try:
+                                connection_config["args"] = shlex.split(
+                                    connection_config["args"]
+                                )
+                                logger.info(
+                                    f"Converted args string to list: {connection_config['args']}"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to parse args string: {e}")
+                                # Fallback to simple split
+                                connection_config["args"] = connection_config[
+                                    "args"
+                                ].split()
+
+                        connections[config["name"]] = connection_config
+
+                    # Load MCP tools
+                    mcp_tools = await load_mcp_tools_as_agent_tools(
+                        connections,
+                        sandbox=sandbox,
+                    )  # type: ignore[arg-type]
+                    normal_tools = mcp_tools if mcp_tools else []  # type: ignore[assignment]
+                except ConnectorRuntimeError:
+                    raise
+                except Exception as e:
+                    logger.warning(f"Failed to create MCP tools: {e}")
+
+            return unavailable_tools + normal_tools
         except ConnectorRuntimeError:
             raise
         except Exception as e:

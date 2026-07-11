@@ -35,7 +35,7 @@ export interface Interaction {
 }
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
-import { getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
+import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
@@ -516,7 +516,6 @@ type AppAction =
   | {
     type: "CLEAR_MESSAGES";
     payload?: {
-      keepMessageId?: string | null;
       preserveUserMessages?: boolean;
       preserveStreamingFinalAnswers?: boolean;
     };
@@ -849,14 +848,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case "CLEAR_MESSAGES":
       if (action.payload) {
         const {
-          keepMessageId,
           preserveUserMessages,
           preserveStreamingFinalAnswers,
         } = action.payload
         const messagesToKeep = state.messages.filter(message => {
-          if (keepMessageId && message.id === keepMessageId) {
-            return true
-          }
           if (preserveUserMessages && message.role === "user") {
             return true
           }
@@ -1043,6 +1038,16 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+interface PendingMessage {
+  message: string
+  files?: File[]
+  targetTaskId?: number
+  force?: boolean
+  clientMessageId?: string
+  resolve?: () => void
+  reject?: (error: Error) => void
+}
+
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
@@ -1066,7 +1071,7 @@ interface AppContextType {
   setReplayPlaying: (isPlaying: boolean) => void
   setReplaySpeed: (speed: number) => void
   setReplayProgress: (progress: number) => void
-  setPendingMessage: React.Dispatch<React.SetStateAction<{ message: string; files?: File[]; targetTaskId?: number } | null>>
+  setPendingMessage: React.Dispatch<React.SetStateAction<PendingMessage | null>>
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined)
@@ -1091,11 +1096,10 @@ export function AppProvider({
   transport?: AppProviderTransportConfig
 }) {
   const [state, dispatch] = useReducer(appReducer, initialState)
-  const [pendingMessage, setPendingMessage] = useState<{ message: string; files?: File[]; targetTaskId?: number } | null>(null)
+  const [pendingMessage, setPendingMessage] = useState<PendingMessage | null>(null)
   const { token: authToken } = useAuth() // Get auth token from context
   const { t } = useI18n()
   const router = useRouter()
-  const pendingOptimisticMessageId = useRef<string | null>(null)
   const lastConnectedTaskId = useRef<number | null>(null)
 
   // Ref to track current state for WebSocket message handler
@@ -1112,14 +1116,9 @@ export function AppProvider({
     // This prevents stale data issues and fixes race conditions
     if (lastConnectedTaskId.current === stateRef.current.taskId) {
       // Reconnection to SAME task -> Clear messages
-      // Keep pending optimistic message if exists
-      const keepMessageId = pendingOptimisticMessageId.current
-      pendingOptimisticMessageId.current = null
-
       dispatch({
         type: "CLEAR_MESSAGES",
         payload: {
-          keepMessageId,
           preserveUserMessages: true,
           preserveStreamingFinalAnswers: true,
         },
@@ -1207,10 +1206,45 @@ export function AppProvider({
         hasFiles: pendingMessage.files && pendingMessage.files.length > 0,
         targetTaskId: pendingMessage.targetTaskId
       })
-      sendChatMessage(pendingMessage.message, pendingMessage.files)
-      setPendingMessage(null)
+      void Promise.resolve(
+        sendChatMessage(
+          pendingMessage.message,
+          pendingMessage.files,
+          pendingMessage.force,
+          pendingMessage.clientMessageId,
+        )
+      ).then(() => {
+        pendingMessage.resolve?.()
+        setPendingMessage(current => current === pendingMessage ? null : current)
+      }).catch((error) => {
+        const deliveryError = error instanceof Error ? error : new Error(String(error))
+        pendingMessage.reject?.(deliveryError)
+        setPendingMessage(current => current === pendingMessage ? null : current)
+      })
     }
   }, [isConnected, pendingMessage, sendChatMessage])
+
+  const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'resolve' | 'reject'>) => {
+    return new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        setPendingMessage(current => (
+          current?.clientMessageId === message.clientMessageId ? null : current
+        ))
+        reject(new Error('Message not sent: timed out waiting for the task connection.'))
+      }, 30000)
+      setPendingMessage({
+        ...message,
+        resolve: () => {
+          window.clearTimeout(timeout)
+          resolve()
+        },
+        reject: (error) => {
+          window.clearTimeout(timeout)
+          reject(error)
+        },
+      })
+    })
+  }, [])
 
   // Handle auto-execute pending task separately
   useEffect(() => {
@@ -2930,8 +2964,8 @@ export function AppProvider({
               step_id: eventData.step_id,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.reactTaskEnd') || 'Task Completed',
-                message: t('agent.logs.event.messages.reactTaskEnd') || 'ReAct Task Completed',
+                action: t('agent.logs.event.actions.react_task_end'),
+                message: t('agent.logs.event.messages.reactTaskCompleted'),
                 ...eventData
               }
             }
@@ -2966,8 +3000,8 @@ export function AppProvider({
               step_id: eventData.step_id,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.reactTaskFailed') || 'Task Failed',
-                message: t('agent.logs.event.messages.reactTaskFailed') || 'ReAct Task Failed',
+                action: t('agent.logs.event.actions.react_task_failed'),
+                message: t('agent.logs.event.messages.reactTaskFailed'),
                 error: eventData.error || eventData.message,
                 ...eventData
               }
@@ -2996,7 +3030,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallStart') || 'LLM Call Start',
+                action: t('agent.logs.event.actions.llm_call_start'),
                 ...eventData
               }
             }
@@ -3009,7 +3043,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallEnd') || 'LLM Call End',
+                action: t('agent.logs.event.actions.llm_call_end'),
                 ...eventData
               }
             }
@@ -3022,7 +3056,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallFailed') || 'LLM Call Failed',
+                action: t('agent.logs.event.actions.llm_call_failed'),
                 ...eventData
               }
             }
@@ -3047,7 +3081,7 @@ export function AppProvider({
               event_type: eventType,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.taskCompleted'),
+                action: t('agent.logs.event.actions.task_completion'),
                 message: t('agent.logs.event.messages.taskCompleted'),
                 result: eventData.result,
                 success: eventData.success
@@ -3983,7 +4017,7 @@ export function AppProvider({
           payload: {
             id: generateMessageId("msg"),
             role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknownError')}`,
+            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
             timestamp: message.timestamp,
             status: "failed",
           },
@@ -4061,34 +4095,18 @@ export function AppProvider({
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
+    const clientMessageId = typeof config?.clientMessageId === 'string'
+      ? config.clientMessageId
+      : generateClientMessageId()
     const targetTaskId = typeof config?.targetTaskId === 'number' ? config.targetTaskId : null
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
-      setPendingMessage({ message, files, targetTaskId })
-
-      if (!isDuplicateMessage(message, 'user-message', config?.force)) {
-        let content: React.ReactNode = message
-        if (files && files.length > 0) {
-          content = (
-            <div className="space-y-2">
-              <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
-              <FileAttachment
-                files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))}
-                variant="user-message"
-              />
-            </div>
-          )
-        }
-
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: generateMessageId("msg-user-optimistic"),
-            role: "user",
-            content,
-            timestamp: Date.now().toString(),
-          }
-        })
-      }
+      await queuePendingMessage({
+        message,
+        files,
+        targetTaskId,
+        force: config?.force,
+        clientMessageId,
+      })
       return
     }
 
@@ -4234,38 +4252,15 @@ export function AppProvider({
             hasFiles: files && files.length > 0
           })
 
-          // Store the message to be sent after WebSocket connects
-          setPendingMessage({ message, files, targetTaskId: newTaskId })
-
-          // Optimistically add the user message to the UI
-          if (!isDuplicateMessage(message, 'user-message')) {
-            let content: React.ReactNode = message
-            if (files && files.length > 0) {
-              content = (
-                <div className="space-y-2">
-                  <div className="whitespace-pre-wrap max-h-60 overflow-y-auto">{message}</div>
-                  <FileAttachment
-                    files={files.map(f => ({ name: f.name, type: f.type, size: f.size, path: '' }))} // Basic info for optimistic render
-                    variant="user-message"
-                  />
-                </div>
-              )
-            }
-
-            const optimisticId = generateMessageId("msg-user-optimistic")
-            // Store ID to prevent clearing it when task loads
-            pendingOptimisticMessageId.current = optimisticId
-
-            dispatch({
-              type: "ADD_MESSAGE",
-              payload: {
-                id: optimisticId,
-                role: "user",
-                content: content,
-                timestamp: Date.now().toString(),
-              }
-            })
-          }
+          // Do not clear the composer until the newly connected task socket
+          // confirms that the message was durably accepted.
+          await queuePendingMessage({
+            message,
+            files,
+            targetTaskId: newTaskId,
+            force: config?.force,
+            clientMessageId,
+          })
         } else {
           const parsed = await parseApiResponse(response)
           const errorMessage = getApiErrorMessage(
@@ -4291,7 +4286,11 @@ export function AppProvider({
         taskId: state.taskId
       })
 
-      // If task is completed, mark it as running immediately to update sidebar
+      // Wait for the server's durable-delivery acknowledgement. If the socket
+      // is disconnected or the backend rejects the turn, this throws and the
+      // composer keeps both its text and attached files.
+      await sendChatMessage(message, files, config?.force, clientMessageId)
+
       if (state.currentTask?.status === 'completed') {
         dispatch({
           type: "UPDATE_TASK_STATUS",
@@ -4300,7 +4299,9 @@ export function AppProvider({
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      // Optimistically add the user message to the UI
+      // The user_message trace usually arrives before the acknowledgement. If
+      // it has not, add a local copy now; the normal dedupe path reconciles the
+      // later trace without displaying a duplicate.
       if (!isDuplicateMessage(message, 'user-message', config?.force)) {
         let content: React.ReactNode = message
         if (files && files.length > 0) {
@@ -4324,15 +4325,9 @@ export function AppProvider({
             timestamp: Date.now().toString(),
           }
         })
-
-        // Send chat message - backend will handle user message via trace event
-        // Only send if not a duplicate
-        sendChatMessage(message, files, config?.force)
-      } else {
-        console.log('⚠️ Duplicate message blocked from sending:', message)
       }
     }
-  }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status])
+  }, [state.taskId, sendChatMessage, wsExecuteTask, state.currentTask?.status, queuePendingMessage])
 
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {

@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 
 import xagent.web.api.mcp as mcp_api
 from xagent.web.api.admin_mcp import admin_mcp_router
-from xagent.web.api.auth import _ensure_user_mcp_server, auth_router
+from xagent.web.api.auth import (
+    AppNotOAuthError,
+    _ensure_user_mcp_server,
+    auth_router,
+)
 from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -430,7 +434,7 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
 
             with pytest.raises(
                 ValueError, match="conflicts with an existing MCP server"
-            ):
+            ) as exc:
                 _ensure_user_mcp_server(
                     db,
                     str(user.id),
@@ -439,8 +443,13 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
                         "name": "Teams",
                         "description": "Connect to Microsoft Teams.",
                         "provider": "microsoft",
+                        "auth_type": "builtin_oauth",
                     },
                 )
+            # A genuine metadata conflict on a real OAuth app is a plain
+            # ValueError, NOT AppNotOAuthError — so the batch loop's narrowed
+            # except surfaces it instead of misreporting it as "non-oauth".
+            assert not isinstance(exc.value, AppNotOAuthError)
         finally:
             db.close()
     finally:
@@ -646,6 +655,215 @@ def test_connected_hidden_public_mcp_app_is_excluded_in_strong_hide_mode() -> No
 
         app_ids = {app["id"] for app in response.json()}
         assert "hidden-app" not in app_ids
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_mixed_case_oauth_transport_app_is_marked_connected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the mixed-case transport fix: list_mcp_apps now routes on
+    auth_type (which lowercases), so a "OAuth"-cased catalog entry is treated as
+    builtin_oauth. Before, the exact-case `transport == "oauth"` branch stranded
+    it in the non-oauth path, leaving is_connected always False."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+
+        # Admin API accepts arbitrary transport casing.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "mixed-oauth",
+                "name": "MixedOauth",
+                "description": "",
+                "icon": "",
+                "transport": "OAuth",
+                "provider_name": "microsoft",
+                "category": "Communication",
+                "oauth_scopes": [],
+                "is_visible_in_connector": True,
+                "launch_config": {},
+            },
+        )
+        assert resp.status_code == 200
+
+        _connect_oauth_account_for_user("regular", "microsoft")
+        monkeypatch.setattr(mcp_api, "_oauth_account_can_connect", lambda _a: True)
+
+        db = next(get_db())
+        try:
+            user = db.query(User).filter(User.username == "regular").first()
+            assert user is not None
+            server = MCPServer(
+                name="MixedOauth",
+                description="",
+                managed="external",
+                transport="oauth",
+                auth={"app_id": "mixed-oauth"},
+            )
+            db.add(server)
+            db.flush()
+            db.add(
+                UserMCPServer(
+                    user_id=user.id,
+                    mcpserver_id=server.id,
+                    is_owner=True,
+                    can_edit=True,
+                    can_delete=True,
+                    is_active=True,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+        assert response.status_code == 200
+        app = next(a for a in response.json() if a["id"] == "mixed-oauth")
+        assert app["is_connected"] is True
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_rejects_keyless_command_entry() -> None:
+    """Write-time constraint (#764): a non-oauth entry with a launch command but
+    no required_env would classify as "unconnectable", so the admin API rejects
+    it instead of silently persisting an unconnectable row."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # Shape 1: command without required_env.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-keyless",
+                "name": "BadKeyless",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "args": ["-y", "x"]},
+            },
+        )
+        assert resp.status_code == 422
+
+        # Shape 2 (the reverse asymmetric shape): required_env without command.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-nocommand",
+                "name": "BadNoCommand",
+                "transport": "stdio",
+                "launch_config": {"required_env": ["KEY"]},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_update_app_enforces_auth_classification() -> None:
+    """The write-time constraint fires on PUT too, not just POST (both use the
+    same PublicMCPAppCreate model)."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-keyed",
+                "name": "GoodKeyed",
+                "transport": "stdio",
+                "launch_config": {"command": "npx", "required_env": ["KEY"]},
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        updated = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "app_id": "good-keyed",
+                "name": "GoodKeyed",
+                "transport": "stdio",
+                "launch_config": {"command": "npx"},
+            },
+        )
+        assert updated.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
+    """The write-time validator lives on the create model only, so listing must
+    not re-validate on response serialization. A legacy/direct-DB row with a
+    partial launch_config (classifies "unconnectable") must be returned, not turn
+    the whole admin list into a 500."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-bad",
+                    name="LegacyBad",
+                    transport="stdio",
+                    launch_config={"command": "npx"},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        resp = client.get("/api/admin/mcp/apps", headers=admin_headers)
+        assert resp.status_code == 200
+        assert any(a["app_id"] == "legacy-bad" for a in resp.json())
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

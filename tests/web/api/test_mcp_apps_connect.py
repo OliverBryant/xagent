@@ -499,6 +499,36 @@ def test_connect_rejects_oauth_app(test_db):
     assert exc.value.status_code == 400
 
 
+def test_connect_rejects_unconnectable_app(test_db):
+    """An entry that classifies as "unconnectable" (a launch command but no
+    required_env, so nothing to key on) is rejected by the key-based gate. Such
+    a row can only reach the DB directly / pre-validator; the connect gate is the
+    backstop. Guards the auth_type != "api_key" branch of _ensure_catalog_app_server.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="keyless",
+            name="keyless",
+            transport="stdio",
+            launch_config={"command": "npx", "args": ["-y", "some-mcp"]},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "keyless",
+            MCPAppConnectRequest(env={"X": "y"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 400
+
+
 def test_last_disconnect_keeps_row_with_platform_key(test_db):
     """When a shared catalog row carries the admin's platform fallback key, the
     last user's disconnect must NOT hard-delete the row — that would silently

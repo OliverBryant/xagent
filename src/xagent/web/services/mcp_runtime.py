@@ -281,6 +281,10 @@ def mcp_oauth_runtime_diagnostic(
 
 
 def _is_mcp_oauth_http_server(server: Any, auth_config: Any) -> bool:
+    # Runtime classification of a *connected* server from its decrypted auth,
+    # a different layer than the catalog auth_type (mcp_apps.classify_app_auth):
+    # this also covers user-added custom HTTP servers that were never catalog
+    # entries, so it stays independent by design.
     return (
         getattr(server, "transport", None) in HTTP_MCP_TRANSPORTS
         and isinstance(auth_config, dict)

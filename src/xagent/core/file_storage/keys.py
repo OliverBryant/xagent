@@ -30,7 +30,14 @@ def safe_storage_filename(filename: str) -> str:
     return _sanitize_component(safe_name) or "file"
 
 
-def _user_key_prefix(user_id: int, scope_segments: Sequence[str]) -> str:
+def build_user_key_prefix(user_id: int, scope_segments: Sequence[str] = ()) -> str:
+    """Compose the user-root key prefix ``users/{user_id}[/{segment}...]``.
+
+    Single source of truth shared by the key builders below and by
+    ``get_user_file_storage`` (so a scope-bound storage handle and the keys
+    written through it use an identical prefix). Segments are validated,
+    never sanitized.
+    """
     prefix = f"users/{user_id}"
     for segment in scope_segments:
         validate_scope_component(segment, field_name="workspace_segments entry")
@@ -46,7 +53,7 @@ def build_upload_storage_key(
     scope_segments: Sequence[str] = (),
 ) -> str:
     return (
-        f"{_user_key_prefix(user_id, scope_segments)}/uploads/"
+        f"{build_user_key_prefix(user_id, scope_segments)}/uploads/"
         f"{file_id}/{safe_storage_filename(filename)}"
     )
 
@@ -60,7 +67,7 @@ def build_task_output_storage_key(
     scope_segments: Sequence[str] = (),
 ) -> str:
     return (
-        f"{_user_key_prefix(user_id, scope_segments)}/tasks/{task_id}/outputs/"
+        f"{build_user_key_prefix(user_id, scope_segments)}/tasks/{task_id}/outputs/"
         f"{file_id}/{_safe_relative_output_path(relative_path)}"
     )
 

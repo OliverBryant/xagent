@@ -231,6 +231,33 @@ class TestSandboxMountSegments:
         assert restored_rooted.sandbox_mount_segments == ()
 
 
+class TestDurableStorageSegments:
+    """The durable-storage-handle field (#828): mirrors the filesystem
+    external-dir allowlist — narrow the object-storage handle to the scope
+    subtree only under ``isolate_external_dirs``."""
+
+    def test_isolated_scope_yields_workspace_segments(self):
+        scope = ExecutionScope(
+            workspace_segments=("clients", "3", "end_users", "7"),
+            isolate_external_dirs=True,
+        )
+        assert scope.durable_storage_segments == ("clients", "3", "end_users", "7")
+
+    def test_non_isolated_scope_yields_empty(self):
+        # Segments present but not isolated => owner-root handle (shared reads).
+        scope = ExecutionScope(
+            workspace_segments=("clients", "3", "end_users", "7"),
+            isolate_external_dirs=False,
+        )
+        assert scope.durable_storage_segments == ()
+
+    def test_unscoped_scope_yields_empty(self):
+        assert ExecutionScope().durable_storage_segments == ()
+
+    def test_isolated_without_segments_yields_empty(self):
+        assert ExecutionScope(isolate_external_dirs=True).durable_storage_segments == ()
+
+
 class TestContextvarHelpers:
     def test_default_is_none(self):
         assert get_execution_scope() is None

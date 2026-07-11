@@ -491,6 +491,7 @@ class GeminiLLM(BaseLLM):
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         model=self._model_name,
+                        model_id=self.model_id,
                         call_type="chat",
                     )
             else:
@@ -728,6 +729,7 @@ class GeminiLLM(BaseLLM):
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             model=self._model_name,
+                            model_id=self.model_id,
                             call_type="stream_chat",
                         )
 

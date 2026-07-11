@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
@@ -359,6 +360,114 @@ async def test_sandbox_unavailability_keeps_local_fallback(
         task_id=1,
         workspace_owner_id=7,
         workspace_config={},
+    )
+
+    assert sandbox is None
+    assert 1 not in manager._agent_sandbox_keys
+
+
+_SCOPE = ExecutionScope(
+    sandbox_key_suffix="client-3",
+    workspace_segments=("clients", "3", "end_users", "7"),
+)
+
+# A scope that sets no ``sandbox_key_suffix`` resolves to the same
+# ``user:{owner}`` lifecycle key as unscoped execution, so it has no container
+# of its own to protect and must keep the unscoped fallback behavior.
+_SUFFIXLESS_SCOPE = ExecutionScope(
+    workspace_segments=("clients", "3", "end_users", "7"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_flag, side_effect, expected_exc",
+    [
+        pytest.param(
+            "true",
+            SandboxCapacityError(cap=2, in_use=2),
+            SandboxCapacityError,
+            id="capacity-with-flag-on",
+        ),
+        pytest.param(
+            None,
+            RuntimeError("docker daemon unreachable"),
+            RuntimeError,
+            id="non-capacity-outage",
+        ),
+    ],
+)
+async def test_suffix_scoped_execution_fails_closed(
+    sandbox_mgr, monkeypatch, fallback_flag, side_effect, expected_exc
+) -> None:
+    """A suffix-scoped task never takes the local fallback.
+
+    Local fallback would run an isolated/untrusted scoped workload outside its
+    container, so both capacity exhaustion (even with the opt-in flag on) and a
+    non-capacity sandbox outage must fail closed rather than downgrade to
+    local execution.
+    """
+    if fallback_flag is None:
+        monkeypatch.delenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", fallback_flag
+        )
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=side_effect)
+
+    with pytest.raises(expected_exc):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            workspace_config={},
+            scope=_SCOPE,
+        )
+
+    assert 1 not in manager._agent_sandbox_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fallback_flag, side_effect",
+    [
+        pytest.param(
+            "true", SandboxCapacityError(cap=2, in_use=2), id="capacity-with-flag-on"
+        ),
+        pytest.param(
+            None, RuntimeError("docker daemon unreachable"), id="non-capacity-outage"
+        ),
+    ],
+)
+async def test_suffixless_scope_keeps_unscoped_fallback(
+    sandbox_mgr, monkeypatch, fallback_flag, side_effect
+) -> None:
+    """A scope without a suffix behaves exactly like unscoped execution.
+
+    It shares the ``user:{owner}`` container, so there is no scope-owned
+    isolation to protect: capacity fallback (when the flag is on) and the
+    non-capacity local fallback both remain available. Gating fail-closed on
+    ``sandbox_key_suffix`` — not scope-presence — is what keeps this path from
+    becoming an availability regression.
+    """
+    if fallback_flag is None:
+        monkeypatch.delenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", fallback_flag
+        )
+    manager = AgentServiceManager()
+    sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=side_effect)
+
+    sandbox = await manager._get_or_create_task_sandbox(
+        task_id=1,
+        workspace_owner_id=7,
+        workspace_config={},
+        scope=_SUFFIXLESS_SCOPE,
     )
 
     assert sandbox is None

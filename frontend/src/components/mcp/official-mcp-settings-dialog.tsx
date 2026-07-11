@@ -177,7 +177,7 @@ export function OfficialMcpSettingsDialog({
             {isGloballyConnected && (
               <>
                 {(() => {
-                  const isKeyBased = (app.launch_config?.required_env?.length || 0) > 0
+                  const isKeyBased = app.auth_type === "api_key"
                   return (
                     <>
                       <Button

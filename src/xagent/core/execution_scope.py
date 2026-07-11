@@ -142,6 +142,19 @@ class ExecutionScope:
             return self.workspace_segments
         return self.sandbox_mount_segments
 
+    @property
+    def durable_storage_segments(self) -> tuple[str, ...]:
+        """Segments a durable-storage handle should confine to.
+
+        Mirrors the filesystem external-dir allowlist
+        (``_build_allowed_external_dirs``): a ``ScopedFileStorage`` handle is
+        narrowed to the scope subtree only when ``isolate_external_dirs`` is
+        set, so a scoped-but-not-isolated execution keeps its legitimate
+        shared owner-level reads. When the flag is off this returns ``()`` — a
+        handle bound to ``users/{owner}`` exactly as before.
+        """
+        return self.workspace_segments if self.isolate_external_dirs else ()
+
     def to_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot (see :func:`ExecutionScope.from_dict`).
 

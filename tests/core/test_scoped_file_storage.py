@@ -159,3 +159,30 @@ def test_signed_url_scope_enforcement_on_s3_backend(tmp_path):
 
 def test_get_user_file_storage_binds_expected_prefix(local_storage):
     assert get_user_file_storage(42).prefix == "users/42"
+
+
+def test_get_user_file_storage_empty_segments_is_owner_prefix(local_storage):
+    assert get_user_file_storage(42, scope_segments=()).prefix == "users/42"
+
+
+def test_get_user_file_storage_binds_scoped_prefix(local_storage):
+    handle = get_user_file_storage(
+        42, scope_segments=("clients", "3", "end_users", "7")
+    )
+    assert handle.prefix == "users/42/clients/3/end_users/7"
+
+
+def test_scoped_handle_admits_owner_key_and_rejects_sibling(local_storage, tmp_path):
+    # A deeper prefix stays a strict extension of the owner root: the scope's
+    # own key round-trips, a sibling scope's key under the same owner does not.
+    handle = get_user_file_storage(1, scope_segments=("clients", "3", "end_users", "7"))
+    source = tmp_path / "source.txt"
+    source.write_text("data", encoding="utf-8")
+
+    own_key = "users/1/clients/3/end_users/7/uploads/file-id/source.txt"
+    assert handle.put_file(source, own_key).key == own_key
+
+    with pytest.raises(StorageKeyScopeError):
+        handle.put_file(
+            source, "users/1/clients/3/end_users/8/uploads/file-id/source.txt"
+        )

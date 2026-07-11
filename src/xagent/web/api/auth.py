@@ -1143,6 +1143,15 @@ def generic_oauth_login(
     return RedirectResponse(full_auth_url)
 
 
+class AppNotOAuthError(ValueError):
+    """Raised when an app routed through the OAuth flow is not builtin_oauth.
+
+    A dedicated subclass so the batch-connect loop can skip only this case while
+    still surfacing the genuine metadata-conflict ValueErrors _ensure_user_mcp_server
+    raises for legitimate OAuth apps.
+    """
+
+
 def _ensure_user_mcp_server(
     db: Session, user_id: str, app_info: Dict[str, Any]
 ) -> None:
@@ -1150,6 +1159,15 @@ def _ensure_user_mcp_server(
     from sqlalchemy.exc import IntegrityError
 
     from ..models.mcp import MCPServer, UserMCPServer
+
+    # Symmetric with the key-based gate in _ensure_catalog_app_server: only apps
+    # classified as builtin_oauth may land here. Otherwise a key-based app routed
+    # through OAuth would get a token injected but never its required_env API key.
+    if app_info.get("auth_type") != "builtin_oauth":
+        raise AppNotOAuthError(
+            f"App '{app_info.get('name')}' is not an OAuth app and cannot be "
+            "connected via the OAuth flow."
+        )
 
     def _oauth_auth_metadata() -> dict[str, str]:
         metadata = {"app_id": str(app_info["id"])}
@@ -1360,7 +1378,21 @@ def generic_oauth_callback(
             if app_id:
                 app_info = get_app_by_id(db, app_id)
                 if app_info:
-                    _ensure_user_mcp_server(db, user_id, app_info)
+                    # A stale/crafted app_id in the OAuth state can point at a
+                    # non-oauth app. Fail with a clear error instead of a generic
+                    # 500 after the user already completed provider consent —
+                    # symmetric with the batch branch's AppNotOAuthError catch.
+                    try:
+                        _ensure_user_mcp_server(db, user_id, app_info)
+                    except AppNotOAuthError:
+                        db.rollback()
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot Connect</h1>"
+                                "<p>This app is not an OAuth app.</p>"
+                            ),
+                            status_code=400,
+                        )
             else:
                 apps = [
                     app
@@ -1368,7 +1400,19 @@ def generic_oauth_callback(
                     if app.get("provider") == provider
                 ]
                 for app_info in apps:
-                    _ensure_user_mcp_server(db, user_id, app_info)
+                    # A mis-tagged non-oauth app sharing this provider must not
+                    # abort the whole batch login: skip it and keep connecting
+                    # the legitimate oauth apps under the same provider. Only the
+                    # not-oauth case is skipped; genuine metadata-conflict
+                    # ValueErrors still propagate as before.
+                    try:
+                        _ensure_user_mcp_server(db, user_id, app_info)
+                    except AppNotOAuthError:
+                        logger.warning(
+                            "Skipping non-oauth app %s during %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
 
             db.commit()
             if (app_id or provider) == "gmail":
@@ -1410,9 +1454,7 @@ def generic_oauth_callback(
         )
     except Exception as e:
         import html
-        import logging
 
-        logger = logging.getLogger(__name__)
         logger.exception("Generic OAuth callback failed")
         return HTMLResponse(
             content=f"<h1>Authentication Failed</h1><p>{html.escape(str(e))}</p>",

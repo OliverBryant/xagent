@@ -637,3 +637,60 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
     assert usage[0]["context_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_tool_invocation_counts_one_action_each() -> None:
+    """Each tool invocation increments tool_calls at start time.
+
+    Billing on invocation (not self-reported success) is intentional: success
+    comes from the tool's own return value, and user-controlled MCP tools could
+    otherwise dodge billing by wrapping real output in {"success": false}.
+    """
+    from xagent.core.model.chat.token_context import (
+        TokenUsage,
+        get_token_usage,
+        set_token_usage,
+    )
+
+    set_token_usage(TokenUsage())
+    runtime = PatternRuntime(execution_id="task-actions")
+
+    await runtime.on_tool_start(tool_call={"name": "calc", "args": {}, "id": "t1"})
+    await runtime.on_tool_start(tool_call={"name": "search", "args": {}, "id": "t2"})
+    assert get_token_usage().tool_calls == 2
+
+    # Even a tool that will report failure was still invoked → billed.
+    await runtime.on_tool_end(
+        tool_call={"name": "search", "id": "t2"},
+        result={"success": False, "error": "boom"},
+    )
+    assert get_token_usage().tool_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_calls_all_count() -> None:
+    """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
+
+    Covers the PR's claim that counting is safe when react runs tools
+    concurrently via _run_concurrent_batch.
+    """
+    from xagent.core.model.chat.token_context import (
+        TokenUsage,
+        get_token_usage,
+        set_token_usage,
+    )
+
+    set_token_usage(TokenUsage())
+    runtime = PatternRuntime(execution_id="task-batch")
+
+    await asyncio.gather(
+        *[
+            runtime.on_tool_start(
+                tool_call={"name": f"t{i}", "args": {}, "id": f"t{i}"}
+            )
+            for i in range(8)
+        ]
+    )
+
+    assert get_token_usage().tool_calls == 8

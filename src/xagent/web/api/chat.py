@@ -626,6 +626,12 @@ class AgentServiceManager:
 
     def __init__(self, request: Optional[Any] = None) -> None:
         self._agents: Dict[int, AgentService] = {}
+        # Building an AgentService performs multiple awaits (snapshot/tool/
+        # sandbox setup). Two WebSocket connections can otherwise both observe
+        # a cache miss, build different execution registries for the same task,
+        # and leave pause/message control attached to the instance that loses
+        # the final cache assignment.
+        self._agent_build_locks: Dict[int, asyncio.Lock] = {}
         # Owner (runtime identity) each cached AgentService was built for. A
         # task_id-keyed cache must not silently hand back an instance built
         # under a different user (e.g. once built with the wrong identity).
@@ -756,14 +762,27 @@ class AgentServiceManager:
         producing ``user:{owner}`` and reuses today's containers untouched.
 
         Capacity exhaustion and sandbox-service unavailability are distinct
-        failure classes: a ``SandboxCapacityError`` rejects the task by
-        default (opt-in local fallback via
-        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), while any other
-        sandbox failure keeps the local-execution fallback.
+        failure classes. For **unscoped** execution the historical behavior is
+        kept: a ``SandboxCapacityError`` rejects the task by default (opt-in
+        local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
+        and any other sandbox failure falls back to local execution.
+
+        A scope that carries a ``sandbox_key_suffix`` isolates an untrusted /
+        third-party workload in a per-scope container; running it outside that
+        container would defeat the isolation the scope exists to provide. So
+        when a suffix is present both fallbacks are disabled and the task fails
+        closed regardless of configuration — neither capacity pressure (even
+        with the opt-in flag on) nor a sandbox-service failure may downgrade
+        such a task to local execution. A scope *without* a suffix shares the
+        unscoped ``user:{owner}`` container and thus has no isolation to
+        protect; it keeps the unscoped fallback behavior.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
-                evictable, and local fallback on capacity is not enabled.
+                evictable, and (for a task with no scope suffix) local fallback
+                on capacity is not enabled, or the scope carries a suffix.
+            Exception: A suffix-scoped execution hit a non-capacity sandbox
+                failure; re-raised instead of falling back to local execution.
         """
         from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 
@@ -772,7 +791,14 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             return None
 
+        # The isolation boundary is the per-scope key suffix, not
+        # scope-presence: a suffix-less scope resolves to the same
+        # ``user:{owner}`` lifecycle key as unscoped execution, so it has no
+        # container of its own to protect and must keep the unscoped fallback
+        # behavior. Gating on the suffix (not ``scope is not None``) honors the
+        # ExecutionScope contract that each field be consumed independently.
         suffix = scope.sandbox_key_suffix if scope is not None else None
+        scoped = suffix is not None
         try:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
@@ -783,7 +809,7 @@ class AgentServiceManager:
             self._agent_sandbox_keys.pop(task_id, None)
             from ...config import get_sandbox_allow_local_fallback_on_capacity
 
-            if get_sandbox_allow_local_fallback_on_capacity():
+            if not scoped and get_sandbox_allow_local_fallback_on_capacity():
                 logger.warning(
                     "Sandbox capacity reached for workspace owner %s; "
                     "falling back to local execution "
@@ -794,14 +820,25 @@ class AgentServiceManager:
                 return None
             logger.warning(
                 "Sandbox capacity reached for workspace owner %s; "
-                "rejecting task %s: %s",
+                "rejecting task %s (scoped=%s): %s",
                 workspace_owner_id,
                 task_id,
+                scoped,
                 e,
             )
             raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            if scoped:
+                logger.error(
+                    "Sandbox creation failed for scoped task %s (workspace "
+                    "owner %s); failing closed instead of running the scoped "
+                    "workload locally: %s",
+                    task_id,
+                    workspace_owner_id,
+                    e,
+                )
+                raise
             logger.warning(
                 "Sandbox creation failed for workspace owner %s, "
                 "falling back to local execution: %s",
@@ -1304,6 +1341,29 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
     ) -> AgentService:
+        lock = self._agent_build_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._agent_build_locks[task_id] = lock
+        async with lock:
+            return await self._get_agent_for_task_unlocked(
+                task_id,
+                db=db,
+                user=user,
+                task_setup_snapshot=task_setup_snapshot,
+                task_owner_user_id=task_owner_user_id,
+                connector_runtime_turn_id=connector_runtime_turn_id,
+            )
+
+    async def _get_agent_for_task_unlocked(
+        self,
+        task_id: int,
+        db: Optional[Session] = None,
+        user: Optional[User] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
+    ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
         ``task_setup_snapshot`` is an off-loop snapshot loaded by the
@@ -1374,8 +1434,7 @@ class AgentServiceManager:
             and self._agent_owner_ids.get(task_id) != runtime_user_id
         ):
             logger.warning(
-                "Evicting cached AgentService for task %s: built for owner %s, "
-                "requested %s",
+                "Evicting cached AgentService for task %s: built for owner %s, requested %s",
                 task_id,
                 self._agent_owner_ids.get(task_id),
                 runtime_user_id,
@@ -1607,8 +1666,7 @@ class AgentServiceManager:
 
                     if snapshot.agent is not None:
                         logger.info(
-                            f"Task {task_id} using Agent Builder config: "
-                            f"{snapshot.agent.name}"
+                            f"Task {task_id} using Agent Builder config: {snapshot.agent.name}"
                         )
                         if agent_config is not None:
                             logger.info(
@@ -1990,8 +2048,7 @@ class AgentServiceManager:
         agent = self._agents.get(task_id)
         if agent is None:
             logger.debug(
-                "Skipping connector runtime turn sync for task %s turn %s: "
-                "agent is not cached",
+                "Skipping connector runtime turn sync for task %s turn %s: agent is not cached",
                 task_id,
                 connector_runtime_turn_id,
             )
@@ -2049,6 +2106,12 @@ class AgentServiceManager:
             # If agent is not in memory, clean up workspace directory directly
             self._cleanup_workspace_directory(task_id, user_id)
 
+        # Do not replace a lock held by an in-flight builder: a fresh lock would
+        # let a second caller bypass single-flight and race the existing build.
+        build_lock = self._agent_build_locks.get(task_id)
+        if build_lock is not None and not build_lock.locked():
+            self._agent_build_locks.pop(task_id, None)
+
         # LLM configuration is now stored in Task table, no need to clean up memory storage
 
     async def execute_task(
@@ -2092,6 +2155,43 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
+        # Reused below for the workforce-status sync so we don't re-query the row.
+        gate_task = None
+
+        # Quota gate: refuse to start a run when the team is out of monthly
+        # quota. Fails open if the check itself errors, so quota infra problems
+        # never block execution.
+        if db_session and tracker_task_id:
+            try:
+                from ..services.quota_hooks import check_run_gate
+
+                gate_task = (
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
+                )
+                if gate_task is None:
+                    # Fail open (a delete-race can legitimately leave no row),
+                    # but surface it rather than silently allowing the run.
+                    logger.warning(
+                        "Quota gate: task %s not found; allowing run", tracker_task_id
+                    )
+                gate_reason = check_run_gate(
+                    db_session, getattr(gate_task, "user_id", None)
+                )
+                if gate_reason:
+                    # `output` is what every result consumer surfaces as the
+                    # assistant message; set it so the quota reason reaches the
+                    # user instead of a misleading "Task completed".
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": gate_reason,
+                        "error": gate_reason,
+                    }
+            except Exception:
+                logger.warning("Quota gate check failed open", exc_info=True)
+
         if manage_task_lease and db_session and tracker_task_id:
             lease = acquire_task_lease(db_session, int(tracker_task_id))
             if lease is None:
@@ -2107,11 +2207,15 @@ class AgentServiceManager:
 
         if db_session and tracker_task_id:
             try:
-                task_for_sync = (
-                    db_session.query(Task)
-                    .filter(Task.id == int(tracker_task_id))
-                    .first()
-                )
+                # Reuse the row already fetched for the quota gate; only re-query
+                # if the gate path didn't run or errored before assigning it.
+                task_for_sync = gate_task
+                if task_for_sync is None:
+                    task_for_sync = (
+                        db_session.query(Task)
+                        .filter(Task.id == int(tracker_task_id))
+                        .first()
+                    )
                 if task_for_sync is not None and sync_workforce_run_status(
                     db_session, task_for_sync, TaskStatus.RUNNING
                 ):
@@ -2400,13 +2504,11 @@ class AgentServiceManager:
                         )
                     else:
                         raise ValueError(
-                            f"Task {task_id} not found in database during "
-                            "agent reconstruction"
+                            f"Task {task_id} not found in database during agent reconstruction"
                         )
                 except Exception as e:
                     logger.error(
-                        f"Failed to rebuild runtime configuration for task "
-                        f"{task_id}: {e}"
+                        f"Failed to rebuild runtime configuration for task {task_id}: {e}"
                     )
                     raise
 

@@ -50,7 +50,10 @@ import type { AppIntegration } from "./types"
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
-import { getRuntimeConfigError } from "./runtime-inputs-form"
+import {
+  getRuntimeConfigError,
+  type RuntimeConfigErrorKey,
+} from "./runtime-inputs-form"
 
 interface ConnectMcpDialogProps {
   open: boolean
@@ -103,7 +106,7 @@ export function ConnectMcpDialog({
     description: "",
     config: {} as Record<string, any>
   })
-  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
+  const [runtimeValidationError, setRuntimeValidationError] = useState<RuntimeConfigErrorKey | null>(null)
 
   const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
 
@@ -325,15 +328,22 @@ export function ConnectMcpDialog({
   }
 
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
-    const provider = app.provider;
-    if (!provider) {
-      // Key-based (non-oauth) catalog app: collect the key. Only these declare
-      // required_env; any other provider-less app is not connectable this way.
-      if (app.launch_config?.required_env?.length) {
+    if (app.auth_type !== "builtin_oauth") {
+      // Key-based catalog app: collect the key. Anything else is a mis-authored
+      // entry (neither OAuth nor a launchable key-based command).
+      if (app.auth_type === "api_key") {
         openKeyConnect(app);
       } else {
-        toast.error("Error: App provider is not defined");
+        toast.error(t('tools.mcp.alerts.notConfigured'));
       }
+      return;
+    }
+
+    const provider = app.provider;
+    if (!provider) {
+      // Mis-authored OAuth entry: transport says oauth but no provider to
+      // build the auth URL. Fail clearly instead of opening a broken popup.
+      toast.error(t('tools.mcp.alerts.providerNotDefined'));
       return;
     }
 
@@ -409,7 +419,7 @@ export function ConnectMcpDialog({
           method: 'DELETE'
         });
         if (response.ok) {
-          toast.success(t('tools.mcp.alerts.deleteSuccess') || "Disconnected successfully");
+          toast.success(t('tools.mcp.dialog.disconnectSuccess', { name: app.name }));
           if (onSuccess) onSuccess();
           setSelectedApp(null);
           // Reload apps to refresh the is_connected state visually

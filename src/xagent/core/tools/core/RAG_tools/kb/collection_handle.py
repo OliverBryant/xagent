@@ -15,14 +15,14 @@ import numbers
 import os
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, cast
 
 if TYPE_CHECKING:
-    from .maintenance_compatibility import CollectionConfigSnapshot
+    from .models import KBVectorStorageCleanupResult
 
 import pandas as pd
 
@@ -836,34 +836,6 @@ class KBCollectionHandle(ABC):
     # --- Collection-level rollback config primitives (#H05 Phase 4) ---
 
     @abstractmethod
-    async def capture_collection_config_snapshot(
-        self,
-    ) -> "CollectionConfigSnapshot":
-        """Capture the collection_config row for this collection before mutation.
-
-        Returns a :class:`CollectionConfigSnapshot` whose ``existed`` flag is
-        ``True`` when a config row was present and ``False`` otherwise.  A
-        snapshot with ``existed=False`` is safe to pass to
-        :meth:`restore_collection_config_snapshot` – the restore is a no-op.
-        """
-
-    @abstractmethod
-    async def restore_collection_config_snapshot(
-        self,
-        snapshot: "CollectionConfigSnapshot",
-    ) -> None:
-        """Restore or remove a collection_config row from a snapshot.
-
-        When ``snapshot.existed`` is ``True`` the original config JSON is
-        written back via :meth:`MetadataStore.save_collection_config`.  When
-        ``snapshot.existed`` is ``False`` this is a no-op (the config row did
-        not exist before the mutation so there is nothing to restore).
-
-        The rollback-complete / side-effects-may-remain guard logic lives in
-        the coordinator/policy layer, not here.
-        """
-
-    @abstractmethod
     async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
         """Delete the collection_config row(s) for this collection.
 
@@ -891,6 +863,27 @@ class KBCollectionHandle(ABC):
         filesystem; physical file cleanup is the caller's responsibility.
 
         Returns a ``dict[str, int]`` mapping table names to deleted row counts.
+        """
+
+    @abstractmethod
+    def cleanup_embeddings_for_operation(
+        self,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> "KBVectorStorageCleanupResult":
+        """Delete or preview embedding rows created by a failed operation.
+
+        The cleanup scope is bound to this handle's collection + user scope;
+        rollback callers pass the operation's known document/parse/chunk/
+        model-tag identity. Per-table failures never raise - they are folded
+        into the result (``status="incomplete"``,
+        ``side_effects_may_remain=True``). ``status="skipped"`` on an empty
+        filter set; ``"planned"`` for previews; ``"complete"`` after deletes.
         """
 
     # --- Collection-level statistics (#H05 Phase 3) ---
@@ -3730,59 +3723,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
     # --- Collection-level rollback config primitives (#H05 Phase 4) ---
 
-    async def capture_collection_config_snapshot(
-        self,
-    ) -> "CollectionConfigSnapshot":
-        """Capture the collection_config row for this collection (metadata read only).
-
-        Reads the config row via the metadata store and wraps it in a
-        :class:`CollectionConfigSnapshot`.  ``config_user_id`` is normalized to
-        0 when ``user_id`` is ``None``, matching legacy ownership convention.
-        """
-        from .maintenance_compatibility import CollectionConfigSnapshot
-
-        collection = self.context.collection
-        # Normalize: None user_id maps to 0 (legacy convention).
-        user_id = self.context.user_scope.user_id
-        config_user_id: int = 0 if user_id is None else int(user_id)
-
-        config_json = await self.metadata_store.get_collection_config(
-            collection,
-            config_user_id,
-            is_admin=False,
-        )
-        return CollectionConfigSnapshot(
-            collection_name=collection,
-            user_id=user_id,
-            config_user_id=config_user_id,
-            config_json=config_json,
-            existed=config_json is not None,
-        )
-
-    async def restore_collection_config_snapshot(
-        self,
-        snapshot: "CollectionConfigSnapshot",
-    ) -> None:
-        """Restore a collection_config row from snapshot (metadata write only).
-
-        When ``snapshot.existed`` is ``True`` the config JSON is written back
-        via :meth:`MetadataStore.save_collection_config`.  When
-        ``snapshot.existed`` is ``False`` this is a no-op.
-
-        The rollback-complete / side-effects-may-remain guard lives in the
-        coordinator/policy layer and is intentionally absent here.
-        """
-        if not snapshot.existed:
-            return
-        assert (
-            snapshot.config_json is not None
-        )  # invariant: existed ↔ config_json is not None
-        await self.metadata_store.save_collection_config(
-            snapshot.collection_name,
-            snapshot.config_json,
-            snapshot.config_user_id,
-        )
-
     async def delete_collection_config(self, *, tenant_only: bool = False) -> int:
         """Delete the collection_config row(s) for this collection (idempotent).
 
@@ -3829,6 +3769,92 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         Returns a ``dict[str, int]`` mapping table names to deleted row counts.
         """
         return self.delete_collection_data(user_id=user_id, is_admin=is_admin)
+
+    def cleanup_embeddings_for_operation(
+        self,
+        *,
+        doc_id: Optional[str] = None,
+        parse_hash: Optional[str] = None,
+        chunk_ids: Optional[Sequence[str]] = None,
+        model_tag: Optional[str] = None,
+        preview_only: bool = True,
+        confirm: bool = False,
+    ) -> "KBVectorStorageCleanupResult":
+        """Delete or preview embedding rows for a failed operation (#515).
+
+        Ports the former facade ``_cleanup_vectors_for_operation_impl``: builds
+        per-table predicates via ``kb/cleanup_filters`` (relocation tracked in
+        #821), counts/deletes through this handle's raw store connection, and
+        derives status / side_effects_may_remain exactly as before.
+        """
+        from ..utils.lancedb_query_utils import _safe_count_rows
+        from .cleanup_filters import KBCleanupScope, build_embedding_cleanup_filters
+        from .models import KBVectorStorageCleanupResult
+
+        scope = KBCleanupScope(
+            collection=self.context.collection,
+            user_id=self.context.user_scope.user_id,
+            is_admin=self.context.user_scope.is_admin,
+            doc_id=doc_id,
+            parse_hash=parse_hash,
+            chunk_ids=tuple(chunk_ids or ()),
+            model_tag=model_tag,
+        )
+        conn = self.vector_index_store.get_raw_connection()
+
+        table_counts: dict[str, int] = {}
+        warnings: list[str] = []
+        side_effects_may_remain = False
+        should_delete = bool(confirm and not preview_only)
+        table_filters = build_embedding_cleanup_filters(conn, scope)
+
+        if not table_filters:
+            return KBVectorStorageCleanupResult(
+                collection=scope.collection,
+                status="skipped",
+                deleted_count=0,
+                table_counts={},
+                model_tag=scope.model_tag,
+                preview_only=preview_only,
+            )
+
+        for table_name, filter_exprs in table_filters.items():
+            table = None
+            try:
+                table = conn.open_table(table_name)
+                count = 0
+                for filter_expr in filter_exprs:
+                    matched = _safe_count_rows(table, filter_expr, on_error="raise")
+                    if should_delete and matched > 0:
+                        table.delete(filter_expr)
+                    count += matched
+                table_counts[table_name] = count
+            except Exception as exc:  # noqa: BLE001 - report rollback cleanup state
+                side_effects_may_remain = True
+                message = f"{table_name}: {exc}"
+                warnings.append(message)
+                logger.warning("Vector cleanup failed for %s: %s", table_name, exc)
+            finally:
+                _safe_close_table(table)
+
+        deleted_count = sum(table_counts.values())
+        if warnings:
+            status = "incomplete"
+        elif should_delete:
+            status = "complete"
+        else:
+            status = "planned"
+
+        return KBVectorStorageCleanupResult(
+            collection=scope.collection,
+            status=status,
+            deleted_count=deleted_count,
+            table_counts=table_counts,
+            model_tag=scope.model_tag,
+            preview_only=preview_only,
+            warnings=tuple(warnings),
+            side_effects_may_remain=side_effects_may_remain,
+        )
 
     # --- Rollback snapshot/restore/clear primitives (#513 Task 7) ---
 

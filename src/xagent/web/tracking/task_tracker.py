@@ -60,6 +60,9 @@ class TaskTracker:
         self._is_tracking = False
         self._update_task: Optional[asyncio.Task] = None
         self._last_reported_usage: Optional[TokenUsage] = None
+        # Per-turn baselines captured in start_tracking; used to meter deltas.
+        self._initial_details_len = 0
+        self._initial_tool_calls = 0
 
         # Load the task model
         from ..models.task import Task as TaskModel
@@ -102,6 +105,13 @@ class TaskTracker:
             details=details,
         )
         set_token_usage(initial_usage)
+
+        # Snapshot the seeded baselines so complete_tracking can meter only this
+        # turn's delta (start_tracking seeds from prior turns for multi-turn
+        # tasks). The new per-model detail entries appended during this turn are
+        # everything past _initial_details_len.
+        self._initial_details_len = len(initial_usage.details)
+        self._initial_tool_calls = initial_usage.tool_calls
 
         logger.info(f"Started token tracking for task {self.task_id}")
 
@@ -267,6 +277,23 @@ class TaskTracker:
         # Get final token usage and update database
         logger.info(f"Force updating token usage for task {self.task_id}")
         usage = get_token_usage()
+
+        # Meter quota FIRST — on the still-clean session, from in-memory
+        # counters — so a transient commit failure below cannot zero-bill a
+        # token/tool-heavy turn. actions = tool calls; credits derive from tokens.
+        try:
+            from ..services.quota_hooks import record_usage
+
+            delta_details = usage.details[self._initial_details_len :]
+            delta_actions = max(0, usage.tool_calls - self._initial_tool_calls)
+            record_usage(
+                self.db_session,
+                getattr(self.task, "user_id", None),
+                delta_details,
+                delta_actions,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
 
         # Update database with final statistics
         self.task.input_tokens = usage.input_tokens

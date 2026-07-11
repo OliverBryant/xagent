@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Sequence
 from urllib.parse import urlparse
 
 import fsspec
@@ -10,6 +11,7 @@ from ...config import (
     get_file_storage_options,
     get_file_storage_uri,
 )
+from .keys import build_user_key_prefix
 from .scoped import ScopedFileStorage
 from .storage import FsspecFileStorage
 
@@ -25,17 +27,27 @@ def get_file_storage_backend() -> str:
     return get_unscoped_file_storage().backend
 
 
-def get_user_file_storage(user_id: int) -> ScopedFileStorage:
+def get_user_file_storage(
+    user_id: int, *, scope_segments: Sequence[str] = ()
+) -> ScopedFileStorage:
     """Get a storage view scoped to a user's key prefix.
 
     This is the primary storage factory: every operation through the returned
     handle is confined to ``users/{user_id}``. Reach for
     ``get_unscoped_file_storage`` only in infrastructure code inside this
     package.
+
+    When ``scope_segments`` is given, the handle is confined to the deeper
+    subtree ``users/{user_id}/{segment}/...`` instead. That prefix is a strict
+    extension of the user root, so existing owner-level keys still validate
+    while keys belonging to a sibling scope are rejected — the durable-storage
+    counterpart to the sandbox filesystem allowlist. Pass the segments from
+    :attr:`ExecutionScope.durable_storage_segments` so the narrowing follows
+    ``isolate_external_dirs``.
     """
     return ScopedFileStorage(
         storage=get_unscoped_file_storage(),
-        prefix=f"users/{int(user_id)}",
+        prefix=build_user_key_prefix(int(user_id), scope_segments),
     )
 
 

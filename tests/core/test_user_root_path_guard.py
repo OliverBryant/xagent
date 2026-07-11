@@ -44,10 +44,10 @@ STORAGE_KEY_LITERAL = re.compile(r"""["']users/\{|f"users/""")
 
 STORAGE_KEY_ALLOWLIST = {
     # The canonical key builders — the single owner of the key layout.
+    # ``get_user_file_storage`` binds ScopedFileStorage through
+    # ``build_user_key_prefix`` from here, so factory.py no longer hand-builds
+    # the ``users/{...}`` prefix and is not allowlisted.
     "core/file_storage/keys.py",
-    # The per-user prefix binding for ScopedFileStorage (the #759
-    # enforcement boundary, deliberately user-level and scope-agnostic).
-    "core/file_storage/factory.py",
     "web/services/startup_file_storage_sync.py",
 }
 

@@ -20,6 +20,10 @@ vi.mock("@/lib/api-wrapper", async () => {
 vi.mock("@/lib/utils", () => ({
   cn: (...classes: Array<string | false | null | undefined>) =>
     classes.filter(Boolean).join(" "),
+  generateClientMessageId: vi.fn()
+    .mockReturnValueOnce("client-message-1")
+    .mockReturnValueOnce("client-message-2")
+    .mockReturnValue("client-message-next"),
   getApiUrl: () => "http://api.local",
   getUploadApiUrl: () => "http://upload.local",
 }))
@@ -205,6 +209,31 @@ describe("ChatInput", () => {
         expect.objectContaining({ model: "" })
       )
     })
+  })
+
+  it("keeps the draft when durable delivery is rejected", async () => {
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    await waitFor(() => {
+      expect(onInputChange).not.toHaveBeenCalledWith("")
+    })
+    expect(onSend.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ clientMessageId: expect.any(String) })
+    )
   })
 
   it("keeps generic loading input disabled without a live task status", () => {

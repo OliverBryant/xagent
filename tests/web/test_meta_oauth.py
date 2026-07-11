@@ -451,3 +451,118 @@ async def test_meta_expired_token_refresh_uses_fb_exchange_token(
             },
         )
     ]
+
+
+def test_generic_oauth_batch_skips_non_oauth_app_and_connects_oauth_app(
+    db_session, monkeypatch
+):
+    """Provider-only OAuth callback (no app_id) connects every catalog app under
+    the provider. A mis-tagged non-oauth app must be skipped without aborting the
+    batch, while the legitimate builtin_oauth app still connects (L1 + the
+    narrowed AppNotOAuthError catch)."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="gmail",
+            name="Gmail",
+            transport="oauth",
+            provider_name="google",
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="gmaps",
+            name="GMaps",
+            transport="stdio",
+            provider_name="google",
+            launch_config={"command": "npx", "required_env": ["KEY"]},
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "google"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "tok",
+                    "token_type": "Bearer",
+                    "scope": "",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"sub": "u1", "email": "alice@gmail.com"})),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+    assert response.status_code == 200
+
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "Gmail" in server_names  # legitimate oauth app connected
+    assert "GMaps" not in server_names  # mis-tagged key-based app skipped
+
+
+def test_generic_oauth_single_app_rejects_non_oauth_app_cleanly(
+    db_session, monkeypatch
+):
+    """Single-app OAuth callback (app_id in state) pointing at a non-oauth app
+    must fail with a clear error page instead of a generic 500, and must not
+    create an MCP server. Symmetric with the batch branch's AppNotOAuthError
+    handling (New Finding C)."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="gmaps",
+            name="GMaps",
+            transport="stdio",
+            provider_name="google",
+            launch_config={"command": "npx", "required_env": ["KEY"]},
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmaps",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "tok",
+                    "token_type": "Bearer",
+                    "scope": "",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"sub": "u1", "email": "alice@gmail.com"})),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 400
+    assert "GMaps" not in {s.name for s in db.query(MCPServer).all()}

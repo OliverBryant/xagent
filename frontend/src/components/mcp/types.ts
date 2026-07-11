@@ -16,6 +16,10 @@ export interface AppIntegration {
   transport?: string
   connected_account?: string
   is_custom?: boolean
+  // Canonical connect classification derived on the catalog entry by the
+  // backend (mcp_apps.classify_app_auth). Read this instead of re-deriving
+  // from provider/required_env so the dialogs can't drift from the backend.
+  auth_type?: "builtin_oauth" | "api_key" | "unconnectable"
   server?: MCPServer
   launch_config?: {
     command?: string

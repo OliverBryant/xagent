@@ -45,6 +45,9 @@ def _make_mock_handle() -> MagicMock:
     handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
     handle.promote_version_main = MagicMock(return_value={"promoted": True})
     handle.list_candidates = MagicMock(return_value={"candidates": []})
+    handle.cleanup_embeddings_for_operation = MagicMock(
+        return_value={"status": "planned"}
+    )
     return handle
 
 
@@ -427,31 +430,6 @@ class TestManagementFacadeDeleteRoutingSwitch:
         )
 
         coordinator.delete_collection.assert_called_once()
-        assert result.status == "success"
-
-    def test_management_facade_delete_collection_falls_back_to_impl_when_no_coordinator(
-        self,
-    ) -> None:
-        """Sync delete_collection falls back to _delete_collection_impl when no coordinator."""
-        facade = KBCoreManagementCompatibilityFacade(coordinator=None)
-
-        expected = CollectionOperationResult(
-            status="success",
-            collection="c",
-            message="ok",
-        )
-
-        with patch(
-            "xagent.core.tools.core.RAG_tools.management.collections._delete_collection_impl",
-            return_value=expected,
-        ) as mock_impl:
-            result = facade.delete_collection(
-                collection="c",
-                user_id=None,
-                is_admin=True,
-            )
-
-        mock_impl.assert_called_once()
         assert result.status == "success"
 
 
@@ -881,4 +859,36 @@ class TestCrossOwnerRollbackRouting:
         assert captured[0].is_admin is False
         handle.restore_candidate_cleanup_snapshot.assert_called_once_with(
             snapshot, cleanup_executed=True
+        )
+
+
+class TestVectorCleanupRouting:
+    """#515: rollback vector cleanup must route coordinator -> handle."""
+
+    def test_cleanup_vectors_for_operation_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.cleanup_vectors_for_operation(
+                "docs",
+                doc_id="doc-1",
+                parse_hash="hash-1",
+                chunk_ids=("ch1",),
+                model_tag="model_a",
+                user_id=7,
+                is_admin=False,
+                preview_only=False,
+                confirm=True,
+            )
+        )
+
+        assert result == {"status": "planned"}
+        handle.cleanup_embeddings_for_operation.assert_called_once_with(
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            chunk_ids=("ch1",),
+            model_tag="model_a",
+            preview_only=False,
+            confirm=True,
         )

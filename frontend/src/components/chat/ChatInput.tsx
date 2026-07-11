@@ -3,7 +3,7 @@ import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn, getApiUrl, getUploadApiUrl } from "@/lib/utils";
+import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
@@ -64,6 +64,7 @@ interface AgentConfig {
   compactModel?: string;
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
+  clientMessageId?: string;
 }
 
 interface ModelRecord {
@@ -112,6 +113,7 @@ export function ChatInput({
   const editorRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
+  const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
@@ -578,9 +580,19 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
       const executionMode = taskConfig?.executionMode;
+      const deliveryKey = JSON.stringify([
+        messageToSend,
+        files.map((file) => [file.name, file.size, file.lastModified]),
+      ]);
+      const previousAttempt = deliveryAttemptRef.current;
+      const clientMessageId = previousAttempt?.key === deliveryKey
+        ? previousAttempt.clientMessageId
+        : generateClientMessageId();
+      deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
 
       const configToSend = {
         ...agentConfig,
+        clientMessageId,
         ...(executionMode
           ? {
               executionMode:
@@ -592,6 +604,7 @@ export function ChatInput({
       };
 
       await onSend(messageToSend, configToSend);
+      deliveryAttemptRef.current = null;
       fileMention.resetMention();
 
       if (isControlled) {
@@ -599,6 +612,18 @@ export function ChatInput({
       } else {
         setInternalMessage("");
       }
+    } catch (error) {
+      if (
+        error instanceof Error
+        && (error as Error & { retryWithNewId?: boolean }).retryWithNewId === true
+      ) {
+        deliveryAttemptRef.current = null;
+      }
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t("builds.list.chat.sendFailed") || "Message was not sent"
+      );
     } finally {
       // Small delay to prevent double submission
       setTimeout(() => {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -21,6 +22,10 @@ from xagent.core.tools.core.RAG_tools.kb import (
     KBPipelineCompatibilityFacade,
     RollbackStatus,
     SideEffectPlane,
+)
+from xagent.core.tools.core.RAG_tools.kb.models import (
+    RollbackFailedIngestionRequest,
+    RollbackFailedIngestionResult,
 )
 
 
@@ -1344,3 +1349,148 @@ def test_rollback_on_failure_compat_wrapper_delegates_to_per_boundary(
 
     _rollback_compat(None)
     assert calls == ["called", "file", "snapshot"]
+
+
+def test_pipeline_facade_rollback_delegates_to_coordinator() -> None:
+    coordinator = MagicMock()
+    expected = RollbackFailedIngestionResult(
+        status="complete",
+        rollback_status=RollbackStatus.COMPLETE,
+        rollback_complete=True,
+        side_effects_may_remain=False,
+    )
+    coordinator.rollback_failed_ingestion_sync.return_value = expected
+    facade = KBPipelineCompatibilityFacade(coordinator=coordinator)
+    request = RollbackFailedIngestionRequest(
+        collection="demo", user_id=None, is_admin=False
+    )
+
+    result = facade.rollback_failed_ingestion_sync(request)
+
+    assert result is expected
+    coordinator.rollback_failed_ingestion_sync.assert_called_once_with(request)
+
+
+def test_run_per_boundary_compensation_delegates_to_coordinator() -> None:
+    from xagent.core.tools.core.RAG_tools.pipelines import web_ingestion
+
+    facade = MagicMock()
+    facade.rollback_failed_ingestion_sync.return_value = RollbackFailedIngestionResult(
+        status="incomplete",
+        rollback_status=RollbackStatus.INCOMPLETE,
+        rollback_complete=False,
+        side_effects_may_remain=True,
+        first_error="FILE boundary compensation failed: boom",
+        warnings=("w1", "w2"),
+    )
+    page_operation = object()
+    warnings: list[str] = []
+
+    def _file_cb() -> None:
+        return None
+
+    def _document_factory(result: object = None) -> object:
+        return lambda: None
+
+    first_error = web_ingestion._run_per_boundary_compensation(
+        pipeline_facade=facade,
+        page_operation=page_operation,
+        file_info={
+            "file_path": "/tmp/page.md",
+            "file_id": "file-1",
+            "file_compensation": _file_cb,
+            "document_compensation": _document_factory,
+            "rollback_context": {"rollback_kind": "new_web_file"},
+        },
+        collection="demo",
+        url="https://example.com/a",
+        warnings=warnings,
+        ingestion_result=None,
+    )
+
+    assert first_error == "FILE boundary compensation failed: boom"
+    assert warnings == ["w1", "w2"]
+    facade.rollback_failed_ingestion_sync.assert_called_once()
+    request = facade.rollback_failed_ingestion_sync.call_args.args[0]
+    assert isinstance(request, RollbackFailedIngestionRequest)
+    assert request.collection == "demo"
+    assert request.source == "https://example.com/a"
+    assert request.operation is page_operation
+    assert request.file_compensation is _file_cb
+    assert request.document_compensation is _document_factory
+    assert request.rollback_context["rollback_kind"] == "new_web_file"
+    assert request.rollback_context["file_id"] == "file-1"
+    assert request.rollback_context["file_path"] == "/tmp/page.md"
+
+
+def test_pipeline_and_legacy_step_share_one_recording_implementation() -> None:
+    """Both facades must produce byte-identical registration metadata for the
+    same document/parse/chunk identity - the #515 dedup proof. If either route
+    re-derives keys or payloads locally, the step tuples diverge."""
+    from xagent.core.tools.core.RAG_tools.kb.legacy_step_compatibility import (
+        KBLegacyStepCompatibilityFacade,
+    )
+    from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
+        KBOperation,
+        PersistencePolicy,
+    )
+
+    def _operation() -> KBOperation:
+        return KBOperation(
+            operation_type="test",
+            collection="demo",
+            persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        )
+
+    pipeline_operation = _operation()
+    pipeline_facade = KBPipelineCompatibilityFacade()
+    pipeline_result = IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        chunk_count=3,
+        completed_steps=[
+            _ingestion_step("register_document", doc_id="doc-1", created=True),
+            _ingestion_step("parse_document", parse_hash="hash-1"),
+            _ingestion_step("chunk_document", chunk_count=3, created=True),
+        ],
+        failed_step="write_vectors_to_db",
+        message="failed",
+    )
+    pipeline_facade._record_document_ingestion_side_effects(
+        pipeline_operation,
+        pipeline_result,
+        collection="demo",
+        source_path="/tmp/a.md",
+        file_id="file-1",
+        user_id=7,
+        is_admin=False,
+    )
+
+    legacy_operation = _operation()
+    legacy_facade = KBLegacyStepCompatibilityFacade()
+    legacy_facade._record_document_side_effect(
+        legacy_operation,
+        collection="demo",
+        source_path="/tmp/a.md",
+        file_id="file-1",
+        user_id=7,
+        result={"doc_id": "doc-1", "created": True},
+    )
+    legacy_facade._record_parse_side_effect(
+        legacy_operation,
+        collection="demo",
+        doc_id="doc-1",
+        result={"parse_hash": "hash-1", "written": True},
+    )
+    legacy_facade._record_chunk_side_effect(
+        legacy_operation,
+        collection="demo",
+        doc_id="doc-1",
+        parse_hash="hash-1",
+        result={"chunk_count": 3, "created": True},
+    )
+
+    assert tuple(pipeline_operation.compensation_steps) == tuple(
+        legacy_operation.compensation_steps
+    )

@@ -9,10 +9,31 @@ from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
 from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
 from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.web.services.model_list_service import (
+    fetch_dashscope_embedding_models,
     fetch_elevenlabs_models,
     fetch_elevenlabs_music_models,
     fetch_elevenlabs_sound_effect_models,
 )
+
+
+async def test_fetch_dashscope_embedding_models_returns_curated_text_models() -> None:
+    models = await fetch_dashscope_embedding_models(
+        api_key="test-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+
+    assert models == [
+        {
+            "id": "text-embedding-v4",
+            "object": "model",
+            "owned_by": "dashscope",
+        },
+        {
+            "id": "text-embedding-v3",
+            "object": "model",
+            "owned_by": "dashscope",
+        },
+    ]
 
 
 async def test_fetch_elevenlabs_models_combines_tts_and_stt(

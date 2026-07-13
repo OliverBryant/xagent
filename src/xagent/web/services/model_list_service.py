@@ -243,6 +243,29 @@ async def fetch_elevenlabs_music_models(
     )
 
 
+async def fetch_dashscope_embedding_models(
+    api_key: str, base_url: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Return curated DashScope text embedding models.
+
+    DashScope's OpenAI-compatible API does not implement ``GET /models``.
+    Reusing ``fetch_openai_models`` therefore returns an empty list after a
+    400 response. Keep the text models supported by ``DashScopeEmbedding``
+    explicit so the UI can populate its embedding model selector without a
+    provider-side discovery request.
+    """
+    _ = api_key, base_url
+
+    return [
+        {
+            "id": model_id,
+            "object": "model",
+            "owned_by": "dashscope",
+        }
+        for model_id in ("text-embedding-v4", "text-embedding-v3")
+    ]
+
+
 async def fetch_dashscope_rerank_models(
     api_key: str, base_url: Optional[str] = None
 ) -> List[Dict[str, Any]]:
@@ -399,6 +422,7 @@ PROVIDER_FETCHERS: Dict[str, Any] = {
     "elevenlabs": fetch_elevenlabs_models,
     "elevenlabs-sound_effect": fetch_elevenlabs_sound_effect_models,
     "elevenlabs-music": fetch_elevenlabs_music_models,
+    "dashscope-embedding": fetch_dashscope_embedding_models,
     "dashscope-rerank": fetch_dashscope_rerank_models,
     "zai-coding-plan": fetch_openai_models,
     "zhipuai-coding-plan": fetch_openai_models,

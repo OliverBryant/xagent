@@ -1218,6 +1218,24 @@ class TestModelAPI:
             "thinking_mode",
         ]
 
+    def test_fetch_dashscope_embedding_models_uses_curated_list(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/providers/dashscope/models",
+            json={"api_key": "test-api-key", "category": "embedding"},
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        assert [model["id"] for model in data["models"]] == [
+            "text-embedding-v4",
+            "text-embedding-v3",
+        ]
+        assert all(model["owned_by"] == "dashscope" for model in data["models"])
+
     def test_fetch_ark_provider_models_returns_platform_scoped_seedance(
         self, test_db, regular_user, regular_headers, monkeypatch
     ):

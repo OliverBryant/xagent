@@ -250,9 +250,9 @@ async def fetch_dashscope_embedding_models(
 
     DashScope's OpenAI-compatible API does not implement ``GET /models``.
     Reusing ``fetch_openai_models`` therefore returns an empty list after a
-    400 response. Keep the text models supported by ``DashScopeEmbedding``
-    explicit so the UI can populate its embedding model selector without a
-    provider-side discovery request.
+    400 response. Return the curated DashScope text-embedding models exposed
+    to the UI. ``DashScopeEmbedding`` imposes no model enumeration, so the
+    list is maintained here.
     """
     _ = api_key, base_url
 

@@ -53,4 +53,5 @@ jobs:
           xagent --help
           tool_python="$(uv tool dir)/xagent-ai/bin/python"
           "$tool_python" -c 'import playwright'
+          "$tool_python" -c 'import xrouter_llm'
           "$tool_python" -c 'from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); executable = Path(manager.chromium.executable_path); manager.stop(); assert executable.is_file(), executable'

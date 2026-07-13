@@ -10,12 +10,14 @@
 # Options (environment variables):
 #   XAGENT_VERSION   pin a specific version, e.g. XAGENT_VERSION=0.6.0
 #   XAGENT_SKIP_BROWSER_INSTALL=1
-#                    skip Playwright and Chromium installation
+#                    skip the Playwright Chromium browser download
+#   XAGENT_SKIP_ROUTER_INSTALL=1
+#                    skip the OpenRouter "auto" model routing runtime
 #
 # Prefer not to pipe curl into sh? The equivalent manual install is:
-#   uv tool install 'xagent-ai[browser]'
+#   uv tool install 'xagent-ai[browser,router]'
 #   "$(uv tool dir)/xagent-ai/bin/python" -m playwright install chromium
-#   # Or, in a virtualenv: pip install 'xagent-ai[browser]'
+#   # Or, in a virtualenv: pip install 'xagent-ai[browser,router]'
 #   # followed by: python -m playwright install chromium
 set -eu
 
@@ -54,12 +56,18 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 command -v uv >/dev/null 2>&1 || err "uv not found on PATH after install; open a new shell and re-run."
 
-spec="$APP[browser]"
+extras="browser,router"
+if [ "${XAGENT_SKIP_ROUTER_INSTALL:-}" = "1" ]; then
+  extras="browser"
+  warn "Skipping OpenRouter auto-routing runtime (XAGENT_SKIP_ROUTER_INSTALL=1)."
+fi
+
+spec="$APP[$extras]"
 if [ -n "${XAGENT_VERSION:-}" ]; then
   # Strip a leading 'v' (e.g. v0.6.0 -> 0.6.0) so a git-tag-style value works.
   version="${XAGENT_VERSION#v}"
   [ -n "$version" ] || err "XAGENT_VERSION='$XAGENT_VERSION' is not a valid version."
-  spec="$APP[browser]==$version"
+  spec="$APP[$extras]==$version"
 fi
 
 info "Installing $spec ..."

@@ -35,6 +35,12 @@ err() {
   printf '\033[1;31merror:\033[0m %s\n' "$1" >&2
   exit 1
 }
+is_truthy() {
+  case "${1:-}" in
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # uv supports Linux and macOS. Windows users should use pip in a venv.
 os="$(uname -s)"
@@ -57,9 +63,9 @@ fi
 command -v uv >/dev/null 2>&1 || err "uv not found on PATH after install; open a new shell and re-run."
 
 extras="browser,router"
-if [ "${XAGENT_SKIP_ROUTER_INSTALL:-}" = "1" ]; then
+if is_truthy "${XAGENT_SKIP_ROUTER_INSTALL:-}"; then
   extras="browser"
-  warn "Skipping OpenRouter auto-routing runtime (XAGENT_SKIP_ROUTER_INSTALL=1)."
+  warn "Skipping OpenRouter auto-routing runtime (XAGENT_SKIP_ROUTER_INSTALL is set)."
 fi
 
 spec="${APP}[$extras]"
@@ -73,13 +79,13 @@ fi
 info "Installing $spec ..."
 uv tool install --upgrade "$spec"
 
-if [ "${XAGENT_SKIP_BROWSER_INSTALL:-}" != "1" ]; then
+if is_truthy "${XAGENT_SKIP_BROWSER_INSTALL:-}"; then
+  warn "Skipping Playwright Chromium installation (XAGENT_SKIP_BROWSER_INSTALL is set)."
+else
   tool_python="$(uv tool dir)/$APP/bin/python"
   [ -x "$tool_python" ] || err "Xagent tool Python not found at '$tool_python'."
   info "Installing Playwright Chromium browser..."
   "$tool_python" -m playwright install chromium
-else
-  warn "Skipping Playwright Chromium installation (XAGENT_SKIP_BROWSER_INSTALL=1)."
 fi
 
 printf '\n'

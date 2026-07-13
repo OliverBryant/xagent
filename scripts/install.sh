@@ -62,12 +62,12 @@ if [ "${XAGENT_SKIP_ROUTER_INSTALL:-}" = "1" ]; then
   warn "Skipping OpenRouter auto-routing runtime (XAGENT_SKIP_ROUTER_INSTALL=1)."
 fi
 
-spec="$APP[$extras]"
+spec="${APP}[$extras]"
 if [ -n "${XAGENT_VERSION:-}" ]; then
   # Strip a leading 'v' (e.g. v0.6.0 -> 0.6.0) so a git-tag-style value works.
   version="${XAGENT_VERSION#v}"
   [ -n "$version" ] || err "XAGENT_VERSION='$XAGENT_VERSION' is not a valid version."
-  spec="$APP[$extras]==$version"
+  spec="${APP}[$extras]==$version"
 fi
 
 info "Installing $spec ..."

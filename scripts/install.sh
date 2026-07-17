@@ -73,7 +73,7 @@ if [ -n "${XAGENT_VERSION:-}" ]; then
   # Strip a leading 'v' (e.g. v0.6.0 -> 0.6.0) so a git-tag-style value works.
   version="${XAGENT_VERSION#v}"
   [ -n "$version" ] || err "XAGENT_VERSION='$XAGENT_VERSION' is not a valid version."
-  spec="${APP}[$extras]==$version"
+  spec="${spec}==$version"
 fi
 
 info "Installing $spec ..."
@@ -85,7 +85,15 @@ else
   tool_python="$(uv tool dir)/$APP/bin/python"
   [ -x "$tool_python" ] || err "Xagent tool Python not found at '$tool_python'."
   info "Installing Playwright Chromium browser..."
-  "$tool_python" -m playwright install chromium
+  # xagent is already installed and usable at this point; the browser binary is
+  # an optional enhancement for browser-enabled tasks. Don't let a transient
+  # download failure abort the whole install (and swallow the "Next steps"
+  # message) — warn and continue so the user can retry manually.
+  if ! "$tool_python" -m playwright install chromium; then
+    warn "Playwright Chromium download failed. Xagent is installed, but browser-enabled tasks need it."
+    warn "Retry with: \"$tool_python\" -m playwright install chromium"
+    warn "Or skip it on re-run with XAGENT_SKIP_BROWSER_INSTALL=1."
+  fi
 fi
 
 printf '\n'

@@ -314,6 +314,7 @@ describe("TokenUsageDisplay media usage", () => {
               model_name: "stable-diffusion-xl",
               unit: "images",
               call_type: "generate_image",
+              resolution: "1K",
               quantity: 3,
               calls: 2,
               tokens: 0,
@@ -342,6 +343,7 @@ describe("TokenUsageDisplay media usage", () => {
     expect(screen.getByText("stable-diffusion-xl")).toBeInTheDocument()
     expect(screen.getByText("Image generation")).toBeInTheDocument()
     expect(screen.getByText("3 images")).toBeInTheDocument()
+    expect(screen.getByText("1K")).toBeInTheDocument()
     expect(screen.getByText("elevenlabs-tts")).toBeInTheDocument()
     expect(screen.getByText("Text-to-speech")).toBeInTheDocument()
     expect(screen.getByText("12.5 sec")).toBeInTheDocument()

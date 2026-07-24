@@ -30,10 +30,14 @@ _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = No
 #       "call_type", ...cache fields}
 #   - Non-LLM media (image/video/tts/asr/embedding/rerank/...):
 #       {"type":"media", "unit":"images"|"seconds"|"characters"|"tokens"|
-#       "requests", "quantity", "tokens", "model", "model_id", "call_type"}
-# The app layer should price media entries by their "unit"/"quantity" (and may
-# read "tokens" for token-billed modalities). Unknown entry types must be
-# ignored, not summed as tokens.
+#       "requests", "quantity", "tokens", "input_tokens", "output_tokens",
+#       "model", "model_id", "call_type", "resolution"}
+# The app layer should price media entries by their "unit"/"quantity". For image
+# models whose price varies by resolution, "resolution" ("1K"/"2K"/"4K" or
+# "1024x1024") keys a per-(model, resolution) price table. Providers that report
+# real image tokens (Gemini, OpenAI gpt-image) also fill "tokens" so a
+# token-based price ($/1M tokens) can take precedence over the resolution table.
+# Unknown entry types must be ignored, not summed as tokens.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
 # only after the run/runner-fenced token-usage update commits. The hook owns

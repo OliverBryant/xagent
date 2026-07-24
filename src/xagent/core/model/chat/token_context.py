@@ -93,6 +93,7 @@ class TokenUsage:
         model_id: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
+        resolution: str = "",
     ) -> None:
         """Record a non-LLM media model call (image/video/tts/asr/...).
 
@@ -101,6 +102,9 @@ class TokenUsage:
         ``input_tokens``/``output_tokens`` carry any accompanying token count
         some media providers still report (e.g. Gemini image generation) so a
         token-based billing path can read ``tokens`` without special-casing.
+        ``resolution`` records the size tier (e.g. "1K"/"2K"/"4K" or "1024x1024")
+        so a per-(model, resolution) price table can bill image models whose
+        price varies by resolution; "" when not applicable.
         """
         self.details.append(
             {
@@ -113,6 +117,7 @@ class TokenUsage:
                 "model": model,
                 "model_id": model_id,
                 "call_type": call_type,
+                "resolution": resolution,
             }
         )
 
@@ -397,19 +402,21 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
 
 
 def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
-    """Aggregate ``type:"media"`` detail entries by (model, unit, call_type).
+    """Aggregate ``type:"media"`` detail entries by model/unit/call_type/resolution.
 
     Companion to :func:`aggregate_token_usage_by_model`, which only keeps
     input/output token entries. Media entries are billed per non-token unit
     (images, seconds, ...), so they are grouped separately by their unit and
-    modality rather than summed into a single token total. Returns one entry
-    per (model, unit, call_type) combination with the summed quantity, call
-    count and any accompanying tokens.
+    modality rather than summed into a single token total. Resolution is part of
+    the key because an image model's price varies by resolution, so different
+    resolutions of the same model surface as separate billable line items.
+    Returns one entry per (model, unit, call_type, resolution) combination with
+    the summed quantity, call count and any accompanying tokens.
     """
     if not isinstance(details, list):
         return []
 
-    grouped: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+    grouped: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     for detail in details:
         if not isinstance(detail, dict):
             continue
@@ -422,12 +429,14 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         raw_model_name = detail.get("model")
         raw_unit = detail.get("unit")
         raw_call_type = detail.get("call_type")
+        raw_resolution = detail.get("resolution")
         model_id = raw_model_id.strip() if isinstance(raw_model_id, str) else ""
         model_name = raw_model_name.strip() if isinstance(raw_model_name, str) else ""
         unit = raw_unit if isinstance(raw_unit, str) else ""
         call_type = raw_call_type if isinstance(raw_call_type, str) else ""
+        resolution = raw_resolution if isinstance(raw_resolution, str) else ""
         identity = model_id or model_name
-        key = (identity, model_id, unit, call_type)
+        key = (identity, model_id, unit, call_type, resolution)
 
         aggregate = grouped.setdefault(
             key,
@@ -436,6 +445,7 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "model_name": model_name,
                 "unit": unit,
                 "call_type": call_type,
+                "resolution": resolution,
                 "quantity": 0.0,
                 "calls": 0,
                 "tokens": 0,
@@ -454,6 +464,7 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             str(item["model_name"]).casefold(),
             str(item["unit"]).casefold(),
             str(item["call_type"]).casefold(),
+            str(item["resolution"]).casefold(),
         ),
     )
 
@@ -517,6 +528,7 @@ def add_media_usage(
     model_id: str = "",
     input_tokens: int = 0,
     output_tokens: int = 0,
+    resolution: str = "",
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
@@ -535,6 +547,10 @@ def add_media_usage(
         model_id: Unique model id (disambiguates identically-named models).
         input_tokens: Accompanying input tokens some providers report; 0 if none.
         output_tokens: Accompanying output tokens some providers report; 0 if none.
+        resolution: Size tier ("1K"/"2K"/"4K" or "1024x1024") for image models
+            whose price varies by resolution; "" when not applicable. Providers
+            that also report real tokens (e.g. Gemini/OpenAI image) still fill
+            input/output_tokens so a token-based price can take precedence.
     """
     # Coerce defensively so a provider returning a malformed count can never
     # crash the underlying media call over accounting.
@@ -552,12 +568,13 @@ def add_media_usage(
         model_id=model_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        resolution=resolution,
     )
 
     logger.debug(
         f"Media usage added: unit={unit}, quantity={quantity}, "
-        f"model={model}, model_id={model_id}, call_type={call_type}, "
-        f"tokens={input_tokens + output_tokens}, "
+        f"resolution={resolution}, model={model}, model_id={model_id}, "
+        f"call_type={call_type}, tokens={input_tokens + output_tokens}, "
         f"total_media_calls={usage.media_calls}"
     )
 

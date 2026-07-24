@@ -128,11 +128,12 @@ class OpenAIImageModel(BaseImageModel):
         assert self._client is not None
 
         response_format = kwargs.pop("response_format", "url")
+        normalized_size = self._normalize_size(size)
         images_client: Any = self._client.images
         response = await images_client.generate(
             prompt=prompt,
             model=self.model_name,
-            size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
+            size=normalized_size,  # pyright: ignore[reportArgumentType]
             response_format=response_format,
             **kwargs,
         )
@@ -151,7 +152,10 @@ class OpenAIImageModel(BaseImageModel):
             "request_id": getattr(response, "id", None),
         }
         record_image_usage(
-            result, model_name=self.model_name, call_type="generate_image"
+            result,
+            model_name=self.model_name,
+            call_type="generate_image",
+            resolution=str(normalized_size or ""),
         )
         return result
 
@@ -183,6 +187,7 @@ class OpenAIImageModel(BaseImageModel):
             image_paths.append(image_path)
 
         response_format = kwargs.pop("response_format", "url")
+        normalized_size = self._normalize_size(kwargs.pop("size", "1024*1024"))
         image_files = []
         try:
             image_files = [open(path, "rb") for path in image_paths]
@@ -191,7 +196,7 @@ class OpenAIImageModel(BaseImageModel):
                 image=image_files if len(image_files) > 1 else image_files[0],
                 prompt=prompt,
                 model=self.model_name,
-                size=self._normalize_size(kwargs.pop("size", "1024*1024")),  # pyright: ignore[reportArgumentType]
+                size=normalized_size,  # pyright: ignore[reportArgumentType]
                 response_format=response_format,
                 **kwargs,
             )
@@ -217,5 +222,10 @@ class OpenAIImageModel(BaseImageModel):
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
-        record_image_usage(result, model_name=self.model_name, call_type="edit_image")
+        record_image_usage(
+            result,
+            model_name=self.model_name,
+            call_type="edit_image",
+            resolution=str(normalized_size or ""),
+        )
         return result

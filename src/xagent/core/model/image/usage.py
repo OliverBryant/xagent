@@ -41,12 +41,16 @@ def record_image_usage(
     model_id: str = "",
     call_type: str = "generate_image",
     image_count: int = 1,
+    resolution: str = "",
 ) -> None:
     """Record one image generation/edit call on the current token context.
 
     Best-effort: any failure here is swallowed so accounting can never break the
     underlying image call. ``result`` is the provider return dict; ``usage`` in
-    it (when present) may carry token counts some providers report (e.g. Gemini).
+    it (when present) may carry token counts some providers report (e.g. Gemini,
+    OpenAI gpt-image). ``resolution`` is the size tier ("1K"/"2K"/"4K" or
+    "1024x1024") so the billing layer can price by (model, resolution); the
+    real image tokens (when present) let a token-based price take precedence.
     """
     try:
         usage = result.get("usage") if isinstance(result, dict) else None
@@ -60,6 +64,7 @@ def record_image_usage(
             call_type=call_type,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            resolution=resolution,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to record image usage: %s", e)

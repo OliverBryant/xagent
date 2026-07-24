@@ -23,6 +23,7 @@ def test_add_media_usage_appends_media_entry_and_counts_call() -> None:
             model="sd-xl",
             model_id="m1",
             call_type="generate_image",
+            resolution="1K",
         )
         usage = manager.get_usage()
 
@@ -39,6 +40,7 @@ def test_add_media_usage_appends_media_entry_and_counts_call() -> None:
     assert entry["model"] == "sd-xl"
     assert entry["model_id"] == "m1"
     assert entry["call_type"] == "generate_image"
+    assert entry["resolution"] == "1K"
 
 
 def test_add_media_usage_carries_accompanying_tokens() -> None:
@@ -144,6 +146,34 @@ def test_media_aggregation_groups_by_model_unit_and_call_type() -> None:
     assert by_unit["seconds"]["calls"] == 1
 
 
+def test_media_aggregation_splits_by_resolution() -> None:
+    # Same model+call_type at different resolutions must bill as separate line
+    # items, since an image model's price varies by resolution.
+    with TokenContextManager() as manager:
+        add_media_usage(
+            unit="images",
+            quantity=1,
+            model="gemini-image",
+            call_type="generate_image",
+            resolution="1K",
+        )
+        add_media_usage(
+            unit="images",
+            quantity=1,
+            model="gemini-image",
+            call_type="generate_image",
+            resolution="4K",
+        )
+        details = manager.get_usage().details
+
+    groups = aggregate_media_usage_by_model(details)
+    assert len(groups) == 2
+    by_res = {group["resolution"]: group for group in groups}
+    assert set(by_res) == {"1K", "4K"}
+    assert by_res["1K"]["calls"] == 1
+    assert by_res["4K"]["calls"] == 1
+
+
 def test_aggregations_tolerate_non_list_and_dirty_entries() -> None:
     assert aggregate_media_usage_by_model(None) == []
     assert aggregate_media_usage_by_model("nope") == []
@@ -153,6 +183,7 @@ def test_aggregations_tolerate_non_list_and_dirty_entries() -> None:
             "model_name": "",
             "unit": "",
             "call_type": "",
+            "resolution": "",
             "quantity": 0.0,
             "calls": 1,
             "tokens": 0,

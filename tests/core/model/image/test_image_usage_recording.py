@@ -13,6 +13,7 @@ def test_record_image_usage_gemini_style_tokens() -> None:
             {"image_url": "x", "usage": {"prompt_tokens": 5, "completion_tokens": 3}},
             model_name="gemini-image",
             call_type="generate_image",
+            resolution="2K",
         )
         usage = manager.get_usage()
 
@@ -23,6 +24,11 @@ def test_record_image_usage_gemini_style_tokens() -> None:
     assert entry["quantity"] == 1.0
     assert entry["tokens"] == 8
     assert entry["call_type"] == "generate_image"
+    # Resolution tier is recorded so cloud can price by (model, resolution),
+    # while the real image tokens let a token-based price take precedence.
+    assert entry["resolution"] == "2K"
+    assert entry["input_tokens"] == 5
+    assert entry["output_tokens"] == 3
 
 
 def test_record_image_usage_empty_or_missing_usage() -> None:

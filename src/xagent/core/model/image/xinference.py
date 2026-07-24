@@ -182,7 +182,11 @@ class XinferenceImageModel(BaseImageModel):
                 "request_id": getattr(result, "id", None),
             }
             record_image_usage(
-                out, model_name=self.model_name, call_type="generate_image"
+                out,
+                model_name=self.model_name,
+                call_type="generate_image",
+                image_count=n,
+                resolution=str(normalized_size or ""),
             )
             return out
 
@@ -281,7 +285,13 @@ class XinferenceImageModel(BaseImageModel):
                 "usage": getattr(result, "usage", {}) or {},
                 "request_id": getattr(result, "id", None),
             }
-            record_image_usage(out, model_name=self.model_name, call_type="edit_image")
+            record_image_usage(
+                out,
+                model_name=self.model_name,
+                call_type="edit_image",
+                image_count=n,
+                resolution=str(size or ""),
+            )
             return out
 
         except Exception as e:

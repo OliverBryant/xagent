@@ -241,7 +241,10 @@ class DashScopeImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
             record_image_usage(
-                result, model_name=self.model_name, call_type="generate_image"
+                result,
+                model_name=self.model_name,
+                call_type="generate_image",
+                resolution=str(size or ""),
             )
             return result
 
@@ -377,7 +380,10 @@ class DashScopeImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
             record_image_usage(
-                result, model_name=self.model_name, call_type="edit_image"
+                result,
+                model_name=self.model_name,
+                call_type="edit_image",
+                resolution=str(kwargs.get("size") or ""),
             )
             return result
 

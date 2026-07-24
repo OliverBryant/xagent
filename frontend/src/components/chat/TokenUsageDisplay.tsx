@@ -35,6 +35,7 @@ interface MediaUsage {
   model_name: string;
   unit: string;
   call_type: string;
+  resolution?: string;
   quantity: number;
   calls: number;
   tokens?: number;
@@ -306,12 +307,18 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                     media.model_name,
                     media.unit,
                     media.call_type,
+                    media.resolution ?? "",
                   ])}
                 >
                   <span className="min-w-0" title={media.model_name || media.model_id}>
                     <span className="block truncate font-medium">
                       {media.model_name || media.model_id || t('chatPage.tokenUsage.unknownModel')}
                     </span>
+                    {media.resolution && (
+                      <span className="block truncate text-[10px] text-muted-foreground">
+                        {media.resolution}
+                      </span>
+                    )}
                   </span>
                   <span className="min-w-0 truncate" title={formatMediaType(media.call_type)}>
                     {formatMediaType(media.call_type)}

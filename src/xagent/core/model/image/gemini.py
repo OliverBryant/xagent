@@ -441,7 +441,10 @@ class GeminiImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
             record_image_usage(
-                result, model_name=self.model_name, call_type="generate_image"
+                result,
+                model_name=self.model_name,
+                call_type="generate_image",
+                resolution=(image_config or {}).get("imageSize", ""),
             )
             return result
 
@@ -700,7 +703,10 @@ class GeminiImageModel(BaseImageModel):
                 "raw_response": response_data,
             }
             record_image_usage(
-                result, model_name=self.model_name, call_type="edit_image"
+                result,
+                model_name=self.model_name,
+                call_type="edit_image",
+                resolution=(image_config or {}).get("imageSize", ""),
             )
             return result
 

@@ -23,9 +23,17 @@ from typing import Any, Callable
 # callbacks may rely on that affinity and must remain non-blocking.
 _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = None
 # (db, user_id, delta_details, delta_actions) -> None; best-effort post-run
-# metering. delta_details is this turn's per-model token breakdown (list of
-# {"type","tokens","model"}) for cost-based credits; delta_actions counts tool
-# calls (one billable action per tool invocation).
+# metering. delta_details is this turn's per-model usage breakdown for
+# cost-based credits; delta_actions counts tool calls (one billable action per
+# tool invocation). Entry shapes in delta_details:
+#   - LLM tokens: {"type":"input"|"output", "tokens", "model", "model_id",
+#       "call_type", ...cache fields}
+#   - Non-LLM media (image/video/tts/asr/embedding/rerank/...):
+#       {"type":"media", "unit":"images"|"seconds"|"characters"|"tokens"|
+#       "requests", "quantity", "tokens", "model", "model_id", "call_type"}
+# The app layer should price media entries by their "unit"/"quantity" (and may
+# read "tokens" for token-billed modalities). Unknown entry types must be
+# ignored, not summed as tokens.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
 # only after the run/runner-fenced token-usage update commits. The hook owns
@@ -41,7 +49,8 @@ _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # in-flight run's live-so-far usage would push the team over a run-gated quota,
 # else None. Polled per step (each LLM reply / tool call) during a run so a
 # single long/expensive run is stopped mid-flight instead of only being metered
-# at completion.
+# at completion. delta_details carries the same entry shapes documented on the
+# metering hook above (LLM token entries plus type:"media" entries).
 #
 # CONTRACT: invoked SYNCHRONOUSLY on the event loop once per step. It MUST NOT
 # block (no synchronous network/DB round-trips per call) — blocking work stalls

@@ -19,6 +19,7 @@ import httpx
 
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 logger = logging.getLogger(__name__)
 
@@ -432,13 +433,17 @@ class GeminiImageModel(BaseImageModel):
                 "total_tokens": usage_metadata.get("totalTokenCount", 0),
             }
 
-            return {
+            result = {
                 "image_url": image_url,
                 "usage": token_usage,
                 "request_id": response_data.get("requestId"),
                 "finish_reason": finish_reason,
                 "raw_response": response_data,
             }
+            record_image_usage(
+                result, model_name=self.model_name, call_type="generate_image"
+            )
+            return result
 
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
@@ -687,13 +692,17 @@ class GeminiImageModel(BaseImageModel):
                 "total_tokens": usage_metadata.get("totalTokenCount", 0),
             }
 
-            return {
+            result = {
                 "image_url": edited_image_url,
                 "usage": token_usage,
                 "request_id": response_data.get("requestId"),
                 "finish_reason": finish_reason,
                 "raw_response": response_data,
             }
+            record_image_usage(
+                result, model_name=self.model_name, call_type="edit_image"
+            )
+            return result
 
         except httpx.HTTPStatusError as e:
             raise RuntimeError(

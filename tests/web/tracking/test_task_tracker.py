@@ -1117,6 +1117,45 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_complete_tracking_reports_media_usage_in_delta(self, db_session):
+        """Non-LLM media usage (image/video/tts/...) reaches the quota metering
+        hook as a type:"media" entry in delta_details, alongside token entries."""
+        from xagent.core.model.chat.token_context import add_media_usage
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 0
+        task.output_tokens = 0
+        task.llm_calls = 0
+        task.token_usage_details = None
+
+        captured = {}
+
+        def _hook(db, user_id, delta_details, delta_actions):
+            captured.update(details=delta_details, actions=delta_actions)
+
+        quota_hooks.set_usage_record_hook(_hook)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+            add_token_usage(
+                input_tokens=8, output_tokens=2, model="gpt", call_type="chat"
+            )
+            add_media_usage(
+                unit="images", quantity=2, model="sd", call_type="generate_image"
+            )
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+
+        media = [d for d in captured["details"] if d.get("type") == "media"]
+        assert len(media) == 1
+        assert media[0]["unit"] == "images"
+        assert media[0]["quantity"] == 2.0
+        assert media[0]["call_type"] == "generate_image"
+
+    @pytest.mark.asyncio
     async def test_interrupt_reason_for_quota_passes_turn_delta(self, db_session):
         """The per-step quota gate must see the same this-turn delta the metering
         path computes, and surface the gate's reason (or None when open)."""

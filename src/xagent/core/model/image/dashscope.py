@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 import aiohttp
 
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 
 class DashScopeImageModel(BaseImageModel):
@@ -232,13 +233,17 @@ class DashScopeImageModel(BaseImageModel):
             usage = response_data.get("usage", {})
             task_metric = output.get("task_metric", {})
 
-            return {
+            result = {
                 "image_url": image_url,
                 "usage": usage,
                 "task_metric": task_metric,
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }
+            record_image_usage(
+                result, model_name=self.model_name, call_type="generate_image"
+            )
+            return result
 
         except aiohttp.ClientError as e:
             raise RuntimeError(
@@ -364,13 +369,17 @@ class DashScopeImageModel(BaseImageModel):
             usage = response_data.get("usage", {})
             task_metric = output.get("task_metric", {})
 
-            return {
+            result = {
                 "image_url": image_url,
                 "usage": usage,
                 "task_metric": task_metric,
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }
+            record_image_usage(
+                result, model_name=self.model_name, call_type="edit_image"
+            )
+            return result
 
         except aiohttp.ClientError as e:
             raise RuntimeError(f"Network error during image editing: {str(e)}") from e

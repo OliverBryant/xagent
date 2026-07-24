@@ -8,6 +8,7 @@ import aiohttp
 from openai import AsyncOpenAI
 
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 
 class OpenAIImageModel(BaseImageModel):
@@ -144,11 +145,15 @@ class OpenAIImageModel(BaseImageModel):
             elif getattr(image_item, "b64_json", None):
                 image_url = f"data:image/png;base64,{image_item.b64_json}"
 
-        return {
+        result = {
             "image_url": image_url,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(
+            result, model_name=self.model_name, call_type="generate_image"
+        )
+        return result
 
     async def edit_image(
         self,
@@ -207,8 +212,10 @@ class OpenAIImageModel(BaseImageModel):
             elif getattr(image_item, "b64_json", None):
                 response_image_url = f"data:image/png;base64,{image_item.b64_json}"
 
-        return {
+        result = {
             "image_url": response_image_url,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(result, model_name=self.model_name, call_type="edit_image")
+        return result

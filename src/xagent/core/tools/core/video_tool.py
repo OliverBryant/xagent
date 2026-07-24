@@ -26,6 +26,7 @@ from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
 from ...workspace import TaskWorkspace
+from .media_usage import _coerce_float, record_media_usage
 
 logger = logging.getLogger(__name__)
 
@@ -720,6 +721,19 @@ The generated video URL is temporary on the provider side, so completed videos a
                 ]
 
             result = await video_model.generate_video(**generate_params)
+
+            duration = _coerce_float(result.get("duration"))
+            if duration and duration > 0:
+                record_media_usage(
+                    "seconds",
+                    duration,
+                    model=str(actual_model_id),
+                    call_type="video",
+                )
+            else:
+                record_media_usage(
+                    "requests", 1, model=str(actual_model_id), call_type="video"
+                )
 
             video_url = result.get("video_url")
             video_path = None

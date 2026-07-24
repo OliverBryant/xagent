@@ -1,3 +1,4 @@
+import logging
 from typing import List, Optional, Union
 
 import requests
@@ -8,6 +9,19 @@ from .base import BaseEmbedding
 from .dashscope import DashScopeEmbedding
 from .openai import OpenAIEmbedding
 from .xinference import XinferenceEmbedding
+
+logger = logging.getLogger(__name__)
+
+
+def _estimate_tokens(text: Union[str, List[str]]) -> int:
+    """Rough token estimate for embedding usage (~4 chars/token).
+
+    Embedding providers here don't return a usage payload, so we approximate
+    from character count. Good enough for cost-tracking granularity.
+    """
+    texts = [text] if isinstance(text, str) else list(text)
+    chars = sum(len(t) for t in texts if isinstance(t, str))
+    return chars // 4
 
 
 def retry_on(e: Exception) -> bool:
@@ -80,7 +94,24 @@ class EmbeddingModelAdapter(BaseEmbedding):
         instruct: Optional[str] = None,
     ) -> Union[List[float], List[List[float]]]:
         """Encode text using the underlying embedding model."""
-        return self._embedding_model.encode(text, dimension, instruct)
+        result = self._embedding_model.encode(text, dimension, instruct)
+        try:
+            # Lazy import: this module is on the model package's init critical
+            # path, and importing ..chat at top level would circularly re-enter
+            # ..model before ChatModelConfig is defined.
+            from ..chat.token_context import add_media_usage
+
+            count = 1 if isinstance(text, str) else len(text)
+            add_media_usage(
+                unit="requests",
+                quantity=count,
+                model=self.model_config.model_name,
+                call_type="embedding",
+                input_tokens=_estimate_tokens(text),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to record embedding usage: %s", e)
+        return result
 
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension."""

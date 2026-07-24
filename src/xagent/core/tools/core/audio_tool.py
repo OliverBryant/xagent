@@ -19,6 +19,7 @@ from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
+from .media_usage import record_media_usage
 from .audio_tool_descriptions import (
     CLONE_TTS_VOICE_DESCRIPTION,
     DELETE_TTS_VOICE_DESCRIPTION,
@@ -742,6 +743,30 @@ class AudioToolCore:
                 )
                 language_detected = result.language
 
+            # Meter ASR by transcribed-audio duration when segment timings are
+            # available (max segment end); otherwise fall back to one request.
+            audio_seconds = 0.0
+            if raw_segments:
+                try:
+                    audio_seconds = max(
+                        float(seg["end"])
+                        for seg in raw_segments
+                        if seg.get("end") is not None
+                    )
+                except (ValueError, TypeError):
+                    audio_seconds = 0.0
+            if audio_seconds > 0:
+                record_media_usage(
+                    "seconds",
+                    audio_seconds,
+                    model=str(actual_model_id),
+                    call_type="asr",
+                )
+            else:
+                record_media_usage(
+                    "requests", 1, model=str(actual_model_id), call_type="asr"
+                )
+
             segment_view = "raw" if verbose else "processed"
             segments = raw_segments
             segments_merged = False
@@ -918,6 +943,14 @@ class AudioToolCore:
             # Determine the actual model used
             actual_model_id = (
                 model_id if model_id and model_id in self._tts_models else "default"
+            )
+
+            # Meter TTS by input characters (how providers like ElevenLabs bill).
+            record_media_usage(
+                "characters",
+                len(text or ""),
+                model=str(actual_model_id),
+                call_type="tts",
             )
 
             audio_data: Optional[bytes] = None

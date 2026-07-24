@@ -19,6 +19,7 @@ interface TokenUsage {
   llm_calls: number;
   cached_input_tokens: number;
   model_usage: ModelTokenUsage[];
+  media_usage: MediaUsage[];
 }
 
 interface ModelTokenUsage {
@@ -29,10 +30,21 @@ interface ModelTokenUsage {
   cached_input_tokens?: number;
 }
 
+interface MediaUsage {
+  model_id: string;
+  model_name: string;
+  unit: string;
+  call_type: string;
+  quantity: number;
+  calls: number;
+  tokens?: number;
+}
+
 // Build formatters lazily per locale so this file stays valid regardless of the
 // locale set (the SaaS overlay adds more locales than the standalone build).
 const compactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
 const exactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
+const mediaQuantityFormatters = new Map<Locale, Intl.NumberFormat>();
 
 function getFormatter(
   cache: Map<Locale, Intl.NumberFormat>,
@@ -65,9 +77,18 @@ export function formatExactTokenCount(value: number, locale: Locale = 'en'): str
   return getFormatter(exactTokenFormatters, locale).format(normalizeTokenCount(value));
 }
 
+function formatMediaQuantity(value: number, locale: Locale = 'en'): string {
+  const safe = Number.isFinite(value) ? Math.max(0, value) : 0;
+  // Media quantities can be fractional (e.g. audio seconds); keep up to one
+  // decimal but drop trailing ".0" for whole counts like image counts.
+  return getFormatter(mediaQuantityFormatters, locale, {
+    maximumFractionDigits: 1,
+  }).format(safe);
+}
+
 export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDisplayProps) {
   const [usage, setUsage] = useState<TokenUsage | null>(null);
-  const { locale, t } = useI18n();
+  const { locale, t, tDynamic } = useI18n();
 
   useEffect(() => {
     if (!taskId) return;
@@ -87,6 +108,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             llm_calls: data.llm_calls || 0,
             cached_input_tokens: data.cached_input_tokens || 0,
             model_usage: Array.isArray(data.model_usage) ? data.model_usage : [],
+            media_usage: Array.isArray(data.media_usage) ? data.media_usage : [],
           });
         }
       } catch (error) {
@@ -127,6 +149,26 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             : 'chatPage.tokenUsage.models',
           { count: attributedModelCount },
         );
+
+  const totalMediaCalls = usage.media_usage.reduce(
+    (sum, media) => sum + (Number.isFinite(media.calls) ? media.calls : 0),
+    0,
+  );
+  const mediaUsageLabel = t(
+    totalMediaCalls === 1
+      ? 'chatPage.tokenUsage.mediaCall'
+      : 'chatPage.tokenUsage.mediaCalls',
+    { count: totalMediaCalls },
+  );
+  const formatMediaType = (callType: string) =>
+    callType
+      ? tDynamic(
+          `chatPage.tokenUsage.mediaType.${callType}`,
+          callType,
+        )
+      : t('chatPage.tokenUsage.unknownModel');
+  const formatMediaUnit = (unit: string) =>
+    unit ? tDynamic(`chatPage.tokenUsage.unit.${unit}`, unit) : '';
 
   return (
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
@@ -226,6 +268,56 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                   </span>
                   <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens, locale)}>
                     {formatTokenCount(model.output_tokens, locale)}
+                  </span>
+                </React.Fragment>
+              ))}
+            </div>
+          </PopoverContent>
+        </Popover>
+      )}
+      {usage.media_usage.length > 0 && (
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              className="flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <span>{mediaUsageLabel}</span>
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            align="end"
+            className="w-[32rem] max-w-[calc(100vw-2rem)] p-0"
+          >
+            <div className="border-b px-3 py-2.5 text-sm font-medium">
+              {t('chatPage.tokenUsage.mediaByModel')}
+            </div>
+            <div className="grid grid-cols-[minmax(0,1fr)_7rem_6rem] gap-x-4 gap-y-2 p-3 text-xs">
+              <span className="text-muted-foreground">{t('chatPage.tokenUsage.model')}</span>
+              <span className="text-muted-foreground">{t('chatPage.tokenUsage.callType')}</span>
+              <span className="text-right text-muted-foreground">
+                {t('chatPage.tokenUsage.quantity')}
+              </span>
+              {usage.media_usage.map((media) => (
+                <React.Fragment
+                  key={JSON.stringify([
+                    media.model_id,
+                    media.model_name,
+                    media.unit,
+                    media.call_type,
+                  ])}
+                >
+                  <span className="min-w-0" title={media.model_name || media.model_id}>
+                    <span className="block truncate font-medium">
+                      {media.model_name || media.model_id || t('chatPage.tokenUsage.unknownModel')}
+                    </span>
+                  </span>
+                  <span className="min-w-0 truncate" title={formatMediaType(media.call_type)}>
+                    {formatMediaType(media.call_type)}
+                  </span>
+                  <span className="text-right tabular-nums">
+                    {formatMediaQuantity(media.quantity, locale)} {formatMediaUnit(media.unit)}
                   </span>
                 </React.Fragment>
               ))}

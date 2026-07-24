@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 from xinference_client import RESTfulClient as XinferenceClient
 
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 logger = logging.getLogger(__name__)
 
@@ -175,11 +176,15 @@ class XinferenceImageModel(BaseImageModel):
                     if image_item.get("b64_json"):
                         image_url = f"data:image/png;base64,{image_url}"
 
-            return {
+            out = {
                 "image_url": image_url,
                 "usage": getattr(result, "usage", {}) or {},
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(
+                out, model_name=self.model_name, call_type="generate_image"
+            )
+            return out
 
         except Exception as e:
             logger.error(f"Xinference image generation failed: {e}")
@@ -271,11 +276,13 @@ class XinferenceImageModel(BaseImageModel):
                     if image_item.get("b64_json"):
                         result_image_url = f"data:image/png;base64,{result_image_url}"
 
-            return {
+            out = {
                 "image_url": result_image_url,
                 "usage": getattr(result, "usage", {}) or {},
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(out, model_name=self.model_name, call_type="edit_image")
+            return out
 
         except Exception as e:
             logger.error(f"Xinference image editing failed: {e}")

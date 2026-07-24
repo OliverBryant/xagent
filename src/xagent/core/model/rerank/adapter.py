@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 
 import requests
@@ -5,6 +6,8 @@ import requests
 from ...retry import create_retry_wrapper
 from ..model import RerankModelConfig
 from .base import BaseRerank
+
+logger = logging.getLogger(__name__)
 
 
 def retry_on(e: Exception) -> bool:
@@ -69,4 +72,19 @@ class RerankModelAdapter(BaseRerank):
         query: str,
     ) -> Sequence[str]:
         """Rerank documents using the underlying rerank model."""
-        return self._rerank_model.compress(documents, query)
+        result = self._rerank_model.compress(documents, query)
+        try:
+            # Lazy import to avoid a circular import via the model package init.
+            from ..chat.token_context import add_media_usage
+
+            doc_chars = sum(len(d) for d in documents if isinstance(d, str))
+            add_media_usage(
+                unit="requests",
+                quantity=1,
+                model=self.model_config.model_name,
+                call_type="rerank",
+                input_tokens=(doc_chars + len(query)) // 4,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to record rerank usage: %s", e)
+        return result

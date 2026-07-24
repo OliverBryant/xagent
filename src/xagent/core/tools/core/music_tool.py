@@ -10,6 +10,7 @@ from typing import Any, Optional
 from ...file_ref import build_workspace_file_ref
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
+from .media_usage import _coerce_float, record_media_usage
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,21 @@ file_id/file_ref.
                 raise RuntimeError(f"Unexpected music response: {type(result)}")
             if not result.audio:
                 raise RuntimeError("Music model returned no audio data")
+
+            seconds = _coerce_float(
+                (result.raw_response or {}).get("music_length_seconds")
+            ) or _coerce_float(music_length_seconds)
+            if seconds and seconds > 0:
+                record_media_usage(
+                    "seconds",
+                    seconds,
+                    model=str(configured_model_id),
+                    call_type="music",
+                )
+            else:
+                record_media_usage(
+                    "requests", 1, model=str(configured_model_id), call_type="music"
+                )
 
             audio_path: Optional[str] = None
             file_id: Optional[str] = None

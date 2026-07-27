@@ -747,14 +747,16 @@ class AudioToolCore:
             # available (max segment end); otherwise fall back to one request.
             audio_seconds = 0.0
             if raw_segments:
-                try:
-                    audio_seconds = max(
-                        float(seg["end"])
-                        for seg in raw_segments
-                        if isinstance(seg, dict) and seg.get("end") is not None
-                    )
-                except (ValueError, TypeError):
-                    audio_seconds = 0.0
+                for seg in raw_segments:
+                    if not isinstance(seg, dict):
+                        continue
+                    end = seg.get("end")
+                    if end is None:
+                        continue
+                    try:
+                        audio_seconds = max(audio_seconds, float(end))
+                    except (ValueError, TypeError):
+                        continue
             if audio_seconds > 0:
                 record_media_usage(
                     "seconds",

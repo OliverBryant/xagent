@@ -2753,9 +2753,7 @@ class AgentServiceManager:
                     else:
                         share_key = None
                     if share_key and isinstance(guest_id, str) and guest_id:
-                        from ..services.share_rate_limit import (
-                            get_share_rate_limiter,
-                        )
+                        from ..services.share_rate_limit import get_share_rate_limiter
 
                         if not get_share_rate_limiter().allow_run(share_key, guest_id):
                             reason_message = (
@@ -2784,9 +2782,7 @@ class AgentServiceManager:
                 logger.warning("Share run quota check failed open", exc_info=True)
 
         if manage_task_lease and tracker_task_id:
-            from ..services.task_execution_controller import (
-                task_execution_controller,
-            )
+            from ..services.task_execution_controller import task_execution_controller
 
             async with task_execution_controller.command(int(tracker_task_id)):
                 lease = await acquire_task_lease_cancellation_safe(
@@ -4026,7 +4022,10 @@ async def get_task(
                 ),
                 "model_usage": model_usage,
                 "media_usage": media_usage,
+                # Derived from the same aggregation the client renders, so the
+                # summary count and the rows can never disagree.
                 "media_calls": sum(entry["calls"] for entry in media_usage),
+                "media_quantity_total": sum(entry["quantity"] for entry in media_usage),
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,

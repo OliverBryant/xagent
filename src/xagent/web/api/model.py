@@ -980,6 +980,7 @@ async def transcribe_speech_input(
     """Transcribe a short UI voice input clip with an accessible ASR model."""
 
     from xagent.core.model.asr.adapter import get_asr_model_instance
+    from xagent.core.model.asr.usage import record_asr_usage
 
     try:
         audio_bytes = await _read_transcribe_upload_with_size_limit(file)
@@ -998,6 +999,13 @@ async def transcribe_speech_input(
                 format=_format_from_upload(file),
             ),
             timeout=180.0,
+        )
+        # Metered here as well as in audio_tool: this endpoint calls the ASR
+        # provider directly, so without this the transcription is never billed.
+        record_asr_usage(
+            result,
+            model_name=str(db_model.model_name),
+            model_id=str(db_model.model_id or ""),
         )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc

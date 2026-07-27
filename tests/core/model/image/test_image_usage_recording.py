@@ -22,13 +22,44 @@ def test_record_image_usage_gemini_style_tokens() -> None:
     assert entry["type"] == "media"
     assert entry["unit"] == "images"
     assert entry["quantity"] == 1.0
-    assert entry["tokens"] == 8
+    assert entry["provider_tokens"] == 8
+    # Provider-reported, not a local estimate — billing may price these.
+    assert entry["tokens_estimated"] is False
     assert entry["call_type"] == "generate_image"
+
+
+def test_record_image_usage_honours_n_and_model_id() -> None:
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {"usage": {}},
+            model_name="dall-e",
+            model_id="img-1",
+            image_count=4,
+            resolution="1024x1024",
+        )
+        entry = manager.get_usage().details[0]
+
+    # n>1 must bill 4 images, not 1.
+    assert entry["quantity"] == 4.0
+    assert entry["model_id"] == "img-1"
+    assert entry["resolution"] == "1024x1024"
+
+
+def test_record_image_usage_records_resolution_tier() -> None:
     # Resolution tier is recorded so cloud can price by (model, resolution),
     # while the real image tokens let a token-based price take precedence.
+    with TokenContextManager() as manager:
+        record_image_usage(
+            {"usage": {"prompt_tokens": 5, "completion_tokens": 3}},
+            model_name="gemini-image",
+            call_type="generate_image",
+            resolution="2K",
+        )
+        entry = manager.get_usage().details[0]
+
     assert entry["resolution"] == "2K"
-    assert entry["input_tokens"] == 5
-    assert entry["output_tokens"] == 3
+    assert entry["provider_input_tokens"] == 5
+    assert entry["provider_output_tokens"] == 3
 
 
 def test_record_image_usage_empty_or_missing_usage() -> None:
@@ -42,7 +73,7 @@ def test_record_image_usage_empty_or_missing_usage() -> None:
         usage = manager.get_usage()
 
     assert usage.media_calls == 2
-    assert all(entry["tokens"] == 0 for entry in usage.details)
+    assert all(entry["provider_tokens"] == 0 for entry in usage.details)
 
 
 def test_record_image_usage_never_raises_on_garbage() -> None:

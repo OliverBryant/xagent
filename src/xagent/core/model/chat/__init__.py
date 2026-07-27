@@ -4,6 +4,8 @@ from .basic.adapter import create_base_llm
 from .basic.base import BaseLLM
 from .timeout_config import TimeoutConfig
 from .token_context import (
+    MediaCallType,
+    MediaUnit,
     TokenContextManager,
     TokenUsage,
     add_media_usage,
@@ -28,6 +30,8 @@ __all__ = [
     # Token tracking
     "TokenUsage",
     "TokenContextManager",
+    "MediaUnit",
+    "MediaCallType",
     "add_token_usage",
     "add_media_usage",
     "aggregate_token_usage_by_model",

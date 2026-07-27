@@ -29,14 +29,23 @@ _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = No
 #   - LLM tokens: {"type":"input"|"output", "tokens", "model", "model_id",
 #       "call_type", ...cache fields}
 #   - Non-LLM media (image/video/tts/asr/embedding/rerank/...):
-#       {"type":"media", "unit":"images"|"seconds"|"characters"|"tokens"|
-#       "requests", "quantity", "tokens", "input_tokens", "output_tokens",
-#       "model", "model_id", "call_type", "resolution"}
-# The app layer should price media entries by their "unit"/"quantity". For image
-# models whose price varies by resolution, "resolution" ("1K"/"2K"/"4K" or
-# "1024x1024") keys a per-(model, resolution) price table. Providers that report
-# real image tokens (Gemini, OpenAI gpt-image) also fill "tokens" so a
-# token-based price ($/1M tokens) can take precedence over the resolution table.
+#       {"type":"media", "unit":"images"|"seconds"|"characters"|"texts"|
+#       "requests", "quantity", "provider_tokens", "provider_input_tokens",
+#       "provider_output_tokens", "tokens_estimated", "model", "model_id",
+#       "call_type", "resolution"}
+# The app layer should price media entries by their "unit"/"quantity". The unit
+# is stable for a given (model, call_type) — a duration-billed modality always
+# reports "seconds", recording quantity=0 when the provider gave no duration,
+# rather than switching units. "requests" always carries quantity=1; a batch of
+# N embedded texts reports unit="texts" with quantity=N and calls=1.
+# For image models whose price varies by resolution, "resolution" ("1K"/"2K"/
+# "4K" or "1024x1024") keys a per-(model, resolution) price table. Providers
+# that report real image tokens (Gemini, OpenAI gpt-image) also fill
+# "provider_tokens" so a token-based price ($/1M tokens) can take precedence
+# over the resolution table — but only when "tokens_estimated" is False;
+# embedding/rerank counts are local heuristics and must not be priced as
+# measured tokens. Media token counts are deliberately NOT under the "tokens"
+# key, so a consumer summing "tokens" across entries cannot double-count them.
 # Unknown entry types must be ignored, not summed as tokens.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking

@@ -3,15 +3,8 @@
 from unittest.mock import patch
 
 from xagent.core.model.model import RerankModelConfig
-from xagent.core.model.rerank import (
-    BaseRerank,
-    DashscopeRerank,
-    XinferenceRerank,
-)
-from xagent.core.model.rerank.adapter import (
-    RerankModelAdapter,
-    _create_rerank_model,
-)
+from xagent.core.model.rerank import BaseRerank, DashscopeRerank, XinferenceRerank
+from xagent.core.model.rerank.adapter import RerankModelAdapter, _create_rerank_model
 
 
 def _config(provider: str) -> RerankModelConfig:

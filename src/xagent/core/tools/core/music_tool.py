@@ -8,9 +8,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...file_ref import build_workspace_file_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
-from .media_usage import _coerce_float, record_media_usage
+from .media_usage import coerce_duration, record_media_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -143,20 +144,16 @@ file_id/file_ref.
             if not result.audio:
                 raise RuntimeError("Music model returned no audio data")
 
-            seconds = _coerce_float(
+            # Music is duration-billed: always meter in seconds, even when the
+            # length was auto-selected and no duration came back.
+            seconds = coerce_duration(
                 (result.raw_response or {}).get("music_length_seconds")
-            ) or _coerce_float(music_length_seconds)
-            if seconds and seconds > 0:
-                record_media_usage(
-                    "seconds",
-                    seconds,
-                    model=str(configured_model_id),
-                    call_type="music",
-                )
-            else:
-                record_media_usage(
-                    "requests", 1, model=str(configured_model_id), call_type="music"
-                )
+            ) or coerce_duration(music_length_seconds)
+            record_media_seconds(
+                seconds,
+                model=str(configured_model_id),
+                call_type=MediaCallType.MUSIC,
+            )
 
             audio_path: Optional[str] = None
             file_id: Optional[str] = None

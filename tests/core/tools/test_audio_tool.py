@@ -978,6 +978,42 @@ async def test_synthesize_speech_json_records_media_usage_per_segment() -> None:
     ]
 
 
+async def test_tts_usage_records_real_model_not_default() -> None:
+    """Omitting model_id is the documented common case, so the usage entry must
+    still name the model — billing the literal string "default" would destroy
+    per-model cost attribution."""
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(tts_models={"tts-a": FakeTTS()})
+
+    with TokenContextManager() as manager:
+        await tool.synthesize_speech(text="hello")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "tts-a"
+    assert entries[0]["model"] != "default"
+
+
+async def test_asr_usage_meters_seconds_from_segments() -> None:
+    """ASR is duration-billed, so the unit is seconds and the quantity comes
+    from the transcribed audio's timing."""
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(asr_models={"asr-a": FakeASR()})
+
+    with TokenContextManager() as manager:
+        result = await tool.transcribe_audio(audio_file_path="x.wav")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert result["success"] is True
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["call_type"] == "asr"
+    assert entries[0]["quantity"] > 0
+    assert entries[0]["model"] == "asr-a"
+
+
 async def test_synthesize_speech_json_rejects_non_object_json() -> None:
     tool = AudioToolCore(tts_models={"fake": FakeTTS()})
 

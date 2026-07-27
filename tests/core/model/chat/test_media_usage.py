@@ -56,12 +56,33 @@ def test_add_media_usage_carries_accompanying_tokens() -> None:
         usage = manager.get_usage()
 
     entry = usage.details[0]
-    assert entry["tokens"] == 8
-    assert entry["input_tokens"] == 5
-    assert entry["output_tokens"] == 3
+    # Stored under provider_tokens, never "tokens": a consumer that sums the
+    # "tokens" key across all entries must not pick up media counts.
+    assert "tokens" not in entry
+    assert entry["provider_tokens"] == 8
+    assert entry["provider_input_tokens"] == 5
+    assert entry["provider_output_tokens"] == 3
+    assert entry["tokens_estimated"] is False
     # Media token passthrough must NOT inflate the LLM token totals.
     assert usage.input_tokens == 0
     assert usage.output_tokens == 0
+
+
+def test_estimated_tokens_are_flagged() -> None:
+    with TokenContextManager() as manager:
+        add_media_usage(
+            unit="texts",
+            quantity=2,
+            model="embed",
+            call_type="embedding",
+            input_tokens=12,
+            tokens_estimated=True,
+        )
+        details = manager.get_usage().details
+
+    assert details[0]["tokens_estimated"] is True
+    # The flag survives aggregation so billing can refuse to price an estimate.
+    assert aggregate_media_usage_by_model(details)[0]["tokens_estimated"] is True
 
 
 def test_dirty_quantity_is_coerced_and_does_not_raise() -> None:
@@ -177,15 +198,20 @@ def test_media_aggregation_splits_by_resolution() -> None:
 def test_aggregations_tolerate_non_list_and_dirty_entries() -> None:
     assert aggregate_media_usage_by_model(None) == []
     assert aggregate_media_usage_by_model("nope") == []
-    assert aggregate_media_usage_by_model([{"type": "media"}, 42, "junk"]) == [
-        {
-            "model_id": "",
-            "model_name": "",
-            "unit": "",
-            "call_type": "",
-            "resolution": "",
-            "quantity": 0.0,
-            "calls": 1,
-            "tokens": 0,
-        }
-    ]
+    # A quantity-less entry is not a billable line item and is dropped, matching
+    # the token aggregator's zero-token behaviour.
+    assert aggregate_media_usage_by_model([{"type": "media"}, 42, "junk"]) == []
+
+
+def test_zero_quantity_media_entries_are_skipped() -> None:
+    # A duration-billed call the provider never measured records 0 seconds; it
+    # must not surface as a "0 sec" row.
+    with TokenContextManager() as manager:
+        add_media_usage(unit="seconds", quantity=0, model="tts", call_type="tts")
+        add_media_usage(unit="seconds", quantity=5, model="tts", call_type="tts")
+        details = manager.get_usage().details
+
+    groups = aggregate_media_usage_by_model(details)
+    assert len(groups) == 1
+    assert groups[0]["quantity"] == 5.0
+    assert groups[0]["calls"] == 1

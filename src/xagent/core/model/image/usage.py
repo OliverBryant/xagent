@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ..chat.token_context import add_media_usage
+from ..chat.token_context import MediaCallType, MediaUnit, add_media_usage
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def record_image_usage(
     *,
     model_name: str = "",
     model_id: str = "",
-    call_type: str = "generate_image",
+    call_type: MediaCallType | str = MediaCallType.GENERATE_IMAGE,
     image_count: int = 1,
     resolution: str = "",
 ) -> None:
@@ -51,14 +51,20 @@ def record_image_usage(
     OpenAI gpt-image). ``resolution`` is the size tier ("1K"/"2K"/"4K" or
     "1024x1024") so the billing layer can price by (model, resolution); the
     real image tokens (when present) let a token-based price take precedence.
+    ``image_count`` must be the request's ``n`` so multi-image requests are not
+    under-billed as a single image.
     """
     try:
         usage = result.get("usage") if isinstance(result, dict) else None
         input_tokens = _read(usage, "prompt_tokens", "input_tokens")
         output_tokens = _read(usage, "completion_tokens", "output_tokens")
+        try:
+            count = max(0, int(image_count))
+        except (TypeError, ValueError):
+            count = 1
         add_media_usage(
-            unit="images",
-            quantity=max(0, image_count),
+            unit=MediaUnit.IMAGES,
+            quantity=count,
             model=model_name,
             model_id=model_id,
             call_type=call_type,

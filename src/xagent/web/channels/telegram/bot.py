@@ -718,6 +718,8 @@ class TelegramBotInstance:
         uploaded_info: list[dict[str, Any]],
         asr_model: Any,
     ) -> dict[str, str]:
+        from ....core.model.asr.usage import record_asr_usage
+
         uploaded_by_source_id = {
             str(info.get("telegram_file_id")): info
             for info in uploaded_info
@@ -739,6 +741,12 @@ class TelegramBotInstance:
                         format=self._audio_format_from_file_info(file_info),
                     ),
                     timeout=self.voice_transcription_timeout_seconds,
+                )
+                # Telegram calls the ASR provider directly rather than going
+                # through audio_tool, so meter here or voice input is free.
+                record_asr_usage(
+                    result,
+                    model_name=str(getattr(asr_model, "model", "") or ""),
                 )
             except asyncio.TimeoutError as exc:
                 raise TelegramVoiceTranscriptionError(

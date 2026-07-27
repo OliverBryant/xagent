@@ -13,19 +13,6 @@ from .xinference import XinferenceEmbedding
 logger = logging.getLogger(__name__)
 
 
-def _estimate_tokens(text: Union[str, List[str]]) -> int:
-    """Rough token estimate for embedding usage (~4 chars/token).
-
-    Embedding providers here don't return a usage payload, so we approximate
-    from character count. Good enough for cost-tracking granularity.
-    """
-    if isinstance(text, str):
-        return len(text) // 4
-    if isinstance(text, (list, tuple, set)):
-        return sum(len(t) for t in text if isinstance(t, str)) // 4
-    return 0
-
-
 def retry_on(e: Exception) -> bool:
     ERRORS = requests.exceptions.Timeout
 
@@ -101,15 +88,25 @@ class EmbeddingModelAdapter(BaseEmbedding):
             # Lazy import: this module is on the model package's init critical
             # path, and importing ..chat at top level would circularly re-enter
             # ..model before ChatModelConfig is defined.
-            from ..chat.token_context import add_media_usage
+            from ..chat.token_context import (
+                MediaCallType,
+                MediaUnit,
+                add_media_usage,
+                estimate_tokens,
+            )
 
+            # unit=TEXTS, not REQUESTS: a batch of 32 texts is one provider call
+            # but 32 billable texts, and REQUESTS is defined as always 1 per
+            # call. Conflating them would over-bill embeddings by batch size.
             count = 1 if isinstance(text, str) else len(text)
             add_media_usage(
-                unit="requests",
+                unit=MediaUnit.TEXTS,
                 quantity=count,
                 model=self.model_config.model_name,
-                call_type="embedding",
-                input_tokens=_estimate_tokens(text),
+                model_id=self.model_config.id,
+                call_type=MediaCallType.EMBEDDING,
+                input_tokens=estimate_tokens(text),
+                tokens_estimated=True,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to record embedding usage: %s", e)

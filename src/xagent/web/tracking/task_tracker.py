@@ -56,14 +56,26 @@ def _copy_details(raw_details: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in raw_details if isinstance(item, dict)]
 
 
+def _media_call_count(details: list[dict[str, Any]]) -> int:
+    """Media calls implied by a details list.
+
+    Derived rather than stored: every media call appends exactly one entry, so
+    a dedicated ``media_calls`` DB column would be redundant state that could
+    drift from the details it summarises.
+    """
+    return sum(1 for item in details if item.get("type") == "media")
+
+
 def _copy_usage(usage: TokenUsage) -> TokenUsage:
     """Detach a stable snapshot before yielding to a database worker."""
+    details = _copy_details(usage.details)
     return TokenUsage(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         llm_calls=usage.llm_calls,
+        media_calls=usage.media_calls or _media_call_count(details),
         tool_calls=usage.tool_calls,
-        details=_copy_details(usage.details),
+        details=details,
     )
 
 

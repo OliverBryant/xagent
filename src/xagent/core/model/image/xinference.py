@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 
 from xinference_client import RESTfulClient as XinferenceClient
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
 from .usage import record_image_usage
 
@@ -184,7 +185,7 @@ class XinferenceImageModel(BaseImageModel):
             record_image_usage(
                 out,
                 model_name=self.model_name,
-                call_type="generate_image",
+                call_type=MediaCallType.GENERATE_IMAGE,
                 image_count=n,
                 resolution=str(normalized_size or ""),
             )
@@ -288,7 +289,7 @@ class XinferenceImageModel(BaseImageModel):
             record_image_usage(
                 out,
                 model_name=self.model_name,
-                call_type="edit_image",
+                call_type=MediaCallType.EDIT_IMAGE,
                 image_count=n,
                 resolution=str(size or ""),
             )

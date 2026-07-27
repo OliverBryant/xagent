@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
+from ...model.chat.token_context import MediaCallType, MediaUnit
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
@@ -27,7 +28,7 @@ from .audio_tool_descriptions import (
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
 )
-from .media_usage import record_media_usage
+from .media_usage import coerce_duration, record_media_seconds, record_media_usage
 
 logger = logging.getLogger(__name__)
 
@@ -573,6 +574,30 @@ class AudioToolCore:
                 return model_id
         return "default"
 
+    @staticmethod
+    def _resolve_billing_model(
+        models: Dict[str, Any], model: Any, model_id: Optional[str]
+    ) -> str:
+        """Identify the model that actually served a call, for usage records.
+
+        The caller-supplied ``model_id`` is optional (the docs call omitting it
+        the normal case), so the usual ``model_id or "default"`` shape would
+        persist the literal string ``"default"`` as the model name and destroy
+        per-model cost attribution. Resolve by object identity like the batch
+        path does, then fall back to the provider's own model name, and only
+        use ``"default"`` when nothing else identifies the model.
+        """
+        if model_id and model_id in models:
+            return model_id
+        if model is not None:
+            for configured_id, configured_model in models.items():
+                if configured_model is model:
+                    return configured_id
+            model_name = getattr(model, "model_name", None)
+            if model_name:
+                return str(model_name)
+        return "default"
+
     def _get_provider_tts_model(
         self,
         *,
@@ -714,14 +739,15 @@ class AudioToolCore:
             )
 
             # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._asr_models else "default"
+            actual_model_id = self._resolve_billing_model(
+                self._asr_models, asr_model, model_id
             )
 
             # Handle different result types
             text = None
             raw_segments = None
             language_detected = None
+            raw_response: dict[str, Any] = {}
 
             if isinstance(result, str):
                 text = result
@@ -742,11 +768,17 @@ class AudioToolCore:
                     else None
                 )
                 language_detected = result.language
+                if isinstance(result.raw_response, dict):
+                    raw_response = result.raw_response
 
-            # Meter ASR by transcribed-audio duration when segment timings are
-            # available (max segment end); otherwise fall back to one request.
-            audio_seconds = 0.0
-            if raw_segments:
+            # Prefer the provider's own total audio duration: the last segment's
+            # end time undercounts a recording with trailing silence, which the
+            # provider still processed and billed for.
+            audio_seconds = coerce_duration(
+                raw_response.get("duration") or raw_response.get("audio_duration")
+            )
+            if audio_seconds is None and raw_segments:
+                last_end = 0.0
                 for seg in raw_segments:
                     if not isinstance(seg, dict):
                         continue
@@ -754,20 +786,10 @@ class AudioToolCore:
                     if end is None:
                         continue
                     try:
-                        audio_seconds = max(audio_seconds, float(end))
+                        last_end = max(last_end, float(end))
                     except (ValueError, TypeError):
                         continue
-            if audio_seconds > 0:
-                record_media_usage(
-                    "seconds",
-                    audio_seconds,
-                    model=str(actual_model_id),
-                    call_type="asr",
-                )
-            else:
-                record_media_usage(
-                    "requests", 1, model=str(actual_model_id), call_type="asr"
-                )
+                audio_seconds = coerce_duration(last_end)
 
             segment_view = "raw" if verbose else "processed"
             segments = raw_segments
@@ -780,6 +802,15 @@ class AudioToolCore:
                     len(segments),
                 )
                 segments_merged = len(segments) < len(raw_segments)
+
+            # Recorded only after every step that can still fail, so a call that
+            # errors out is not billed. ASR is duration-billed, so the unit stays
+            # seconds even when no duration could be determined.
+            record_media_seconds(
+                audio_seconds,
+                model=str(actual_model_id),
+                call_type=MediaCallType.ASR,
+            )
 
             # Save transcription to JSON file if workspace is available
             file_id: Optional[str] = None
@@ -943,16 +974,16 @@ class AudioToolCore:
             )
 
             # Determine the actual model used
-            actual_model_id = (
-                model_id if model_id and model_id in self._tts_models else "default"
+            actual_model_id = self._resolve_billing_model(
+                self._tts_models, tts_model, model_id
             )
 
             # Meter TTS by input characters (how providers like ElevenLabs bill).
             record_media_usage(
-                "characters",
+                MediaUnit.CHARACTERS,
                 len(text or ""),
                 model=str(actual_model_id),
-                call_type="tts",
+                call_type=MediaCallType.TTS,
             )
 
             audio_data: Optional[bytes] = None
@@ -1911,10 +1942,10 @@ class AudioToolCore:
             # Meter TTS by input characters, matching synthesize_speech so batch
             # synthesis is metered the same way as single-shot synthesis.
             record_media_usage(
-                "characters",
+                MediaUnit.CHARACTERS,
                 len(text or ""),
                 model=str(self._get_tts_model_id(tts_model)),
-                call_type="tts",
+                call_type=MediaCallType.TTS,
             )
 
             # Handle result

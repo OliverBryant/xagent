@@ -38,7 +38,8 @@ interface MediaUsage {
   resolution?: string;
   quantity: number;
   calls: number;
-  tokens?: number;
+  provider_tokens?: number;
+  tokens_estimated?: boolean;
 }
 
 // Build formatters lazily per locale so this file stays valid regardless of the
@@ -324,7 +325,22 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                     {formatMediaType(media.call_type)}
                   </span>
                   <span className="text-right tabular-nums">
-                    {formatMediaQuantity(media.quantity, locale)} {formatMediaUnit(media.unit)}
+                    {/* Joined via filter so an unrecognised (or empty) unit
+                        renders as "4" rather than "4 " with a dangling space. */}
+                    {[
+                      formatMediaQuantity(media.quantity, locale),
+                      formatMediaUnit(media.unit),
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    {media.provider_tokens ? (
+                      <span className="block text-[10px] text-muted-foreground">
+                        {formatTokenCount(media.provider_tokens, locale)}
+                        {media.tokens_estimated ? '~' : ''}
+                        {' '}
+                        {t('chatPage.tokenUsage.tokensShort')}
+                      </span>
+                    ) : null}
                   </span>
                 </React.Fragment>
               ))}

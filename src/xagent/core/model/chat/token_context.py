@@ -8,9 +8,42 @@ statistics to be automatically collected during task execution.
 import contextvars
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class MediaUnit(str, Enum):
+    """Billable dimension of a non-LLM media call.
+
+    One unit per modality, chosen so a given (model, call_type) always reports
+    the same unit regardless of how complete the provider's response was — a
+    price table keyed on (model, unit) is only usable if the unit is stable.
+    ``REQUESTS`` means exactly one provider call and always carries
+    ``quantity=1``; use it only when the modality genuinely has no finer
+    billable dimension, never as a degraded fallback for a missing measurement.
+    """
+
+    IMAGES = "images"
+    SECONDS = "seconds"
+    CHARACTERS = "characters"
+    TEXTS = "texts"
+    REQUESTS = "requests"
+
+
+class MediaCallType(str, Enum):
+    """Modality/operation that produced a media usage entry."""
+
+    GENERATE_IMAGE = "generate_image"
+    EDIT_IMAGE = "edit_image"
+    VIDEO = "video"
+    TTS = "tts"
+    ASR = "asr"
+    MUSIC = "music"
+    SOUND_EFFECT = "sound_effect"
+    EMBEDDING = "embedding"
+    RERANK = "rerank"
 
 
 @dataclass
@@ -94,26 +127,32 @@ class TokenUsage:
         input_tokens: int = 0,
         output_tokens: int = 0,
         resolution: str = "",
+        tokens_estimated: bool = False,
     ) -> None:
         """Record a non-LLM media model call (image/video/tts/asr/...).
 
-        ``unit`` names the billable dimension ("images", "seconds",
-        "characters", "tokens", "requests"); ``quantity`` is its amount.
-        ``input_tokens``/``output_tokens`` carry any accompanying token count
-        some media providers still report (e.g. Gemini image generation) so a
-        token-based billing path can read ``tokens`` without special-casing.
-        ``resolution`` records the size tier (e.g. "1K"/"2K"/"4K" or "1024x1024")
-        so a per-(model, resolution) price table can bill image models whose
-        price varies by resolution; "" when not applicable.
+        ``unit`` names the billable dimension (see :class:`MediaUnit`);
+        ``quantity`` is its amount. ``resolution`` records the size tier
+        ("1K"/"2K"/"4K" or "1024x1024") so a per-(model, resolution) price table
+        can bill image models whose price varies by resolution; "" otherwise.
+
+        Token passthrough is deliberately **not** stored under ``tokens``: that
+        key means "billable LLM tokens" on input/output entries, and a consumer
+        that naively sums it across all entries must not pick up media counts.
+        ``provider_tokens`` holds the provider-reported count instead, and
+        ``tokens_estimated`` marks it as a local heuristic (embedding/rerank)
+        rather than a measurement (Gemini / OpenAI gpt-image), so billing can
+        refuse to price an estimate.
         """
         self.details.append(
             {
                 "type": "media",
                 "unit": unit,
                 "quantity": quantity,
-                "tokens": input_tokens + output_tokens,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
+                "provider_tokens": input_tokens + output_tokens,
+                "provider_input_tokens": input_tokens,
+                "provider_output_tokens": output_tokens,
+                "tokens_estimated": tokens_estimated,
                 "model": model,
                 "model_id": model_id,
                 "call_type": call_type,
@@ -255,6 +294,40 @@ def _coerce_int(value: Any) -> int:
         if value is not None:
             logger.warning("Discarding non-numeric token count: %r", value)
         return 0
+
+
+def estimate_tokens(text: Any) -> int:
+    """Language-aware token estimate for providers that report no usage.
+
+    CJK characters are roughly one token each, while Latin script averages
+    about four characters per token; a flat chars/4 heuristic therefore
+    undercounts Chinese text by close to 4x. Accepts a string or an iterable of
+    strings and ignores anything else, so a malformed input can never raise in
+    an accounting path. Callers must pass ``tokens_estimated=True`` alongside
+    the result so billing can tell this apart from a measured count.
+    """
+    if isinstance(text, str):
+        items: List[str] = [text]
+    elif isinstance(text, (list, tuple, set)):
+        items = [item for item in text if isinstance(item, str)]
+    else:
+        return 0
+
+    cjk = 0
+    other = 0
+    for item in items:
+        for char in item:
+            # CJK Unified Ideographs plus the common Japanese kana blocks.
+            code = ord(char)
+            if (
+                0x4E00 <= code <= 0x9FFF
+                or 0x3040 <= code <= 0x30FF
+                or 0xAC00 <= code <= 0xD7AF
+            ):
+                cjk += 1
+            else:
+                other += 1
+    return cjk + other // 4
 
 
 def _coerce_float(value: Any) -> float:
@@ -411,19 +484,25 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     the key because an image model's price varies by resolution, so different
     resolutions of the same model surface as separate billable line items.
     Returns one entry per (model, unit, call_type, resolution) combination with
-    the summed quantity, call count and any accompanying tokens.
+    the summed quantity, call count and provider-reported tokens. A group is
+    marked ``tokens_estimated`` when any entry in it carried estimated tokens,
+    so a consumer never prices a mixed group as if it were measured.
     """
     if not isinstance(details, list):
         return []
 
-    grouped: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
+    grouped: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
     for detail in details:
         if not isinstance(detail, dict):
             continue
         if detail.get("type") != "media":
             continue
         quantity = max(0.0, _coerce_float(detail.get("quantity")))
-        tokens = max(0, _coerce_int(detail.get("tokens")))
+        # Mirror the token aggregator: a zero-quantity entry is not a billable
+        # line item and would surface as a "0 chars" row in the UI.
+        if quantity == 0:
+            continue
+        tokens = max(0, _coerce_int(detail.get("provider_tokens")))
 
         raw_model_id = detail.get("model_id")
         raw_model_name = detail.get("model")
@@ -435,8 +514,10 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         unit = raw_unit if isinstance(raw_unit, str) else ""
         call_type = raw_call_type if isinstance(raw_call_type, str) else ""
         resolution = raw_resolution if isinstance(raw_resolution, str) else ""
+        # model_id is redundant in the key: it equals identity when set, and is
+        # constant "" otherwise.
         identity = model_id or model_name
-        key = (identity, model_id, unit, call_type, resolution)
+        key = (identity, unit, call_type, resolution)
 
         aggregate = grouped.setdefault(
             key,
@@ -448,14 +529,19 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "resolution": resolution,
                 "quantity": 0.0,
                 "calls": 0,
-                "tokens": 0,
+                "provider_tokens": 0,
+                "tokens_estimated": False,
             },
         )
         if not aggregate["model_name"] and model_name:
             aggregate["model_name"] = model_name
+        if not aggregate["model_id"] and model_id:
+            aggregate["model_id"] = model_id
         aggregate["quantity"] += quantity
         aggregate["calls"] += 1
-        aggregate["tokens"] += tokens
+        aggregate["provider_tokens"] += tokens
+        if detail.get("tokens_estimated"):
+            aggregate["tokens_estimated"] = True
 
     return sorted(
         grouped.values(),
@@ -521,14 +607,15 @@ def add_token_usage(
 
 
 def add_media_usage(
-    unit: str,
+    unit: "MediaUnit | str",
     quantity: float,
     model: str = "",
-    call_type: str = "",
+    call_type: "MediaCallType | str" = "",
     model_id: str = "",
     input_tokens: int = 0,
     output_tokens: int = 0,
     resolution: str = "",
+    tokens_estimated: bool = False,
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
@@ -538,43 +625,54 @@ def add_media_usage(
     the quota ``delta_details`` contract, so callers need only this one call.
 
     Args:
-        unit: Billable dimension ("images", "seconds", "characters",
-            "tokens", "requests").
+        unit: Billable dimension; see :class:`MediaUnit`. Must be stable for a
+            given (model, call_type) — never vary it by response completeness.
         quantity: Amount of ``unit`` consumed (may be fractional, e.g. seconds).
+            Always 1 for ``MediaUnit.REQUESTS``.
         model: Model name for tracking.
-        call_type: Modality/operation ("generate_image", "edit_image", "tts",
-            "asr", "video", "embedding", "rerank", ...).
+        call_type: Modality/operation; see :class:`MediaCallType`.
         model_id: Unique model id (disambiguates identically-named models).
-        input_tokens: Accompanying input tokens some providers report; 0 if none.
-        output_tokens: Accompanying output tokens some providers report; 0 if none.
+        input_tokens: Provider-reported input tokens; 0 if none.
+        output_tokens: Provider-reported output tokens; 0 if none.
         resolution: Size tier ("1K"/"2K"/"4K" or "1024x1024") for image models
             whose price varies by resolution; "" when not applicable. Providers
-            that also report real tokens (e.g. Gemini/OpenAI image) still fill
+            that also report real tokens (Gemini / OpenAI gpt-image) fill
             input/output_tokens so a token-based price can take precedence.
+        tokens_estimated: True when the token counts are a local heuristic
+            rather than provider-reported, so billing can refuse to price them.
     """
     # Coerce defensively so a provider returning a malformed count can never
     # crash the underlying media call over accounting.
     quantity = _coerce_float(quantity)
     input_tokens = _coerce_int(input_tokens)
     output_tokens = _coerce_int(output_tokens)
+    # Store plain strings so the details list stays JSON-serialisable whether
+    # the caller passed an enum member or a bare string.
+    unit_value = unit.value if isinstance(unit, MediaUnit) else str(unit)
+    call_type_value = (
+        call_type.value if isinstance(call_type, MediaCallType) else str(call_type)
+    )
 
     usage = get_token_usage()
     usage.increment_media_calls()
     usage.add_media_usage(
-        unit=unit,
+        unit=unit_value,
         quantity=quantity,
         model=model,
-        call_type=call_type,
+        call_type=call_type_value,
         model_id=model_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         resolution=resolution,
+        tokens_estimated=tokens_estimated,
     )
 
     logger.debug(
-        f"Media usage added: unit={unit}, quantity={quantity}, "
+        f"Media usage added: unit={unit_value}, quantity={quantity}, "
         f"resolution={resolution}, model={model}, model_id={model_id}, "
-        f"call_type={call_type}, tokens={input_tokens + output_tokens}, "
+        f"call_type={call_type_value}, "
+        f"provider_tokens={input_tokens + output_tokens}"
+        f"{' (estimated)' if tokens_estimated else ''}, "
         f"total_media_calls={usage.media_calls}"
     )
 

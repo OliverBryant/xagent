@@ -435,6 +435,82 @@ describe("TokenUsageDisplay media usage", () => {
     expect(await screen.findByText("custom_op")).toBeInTheDocument()
     expect(screen.getByText("4 widgets")).toBeInTheDocument()
   })
+
+  it("renders an empty unit without a dangling trailing space", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "x",
+              model_name: "no-unit-model",
+              unit: "",
+              call_type: "video",
+              quantity: 4,
+              calls: 1,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={24} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    // Exact match: "4 " with a trailing space would not satisfy this.
+    expect(await screen.findByText("4")).toBeInTheDocument()
+  })
+
+  it("renders provider tokens and marks estimated counts", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "g",
+              model_name: "gemini-image",
+              unit: "images",
+              call_type: "generate_image",
+              quantity: 1,
+              calls: 1,
+              provider_tokens: 1120,
+              tokens_estimated: false,
+            },
+            {
+              model_id: "e",
+              model_name: "text-embed",
+              unit: "texts",
+              call_type: "embedding",
+              quantity: 3,
+              calls: 1,
+              provider_tokens: 40,
+              tokens_estimated: true,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={25} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    // Real Gemini image tokens are surfaced, not silently dropped.
+    expect(await screen.findByText(/1\.12k/)).toBeInTheDocument()
+    // The estimate is visibly marked so it is not mistaken for a measurement.
+    expect(screen.getByText(/40~/)).toBeInTheDocument()
+  })
 })
 
 describe("TokenUsageDisplay cached tokens", () => {

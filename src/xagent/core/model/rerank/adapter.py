@@ -75,18 +75,26 @@ class RerankModelAdapter(BaseRerank):
         result = self._rerank_model.compress(documents, query)
         try:
             # Lazy import to avoid a circular import via the model package init.
-            from ..chat.token_context import add_media_usage
-
-            doc_chars = (
-                sum(len(d) for d in documents if isinstance(d, str)) if documents else 0
+            from ..chat.token_context import (
+                MediaCallType,
+                MediaUnit,
+                add_media_usage,
+                estimate_tokens,
             )
-            query_len = len(query) if isinstance(query, str) else 0
+
+            # One rerank call is one billable unit regardless of document count,
+            # so REQUESTS (always quantity=1) is the correct dimension here.
+            texts = list(documents) if documents else []
+            if isinstance(query, str):
+                texts.append(query)
             add_media_usage(
-                unit="requests",
+                unit=MediaUnit.REQUESTS,
                 quantity=1,
                 model=self.model_config.model_name,
-                call_type="rerank",
-                input_tokens=(doc_chars + query_len) // 4,
+                model_id=self.model_config.id,
+                call_type=MediaCallType.RERANK,
+                input_tokens=estimate_tokens(texts),
+                tokens_estimated=True,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to record rerank usage: %s", e)

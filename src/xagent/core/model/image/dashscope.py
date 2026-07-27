@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 import aiohttp
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
 from .usage import record_image_usage
 
@@ -243,7 +244,7 @@ class DashScopeImageModel(BaseImageModel):
             record_image_usage(
                 result,
                 model_name=self.model_name,
-                call_type="generate_image",
+                call_type=MediaCallType.GENERATE_IMAGE,
                 resolution=str(size or ""),
             )
             return result
@@ -382,7 +383,7 @@ class DashScopeImageModel(BaseImageModel):
             record_image_usage(
                 result,
                 model_name=self.model_name,
-                call_type="edit_image",
+                call_type=MediaCallType.EDIT_IMAGE,
                 resolution=str(kwargs.get("size") or ""),
             )
             return result

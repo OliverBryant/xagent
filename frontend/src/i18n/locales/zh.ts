@@ -284,6 +284,7 @@ const zh = {
       model: "模型",
       unknownModel: "未知模型",
       unattributed: "未归属",
+      tokensShort: "tokens",
       mediaByModel: "媒体用量",
       mediaCall: "{count} 次媒体调用",
       mediaCalls: "{count} 次媒体调用",

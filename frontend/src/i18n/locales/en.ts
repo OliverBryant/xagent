@@ -284,6 +284,7 @@ const en = {
       model: "Model",
       unknownModel: "Unknown model",
       unattributed: "Unattributed",
+      tokensShort: "tokens",
       mediaByModel: "Media usage",
       mediaCall: "{count} media call",
       mediaCalls: "{count} media calls",

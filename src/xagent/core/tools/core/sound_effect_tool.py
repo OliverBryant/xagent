@@ -8,9 +8,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...file_ref import build_workspace_file_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.sound_effect import BaseSoundEffectModel, SoundEffectResult
 from ...workspace import TaskWorkspace
-from .media_usage import _coerce_float, record_media_usage
+from .media_usage import coerce_duration, record_media_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -157,24 +158,18 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
             if not result.audio:
                 raise RuntimeError("Sound effect model returned no audio data")
 
-            seconds = _coerce_float(
+            # ElevenLabs prices sound effects by duration, so seconds is the
+            # only meaningful unit here — an auto-length call with no reported
+            # duration records 0 seconds rather than switching to characters,
+            # which would be wrong in kind, not just in magnitude.
+            seconds = coerce_duration(
                 (result.raw_response or {}).get("duration_seconds")
-            ) or _coerce_float(duration_seconds)
-            if seconds and seconds > 0:
-                record_media_usage(
-                    "seconds",
-                    seconds,
-                    model=str(configured_model_id),
-                    call_type="sound_effect",
-                )
-            else:
-                # Auto-length: no reliable seconds, meter by input characters.
-                record_media_usage(
-                    "characters",
-                    len(text or ""),
-                    model=str(configured_model_id),
-                    call_type="sound_effect",
-                )
+            ) or coerce_duration(duration_seconds)
+            record_media_seconds(
+                seconds,
+                model=str(configured_model_id),
+                call_type=MediaCallType.SOUND_EFFECT,
+            )
 
             audio_path: Optional[str] = None
             file_id: Optional[str] = None

@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import aiohttp
 from openai import AsyncOpenAI
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
 from .usage import record_image_usage
 
@@ -129,6 +130,9 @@ class OpenAIImageModel(BaseImageModel):
 
         response_format = kwargs.pop("response_format", "url")
         normalized_size = self._normalize_size(size)
+        # Captured for usage accounting: n reaches this provider only via
+        # kwargs, and billing must reflect how many images were requested.
+        image_count = kwargs.get("n", 1)
         images_client: Any = self._client.images
         response = await images_client.generate(
             prompt=prompt,
@@ -154,7 +158,8 @@ class OpenAIImageModel(BaseImageModel):
         record_image_usage(
             result,
             model_name=self.model_name,
-            call_type="generate_image",
+            call_type=MediaCallType.GENERATE_IMAGE,
+            image_count=image_count,
             resolution=str(normalized_size or ""),
         )
         return result
@@ -225,7 +230,7 @@ class OpenAIImageModel(BaseImageModel):
         record_image_usage(
             result,
             model_name=self.model_name,
-            call_type="edit_image",
+            call_type=MediaCallType.EDIT_IMAGE,
             resolution=str(normalized_size or ""),
         )
         return result

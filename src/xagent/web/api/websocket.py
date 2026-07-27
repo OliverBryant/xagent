@@ -4639,6 +4639,7 @@ def _enqueue_websocket_task_command_sync(
             command_id=command_id,
             kind=kind,
             payload=payload,
+            loaded_task=task,
         )
         return result
 

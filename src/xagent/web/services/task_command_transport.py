@@ -158,20 +158,28 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    loaded_task: Task | None = None,
 ) -> EnqueuedTaskCommand:
     """Commit an idempotent command and return only after it is durable."""
 
     normalized_id = command_id.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
-    task = db.query(Task).filter(Task.id == int(task_id)).first()
+    resolved_task_id = int(task_id)
+    task = loaded_task
+    if task is None:
+        task = db.query(Task).filter(Task.id == resolved_task_id).first()
     if task is None:
         raise ValueError(f"Task {task_id} not found")
+    if int(task.id) != resolved_task_id:
+        raise ValueError(
+            f"Task snapshot {task.id} does not match requested task {resolved_task_id}"
+        )
 
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
-            TaskExecutionCommand.task_id == int(task_id),
+            TaskExecutionCommand.task_id == resolved_task_id,
             TaskExecutionCommand.command_id == normalized_id,
         )
         .first()
@@ -197,7 +205,7 @@ def enqueue_task_command(
         else None
     )
     command = TaskExecutionCommand(
-        task_id=int(task_id),
+        task_id=resolved_task_id,
         actor_user_id=actor_user_id,
         command_id=normalized_id,
         kind=kind.value,
@@ -208,14 +216,15 @@ def enqueue_task_command(
     )
     db.add(command)
     try:
+        db.flush()
+        command_db_id = int(command.id)
         db.commit()
-        db.refresh(command)
     except IntegrityError:
         db.rollback()
         raced = (
             db.query(TaskExecutionCommand)
             .filter(
-                TaskExecutionCommand.task_id == int(task_id),
+                TaskExecutionCommand.task_id == resolved_task_id,
                 TaskExecutionCommand.command_id == normalized_id,
             )
             .one()
@@ -236,7 +245,7 @@ def enqueue_task_command(
 
     notify_task_command_dispatcher()
     return EnqueuedTaskCommand(
-        command_id=int(command.id),
+        command_id=command_db_id,
         client_command_id=normalized_id,
         created=True,
         payload_matches=True,

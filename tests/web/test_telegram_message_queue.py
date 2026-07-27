@@ -27,6 +27,7 @@ def make_bot() -> TelegramBotInstance:
     bot.user_message_queues = {}
     bot.user_message_tasks = {}
     bot.user_active_executions = {}
+    bot.user_active_trace_handlers = {}
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     return bot

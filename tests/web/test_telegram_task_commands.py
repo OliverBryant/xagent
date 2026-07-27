@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.web.channels.telegram.bot import TelegramBotInstance
+from xagent.web.channels.telegram.handler import TelegramTraceHandler
 from xagent.web.models import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -33,6 +34,7 @@ def _bot(channel_id: int) -> TelegramBotInstance:
     bot.active_tasks = {}
     bot.user_message_queues = {}
     bot.user_active_executions = {}
+    bot.user_active_trace_handlers = {}
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     bot._accepting = True
@@ -432,6 +434,18 @@ async def test_switch_stops_current_run_clears_queue_and_persists_selection(
     service = _AgentService()
     bot.user_active_executions[101] = (int(current.id), service)
 
+    class _TraceHandler(TelegramTraceHandler):
+        def cancel(self) -> None:
+            events.append("cancel-stream")
+            super().cancel()
+
+    trace_handler = _TraceHandler(
+        task_id=int(current.id),
+        bot=object(),  # type: ignore[arg-type]
+        chat_id=101,
+    )
+    bot.user_active_trace_handlers[101] = trace_handler
+
     snapshot = TelegramChannelTaskSnapshot(
         task_id=int(target.id),
         title=str(target.title),
@@ -457,7 +471,13 @@ async def test_switch_stops_current_run_clears_queue_and_persists_selection(
     assert service.calls == [
         (str(current.id), "Telegram task switch requested"),
     ]
-    assert events == ["clear-queue", "pause", f"select:{target.id}"]
+    assert trace_handler.cancelled is True
+    assert events == [
+        "clear-queue",
+        "cancel-stream",
+        "pause",
+        f"select:{target.id}",
+    ]
     assert message.answers[-1].startswith(f"Switched to task <code>{target.id}</code>")
 
 
@@ -502,9 +522,30 @@ def test_switch_task_id_parsing(text: str, expected: int | None) -> None:
     assert TelegramBotInstance._switch_task_id(text) == expected
 
 
-def test_stale_task_output_is_not_delivered_after_switch() -> None:
+@pytest.mark.asyncio
+async def test_switch_to_running_active_task_reports_that_it_is_still_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bot = _bot(1)
     bot.active_tasks[101] = 42
+    bot.user_active_executions[101] = (42, object())
+    snapshot = TelegramChannelTaskSnapshot(
+        task_id=42,
+        title="running",
+        status="running",
+        created_at=None,
+        updated_at=None,
+    )
 
-    assert bot._is_active_telegram_task(101, 42) is True
-    assert bot._is_active_telegram_task(101, 41) is False
+    async def load_task(**_kwargs: object) -> TelegramChannelTaskSnapshot:
+        return snapshot
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_telegram_channel_task",
+        load_task,
+    )
+    message = _Message(101, "/switch 42")
+
+    await bot._handle_switch_command(message)  # type: ignore[arg-type]
+
+    assert "current run is still running" in message.answers[-1]

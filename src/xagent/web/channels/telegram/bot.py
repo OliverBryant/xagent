@@ -102,6 +102,7 @@ class TelegramBotInstance:
         self.user_message_queues: Dict[int, list] = {}
         self.user_message_tasks: Dict[int, asyncio.Task] = {}
         self.user_active_executions: Dict[int, tuple[int, object]] = {}
+        self.user_active_trace_handlers: Dict[int, TelegramTraceHandler] = {}
         self.user_preparing_executions: set[int] = set()
         self.user_stop_events: Dict[int, asyncio.Event] = {}
         self._accepting = True
@@ -274,9 +275,6 @@ class TelegramBotInstance:
             "/help — show this help"
         )
 
-    def _is_active_telegram_task(self, telegram_user_id: int, task_id: int) -> bool:
-        return self.active_tasks.get(telegram_user_id) == task_id
-
     @staticmethod
     def _task_list_line(
         task: TelegramChannelTaskSnapshot,
@@ -390,8 +388,12 @@ class TelegramBotInstance:
                 return
 
             if self.active_tasks.get(telegram_user_id) == task_id:
+                is_running = telegram_user_id in self.user_active_executions
+                running_suffix = (
+                    " and its current run is still running" if is_running else ""
+                )
                 await message.answer(
-                    f"Task <code>{task_id}</code> is already active: "
+                    f"Task <code>{task_id}</code> is already active{running_suffix}: "
                     f"{html.escape(task.title)}"
                 )
                 return
@@ -435,11 +437,21 @@ class TelegramBotInstance:
 
     def _request_current_conversation_stop(self, user_id: int, *, reason: str) -> bool:
         queued_messages = self.user_message_queues.pop(user_id, None)
+        active_trace_handler = self._active_trace_handlers().get(user_id)
+        if active_trace_handler is not None:
+            active_trace_handler.cancel()
         stopped = self._stop_user_active_execution(user_id, reason=reason)
         preparing = user_id in self.user_preparing_executions
         if preparing and not stopped:
             self._request_user_stop(user_id)
         return bool(queued_messages) or stopped or preparing
+
+    def _active_trace_handlers(self) -> Dict[int, TelegramTraceHandler]:
+        handlers = getattr(self, "user_active_trace_handlers", None)
+        if handlers is None:
+            handlers = {}
+            self.user_active_trace_handlers = handlers
+        return handlers
 
     def _stop_user_active_execution(self, user_id: int, *, reason: str) -> bool:
         active_execution = self.user_active_executions.get(user_id)
@@ -843,6 +855,7 @@ class TelegramBotInstance:
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
+        tg_handler: TelegramTraceHandler | None = None
         try:
             try:
                 expected_owner_user_id: int | None = None
@@ -1053,6 +1066,7 @@ class TelegramBotInstance:
                 last_message.chat.id,
                 message_id=loading_msg.message_id,
             )
+            self._active_trace_handlers()[user_id] = tg_handler
             agent_service.tracer.add_handler(tg_handler)
 
             from ...user_isolated_memory import UserContext
@@ -1102,10 +1116,10 @@ class TelegramBotInstance:
                     f"task {task_id} ownership changed before Telegram result"
                 )
 
-            if not self._is_active_telegram_task(user_id, task_id):
+            if tg_handler.cancelled:
                 logger.info(
-                    "Skipping Telegram delivery for task %s after user %s "
-                    "switched conversations",
+                    "Skipping Telegram delivery for cancelled execution of task %s "
+                    "for user %s",
                     task_id,
                     user_id,
                 )
@@ -1134,12 +1148,16 @@ class TelegramBotInstance:
                             logger.warning(f"Failed to edit message: {e2}")
 
             for chunk in text_chunks[1:]:
+                if tg_handler.cancelled:
+                    return
                 try:
                     html_chunk = markdown_to_tg_html(chunk)
                     await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
                 except Exception:
                     await last_message.answer(chunk)
 
+            if tg_handler.cancelled:
+                return
             if image_refs:
                 failed_image_refs = await self._send_output_images(
                     image_refs=image_refs,
@@ -1152,6 +1170,8 @@ class TelegramBotInstance:
                         image_refs=failed_image_refs,
                         reply_to=last_message,
                     )
+            if tg_handler.cancelled:
+                return
             if file_refs:
                 failed_file_refs = await self._send_output_files(
                     file_refs=file_refs,
@@ -1191,15 +1211,23 @@ class TelegramBotInstance:
                     )
                     return
             if isinstance(e, TelegramVoiceTranscriptionError):
+                if tg_handler is not None and tg_handler.cancelled:
+                    return
                 await last_message.answer(
                     "I couldn't transcribe that voice message. Please try again "
                     "or send the request as text."
                 )
             else:
+                if tg_handler is not None and tg_handler.cancelled:
+                    return
                 await last_message.answer(
                     "Sorry, an error occurred while processing your request."
                 )
         finally:
+            if tg_handler is not None:
+                active_trace_handlers = self._active_trace_handlers()
+                if active_trace_handlers.get(user_id) is tg_handler:
+                    active_trace_handlers.pop(user_id, None)
 
             async def _cleanup_message_batch() -> None:
                 try:
@@ -1473,6 +1501,7 @@ class TelegramBotInstance:
             self.user_message_tasks.clear()
             self.user_message_queues.clear()
             self.user_active_executions.clear()
+            self._active_trace_handlers().clear()
             self.user_preparing_executions.clear()
             self.user_stop_events.clear()
 

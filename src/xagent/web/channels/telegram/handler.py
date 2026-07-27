@@ -22,13 +22,19 @@ class TelegramTraceHandler(TraceHandler):
         self.chat_id = chat_id
         self.message_id = message_id
         self.current_text = ""
+        self.cancelled = False
         self._last_status_update_at = 0.0
         self._last_status_text = ""
         self._activity_items: list[str] = []
 
+    def cancel(self) -> None:
+        """Permanently suppress updates from this execution."""
+
+        self.cancelled = True
+
     async def handle_event(self, event: TraceEvent) -> None:
         try:
-            if not self._matches_task(event):
+            if self.cancelled or not self._matches_task(event):
                 return
 
             # We only care about assistant messages and coarse tool activity for Telegram.
@@ -125,7 +131,7 @@ class TelegramTraceHandler(TraceHandler):
         await self._update_message(text)
 
     async def _update_message(self, text: str, final: bool = False) -> None:
-        if not text:
+        if self.cancelled or not text:
             return
 
         text, image_refs = strip_telegram_image_refs(text)

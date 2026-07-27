@@ -152,7 +152,7 @@ def test_telegram_tasks_are_sender_scoped_and_newest_first(
     assert [task.task_id for task in tasks] == [newer.id, older.id]
 
 
-def test_legacy_history_backfills_only_for_exclusive_allowed_sender(
+def test_legacy_history_is_not_bulk_claimed_from_current_single_user_allowlist(
     telegram_db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,8 +173,8 @@ def test_legacy_history_backfills_only_for_exclusive_allowed_sender(
     )
     telegram_db.refresh(legacy)
 
-    assert [task.task_id for task in tasks] == [legacy.id]
-    assert legacy.telegram_user_id == "101"
+    assert tasks == ()
+    assert legacy.telegram_user_id is None
 
 
 @pytest.mark.parametrize("allowed_users", [None, ["101", "202"]])
@@ -232,6 +232,49 @@ def test_legacy_active_mapping_can_safely_claim_one_task(
 
     assert [task.task_id for task in tasks] == [legacy.id]
     assert legacy.telegram_user_id == "101"
+
+
+def test_list_limits_results_to_most_recent_tasks(
+    telegram_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner, channel = _owner_and_channel(telegram_db, allowed_users=["101"])
+    for index in range(channel_runtime.TELEGRAM_TASK_LIST_LIMIT + 5):
+        _task(
+            telegram_db,
+            owner=owner,
+            channel=channel,
+            sender="101",
+            title=f"task-{index}",
+            updated_at=datetime.now(UTC) + timedelta(seconds=index),
+        )
+
+    _use_telegram_db(monkeypatch, telegram_db)
+    tasks = channel_runtime._load_telegram_channel_tasks_sync(
+        channel_id=int(channel.id),
+        external_user_id="101",
+        active_task_id=None,
+    )
+
+    assert len(tasks) == channel_runtime.TELEGRAM_TASK_LIST_LIMIT
+    assert tasks[0].title == (f"task-{channel_runtime.TELEGRAM_TASK_LIST_LIMIT + 4}")
+
+
+def test_deactivated_channel_rejects_task_history(
+    telegram_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _owner, channel = _owner_and_channel(telegram_db, allowed_users=["101"])
+    channel.is_active = False
+    telegram_db.commit()
+    _use_telegram_db(monkeypatch, telegram_db)
+
+    with pytest.raises(channel_runtime.ChannelConfigurationError):
+        channel_runtime._load_telegram_channel_tasks_sync(
+            channel_id=int(channel.id),
+            external_user_id="101",
+            active_task_id=None,
+        )
 
 
 @pytest.mark.parametrize("mismatch", ["sender", "channel", "owner"])
@@ -441,6 +484,7 @@ def test_task_list_messages_escape_titles_and_stay_below_telegram_limit() -> Non
     )
     assert all("<unsafe" not in message for message in messages)
     assert any("● <code>2</code>" in message for message in messages)
+    assert any("50 most recent" in message for message in messages)
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,8 @@ from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_TASK_LIST_LIMIT = 50
+
 
 class ChannelConfigurationError(RuntimeError):
     """The configured channel has no resolvable owner."""
@@ -207,7 +209,14 @@ def _load_channel_owner_sync(
     if channel_id is None:
         raise ChannelConfigurationError("Channel owner is not configured")
 
-    channel = db.query(UserChannel).filter(UserChannel.id == int(channel_id)).first()
+    channel = (
+        db.query(UserChannel)
+        .filter(
+            UserChannel.id == int(channel_id),
+            UserChannel.is_active.is_(True),
+        )
+        .first()
+    )
     if channel is None:
         raise ChannelConfigurationError("Channel owner is not configured")
 
@@ -224,47 +233,41 @@ def _load_channel_owner_sync(
     return ChannelOwnerSnapshot(user_id=owner_id)
 
 
-def _claim_legacy_telegram_tasks_sync(
+def _claim_legacy_active_telegram_task_sync(
     db: Any,
     *,
     channel: UserChannel,
     owner_id: int,
     external_user_id: str,
     active_task_id: int | None,
-) -> None:
-    """Backfill only legacy Telegram tasks whose sender can be proven."""
+) -> bool:
+    """Claim the legacy active task whose per-sender mapping proves ownership."""
 
-    if active_task_id is not None and active_task_id > 0:
-        active_task = (
-            db.query(Task)
-            .filter(
-                Task.id == active_task_id,
-                Task.user_id == owner_id,
-                Task.channel_id == channel.id,
-                Task.telegram_user_id.is_(None),
-            )
-            .first()
-        )
-        if active_task is not None:
-            active_task.telegram_user_id = external_user_id
-
-    allowed_users = channel.config.get("allowed_users")
-    if allowed_users is None or {str(value) for value in allowed_users} != {
-        external_user_id
-    }:
-        return
-
-    (
+    if active_task_id is None or active_task_id <= 0:
+        return False
+    active_task = (
         db.query(Task)
         .filter(
+            Task.id == active_task_id,
             Task.user_id == owner_id,
             Task.channel_id == channel.id,
             Task.telegram_user_id.is_(None),
         )
-        .update(
-            {Task.telegram_user_id: external_user_id},
-            synchronize_session=False,
-        )
+        .first()
+    )
+    if active_task is None:
+        return False
+    active_task.telegram_user_id = external_user_id
+    return True
+
+
+def _telegram_task_snapshot(task: Task) -> TelegramChannelTaskSnapshot:
+    return TelegramChannelTaskSnapshot(
+        task_id=int(task.id),
+        title=str(task.title or "Untitled Task"),
+        status=str(getattr(task.status, "value", task.status) or "unknown"),
+        created_at=task.created_at,
+        updated_at=task.updated_at,
     )
 
 
@@ -293,13 +296,15 @@ def _load_telegram_channel_tasks_sync(
         if channel is None:
             raise ChannelConfigurationError("Telegram channel is not configured")
 
-        _claim_legacy_telegram_tasks_sync(
+        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
             db,
             channel=channel,
             owner_id=owner.user_id,
             external_user_id=external_user_id,
             active_task_id=active_task_id,
         )
+        if claimed_legacy_task:
+            db.commit()
         rows = (
             db.query(Task)
             .filter(
@@ -309,20 +314,10 @@ def _load_telegram_channel_tasks_sync(
                 Task.is_visible.is_(True),
             )
             .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.id.desc())
+            .limit(TELEGRAM_TASK_LIST_LIMIT)
             .all()
         )
-        snapshots = tuple(
-            TelegramChannelTaskSnapshot(
-                task_id=int(task.id),
-                title=str(task.title or "Untitled Task"),
-                status=str(getattr(task.status, "value", task.status) or "unknown"),
-                created_at=task.created_at,
-                updated_at=task.updated_at,
-            )
-            for task in rows
-        )
-        db.commit()
-        return snapshots
+        return tuple(_telegram_task_snapshot(task) for task in rows)
 
 
 async def load_telegram_channel_tasks(
@@ -349,12 +344,45 @@ def _load_telegram_channel_task_sync(
     task_id: int,
     active_task_id: int | None,
 ) -> TelegramChannelTaskSnapshot | None:
-    tasks = _load_telegram_channel_tasks_sync(
-        channel_id=channel_id,
-        external_user_id=external_user_id,
-        active_task_id=active_task_id,
-    )
-    return next((task for task in tasks if task.task_id == task_id), None)
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner = _load_channel_owner_sync(
+            db,
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+        )
+        channel = (
+            db.query(UserChannel)
+            .filter(
+                UserChannel.id == channel_id,
+                UserChannel.channel_type == "telegram",
+                UserChannel.is_active.is_(True),
+            )
+            .first()
+        )
+        if channel is None:
+            raise ChannelConfigurationError("Telegram channel is not configured")
+        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+            db,
+            channel=channel,
+            owner_id=owner.user_id,
+            external_user_id=external_user_id,
+            active_task_id=active_task_id,
+        )
+        if claimed_legacy_task:
+            db.commit()
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == owner.user_id,
+                Task.channel_id == channel.id,
+                Task.telegram_user_id == external_user_id,
+                Task.is_visible.is_(True),
+            )
+            .first()
+        )
+        return _telegram_task_snapshot(task) if task is not None else None
 
 
 async def load_telegram_channel_task(
@@ -434,7 +462,7 @@ def _prepare_channel_task_sync(
 
             is_telegram = str(channel.channel_type) == "telegram"
             if is_telegram:
-                _claim_legacy_telegram_tasks_sync(
+                _claim_legacy_active_telegram_task_sync(
                     db,
                     channel=channel,
                     owner_id=owner_id,
@@ -447,10 +475,10 @@ def _prepare_channel_task_sync(
                 query = db.query(Task).filter(
                     Task.id == active_task_id,
                     Task.user_id == owner_id,
-                    Task.channel_id == channel_id,
                 )
                 if is_telegram:
                     query = query.filter(
+                        Task.channel_id == channel_id,
                         Task.telegram_user_id == external_user_id,
                     )
                 task = query.first()

@@ -27,6 +27,7 @@ from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
     DownloadedChannelFile,
+    TELEGRAM_TASK_LIST_LIMIT,
     TelegramChannelTaskSnapshot,
     authorize_channel_sender,
     load_active_channel_configs,
@@ -309,7 +310,7 @@ class TelegramBotInstance:
                 "Send a message to create one."
             ]
 
-        header = "<b>Your Telegram tasks</b> (newest first)"
+        header = f"<b>Your Telegram tasks</b> ({TELEGRAM_TASK_LIST_LIMIT} most recent)"
         footer = "Use <code>/switch &lt;task_id&gt;</code> to continue one."
         messages: list[str] = []
         current = header
@@ -353,9 +354,7 @@ class TelegramBotInstance:
         except ChannelAuthorizationError:
             await message.answer("🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
-            await message.answer(
-                "Configuration error: Cannot find the owner of this bot."
-            )
+            await message.answer("This bot is inactive or not correctly configured.")
 
     @staticmethod
     def _switch_task_id(command_text: str | None) -> int | None:
@@ -411,9 +410,7 @@ class TelegramBotInstance:
         except ChannelAuthorizationError:
             await message.answer("🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
-            await message.answer(
-                "Configuration error: Cannot find the owner of this bot."
-            )
+            await message.answer("This bot is inactive or not correctly configured.")
 
     def _schedule_user_queue(self, user_id: int) -> bool:
         if not self._accepting:
@@ -884,7 +881,7 @@ class TelegramBotInstance:
                 return
             except ChannelConfigurationError:
                 await last_message.answer(
-                    "Configuration error: Cannot find the owner of this bot."
+                    "This bot is inactive or not correctly configured."
                 )
                 return
 

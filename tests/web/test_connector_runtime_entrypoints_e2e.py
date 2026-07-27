@@ -982,6 +982,7 @@ async def test_telegram_new_task_fallback_snapshots_empty(
             .one_or_none()
         )
         assert task is not None
+        assert task.telegram_user_id == "123"
         assert task.connector_runtime_selected_refs == []
         assert _context_row_count(int(task.id)) == 0
         persisted_turns = (

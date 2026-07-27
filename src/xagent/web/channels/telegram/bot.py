@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile
+from aiogram.types import BotCommand, FSInputFile
 from sqlalchemy.orm import Session
 
 from ....core.file_ref import build_file_id_ref
@@ -27,9 +27,12 @@ from ...services.channel_runtime import (
     ChannelAuthorizationError,
     ChannelConfigurationError,
     DownloadedChannelFile,
+    TelegramChannelTaskSnapshot,
     authorize_channel_sender,
     load_active_channel_configs,
     load_channel_output_files,
+    load_telegram_channel_task,
+    load_telegram_channel_tasks,
     persist_channel_user_message,
     prepare_channel_task,
     register_channel_uploaded_files,
@@ -71,7 +74,15 @@ class TelegramVoiceTranscriptionError(RuntimeError):
 class TelegramBotInstance:
     queue_flush_delay_seconds = 1.0
     voice_transcription_timeout_seconds = 180.0
+    task_list_message_limit = 3800
     stop_text_aliases = {"/stop", "/pause", "stop", "pause", "停止", "暂停"}
+    bot_commands = (
+        BotCommand(command="new", description="Start a new task"),
+        BotCommand(command="list", description="List your previous tasks"),
+        BotCommand(command="switch", description="Switch to a previous task"),
+        BotCommand(command="stop", description="Stop the current run"),
+        BotCommand(command="help", description="Show available commands"),
+    )
 
     def __init__(
         self,
@@ -155,8 +166,15 @@ class TelegramBotInstance:
                 f"Received /start from {message.from_user.id} on bot {self.instance_id}"
             )
             await message.answer(
-                "Hi, I'm Xagent. Send me anything you'd like help with, or use /new when you want a fresh start."
+                "Hi, I'm Xagent. Send me anything you'd like help with, use /new "
+                "for a fresh start, or /list to find a previous task."
             )
+
+        @self.dp.message(Command("help"))
+        async def cmd_help(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
+            await message.answer(self._help_text())
 
         @self.dp.message(Command("new"))
         async def cmd_new(message: types.Message) -> None:
@@ -169,6 +187,18 @@ class TelegramBotInstance:
             await message.answer(
                 "Fresh start. Send me what you'd like to work on next."
             )
+
+        @self.dp.message(Command("list"))
+        async def cmd_list(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
+            await self._handle_list_command(message)
+
+        @self.dp.message(Command("switch"))
+        async def cmd_switch(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
+            await self._handle_switch_command(message)
 
         @self.dp.message(Command("stop", "pause"))
         async def cmd_stop(message: types.Message) -> None:
@@ -231,6 +261,159 @@ class TelegramBotInstance:
         if task is None or task.done():
             self._schedule_user_queue(user_id)
         return True
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "Send a message to continue the current task.\n\n"
+            "/new — start a new task\n"
+            "/list — list your previous tasks\n"
+            "/switch &lt;task_id&gt; — switch to a task shown by /list\n"
+            "/stop — stop the current run\n"
+            "/help — show this help"
+        )
+
+    def _is_active_telegram_task(self, telegram_user_id: int, task_id: int) -> bool:
+        return self.active_tasks.get(telegram_user_id) == task_id
+
+    @staticmethod
+    def _task_list_line(
+        task: TelegramChannelTaskSnapshot,
+        *,
+        is_active: bool,
+    ) -> str:
+        raw_title = " ".join((task.title or "Untitled Task").split())
+        title = html.escape(raw_title[:80] + ("…" if len(raw_title) > 80 else ""))
+        timestamp = task.updated_at or task.created_at
+        date_text = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "unknown"
+        marker = "● " if is_active else ""
+        return (
+            f"{marker}<code>{task.task_id}</code> · {title}\n"
+            f"   {html.escape(task.status)} · {date_text} UTC"
+        )
+
+    @staticmethod
+    def _telegram_text_units(text: str) -> int:
+        """Count the UTF-16 code units used by Telegram's message limit."""
+        return len(text.encode("utf-16-le")) // 2
+
+    def _format_task_list_messages(
+        self,
+        tasks: list[TelegramChannelTaskSnapshot],
+        *,
+        active_task_id: int | None,
+    ) -> list[str]:
+        if not tasks:
+            return [
+                "You don't have any saved Telegram tasks yet. "
+                "Send a message to create one."
+            ]
+
+        header = "<b>Your Telegram tasks</b> (newest first)"
+        footer = "Use <code>/switch &lt;task_id&gt;</code> to continue one."
+        messages: list[str] = []
+        current = header
+        for task in tasks:
+            line = self._task_list_line(
+                task,
+                is_active=task.task_id == active_task_id,
+            )
+            candidate = f"{current}\n\n{line}"
+            if self._telegram_text_units(candidate) > self.task_list_message_limit:
+                messages.append(current)
+                current = f"{header}\n\n{line}"
+            else:
+                current = candidate
+
+        footer_candidate = f"{current}\n\n{footer}"
+        if self._telegram_text_units(footer_candidate) > self.task_list_message_limit:
+            messages.append(current)
+            current = footer
+        else:
+            current = footer_candidate
+        messages.append(current)
+        return messages
+
+    async def _handle_list_command(self, message: types.Message) -> None:
+        if not self._accepting or message.from_user is None:
+            return
+        telegram_user_id = int(message.from_user.id)
+        try:
+            active_task_id = self.active_tasks.get(telegram_user_id)
+            tasks = await load_telegram_channel_tasks(
+                channel_id=self.channel_id,
+                external_user_id=str(telegram_user_id),
+                active_task_id=active_task_id,
+            )
+            for response in self._format_task_list_messages(
+                list(tasks),
+                active_task_id=active_task_id if active_task_id != -1 else None,
+            ):
+                await message.answer(response)
+        except ChannelAuthorizationError:
+            await message.answer("🚫 You are not authorized to use this bot.")
+        except ChannelConfigurationError:
+            await message.answer(
+                "Configuration error: Cannot find the owner of this bot."
+            )
+
+    @staticmethod
+    def _switch_task_id(command_text: str | None) -> int | None:
+        parts = (command_text or "").strip().split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            return None
+        task_id = int(parts[1])
+        return task_id if task_id > 0 else None
+
+    async def _handle_switch_command(self, message: types.Message) -> None:
+        if not self._accepting or message.from_user is None:
+            return
+        task_id = self._switch_task_id(message.text)
+        if task_id is None:
+            await message.answer(
+                "Usage: <code>/switch &lt;task_id&gt;</code>\n"
+                "Use /list to see your task IDs."
+            )
+            return
+
+        telegram_user_id = int(message.from_user.id)
+        try:
+            task = await load_telegram_channel_task(
+                channel_id=self.channel_id,
+                external_user_id=str(telegram_user_id),
+                task_id=task_id,
+                active_task_id=self.active_tasks.get(telegram_user_id),
+            )
+            if task is None:
+                await message.answer(
+                    "Task not found or not accessible. Use /list to see your tasks."
+                )
+                return
+
+            if self.active_tasks.get(telegram_user_id) == task_id:
+                await message.answer(
+                    f"Task <code>{task_id}</code> is already active: "
+                    f"{html.escape(task.title)}"
+                )
+                return
+
+            self._request_current_conversation_stop(
+                telegram_user_id,
+                reason="Telegram task switch requested",
+            )
+            self.active_tasks[telegram_user_id] = task_id
+            self._save_active_tasks()
+            await message.answer(
+                f"Switched to task <code>{task_id}</code>: "
+                f"{html.escape(task.title)}\n"
+                "Send a message to continue it."
+            )
+        except ChannelAuthorizationError:
+            await message.answer("🚫 You are not authorized to use this bot.")
+        except ChannelConfigurationError:
+            await message.answer(
+                "Configuration error: Cannot find the owner of this bot."
+            )
 
     def _schedule_user_queue(self, user_id: int) -> bool:
         if not self._accepting:
@@ -628,16 +811,25 @@ class TelegramBotInstance:
     async def _process_user_messages_batch(
         self, user_id: int, messages: list[types.Message]
     ) -> None:
+        # Mark preparation before the first await so /new, /stop, and /switch
+        # cannot miss a batch that has already been dequeued.
+        self.user_preparing_executions.add(user_id)
+        self._clear_user_stop_request(user_id)
         message_contents: list[tuple[types.Message, str, list]] = []
         files = []
 
         # We'll use the last message for answering
         last_message = messages[-1]
 
-        for msg in messages:
-            message_text, message_files = await self._extract_message_content(msg)
-            message_contents.append((msg, message_text, message_files))
-            files.extend(message_files)
+        try:
+            for msg in messages:
+                message_text, message_files = await self._extract_message_content(msg)
+                message_contents.append((msg, message_text, message_files))
+                files.extend(message_files)
+        except Exception:
+            self.user_preparing_executions.discard(user_id)
+            self._clear_user_stop_request(user_id)
+            raise
 
         text = self._compose_prompt_text(message_contents, {})
         voice_file_ids = [
@@ -647,10 +839,10 @@ class TelegramBotInstance:
         ]
 
         if not text and not files:
+            self.user_preparing_executions.discard(user_id)
+            self._clear_user_stop_request(user_id)
             return
 
-        self.user_preparing_executions.add(user_id)
-        self._clear_user_stop_request(user_id)
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
@@ -912,6 +1104,15 @@ class TelegramBotInstance:
                 raise TaskLeaseLostError(
                     f"task {task_id} ownership changed before Telegram result"
                 )
+
+            if not self._is_active_telegram_task(user_id, task_id):
+                logger.info(
+                    "Skipping Telegram delivery for task %s after user %s "
+                    "switched conversations",
+                    task_id,
+                    user_id,
+                )
+                return
 
             output, image_refs, file_refs = self._extract_telegram_output_refs(
                 projection.visible_text,
@@ -1228,6 +1429,14 @@ class TelegramBotInstance:
             await self.bot.delete_webhook(drop_pending_updates=True)
             if not self._accepting:
                 return
+            try:
+                await self.bot.set_my_commands(list(self.bot_commands))
+            except Exception:
+                logger.warning(
+                    "Failed to register Telegram commands for %s",
+                    self.instance_id,
+                    exc_info=True,
+                )
             # Get bot info manually just for logging (optional, since dp.start_polling also logs)
             # We remove the duplicate log to avoid confusion
             await self.dp.start_polling(self.bot, handle_signals=False)

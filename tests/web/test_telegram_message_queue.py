@@ -461,6 +461,35 @@ async def test_process_user_queue_drains_message_added_while_unregistering() -> 
     assert bot.user_message_queues == {}
 
 
+@pytest.mark.asyncio
+async def test_switch_stop_request_sees_batch_during_message_extraction() -> None:
+    bot = make_bot()
+    extraction_started = asyncio.Event()
+    finish_extraction = asyncio.Event()
+
+    async def slow_extract(_message: object) -> tuple[str, list]:
+        extraction_started.set()
+        await finish_extraction.wait()
+        raise RuntimeError("stop test")
+
+    bot._extract_message_content = slow_extract  # type: ignore[method-assign]
+    processing = asyncio.create_task(
+        bot._process_user_messages_batch(123, [SimpleNamespace()])
+    )
+    await extraction_started.wait()
+
+    assert bot._request_current_conversation_stop(
+        123,
+        reason="Telegram task switch requested",
+    )
+    assert bot.user_stop_events[123].is_set()
+
+    finish_extraction.set()
+    with pytest.raises(RuntimeError, match="stop test"):
+        await processing
+    assert 123 not in bot.user_preparing_executions
+
+
 def test_start_new_conversation_clears_queue_and_pauses_active_execution() -> None:
     bot = make_bot()
     bot.user_message_queues = {123: ["old queued message"]}

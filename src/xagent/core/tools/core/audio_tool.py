@@ -19,7 +19,6 @@ from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...workspace import TaskWorkspace
-from .media_usage import record_media_usage
 from .audio_tool_descriptions import (
     CLONE_TTS_VOICE_DESCRIPTION,
     DELETE_TTS_VOICE_DESCRIPTION,
@@ -28,6 +27,7 @@ from .audio_tool_descriptions import (
     SYNTHESIZE_SPEECH_JSON_DESCRIPTION,
     TRANSCRIBE_AUDIO_DESCRIPTION,
 )
+from .media_usage import record_media_usage
 
 logger = logging.getLogger(__name__)
 
@@ -751,7 +751,7 @@ class AudioToolCore:
                     audio_seconds = max(
                         float(seg["end"])
                         for seg in raw_segments
-                        if seg.get("end") is not None
+                        if isinstance(seg, dict) and seg.get("end") is not None
                     )
                 except (ValueError, TypeError):
                     audio_seconds = 0.0
@@ -1904,6 +1904,15 @@ class AudioToolCore:
                 voice=voice,
                 language=language,
                 **kwargs,
+            )
+
+            # Meter TTS by input characters, matching synthesize_speech so batch
+            # synthesis is metered the same way as single-shot synthesis.
+            record_media_usage(
+                "characters",
+                len(text or ""),
+                model=str(self._get_tts_model_id(tts_model)),
+                call_type="tts",
             )
 
             # Handle result

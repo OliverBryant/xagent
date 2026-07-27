@@ -171,7 +171,7 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
                 # Auto-length: no reliable seconds, meter by input characters.
                 record_media_usage(
                     "characters",
-                    len(text),
+                    len(text or ""),
                     model=str(configured_model_id),
                     call_type="sound_effect",
                 )

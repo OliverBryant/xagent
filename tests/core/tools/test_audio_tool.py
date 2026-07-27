@@ -949,6 +949,35 @@ async def test_synthesize_speech_json_merges_default_and_segment_options() -> No
     ]
 
 
+async def test_synthesize_speech_json_records_media_usage_per_segment() -> None:
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tts = FakeTTS()
+    tool = AudioToolCore(tts_models={"fake": tts})
+
+    with TokenContextManager() as manager:
+        result = await tool.synthesize_speech_json(
+            json_data={
+                "segments": [
+                    {"text": "First line"},
+                    {"text": "Second longer line"},
+                ],
+                "default_voice": "voice-1",
+            },
+            model_id="fake",
+        )
+        usage = manager.get_usage()
+
+    assert result["success"] is True
+    media_entries = [d for d in usage.details if d.get("type") == "media"]
+    # One TTS media entry per synthesized segment, metered by input characters.
+    assert usage.media_calls == 2
+    assert [(d["unit"], d["quantity"], d["call_type"]) for d in media_entries] == [
+        ("characters", len("First line"), "tts"),
+        ("characters", len("Second longer line"), "tts"),
+    ]
+
+
 async def test_synthesize_speech_json_rejects_non_object_json() -> None:
     tool = AudioToolCore(tts_models={"fake": FakeTTS()})
 

@@ -77,13 +77,16 @@ class RerankModelAdapter(BaseRerank):
             # Lazy import to avoid a circular import via the model package init.
             from ..chat.token_context import add_media_usage
 
-            doc_chars = sum(len(d) for d in documents if isinstance(d, str))
+            doc_chars = (
+                sum(len(d) for d in documents if isinstance(d, str)) if documents else 0
+            )
+            query_len = len(query) if isinstance(query, str) else 0
             add_media_usage(
                 unit="requests",
                 quantity=1,
                 model=self.model_config.model_name,
                 call_type="rerank",
-                input_tokens=(doc_chars + len(query)) // 4,
+                input_tokens=(doc_chars + query_len) // 4,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to record rerank usage: %s", e)

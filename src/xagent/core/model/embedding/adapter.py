@@ -19,9 +19,11 @@ def _estimate_tokens(text: Union[str, List[str]]) -> int:
     Embedding providers here don't return a usage payload, so we approximate
     from character count. Good enough for cost-tracking granularity.
     """
-    texts = [text] if isinstance(text, str) else list(text)
-    chars = sum(len(t) for t in texts if isinstance(t, str))
-    return chars // 4
+    if isinstance(text, str):
+        return len(text) // 4
+    if isinstance(text, (list, tuple, set)):
+        return sum(len(t) for t in text if isinstance(t, str)) // 4
+    return 0
 
 
 def retry_on(e: Exception) -> bool:

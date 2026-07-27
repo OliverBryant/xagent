@@ -722,11 +722,11 @@ The generated video URL is temporary on the provider side, so completed videos a
 
             result = await video_model.generate_video(**generate_params)
 
-            duration = _coerce_float(result.get("duration"))
-            if duration and duration > 0:
+            duration_seconds = _coerce_float(result.get("duration"))
+            if duration_seconds and duration_seconds > 0:
                 record_media_usage(
                     "seconds",
-                    duration,
+                    duration_seconds,
                     model=str(actual_model_id),
                     call_type="video",
                 )

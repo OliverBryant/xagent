@@ -166,7 +166,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
           `chatPage.tokenUsage.mediaType.${callType}`,
           callType,
         )
-      : t('chatPage.tokenUsage.unknownModel');
+      : '-';
   const formatMediaUnit = (unit: string) =>
     unit ? tDynamic(`chatPage.tokenUsage.unit.${unit}`, unit) : '';
 

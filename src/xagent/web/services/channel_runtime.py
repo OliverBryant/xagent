@@ -80,7 +80,6 @@ class ClaimedChannelTask:
     task_id: int
     is_new_task: bool
     managed_lease: ManagedTaskLease
-    agent_id: int | None = None
     requested_agent_missing: bool = False
 
 
@@ -92,7 +91,6 @@ class _ChannelTaskClaimSnapshot:
     task_id: int
     is_new_task: bool
     lease: TaskLease
-    agent_id: int | None = None
     requested_agent_missing: bool = False
 
 
@@ -403,11 +401,8 @@ def _prepare_channel_task_sync(
                         task = None
 
             is_new_task = task is None
-            task_agent_id: int | None = None
             if task is None:
-                if agent_row is not None:
-                    task_agent_id = int(agent_row.id)
-
+                task_agent_id = int(agent_row.id) if agent_row is not None else None
                 task_title = text or "Untitled Task"
                 if len(task_title) > 50:
                     task_title = f"{task_title[:50]}..."
@@ -433,10 +428,6 @@ def _prepare_channel_task_sync(
                 )
                 db.add(task)
                 db.flush()
-            else:
-                task_agent_id = (
-                    int(task.agent_id) if task.agent_id is not None else None
-                )
 
             task_id = int(task.id)
             lease = acquire_task_lease_no_commit(db, task_id, new_run=True)
@@ -456,7 +447,6 @@ def _prepare_channel_task_sync(
                 task_id=task_id,
                 is_new_task=is_new_task,
                 lease=lease,
-                agent_id=task_agent_id,
                 requested_agent_missing=requested_agent_missing,
             )
         except Exception:
@@ -534,7 +524,6 @@ async def prepare_channel_task(
         task_id=snapshot.task_id,
         is_new_task=snapshot.is_new_task,
         managed_lease=managed_lease,
-        agent_id=snapshot.agent_id,
         requested_agent_missing=snapshot.requested_agent_missing,
     )
 

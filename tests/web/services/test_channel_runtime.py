@@ -104,7 +104,6 @@ async def test_prepare_channel_task_binds_owned_agent(
     )
 
     assert prepared is not None
-    assert prepared.agent_id == agent_id
     assert prepared.requested_agent_missing is False
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == prepared.task_id).one()
@@ -151,7 +150,6 @@ async def test_prepare_channel_task_falls_back_when_agent_not_selectable(
     )
 
     assert prepared is not None
-    assert prepared.agent_id is None
     assert prepared.requested_agent_missing is True
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == prepared.task_id).one()
@@ -191,8 +189,10 @@ async def test_prepare_channel_task_rejects_workforce_manager_agent(
     )
 
     assert prepared is not None
-    assert prepared.agent_id is None
     assert prepared.requested_agent_missing is True
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.agent_id is None
 
     assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
     engine.dispose()
@@ -704,7 +704,6 @@ async def test_prepare_channel_task_evicts_existing_task_when_selection_stale(
         agent_id=agent_id,
     )
     assert first is not None
-    assert first.agent_id == agent_id
     assert await first.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
     await first.managed_lease.close()
 
@@ -729,7 +728,6 @@ async def test_prepare_channel_task_evicts_existing_task_when_selection_stale(
     assert second is not None
     assert second.is_new_task is True
     assert second.task_id != first.task_id
-    assert second.agent_id is None
     assert second.requested_agent_missing is True
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == second.task_id).one()
@@ -779,8 +777,10 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
     assert second is not None
     assert second.is_new_task is False
     assert second.task_id == first.task_id
-    assert second.agent_id == agent_id
     assert second.requested_agent_missing is False
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == second.task_id).one()
+        assert task.agent_id == agent_id
 
     assert await second.managed_lease.finalize_result(status=TaskStatus.FAILED)
     engine.dispose()
@@ -809,7 +809,9 @@ async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
         channel_name="Telegram",
     )
     assert default_task is not None
-    assert default_task.agent_id is None
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == default_task.task_id).one()
+        assert task.agent_id is None
     assert await default_task.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
     await default_task.managed_lease.close()
 
@@ -825,7 +827,6 @@ async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
     assert switched is not None
     assert switched.is_new_task is True
     assert switched.task_id != default_task.task_id
-    assert switched.agent_id == agent_id
     assert switched.requested_agent_missing is False
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == switched.task_id).one()

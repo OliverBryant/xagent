@@ -39,7 +39,12 @@ def _bot(channel_id: int) -> TelegramBotInstance:
     bot.user_stop_events = {}
     bot._accepting = True
     bot.saved = False
-    bot._save_active_tasks = lambda: setattr(bot, "saved", True)
+
+    def _save() -> bool:
+        bot.saved = True
+        return True
+
+    bot._save_active_tasks = _save
     return bot
 
 
@@ -549,3 +554,84 @@ async def test_switch_to_running_active_task_reports_that_it_is_still_running(
     await bot._handle_switch_command(message)  # type: ignore[arg-type]
 
     assert "current run is still running" in message.answers[-1]
+
+
+@pytest.mark.asyncio
+async def test_switch_is_not_confirmed_when_selection_cannot_be_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _bot(1)
+    bot.active_tasks[101] = 7
+    bot._save_active_tasks = lambda: False
+
+    snapshot = TelegramChannelTaskSnapshot(
+        task_id=9,
+        title="target",
+        status="completed",
+        created_at=None,
+        updated_at=None,
+    )
+
+    async def load_task(**_kwargs: object) -> TelegramChannelTaskSnapshot:
+        return snapshot
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_telegram_channel_task",
+        load_task,
+    )
+    message = _Message(101, "/switch 9")
+
+    await bot._handle_switch_command(message)  # type: ignore[arg-type]
+
+    assert bot.active_tasks[101] == 7
+    assert "couldn't save the switch" in message.answers[-1]
+    assert not any("Switched to task" in answer for answer in message.answers)
+
+
+def test_save_active_tasks_is_atomic_and_reports_failure(tmp_path: Path) -> None:
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    del bot._save_active_tasks
+
+    bot.active_tasks = {101: 7}
+    assert TelegramBotInstance._save_active_tasks(bot) is True
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
+    assert list(tmp_path.glob("*.tmp")) == []
+
+    # A serialization failure must not truncate the previously saved mapping.
+    bot.active_tasks = {101: object()}
+    assert TelegramBotInstance._save_active_tasks(bot) is False
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_output_attachments_stop_when_cancelled_mid_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.channels.telegram.utils import TelegramImageRef
+
+    bot = _bot(1)
+    handler = TelegramTraceHandler(7, bot=None, chat_id=1, message_id=1)  # type: ignore[arg-type]
+    refs = [TelegramImageRef(file_id=f"f{i}", alt_text="a") for i in range(3)]
+
+    async def load_files(**_kwargs: object) -> list:
+        return []
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_channel_output_files",
+        load_files,
+    )
+
+    # Cancelled before the first send: nothing is delivered and no failed refs
+    # are returned, so the caller cannot emit a stale fallback message either.
+    handler.cancel()
+    failed = await bot._send_output_images(
+        image_refs=refs,
+        user_id=1,
+        task_id=7,
+        reply_to=_Message(101, ""),  # type: ignore[arg-type]
+        is_cancelled=lambda: handler.cancelled,
+    )
+    assert failed == []

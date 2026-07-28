@@ -5,7 +5,7 @@ import logging
 import mimetypes
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, Optional, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -147,15 +147,39 @@ class TelegramBotInstance:
                 )
         return {}
 
-    def _save_active_tasks(self) -> None:
+    def _save_active_tasks(self) -> bool:
+        """Persist the active-task mapping atomically.
+
+        Returns True only when the mapping is durably on disk. Callers that
+        confirm a selection to the user must not report success on False: a
+        truncated or missing file silently resurrects the previous task after
+        a restart.
+        """
+        tmp_path = self.active_tasks_file.with_suffix(
+            f"{self.active_tasks_file.suffix}.tmp"
+        )
         try:
             self.active_tasks_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.active_tasks_file, "w") as f:
-                json.dump(self.active_tasks, f)
+            payload = json.dumps(self.active_tasks)
+            with open(tmp_path, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.active_tasks_file)
+            return True
         except Exception as e:
             logger.error(
                 f"Failed to save Telegram active tasks for {self.instance_id}: {e}"
             )
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug(
+                    "Failed to remove temporary Telegram active-task file %s",
+                    tmp_path,
+                    exc_info=True,
+                )
+            return False
 
     def _register_handlers(self) -> None:
         from aiogram.filters import Command
@@ -402,8 +426,20 @@ class TelegramBotInstance:
                 telegram_user_id,
                 reason="Telegram task switch requested",
             )
+            previous_task_id = self.active_tasks.get(telegram_user_id)
             self.active_tasks[telegram_user_id] = task_id
-            self._save_active_tasks()
+            if not self._save_active_tasks():
+                # Never confirm a selection that would not survive a restart.
+                if previous_task_id is None:
+                    self.active_tasks.pop(telegram_user_id, None)
+                else:
+                    self.active_tasks[telegram_user_id] = previous_task_id
+                self._save_active_tasks()
+                await message.answer(
+                    "I couldn't save the switch, so the previous task is still "
+                    "active. Please try again."
+                )
+                return
             await message.answer(
                 f"Switched to task <code>{task_id}</code>: "
                 f"{html.escape(task.title)}\n"
@@ -1156,7 +1192,10 @@ class TelegramBotInstance:
                 except Exception:
                     await last_message.answer(chunk)
 
-            if tg_handler.cancelled:
+            def is_cancelled() -> bool:
+                return bool(tg_handler is not None and tg_handler.cancelled)
+
+            if is_cancelled():
                 return
             if image_refs:
                 failed_image_refs = await self._send_output_images(
@@ -1164,13 +1203,14 @@ class TelegramBotInstance:
                     user_id=owner_user_id,
                     task_id=task_id,
                     reply_to=last_message,
+                    is_cancelled=is_cancelled,
                 )
-                if failed_image_refs:
+                if failed_image_refs and not is_cancelled():
                     await self._send_image_fallback_message(
                         image_refs=failed_image_refs,
                         reply_to=last_message,
                     )
-            if tg_handler.cancelled:
+            if is_cancelled():
                 return
             if file_refs:
                 failed_file_refs = await self._send_output_files(
@@ -1178,8 +1218,9 @@ class TelegramBotInstance:
                     user_id=owner_user_id,
                     task_id=task_id,
                     reply_to=last_message,
+                    is_cancelled=is_cancelled,
                 )
-                if failed_file_refs:
+                if failed_file_refs and not is_cancelled():
                     await self._send_file_fallback_message(
                         file_refs=failed_file_refs,
                         reply_to=last_message,
@@ -1191,6 +1232,28 @@ class TelegramBotInstance:
             )
         except Exception as e:
             logger.error(f"Error processing Telegram message: {e}")
+            # A /stop, /new, or /switch can land during awaited setup, before
+            # tg_handler exists. Without this the run is finalized FAILED and a
+            # stale error reaches the conversation the user already left.
+            handler_cancelled = tg_handler is not None and tg_handler.cancelled
+            stop_requested = handler_cancelled or self._consume_user_stop_request(
+                user_id
+            )
+            if stop_requested and managed_lease is not None:
+                try:
+                    await self._finalize_requested_stop(
+                        managed_lease,
+                        task_id=claimed_task_id if claimed_task_id is not None else -1,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize paused Telegram task %s after stop",
+                        claimed_task_id,
+                        exc_info=True,
+                    )
+                return
+            if stop_requested:
+                return
             if managed_lease is not None:
                 try:
                     finalized = await managed_lease.finalize_result(
@@ -1211,15 +1274,11 @@ class TelegramBotInstance:
                     )
                     return
             if isinstance(e, TelegramVoiceTranscriptionError):
-                if tg_handler is not None and tg_handler.cancelled:
-                    return
                 await last_message.answer(
                     "I couldn't transcribe that voice message. Please try again "
                     "or send the request as text."
                 )
             else:
-                if tg_handler is not None and tg_handler.cancelled:
-                    return
                 await last_message.answer(
                     "Sorry, an error occurred while processing your request."
                 )
@@ -1251,6 +1310,7 @@ class TelegramBotInstance:
         user_id: int,
         task_id: int,
         reply_to: types.Message,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[TelegramImageRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in image_refs))
         failed_refs: list[TelegramImageRef] = []
@@ -1262,8 +1322,14 @@ class TelegramBotInstance:
         )
         file_record_by_id = {record.file_id: record for record in file_records}
 
+        # Loading the records is awaited, so re-check before the first send.
+        if is_cancelled is not None and is_cancelled():
+            return []
+
         sent_file_ids: set[str] = set()
         for image_ref in image_refs:
+            if is_cancelled is not None and is_cancelled():
+                return []
             if image_ref.file_id in sent_file_ids:
                 continue
             sent_file_ids.add(image_ref.file_id)
@@ -1376,6 +1442,7 @@ class TelegramBotInstance:
         user_id: int,
         task_id: int,
         reply_to: types.Message,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[TelegramFileRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in file_refs))
         failed_refs: list[TelegramFileRef] = []
@@ -1387,8 +1454,14 @@ class TelegramBotInstance:
         )
         file_record_by_id = {record.file_id: record for record in file_records}
 
+        # Loading the records is awaited, so re-check before the first send.
+        if is_cancelled is not None and is_cancelled():
+            return []
+
         sent_file_ids: set[str] = set()
         for file_ref in file_refs:
+            if is_cancelled is not None and is_cancelled():
+                return []
             if file_ref.file_id in sent_file_ids:
                 continue
             sent_file_ids.add(file_ref.file_id)

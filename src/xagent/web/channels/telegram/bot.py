@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -101,6 +102,7 @@ class TelegramBotInstance:
         self.user_active_executions: Dict[int, tuple[int, object]] = {}
         self.user_preparing_executions: set[int] = set()
         self.user_stop_events: Dict[int, asyncio.Event] = {}
+        self.user_conversation_generations: Dict[int, int] = {}
         self._accepting = True
         self._ingress_stopped = False
         self._stop_lock: asyncio.Lock | None = None
@@ -111,9 +113,7 @@ class TelegramBotInstance:
         self.active_tasks = self._load_active_tasks()
 
         # Per-Telegram-user custom agent selection for the next conversation
-        self.selected_agents_file = Path(
-            f"data/telegram_selected_agents_{instance_id}.json"
-        )
+        self.selected_agents_file = self._selected_agents_store_path(channel_id, token)
         self.selected_agents: Dict[int, int] = self._load_selected_agents()
 
         default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -158,6 +158,23 @@ class TelegramBotInstance:
             logger.error(
                 f"Failed to save Telegram active tasks for {self.instance_id}: {e}"
             )
+
+    @staticmethod
+    def _selected_agents_store_path(channel_id: Optional[int], token: str) -> Path:
+        """Durable per-channel selection store.
+
+        Lives under the storage root (survives container recreation, unlike a
+        cwd-relative ``data/`` path) and is keyed by the stable channel id —
+        falling back to a full-token hash — so distinct bots whose tokens share
+        a prefix can never collide on one file.
+        """
+        from ....config import get_storage_root
+
+        if channel_id is not None:
+            key = f"channel_{int(channel_id)}"
+        else:
+            key = hashlib.sha256(token.encode()).hexdigest()[:16]
+        return Path(get_storage_root()) / "telegram" / f"selected_agents_{key}.json"
 
     def _load_selected_agents(self) -> Dict[int, int]:
         if self.selected_agents_file.exists():
@@ -305,7 +322,15 @@ class TelegramBotInstance:
         )
         return True
 
+    def _conversation_generation(self, user_id: int) -> int:
+        return self.user_conversation_generations.get(user_id, 0)
+
     def _start_new_conversation(self, user_id: int) -> bool:
+        # Bumping the generation fences out any in-flight preparation for the
+        # previous conversation: its result must not overwrite the new state.
+        self.user_conversation_generations[user_id] = (
+            self._conversation_generation(user_id) + 1
+        )
         stopped = self._request_current_conversation_stop(
             user_id, reason="new Telegram conversation requested"
         )
@@ -527,7 +552,11 @@ class TelegramBotInstance:
                     return
                 self._set_selected_agent(user_id, agent.agent_id)
                 self._start_new_conversation(user_id)
-                await callback.answer(f"{agent.name} selected")
+                # answerCallbackQuery rejects texts over 200 characters
+                toast = f"{agent.name} selected"
+                if len(toast) > 200:
+                    toast = f"{toast[:197]}..."
+                await callback.answer(toast)
                 confirmation = (
                     f"Agent selected: {html.escape(agent.name)}. "
                     "Send a message to start a fresh conversation. "
@@ -881,6 +910,7 @@ class TelegramBotInstance:
 
         self.user_preparing_executions.add(user_id)
         self._clear_user_stop_request(user_id)
+        conversation_generation = self._conversation_generation(user_id)
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
@@ -941,6 +971,17 @@ class TelegramBotInstance:
             claimed_task_id = task_id
             owner_user_id = prepared_task.user_id
             is_new_task = prepared_task.is_new_task
+
+            # The user switched conversations (agent selection or /new) while
+            # this turn was being prepared: settle the stale claim without
+            # touching active_tasks or selected_agents.
+            if self._conversation_generation(user_id) != conversation_generation:
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
             if is_new_task:
                 self.active_tasks[user_id] = task_id
                 self._save_active_tasks()
@@ -1529,6 +1570,7 @@ class TelegramBotInstance:
             self.user_active_executions.clear()
             self.user_preparing_executions.clear()
             self.user_stop_events.clear()
+            self.user_conversation_generations.clear()
 
     async def _stop_ingress(self) -> None:
         try:

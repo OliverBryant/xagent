@@ -678,3 +678,158 @@ async def test_load_active_channel_configs_keeps_event_loop_responsive(
     assert loading.done() is False
     allow_worker.set()
     assert await loading == ()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_evicts_existing_task_when_selection_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Doomed Agent")
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    first = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+    assert first is not None
+    assert first.agent_id == agent_id
+    assert await first.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    await first.managed_lease.close()
+
+    # Mirror AgentStore.stage_delete_agent: the agent row goes away and the
+    # bound tasks are nulled, while the Telegram selection still points at it.
+    with SessionLocal() as db:
+        db.query(Task).filter(Task.agent_id == agent_id).update(
+            {Task.agent_id: None}, synchronize_session=False
+        )
+        db.query(Agent).filter(Agent.id == agent_id).delete(synchronize_session=False)
+        db.commit()
+
+    second = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=first.task_id,
+        text="hello again",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+
+    assert second is not None
+    assert second.is_new_task is True
+    assert second.task_id != first.task_id
+    assert second.agent_id is None
+    assert second.requested_agent_missing is True
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == second.task_id).one()
+        assert task.agent_id is None
+        assert task.connector_runtime_selected_refs == []
+
+    assert await second.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_continues_task_when_selection_still_valid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Stable Agent")
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    first = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+    assert first is not None
+    assert await first.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    await first.managed_lease.close()
+
+    second = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=first.task_id,
+        text="hello again",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+
+    assert second is not None
+    assert second.is_new_task is False
+    assert second.task_id == first.task_id
+    assert second.agent_id == agent_id
+    assert second.requested_agent_missing is False
+
+    assert await second.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Drift Agent")
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    default_task = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+    assert default_task is not None
+    assert default_task.agent_id is None
+    assert await default_task.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    await default_task.managed_lease.close()
+
+    switched = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=default_task.task_id,
+        text="hello again",
+        channel_name="Telegram",
+        agent_id=agent_id,
+    )
+
+    assert switched is not None
+    assert switched.is_new_task is True
+    assert switched.task_id != default_task.task_id
+    assert switched.agent_id == agent_id
+    assert switched.requested_agent_missing is False
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == switched.task_id).one()
+        assert task.agent_id == agent_id
+
+    assert await switched.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()

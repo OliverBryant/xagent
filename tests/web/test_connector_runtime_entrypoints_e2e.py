@@ -226,6 +226,7 @@ def _telegram_voice_error_bot(
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     bot.user_active_executions = {}
+    bot.user_conversation_generations = {}
     bot.selected_agents = {}
     bot._save_selected_agents = lambda: None
     bot._save_active_tasks = lambda: None
@@ -950,6 +951,7 @@ async def test_telegram_new_task_fallback_snapshots_empty(
         bot.user_preparing_executions = set()
         bot.user_stop_events = {}
         bot.user_active_executions = {}
+        bot.user_conversation_generations = {}
         bot.selected_agents = {}
         bot._save_selected_agents = lambda: None
         bot._save_active_tasks = lambda: None
@@ -1057,6 +1059,7 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
         bot.user_preparing_executions = set()
         bot.user_stop_events = {}
         bot.user_active_executions = {}
+        bot.user_conversation_generations = {}
         bot.selected_agents = {}
         bot._save_selected_agents = lambda: None
         bot._save_active_tasks = lambda: None

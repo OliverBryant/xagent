@@ -379,20 +379,32 @@ def _prepare_channel_task_sync(
                     .first()
                 )
 
+            # Revalidate the requested selection on every turn, not only for
+            # new tasks. A conversation may only continue when its task binding
+            # still matches the selection: a stale selection (agent deleted or
+            # visibility revoked) or a drifted binding evicts to a fresh task
+            # instead of resuming with stale cached agent state.
+            agent_row = None
+            requested_agent_missing = False
+            if agent_id is not None:
+                agent_row = (
+                    _owned_channel_agents_query(db, owner_id)
+                    .filter(Agent.id == int(agent_id))
+                    .first()
+                )
+                requested_agent_missing = agent_row is None
+                if task is not None:
+                    if agent_row is None:
+                        # Evict to a clean default task; never fail the turn.
+                        task = None
+                    elif task.agent_id is None or int(task.agent_id) != int(
+                        agent_row.id
+                    ):
+                        task = None
+
             is_new_task = task is None
             task_agent_id: int | None = None
-            requested_agent_missing = False
             if task is None:
-                # A stale selection (agent deleted or no longer owner-visible)
-                # falls back to the default agent instead of failing the turn.
-                agent_row = None
-                if agent_id is not None:
-                    agent_row = (
-                        _owned_channel_agents_query(db, owner_id)
-                        .filter(Agent.id == int(agent_id))
-                        .first()
-                    )
-                    requested_agent_missing = agent_row is None
                 if agent_row is not None:
                     task_agent_id = int(agent_row.id)
 

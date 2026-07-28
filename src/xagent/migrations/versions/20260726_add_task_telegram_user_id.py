@@ -20,6 +20,24 @@ TABLE = "tasks"
 COLUMN = "telegram_user_id"
 INDEX = "ix_tasks_telegram_user_id"
 
+POSTGRES_INDEX_VALIDITY_SQL = sa.text(
+    """
+    SELECT i.indisvalid
+    FROM pg_catalog.pg_index AS i
+    WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
+    """
+)
+
+
+def _postgres_index_validity() -> bool | None:
+    """Return whether the index exists and is usable, or None if absent."""
+
+    return (
+        op.get_bind()
+        .execute(POSTGRES_INDEX_VALIDITY_SQL, {"index_name": INDEX})
+        .scalar_one_or_none()
+    )
+
 
 def _online_columns() -> set[str]:
     inspector = sa.inspect(op.get_bind())
@@ -75,7 +93,20 @@ def upgrade() -> None:
     # A plain CREATE INDEX holds a SHARE lock and blocks writes to the live
     # tasks table for the whole build, so PostgreSQL builds it concurrently.
     if is_postgresql:
+        validity = _postgres_index_validity()
+        if validity is True:
+            return
         with context.autocommit_block():
+            # A failed CREATE INDEX CONCURRENTLY leaves the index present but
+            # invalid. IF NOT EXISTS would skip the rebuild and let Alembic
+            # stamp the revision with an unusable index, so drop it first.
+            if validity is False:
+                op.drop_index(
+                    INDEX,
+                    table_name=TABLE,
+                    if_exists=True,
+                    postgresql_concurrently=True,
+                )
             op.create_index(
                 INDEX,
                 TABLE,

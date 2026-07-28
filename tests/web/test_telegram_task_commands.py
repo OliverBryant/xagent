@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -530,12 +531,19 @@ def test_switch_task_id_parsing(text: str, expected: int | None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_switch_to_running_active_task_reports_that_it_is_still_running(
+@pytest.mark.parametrize("busy_state", ["executing", "preparing", "idle"])
+async def test_switch_to_active_task_reports_whether_work_is_underway(
+    busy_state: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A dequeued batch is active work even before its execution registers."""
+
     bot = _bot(1)
     bot.active_tasks[101] = 42
-    bot.user_active_executions[101] = (42, object())
+    if busy_state == "executing":
+        bot.user_active_executions[101] = (42, object())
+    elif busy_state == "preparing":
+        bot.user_preparing_executions.add(101)
     snapshot = TelegramChannelTaskSnapshot(
         task_id=42,
         title="running",
@@ -555,7 +563,10 @@ async def test_switch_to_running_active_task_reports_that_it_is_still_running(
 
     await bot._handle_switch_command(message)  # type: ignore[arg-type]
 
-    assert "current run is still running" in message.answers[-1]
+    if busy_state == "idle":
+        assert "still working" not in message.answers[-1]
+    else:
+        assert "is still working" in message.answers[-1]
 
 
 @pytest.mark.asyncio
@@ -706,3 +717,72 @@ def test_failed_new_conversation_save_keeps_previous_selection() -> None:
     assert bot.active_tasks[101] == 7
     assert bot.user_message_queues[101] == ["pending"]
     assert handler.cancelled is False
+
+
+def test_save_active_tasks_tracks_unsaved_state_for_retry(tmp_path: Path) -> None:
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._active_tasks_unsaved = False
+    del bot._save_active_tasks
+
+    bot.active_tasks = {101: object()}
+    assert TelegramBotInstance._save_active_tasks(bot) is False
+    assert bot._active_tasks_unsaved is True
+
+    # A later successful save clears the retry flag.
+    bot.active_tasks = {101: 7}
+    assert TelegramBotInstance._save_active_tasks(bot) is True
+    assert bot._active_tasks_unsaved is False
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
+
+
+def test_save_active_tasks_survives_unsupported_directory_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._active_tasks_unsaved = False
+    del bot._save_active_tasks
+    bot.active_tasks = {101: 7}
+
+    real_open = os.open
+
+    def fake_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(tmp_path):
+            raise OSError("directory fsync unsupported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", fake_open)
+
+    assert TelegramBotInstance._save_active_tasks(bot) is True
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
+
+
+@pytest.mark.asyncio
+async def test_trace_handler_skips_text_fallback_after_cancellation() -> None:
+    """A cancellation landing while the HTML edit is in flight must stop the
+    plain-text fallback too."""
+
+    sent: list[str] = []
+
+    class _Bot:
+        def __init__(self, handler_box: list) -> None:
+            self.handler_box = handler_box
+
+        async def edit_message_text(self, **kwargs: object) -> None:
+            if "parse_mode" in kwargs:
+                # Cancel mid-flight, then fail so the fallback path is taken.
+                self.handler_box[0].cancel()
+                raise RuntimeError("bad html")
+            sent.append(str(kwargs.get("text")))
+
+    box: list = [None]
+    handler = TelegramTraceHandler(7, _Bot(box), chat_id=1, message_id=1)  # type: ignore[arg-type]
+    box[0] = handler
+
+    await handler._update_message("hello")
+
+    assert sent == []

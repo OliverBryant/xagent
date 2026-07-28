@@ -155,6 +155,11 @@ class TelegramTraceHandler(TraceHandler):
                         chat_id=self.chat_id, text=html_text, parse_mode=ParseMode.HTML
                     )
                 except Exception:
+                    # The HTML request was awaited, so re-check the latch
+                    # before the fallback: a /stop, /new, or /switch may have
+                    # cancelled this execution while it was in flight.
+                    if self.cancelled:
+                        return
                     # Fallback if HTML parsing fails
                     msg = await self.bot.send_message(
                         chat_id=self.chat_id, text=display_text[:4000]
@@ -170,6 +175,9 @@ class TelegramTraceHandler(TraceHandler):
                     )
                 except Exception as e:
                     if "message is not modified" not in str(e).lower():
+                        # Same re-check as the send path above.
+                        if self.cancelled:
+                            return
                         # Fallback if HTML parsing fails
                         await self.bot.edit_message_text(
                             chat_id=self.chat_id,

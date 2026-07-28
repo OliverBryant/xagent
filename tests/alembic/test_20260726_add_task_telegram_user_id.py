@@ -127,3 +127,50 @@ def test_postgresql_offline_concurrent_ddl_escapes_outer_transaction() -> None:
         # so the generated script must COMMIT before emitting it.
         concurrent_at = sql.index("CONCURRENTLY")
         assert "COMMIT;" in sql[:concurrent_at]
+
+
+def test_postgresql_online_upgrade_rebuilds_an_invalid_index() -> None:
+    """A failed CREATE INDEX CONCURRENTLY leaves the index invalid. IF NOT
+    EXISTS would skip the rebuild, so the retry must drop it first."""
+
+    migration = _migration_module()
+    context = MigrationContext.configure(dialect_name="postgresql")
+
+    class _NoopAutocommit:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_exc: object) -> bool:
+            return False
+
+    for validity, expect_drop in ((False, True), (None, False), (True, False)):
+        created: list[dict] = []
+        dropped: list[dict] = []
+        with Operations.context(context):
+            with (
+                patch.object(context, "autocommit_block", _NoopAutocommit),
+                patch.object(migration.op, "get_context", return_value=context),
+                patch.object(migration, "_online_table_exists", return_value=True),
+                patch.object(migration, "_online_columns", return_value={COLUMN}),
+                patch.object(
+                    migration, "_postgres_index_validity", return_value=validity
+                ),
+                patch.object(
+                    migration.op,
+                    "create_index",
+                    side_effect=lambda *a, **kw: created.append(kw),
+                ),
+                patch.object(
+                    migration.op,
+                    "drop_index",
+                    side_effect=lambda *a, **kw: dropped.append(kw),
+                ),
+            ):
+                migration.upgrade()
+
+        assert bool(dropped) is expect_drop, validity
+        if validity is True:
+            # Already usable: no rebuild at all.
+            assert created == []
+        else:
+            assert created == [{"if_not_exists": True, "postgresql_concurrently": True}]

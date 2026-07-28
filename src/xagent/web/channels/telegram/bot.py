@@ -113,6 +113,8 @@ class TelegramBotInstance:
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
         self.active_tasks = self._load_active_tasks()
+        # Set when a save failed, so the next batch retries the persist.
+        self._active_tasks_unsaved = False
 
         default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
 
@@ -158,6 +160,7 @@ class TelegramBotInstance:
         tmp_path = self.active_tasks_file.with_suffix(
             f"{self.active_tasks_file.suffix}.tmp"
         )
+        self._active_tasks_unsaved = True
         try:
             self.active_tasks_file.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(self.active_tasks)
@@ -166,6 +169,23 @@ class TelegramBotInstance:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.active_tasks_file)
+            # Fsyncing the temp file does not commit the renamed directory
+            # entry, so a host crash could still lose a selection reported as
+            # durable. Directory fsync is unsupported on some platforms.
+            try:
+                dir_fd = os.open(str(self.active_tasks_file.parent), os.O_RDONLY)
+            except OSError:
+                logger.debug(
+                    "Directory fsync unsupported for Telegram active tasks %s",
+                    self.active_tasks_file.parent,
+                    exc_info=True,
+                )
+            else:
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            self._active_tasks_unsaved = False
             return True
         except Exception as e:
             logger.error(
@@ -419,10 +439,13 @@ class TelegramBotInstance:
                 return
 
             if self.active_tasks.get(telegram_user_id) == task_id:
-                is_running = telegram_user_id in self.user_active_executions
-                running_suffix = (
-                    " and its current run is still running" if is_running else ""
+                # A dequeued batch is active work too, even before its
+                # execution is registered.
+                is_busy = (
+                    telegram_user_id in self.user_active_executions
+                    or telegram_user_id in self.user_preparing_executions
                 )
+                running_suffix = " and is still working" if is_busy else ""
                 await message.answer(
                     f"Task <code>{task_id}</code> is already active{running_suffix}: "
                     f"{html.escape(task.title)}"
@@ -974,14 +997,19 @@ class TelegramBotInstance:
                 self.active_tasks[user_id] = task_id
                 if not self._save_active_tasks():
                     # The row is already committed, so rolling the mapping back
-                    # would orphan it. Keep the in-memory selection and warn:
-                    # only a restart before the next successful save loses it.
+                    # would orphan it. Mark it dirty instead: without this the
+                    # selection stays non-durable forever, because later
+                    # messages see an existing task and never reach this branch.
                     logger.warning(
-                        "Telegram active task %s for user %s is only in memory; "
-                        "a restart will resume the previous task instead",
+                        "Telegram active task %s for user %s is not durable yet; "
+                        "will retry persisting the selection",
                         task_id,
                         user_id,
                     )
+            elif self._active_tasks_unsaved:
+                # Retry a previously failed activation: later messages see an
+                # existing task, so the branch above never runs again.
+                self._save_active_tasks()
 
             if self._consume_user_stop_request(user_id):
                 await self._finalize_requested_stop(
@@ -1121,6 +1149,16 @@ class TelegramBotInstance:
                 turn_id=message_turn_id,
             )
 
+            # Persisting the user message is awaited, so consume a stop that
+            # landed during it. Otherwise the abandoned conversation gets an
+            # orphaned "I'm working on this" message after the switch.
+            if self._consume_user_stop_request(user_id):
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
             loading_msg = await last_message.answer(
                 "Got it, I'm working on this now.\n"
                 "<i>I'll update this message as I make progress.</i>",
@@ -1198,6 +1236,9 @@ class TelegramBotInstance:
             if not output and (image_refs or file_refs):
                 output = "Task completed."
 
+            def is_cancelled() -> bool:
+                return bool(tg_handler is not None and tg_handler.cancelled)
+
             max_len = 4000
             text_chunks = [
                 output[i : i + max_len] for i in range(0, len(output), max_len)
@@ -1208,6 +1249,10 @@ class TelegramBotInstance:
                 await loading_msg.edit_text(html_chunk0, parse_mode=ParseMode.HTML)
             except Exception as e:
                 if "message is not modified" not in str(e).lower():
+                    # The HTML edit was awaited, so a cancellation may have
+                    # landed while it was in flight.
+                    if is_cancelled():
+                        return
                     try:
                         await loading_msg.edit_text(text_chunks[0])
                     except Exception as e2:
@@ -1215,16 +1260,15 @@ class TelegramBotInstance:
                             logger.warning(f"Failed to edit message: {e2}")
 
             for chunk in text_chunks[1:]:
-                if tg_handler.cancelled:
+                if is_cancelled():
                     return
                 try:
                     html_chunk = markdown_to_tg_html(chunk)
                     await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
                 except Exception:
+                    if is_cancelled():
+                        return
                     await last_message.answer(chunk)
-
-            def is_cancelled() -> bool:
-                return bool(tg_handler is not None and tg_handler.cancelled)
 
             if is_cancelled():
                 return

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -1749,3 +1750,58 @@ async def test_prompt_dispatch_observes_late_task_failure(monkeypatch, caplog) -
         raise AssertionError("late prompt dispatch failure was not observed")
 
     assert "late dispatch failure" in caplog.text
+
+
+def test_enqueue_detects_a_task_deleted_after_the_caller_loaded_it(
+    db_session,
+) -> None:
+    """A caller's earlier snapshot must not let a deleted task be enqueued."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+    # The caller still holds `task` in its identity map, as the websocket
+    # transport does between its permission check and this enqueue.
+    db_session.query(Task).filter(Task.id == task_id).delete()
+    db_session.commit()
+
+    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-after-delete",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+    assert db_session.query(TaskExecutionCommand).count() == 0
+
+
+def test_foreign_key_violation_is_not_reported_as_an_idempotency_conflict(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An IntegrityError with no duplicate row means the task row vanished
+    between the existence check and the insert. That must surface as a missing
+    task, not raise NoResultFound from the duplicate lookup."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    real_flush = db_session.flush
+
+    def flush_raising_fk_error(*args, **kwargs):
+        db_session.flush = real_flush
+        raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+
+    monkeypatch.setattr(db_session, "flush", flush_raising_fk_error)
+
+    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-fk",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )

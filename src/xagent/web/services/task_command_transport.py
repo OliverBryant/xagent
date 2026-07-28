@@ -158,7 +158,6 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
-    loaded_task: Task | None = None,
 ) -> EnqueuedTaskCommand:
     """Commit an idempotent command and return only after it is durable."""
 
@@ -166,15 +165,16 @@ def enqueue_task_command(
     if COMMAND_ID_PATTERN.fullmatch(normalized_id) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
     resolved_task_id = int(task_id)
-    task = loaded_task
-    if task is None:
-        task = db.query(Task).filter(Task.id == resolved_task_id).first()
+    # A task snapshot a caller loaded earlier would widen the concurrent-delete
+    # window across everything it did in between, so existence is re-checked
+    # here before inserting a command that references the row.
+    # This id query bypasses the identity map, so it observes a concurrent
+    # delete that a cached snapshot would not.
+    if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
+        raise ValueError(f"Task {task_id} not found")
+    task = db.query(Task).filter(Task.id == resolved_task_id).first()
     if task is None:
         raise ValueError(f"Task {task_id} not found")
-    if int(task.id) != resolved_task_id:
-        raise ValueError(
-            f"Task snapshot {task.id} does not match requested task {resolved_task_id}"
-        )
 
     existing = (
         db.query(TaskExecutionCommand)
@@ -227,8 +227,14 @@ def enqueue_task_command(
                 TaskExecutionCommand.task_id == resolved_task_id,
                 TaskExecutionCommand.command_id == normalized_id,
             )
-            .one()
+            .one_or_none()
         )
+        if raced is None:
+            # No duplicate command exists, so the IntegrityError was not an
+            # idempotency race. The task row was deleted concurrently and the
+            # insert violated the foreign key. Surface it as a missing task so
+            # callers reach their recovery path instead of NoResultFound.
+            raise ValueError(f"Task {task_id} not found") from None
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,

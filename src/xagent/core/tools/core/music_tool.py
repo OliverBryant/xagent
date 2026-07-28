@@ -11,7 +11,7 @@ from ...file_ref import build_workspace_file_ref
 from ...model.chat.token_context import MediaCallType
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
-from .media_usage import coerce_duration, record_media_seconds
+from .media_usage import coerce_duration, record_media_seconds, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,11 @@ file_id/file_ref.
             ) or coerce_duration(music_length_seconds)
             record_media_seconds(
                 seconds,
-                model=str(configured_model_id),
+                # Never str(None): _configured_model_id returns Optional[str]
+                # and an inactive shared default resolves to None, which would
+                # bill against a phantom model literally named "None".
+                model=resolve_billing_model(configured_model_id, model),
+                model_id=configured_model_id or "",
                 call_type=MediaCallType.MUSIC,
             )
 

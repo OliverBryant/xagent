@@ -66,13 +66,8 @@ class RerankModelAdapter(BaseRerank):
         self.model_config = model_config
         self._rerank_model = _create_rerank_model(model_config)
 
-    def compress(
-        self,
-        documents: Sequence[str],
-        query: str,
-    ) -> Sequence[str]:
-        """Rerank documents using the underlying rerank model."""
-        result = self._rerank_model.compress(documents, query)
+    def _record_usage(self, documents: Sequence[str], query: str) -> None:
+        """Meter one rerank call; never let accounting break the call itself."""
         try:
             # Lazy import to avoid a circular import via the model package init.
             from ..chat.token_context import (
@@ -98,4 +93,28 @@ class RerankModelAdapter(BaseRerank):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("Failed to record rerank usage: %s", e)
+
+    def compress(
+        self,
+        documents: Sequence[str],
+        query: str,
+    ) -> Sequence[str]:
+        """Rerank documents using the underlying rerank model."""
+        result = self._rerank_model.compress(documents, query)
+        self._record_usage(documents, query)
+        return result
+
+    def compress_with_scores(
+        self,
+        documents: Sequence[str],
+        query: str,
+    ) -> list[tuple[str, float]]:
+        """Rerank with per-document scores, metering the call.
+
+        The RAG search pipeline needs the scores, so it must be able to get
+        them *through* the adapter — reaching the inner provider directly would
+        skip metering and leave real rerank usage unbilled.
+        """
+        result = self._rerank_model.compress_with_scores(documents, query)
+        self._record_usage(documents, query)
         return result

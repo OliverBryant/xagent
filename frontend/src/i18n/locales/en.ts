@@ -285,6 +285,7 @@ const en = {
       unknownModel: "Unknown model",
       unattributed: "Unattributed",
       tokensShort: "tokens",
+      unmeasured: "not yet measured",
       mediaByModel: "Media usage",
       mediaCall: "{count} media call",
       mediaCalls: "{count} media calls",
@@ -295,7 +296,7 @@ const en = {
         seconds: "sec",
         characters: "chars",
         requests: "requests",
-        tokens: "tokens",
+        texts: "texts",
       },
       mediaType: {
         generate_image: "Image generation",

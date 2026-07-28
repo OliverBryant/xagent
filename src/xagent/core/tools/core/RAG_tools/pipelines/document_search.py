@@ -19,8 +19,7 @@ from typing import (
 import requests
 
 from xagent.core.model.embedding.base import BaseEmbedding
-from xagent.core.model.rerank.dashscope import DashscopeRerank
-from xagent.core.model.rerank.xinference import XinferenceRerank
+from xagent.core.model.rerank.base import BaseRerank
 
 from ..core.exceptions import (
     DocumentValidationError,
@@ -51,49 +50,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _extract_dashscope_rerank(
-    rerank_adapter: Any,
-) -> Optional[DashscopeRerank]:
-    """Extract DashscopeRerank instance from rerank adapter.
+def _supports_rerank(candidate: Any) -> bool:
+    """Whether an object can serve a scored rerank.
 
-    Args:
-        rerank_adapter: Rerank adapter instance (may be wrapped).
-
-    Returns:
-        DashscopeRerank instance if found, None otherwise.
+    Deliberately does NOT unwrap ``_rerank_model``: usage metering lives on the
+    adapter, so reaching the inner provider would rerank correctly but bill
+    nothing. ``compress_with_scores`` is declared on ``BaseRerank``, so the
+    adapter itself satisfies every caller.
     """
-    if isinstance(rerank_adapter, DashscopeRerank):
-        return rerank_adapter
-    if hasattr(rerank_adapter, "_rerank_model") and isinstance(
-        rerank_adapter._rerank_model, DashscopeRerank
-    ):
-        return rerank_adapter._rerank_model
-    return None
-
-
-def _extract_xinference_rerank(
-    rerank_adapter: Any,
-) -> Optional[XinferenceRerank]:
-    """Extract XinferenceRerank instance from rerank adapter.
-
-    Args:
-        rerank_adapter: Rerank adapter instance (may be wrapped).
-
-    Returns:
-        XinferenceRerank instance if found, None otherwise.
-    """
-    if isinstance(rerank_adapter, XinferenceRerank):
-        return rerank_adapter
-    if hasattr(rerank_adapter, "_rerank_model") and isinstance(
-        rerank_adapter._rerank_model, XinferenceRerank
-    ):
-        return rerank_adapter._rerank_model
-    return None
+    return candidate is not None and callable(
+        getattr(candidate, "compress_with_scores", None)
+    )
 
 
 def _resolve_unified_rerank(
     cfg: Optional[SearchConfig] = None,
-) -> Optional[Union[DashscopeRerank, XinferenceRerank]]:
+) -> Optional[BaseRerank]:
     """Resolve rerank configuration supporting multiple providers.
 
     Priority: explicit model_id from cfg -> hub/user default -> env fallback.
@@ -119,12 +91,10 @@ def _resolve_unified_rerank(
             base_url=None,
             timeout_sec=None,
         )
-        dashscope_rerank = _extract_dashscope_rerank(rerank_adapter)
-        if dashscope_rerank:
-            return dashscope_rerank
-        xinference_rerank = _extract_xinference_rerank(rerank_adapter)
-        if xinference_rerank:
-            return xinference_rerank
+        # Return the adapter itself, not its inner provider: the adapter is
+        # where rerank usage is metered.
+        if _supports_rerank(rerank_adapter):
+            return rerank_adapter
     except (RagCoreException, ValueError, TypeError, ImportError) as exc:
         logger.warning(
             "Failed to load rerank adapter from unified resolver: %s",
@@ -319,7 +289,7 @@ def _apply_rerank_top_k_limit(
     return results
 
 
-def _resolve_dashscope_rerank_from_env() -> Optional[DashscopeRerank]:
+def _resolve_dashscope_rerank_from_env() -> Optional[BaseRerank]:
     """Resolve DashscopeRerank purely from environment variables.
 
     This preserves backward compatibility with deployments that configure
@@ -361,15 +331,25 @@ def _resolve_dashscope_rerank_from_env() -> Optional[DashscopeRerank]:
             top_n = None
 
     try:
-        kwargs: Dict[str, Any] = {"model": model_id, "api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        if top_n is not None:
-            kwargs["top_n"] = top_n
-        return DashscopeRerank(**kwargs)
+        # Built through the adapter rather than instantiating DashscopeRerank
+        # directly: the adapter is where rerank usage is metered, so a raw
+        # provider here would rerank correctly but bill nothing.
+        from xagent.core.model.model import RerankModelConfig
+        from xagent.core.model.rerank.adapter import RerankModelAdapter
+
+        return RerankModelAdapter(
+            RerankModelConfig(
+                id=model_id,
+                model_name=model_id,
+                model_provider="dashscope",
+                api_key=api_key,
+                base_url=base_url,
+                top_n=top_n,
+            )
+        )
     except (ValueError, TypeError, ImportError) as exc:
         logger.warning(
-            "Failed to construct DashscopeRerank from env vars: %s",
+            "Failed to construct DashScope rerank adapter from env vars: %s",
             exc,
         )
         return None

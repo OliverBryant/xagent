@@ -317,7 +317,8 @@ def estimate_tokens(text: Any) -> int:
     other = 0
     for item in items:
         for char in item:
-            # CJK Unified Ideographs plus the common Japanese kana blocks.
+            # CJK Unified Ideographs, Japanese kana, and Hangul syllables —
+            # all roughly one token per character.
             code = ord(char)
             if (
                 0x4E00 <= code <= 0x9FFF
@@ -498,10 +499,12 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         if detail.get("type") != "media":
             continue
         quantity = max(0.0, _coerce_float(detail.get("quantity")))
-        # Mirror the token aggregator: a zero-quantity entry is not a billable
-        # line item and would surface as a "0 chars" row in the UI.
-        if quantity == 0:
-            continue
+        # Zero-quantity entries are deliberately KEPT. Unlike a zero-token LLM
+        # entry, a zero-quantity media entry is meaningful: the duration-billed
+        # tools record quantity=0 precisely to say "this provider call happened
+        # but its size is unknown" (an async video with no duration yet).
+        # Dropping it would hide the whole media popover and report
+        # media_calls=0 for a task that really did make billable calls.
         tokens = max(0, _coerce_int(detail.get("provider_tokens")))
 
         raw_model_id = detail.get("model_id")

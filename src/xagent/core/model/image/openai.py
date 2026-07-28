@@ -193,6 +193,9 @@ class OpenAIImageModel(BaseImageModel):
 
         response_format = kwargs.pop("response_format", "url")
         normalized_size = self._normalize_size(kwargs.pop("size", "1024*1024"))
+        # Mirrors generate_image: n reaches this provider only via kwargs, and
+        # the provider generates and bills the full count.
+        image_count = kwargs.get("n", 1)
         image_files = []
         try:
             image_files = [open(path, "rb") for path in image_paths]
@@ -231,6 +234,7 @@ class OpenAIImageModel(BaseImageModel):
             result,
             model_name=self.model_name,
             call_type=MediaCallType.EDIT_IMAGE,
+            image_count=image_count,
             resolution=str(normalized_size or ""),
         )
         return result

@@ -4023,9 +4023,10 @@ async def get_task(
                 "model_usage": model_usage,
                 "media_usage": media_usage,
                 # Derived from the same aggregation the client renders, so the
-                # summary count and the rows can never disagree.
+                # summary count and the rows can never disagree. Deliberately
+                # no cross-unit quantity total: summing images + seconds +
+                # characters produces a number with no meaning.
                 "media_calls": sum(entry["calls"] for entry in media_usage),
-                "media_quantity_total": sum(entry["quantity"] for entry in media_usage),
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,

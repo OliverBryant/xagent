@@ -59,7 +59,7 @@ def test_embedding_token_estimate_is_cjk_aware() -> None:
     assert estimate_tokens(123) == 0
 
 
-def test_embedding_encode_single_string_counts_one_request():
+def test_embedding_encode_single_string_counts_one_text():
     adapter = _adapter()
     adapter._embedding_model.encode.return_value = [0.1, 0.2]
 

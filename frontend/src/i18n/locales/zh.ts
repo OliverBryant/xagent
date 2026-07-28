@@ -285,6 +285,7 @@ const zh = {
       unknownModel: "未知模型",
       unattributed: "未归属",
       tokensShort: "tokens",
+      unmeasured: "暂未计量",
       mediaByModel: "媒体用量",
       mediaCall: "{count} 次媒体调用",
       mediaCalls: "{count} 次媒体调用",
@@ -295,7 +296,7 @@ const zh = {
         seconds: "秒",
         characters: "字符",
         requests: "次",
-        tokens: "tokens",
+        texts: "条文本",
       },
       mediaType: {
         generate_image: "生图",

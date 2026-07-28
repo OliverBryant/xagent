@@ -5,16 +5,67 @@ payload the way image/chat models do, and their adapters are factory-only, so
 the natural metering point is the tool call site where the request params and
 result are both in scope. This helper wraps ``add_media_usage`` so a failure in
 accounting can never break the underlying media call.
+
+Metering invariants
+-------------------
+A usage record is only worth what its identity and unit are worth, so every
+producer must satisfy all of these:
+
+1. **Metering must survive adapter unwrapping.** Record on the object callers
+   actually hold. Reaching past an adapter to its inner provider silently drops
+   the metering — this is how rerank shipped entirely unbilled.
+2. **Metering must survive thread boundaries.** ``ThreadPoolExecutor`` does not
+   copy contextvars, so a worker gets a fresh empty ``TokenUsage`` unless the
+   caller's is bound explicitly.
+3. **The unit is a property of the modality, never of the response.** A
+   duration-billed modality always reports seconds, recording ``quantity=0``
+   when unmeasured rather than switching units.
+4. **Never bill a placeholder identity.** ``"default"``, ``"None"`` and ``""``
+   are not models; resolve through :func:`resolve_billing_model`.
+
+Model identity convention
+-------------------------
+``model`` carries the human-readable **name**, ``model_id`` the configured
+**id**. Populate both when known: the aggregator groups on
+``model_id or model``, so a producer that leaves ``model_id`` empty while
+another sets it splits one physical model into two un-mergeable billing rows.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from ...model.chat.token_context import MediaCallType, MediaUnit, add_media_usage
 
 logger = logging.getLogger(__name__)
+
+# Placeholders that must never reach a usage record as a model identity.
+_PLACEHOLDER_MODEL_NAMES = {"", "none", "null", "default"}
+
+
+def resolve_billing_model(
+    configured_id: Optional[str],
+    model: Any = None,
+    *,
+    fallback: str = "default",
+) -> str:
+    """Best available identity for a model, never a placeholder string.
+
+    ``_configured_model_id``-style lookups return ``Optional[str]``, and passing
+    that through ``str()`` records a model literally named ``"None"``. Prefer
+    the configured id, fall back to the provider's own ``model_name``/``model``
+    attribute, and only then to ``fallback``.
+    """
+    if isinstance(configured_id, str) and configured_id.strip():
+        return configured_id
+    for attr in ("model_name", "model"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value.strip().lower() not in (
+            _PLACEHOLDER_MODEL_NAMES
+        ):
+            return value
+    return fallback
 
 
 def coerce_duration(value: object) -> Optional[float]:

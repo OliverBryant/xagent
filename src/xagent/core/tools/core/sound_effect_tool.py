@@ -11,7 +11,7 @@ from ...file_ref import build_workspace_file_ref
 from ...model.chat.token_context import MediaCallType
 from ...model.sound_effect import BaseSoundEffectModel, SoundEffectResult
 from ...workspace import TaskWorkspace
-from .media_usage import coerce_duration, record_media_seconds
+from .media_usage import coerce_duration, record_media_seconds, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +167,9 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
             ) or coerce_duration(duration_seconds)
             record_media_seconds(
                 seconds,
-                model=str(configured_model_id),
+                # Never str(None) — see resolve_billing_model.
+                model=resolve_billing_model(configured_model_id, model),
+                model_id=configured_model_id or "",
                 call_type=MediaCallType.SOUND_EFFECT,
             )
 

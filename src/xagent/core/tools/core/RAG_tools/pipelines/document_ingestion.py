@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from xagent.core.model.chat.token_context import get_token_usage, set_token_usage
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
 
@@ -1226,12 +1227,36 @@ def _process_document_impl(
 
                 max_encode_workers = max(1, cfg.embedding_concurrent)
                 if len(batch_slices) > 1 and max_encode_workers > 1:
+                    # ThreadPoolExecutor does not propagate contextvars to its
+                    # workers, so without this every batch would record its
+                    # embedding usage into a fresh, unreferenced TokenUsage that
+                    # is discarded when the worker returns — silently losing all
+                    # embedding usage for any multi-batch document (the default
+                    # config, embedding_concurrent=10). Run each batch inside a
+                    # copy of the caller's context so usage lands on the caller's
+                    # TokenUsage, matching the async sibling path's to_thread.
+                    #
+                    # Bind the caller's TokenUsage explicitly instead of
+                    # entering a shared Context: a single Context cannot be
+                    # entered by two threads at once, and copy_context() inside
+                    # a worker would copy the worker's own (empty) context
+                    # rather than the caller's.
+                    caller_usage = get_token_usage()
+
+                    def _encode_batch_in_context(
+                        item: tuple[int, Any],
+                    ) -> list[list[float]]:
+                        set_token_usage(caller_usage)
+                        return _encode_batch(item)
+
                     with concurrent.futures.ThreadPoolExecutor(
                         max_workers=min(max_encode_workers, len(batch_slices))
                     ) as encode_pool:
                         # map preserves input order, so vectors line up with batches.
                         all_vectors = list(
-                            encode_pool.map(_encode_batch, enumerate(batch_slices))
+                            encode_pool.map(
+                                _encode_batch_in_context, enumerate(batch_slices)
+                            )
                         )
                 else:
                     all_vectors = [

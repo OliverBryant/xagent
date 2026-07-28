@@ -18,6 +18,11 @@ from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
 
 logger = logging.getLogger(__name__)
 
+# Matches DashScopeEmbedding's own default. Memory vectors written before the
+# store routed through the metered adapter used this model, so it stays the
+# fallback whenever the DB row does not name one.
+_DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-v4"
+
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
     InMemoryMemoryStore, LanceDBMemoryStore, UserIsolatedMemoryStore
@@ -168,6 +173,22 @@ class DynamicMemoryStoreManager:
                 db_dir = str(new_dir)
 
             if embedding_model.model_provider == "dashscope":
+                # Keep the previous class default when the DB row carries no
+                # usable name. Memories already on disk were embedded with this
+                # model, and switching it would silently put old and new
+                # vectors in incompatible spaces — a recall-quality regression
+                # with no error at store-creation time (DashScopeEmbedding does
+                # not validate the name; a bad one only fails later at encode).
+                configured_name = str(
+                    getattr(embedding_model, "model_name", "") or ""
+                ).strip()
+                if not configured_name:
+                    configured_name = _DEFAULT_MEMORY_EMBEDDING_MODEL
+                    logger.warning(
+                        "Embedding model row has no model_name; falling back to "
+                        "%s to stay compatible with existing memory vectors",
+                        configured_name,
+                    )
                 # Built through the adapter rather than instantiating the
                 # provider directly: the adapter is where embedding usage is
                 # metered, so a direct DashScopeEmbedding() would make every
@@ -177,9 +198,7 @@ class DynamicMemoryStoreManager:
                     embedding_model=create_embedding_adapter(
                         EmbeddingModelConfig(
                             id=str(getattr(embedding_model, "model_id", "") or ""),
-                            model_name=str(
-                                getattr(embedding_model, "model_name", "") or ""
-                            ),
+                            model_name=configured_name,
                             model_provider="dashscope",
                             api_key=str(embedding_model.api_key),
                             dimension=int(embedding_model.dimension or 1024),

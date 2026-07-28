@@ -16,6 +16,7 @@ from xagent.core.tools.core.media_usage import (
     coerce_duration,
     record_media_seconds,
     record_media_usage,
+    resolve_billing_model,
 )
 
 
@@ -64,3 +65,25 @@ def test_record_media_usage_never_raises() -> None:
     with TokenContextManager() as manager:
         record_media_usage("seconds", None, model="m", call_type="video")  # type: ignore[arg-type]
         assert manager.get_usage().media_calls == 1
+
+
+def test_resolve_billing_model_never_returns_a_placeholder() -> None:
+    """`_configured_model_id`-style lookups return Optional[str]; passing that
+    through str() records a model literally named "None"."""
+
+    class _Model:
+        model_name = "elevenlabs-music-v1"
+
+    # None id -> falls back to the provider's own name, not "None".
+    assert resolve_billing_model(None, _Model()) == "elevenlabs-music-v1"
+    assert resolve_billing_model("", _Model()) == "elevenlabs-music-v1"
+    # A real configured id always wins.
+    assert resolve_billing_model("cfg-id", _Model()) == "cfg-id"
+    # Nothing identifies the model: an explicit fallback, never None/"None".
+    assert resolve_billing_model(None, None) == "default"
+
+    # Placeholder names on the model are not treated as identities.
+    class _Placeholder:
+        model_name = "None"
+
+    assert resolve_billing_model(None, _Placeholder()) == "default"

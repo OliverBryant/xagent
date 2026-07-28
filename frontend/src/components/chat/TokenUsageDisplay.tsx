@@ -325,14 +325,20 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                     {formatMediaType(media.call_type)}
                   </span>
                   <span className="text-right tabular-nums">
-                    {/* Joined via filter so an unrecognised (or empty) unit
-                        renders as "4" rather than "4 " with a dangling space. */}
-                    {[
-                      formatMediaQuantity(media.quantity, locale),
-                      formatMediaUnit(media.unit),
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
+                    {/* quantity 0 means the call happened but the provider
+                        reported no measurable size (e.g. an async video with
+                        no duration yet) — say so rather than showing "0 sec",
+                        which reads as "this cost nothing". */}
+                    {media.quantity > 0
+                      ? /* Joined via filter so an unrecognised (or empty) unit
+                           renders as "4" rather than "4 " with a trailing space. */
+                        [
+                          formatMediaQuantity(media.quantity, locale),
+                          formatMediaUnit(media.unit),
+                        ]
+                          .filter(Boolean)
+                          .join(' ')
+                      : t('chatPage.tokenUsage.unmeasured')}
                     {media.provider_tokens ? (
                       <span className="block text-[10px] text-muted-foreground">
                         {formatTokenCount(media.provider_tokens, locale)}

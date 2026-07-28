@@ -198,14 +198,19 @@ def test_media_aggregation_splits_by_resolution() -> None:
 def test_aggregations_tolerate_non_list_and_dirty_entries() -> None:
     assert aggregate_media_usage_by_model(None) == []
     assert aggregate_media_usage_by_model("nope") == []
-    # A quantity-less entry is not a billable line item and is dropped, matching
-    # the token aggregator's zero-token behaviour.
-    assert aggregate_media_usage_by_model([{"type": "media"}, 42, "junk"]) == []
+    # Non-dict junk is ignored; a bare media entry still counts as a call, since
+    # a media row's existence is itself the billing signal.
+    groups = aggregate_media_usage_by_model([{"type": "media"}, 42, "junk"])
+    assert len(groups) == 1
+    assert groups[0]["calls"] == 1
+    assert groups[0]["quantity"] == 0.0
 
 
-def test_zero_quantity_media_entries_are_skipped() -> None:
-    # A duration-billed call the provider never measured records 0 seconds; it
-    # must not surface as a "0 sec" row.
+def test_zero_quantity_media_entries_stay_visible() -> None:
+    # A duration-billed call the provider never measured records 0 seconds.
+    # That entry must survive aggregation: it is the only evidence the task
+    # made a billable provider call, and dropping it would report
+    # media_calls=0 (and hide the whole popover) for a task that did.
     with TokenContextManager() as manager:
         add_media_usage(unit="seconds", quantity=0, model="tts", call_type="tts")
         add_media_usage(unit="seconds", quantity=5, model="tts", call_type="tts")
@@ -214,4 +219,17 @@ def test_zero_quantity_media_entries_are_skipped() -> None:
     groups = aggregate_media_usage_by_model(details)
     assert len(groups) == 1
     assert groups[0]["quantity"] == 5.0
-    assert groups[0]["calls"] == 1
+    assert groups[0]["calls"] == 2  # both calls counted, including the unmeasured one
+
+
+def test_only_unmeasured_calls_still_surface() -> None:
+    # The async-video case: no duration is available yet for any call, so the
+    # whole group is zero-quantity. It must still be reported.
+    with TokenContextManager() as manager:
+        for _ in range(3):
+            add_media_usage(unit="seconds", quantity=0, model="veo", call_type="video")
+        groups = aggregate_media_usage_by_model(manager.get_usage().details)
+
+    assert len(groups) == 1
+    assert groups[0]["calls"] == 3
+    assert groups[0]["quantity"] == 0.0

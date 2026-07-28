@@ -1,62 +1,80 @@
-"""Media-usage recording for ASR providers.
+"""Media-usage recording for ASR.
 
-Recorded at the provider layer rather than the tool layer because ASR is
-reached from several entry points that do not go through ``audio_tool`` — the
-Telegram channel and the ``/speech/transcribe`` API both call ``transcribe``
-directly. Metering here makes every caller billable by construction.
+ASR is reached from several entry points that do not go through ``audio_tool``
+— the Telegram channel and the ``/speech/transcribe`` API both call
+``transcribe`` directly — so this module is the single place that knows how to
+turn a transcription result into a usage record. Every ASR caller routes here,
+including ``audio_tool``: keeping one implementation is what stops the copies
+from drifting (an earlier pair differed in whether they logged at all).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
+from ...tools.core.media_usage import coerce_duration
 from ..chat.token_context import MediaCallType, MediaUnit, add_media_usage
 from .base import ASRResult
 
 logger = logging.getLogger(__name__)
 
+# Keys providers use for the total length of the submitted audio.
+_DURATION_KEYS = ("duration", "audio_duration", "duration_seconds")
 
-def _duration_from_raw(raw_response: Any) -> Optional[float]:
-    """Provider-reported total audio duration, if it exposed one."""
+
+def duration_from_raw_response(raw_response: Any) -> Optional[float]:
+    """Provider-reported total audio duration, if it exposed one.
+
+    Preferred over segment timings: the end of the last spoken segment
+    undercounts a recording with trailing silence, which the provider still
+    processed and billed for.
+    """
     if not isinstance(raw_response, dict):
         return None
-    for key in ("duration", "audio_duration", "duration_seconds"):
-        value = raw_response.get(key)
-        if value is None:
-            continue
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            continue
-        if seconds > 0:
+    for key in _DURATION_KEYS:
+        seconds = coerce_duration(raw_response.get(key))
+        if seconds is not None:
             return seconds
     return None
 
 
-def _duration_from_segments(result: ASRResult) -> Optional[float]:
-    """Fall back to the end of the last timed segment."""
-    if not result.segments:
+def duration_from_segments(segments: Optional[Sequence[Any]]) -> Optional[float]:
+    """Transcribed duration inferred from the end of the last timed segment.
+
+    Accepts both ``ASRSegment`` objects and the plain dicts ``audio_tool``
+    builds from them.
+    """
+    if not segments:
         return None
     last_end = 0.0
-    for segment in result.segments:
-        end = getattr(segment, "end", None)
-        if end is None:
-            continue
-        try:
-            last_end = max(last_end, float(end))
-        except (TypeError, ValueError):
-            continue
+    for segment in segments:
+        end = (
+            segment.get("end")
+            if isinstance(segment, dict)
+            else getattr(segment, "end", None)
+        )
+        seconds = coerce_duration(end)
+        if seconds is not None:
+            last_end = max(last_end, seconds)
     return last_end if last_end > 0 else None
 
 
-def record_asr_usage(
-    result: Union[str, ASRResult],
+def resolve_asr_seconds(
+    raw_response: Any = None,
+    segments: Optional[Sequence[Any]] = None,
+) -> Optional[float]:
+    """Best available transcribed-audio duration, provider field first."""
+    return duration_from_raw_response(raw_response) or duration_from_segments(segments)
+
+
+def record_asr_seconds(
+    seconds: Optional[float],
     *,
     model_name: str = "",
     model_id: str = "",
 ) -> None:
-    """Record one transcription on the current token context.
+    """Record one transcription from an already-resolved duration.
 
     ASR is duration-billed, so the unit is always seconds — a call whose
     duration cannot be determined records 0 seconds rather than switching
@@ -64,11 +82,6 @@ def record_asr_usage(
     any failure is swallowed so accounting never breaks a transcription.
     """
     try:
-        seconds: Optional[float] = None
-        if isinstance(result, ASRResult):
-            seconds = _duration_from_raw(
-                result.raw_response
-            ) or _duration_from_segments(result)
         if seconds is None:
             logger.warning(
                 "No audio duration available for ASR call on model %r; "
@@ -84,3 +97,26 @@ def record_asr_usage(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to record ASR usage: %s", e)
+
+
+def record_asr_usage(
+    result: Union[str, ASRResult],
+    *,
+    model_name: str = "",
+    model_id: str = "",
+) -> None:
+    """Record one transcription from a provider result.
+
+    A non-verbose call returns a bare string with no timing information, so it
+    is recorded as unmeasured rather than silently skipped.
+    """
+    raw_response = None
+    segments = None
+    if isinstance(result, ASRResult):
+        raw_response = result.raw_response
+        segments = result.segments
+    record_asr_seconds(
+        resolve_asr_seconds(raw_response, segments),
+        model_name=model_name,
+        model_id=model_id,
+    )

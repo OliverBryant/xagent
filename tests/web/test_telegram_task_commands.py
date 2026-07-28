@@ -477,11 +477,13 @@ async def test_switch_stops_current_run_clears_queue_and_persists_selection(
         (str(current.id), "Telegram task switch requested"),
     ]
     assert trace_handler.cancelled is True
+    # The selection is persisted first: tearing down the old conversation is
+    # irreversible, so it must only happen once the switch is durable.
     assert events == [
+        f"select:{target.id}",
         "clear-queue",
         "cancel-stream",
         "pause",
-        f"select:{target.id}",
     ]
     assert message.answers[-1].startswith(f"Switched to task <code>{target.id}</code>")
 
@@ -635,3 +637,72 @@ async def test_output_attachments_stop_when_cancelled_mid_delivery(
         is_cancelled=lambda: handler.cancelled,
     )
     assert failed == []
+
+
+@pytest.mark.asyncio
+async def test_failed_switch_save_leaves_old_conversation_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Persistence is the commit point: a failed save must not tear down the
+    previous conversation's queue, trace handler, or running execution."""
+
+    bot = _bot(1)
+    bot.active_tasks[101] = 7
+    bot.user_message_queues[101] = ["pending"]
+    handler = TelegramTraceHandler(7, bot=None, chat_id=1, message_id=1)  # type: ignore[arg-type]
+    bot.user_active_trace_handlers[101] = handler
+
+    paused: list[str] = []
+
+    class _AgentService:
+        def pause_execution_by_id(
+            self,
+            execution_id: str,
+            reason: str | None = None,
+        ) -> bool:
+            paused.append(execution_id)
+            return True
+
+    bot.user_active_executions[101] = (7, _AgentService())
+    bot._save_active_tasks = lambda: False
+
+    snapshot = TelegramChannelTaskSnapshot(
+        task_id=9,
+        title="target",
+        status="completed",
+        created_at=None,
+        updated_at=None,
+    )
+
+    async def load_task(**_kwargs: object) -> TelegramChannelTaskSnapshot:
+        return snapshot
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_telegram_channel_task",
+        load_task,
+    )
+    message = _Message(101, "/switch 9")
+
+    await bot._handle_switch_command(message)  # type: ignore[arg-type]
+
+    assert bot.active_tasks[101] == 7
+    assert bot.user_message_queues[101] == ["pending"]
+    assert handler.cancelled is False
+    assert paused == []
+    assert "couldn't save the switch" in message.answers[-1]
+
+
+def test_failed_new_conversation_save_keeps_previous_selection() -> None:
+    bot = _bot(1)
+    bot.active_tasks[101] = 7
+    bot.user_message_queues[101] = ["pending"]
+    handler = TelegramTraceHandler(7, bot=None, chat_id=1, message_id=1)  # type: ignore[arg-type]
+    bot.user_active_trace_handlers[101] = handler
+    bot._save_active_tasks = lambda: False
+
+    stopped, persisted = bot._start_new_conversation(101)
+
+    assert (stopped, persisted) == (False, False)
+    assert bot.active_tasks[101] == 7
+    assert bot.user_message_queues[101] == ["pending"]
+    assert handler.cancelled is False

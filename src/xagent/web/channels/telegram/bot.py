@@ -209,7 +209,14 @@ class TelegramBotInstance:
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
             )
-            self._start_new_conversation(message.from_user.id)
+            _, persisted = self._start_new_conversation(message.from_user.id)
+            if not persisted:
+                await message.answer(
+                    "I couldn't start a new task because the change could not "
+                    "be saved. The current task is still active. Please try "
+                    "again."
+                )
+                return
             await message.answer(
                 "Fresh start. Send me what you'd like to work on next."
             )
@@ -422,14 +429,12 @@ class TelegramBotInstance:
                 )
                 return
 
-            self._request_current_conversation_stop(
-                telegram_user_id,
-                reason="Telegram task switch requested",
-            )
+            # Persistence is the commit point: stopping the old conversation
+            # discards its queue, cancels its trace handler, and pauses its
+            # run, none of which can be undone by restoring the mapping.
             previous_task_id = self.active_tasks.get(telegram_user_id)
             self.active_tasks[telegram_user_id] = task_id
             if not self._save_active_tasks():
-                # Never confirm a selection that would not survive a restart.
                 if previous_task_id is None:
                     self.active_tasks.pop(telegram_user_id, None)
                 else:
@@ -440,6 +445,11 @@ class TelegramBotInstance:
                     "active. Please try again."
                 )
                 return
+
+            self._request_current_conversation_stop(
+                telegram_user_id,
+                reason="Telegram task switch requested",
+            )
             await message.answer(
                 f"Switched to task <code>{task_id}</code>: "
                 f"{html.escape(task.title)}\n"
@@ -458,13 +468,25 @@ class TelegramBotInstance:
         )
         return True
 
-    def _start_new_conversation(self, user_id: int) -> bool:
+    def _start_new_conversation(self, user_id: int) -> tuple[bool, bool]:
+        """Reset the conversation. Returns (stopped_something, persisted)."""
+
+        # Persist before stopping: the stop is irreversible, so a mapping that
+        # will not survive a restart must not tear the old conversation down.
+        previous_task_id = self.active_tasks.get(user_id)
+        self.active_tasks[user_id] = -1
+        if not self._save_active_tasks():
+            if previous_task_id is None:
+                self.active_tasks.pop(user_id, None)
+            else:
+                self.active_tasks[user_id] = previous_task_id
+            self._save_active_tasks()
+            return False, False
+
         stopped = self._request_current_conversation_stop(
             user_id, reason="new Telegram conversation requested"
         )
-        self.active_tasks[user_id] = -1
-        self._save_active_tasks()
-        return stopped
+        return stopped, True
 
     def _stop_current_conversation(self, user_id: int) -> bool:
         return self._request_current_conversation_stop(
@@ -950,7 +972,16 @@ class TelegramBotInstance:
             is_new_task = prepared_task.is_new_task
             if is_new_task:
                 self.active_tasks[user_id] = task_id
-                self._save_active_tasks()
+                if not self._save_active_tasks():
+                    # The row is already committed, so rolling the mapping back
+                    # would orphan it. Keep the in-memory selection and warn:
+                    # only a restart before the next successful save loses it.
+                    logger.warning(
+                        "Telegram active task %s for user %s is only in memory; "
+                        "a restart will resume the previous task instead",
+                        task_id,
+                        user_id,
+                    )
 
             if self._consume_user_stop_request(user_id):
                 await self._finalize_requested_stop(

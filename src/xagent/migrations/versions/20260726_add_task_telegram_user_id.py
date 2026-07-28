@@ -21,37 +21,104 @@ COLUMN = "telegram_user_id"
 INDEX = "ix_tasks_telegram_user_id"
 
 
-def _existing_columns(inspector: sa.Inspector) -> list[str]:
-    return [str(column["name"]) for column in inspector.get_columns(TABLE)]
+def _online_columns() -> set[str]:
+    inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names():
+        return set()
+    return {str(item["name"]) for item in inspector.get_columns(TABLE)}
 
 
-def _existing_indexes(inspector: sa.Inspector) -> list[str]:
-    return [str(index["name"]) for index in inspector.get_indexes(TABLE)]
+def _online_indexes() -> set[str]:
+    inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names():
+        return set()
+    return {
+        name
+        for item in inspector.get_indexes(TABLE)
+        if (name := item.get("name")) is not None
+    }
+
+
+def _online_table_exists() -> bool:
+    return TABLE in sa.inspect(op.get_bind()).get_table_names()
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if TABLE not in inspector.get_table_names():
+    context = op.get_context()
+    is_postgresql = context.dialect.name == "postgresql"
+
+    # Offline (--sql) generation has a MockConnection, so reflection is
+    # unavailable. Emit the unconditional DDL instead of inspecting.
+    if context.as_sql:
+        op.add_column(TABLE, sa.Column(COLUMN, sa.String(length=32), nullable=True))
+        if is_postgresql:
+            with context.autocommit_block():
+                op.create_index(
+                    INDEX,
+                    TABLE,
+                    [COLUMN],
+                    postgresql_concurrently=True,
+                )
+        else:
+            op.create_index(INDEX, TABLE, [COLUMN])
         return
 
-    if COLUMN not in _existing_columns(inspector):
+    if not _online_table_exists():
+        return
+
+    if COLUMN not in _online_columns():
         op.add_column(TABLE, sa.Column(COLUMN, sa.String(length=32), nullable=True))
 
-    inspector = sa.inspect(bind)
-    if INDEX not in _existing_indexes(inspector):
+    if COLUMN not in _online_columns():
+        return
+
+    # A plain CREATE INDEX holds a SHARE lock and blocks writes to the live
+    # tasks table for the whole build, so PostgreSQL builds it concurrently.
+    if is_postgresql:
+        with context.autocommit_block():
+            op.create_index(
+                INDEX,
+                TABLE,
+                [COLUMN],
+                if_not_exists=True,
+                postgresql_concurrently=True,
+            )
+        return
+
+    if INDEX not in _online_indexes():
         op.create_index(INDEX, TABLE, [COLUMN])
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if TABLE not in inspector.get_table_names():
+    context = op.get_context()
+    is_postgresql = context.dialect.name == "postgresql"
+
+    if context.as_sql:
+        if is_postgresql:
+            with context.autocommit_block():
+                op.drop_index(
+                    INDEX,
+                    table_name=TABLE,
+                    postgresql_concurrently=True,
+                )
+        else:
+            op.drop_index(INDEX, table_name=TABLE)
+        op.drop_column(TABLE, COLUMN)
         return
 
-    if INDEX in _existing_indexes(inspector):
+    if not _online_table_exists():
+        return
+
+    if is_postgresql:
+        with context.autocommit_block():
+            op.drop_index(
+                INDEX,
+                table_name=TABLE,
+                if_exists=True,
+                postgresql_concurrently=True,
+            )
+    elif INDEX in _online_indexes():
         op.drop_index(INDEX, table_name=TABLE)
 
-    inspector = sa.inspect(bind)
-    if COLUMN in _existing_columns(inspector):
+    if COLUMN in _online_columns():
         op.drop_column(TABLE, COLUMN)

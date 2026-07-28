@@ -510,12 +510,13 @@ def test_start_new_conversation_clears_queue_and_pauses_active_execution() -> No
     agent_service = FakeAgentService()
     bot.user_active_executions = {123: (456, agent_service)}
 
-    def fake_save_active_tasks() -> None:
+    def fake_save_active_tasks() -> bool:
         bot.saved = True
+        return True
 
     bot._save_active_tasks = fake_save_active_tasks
 
-    assert bot._start_new_conversation(123) is True
+    assert bot._start_new_conversation(123) == (True, True)
     assert 123 not in bot.user_message_queues
     assert bot.active_tasks[123] == -1
     assert bot.saved is True

@@ -1085,6 +1085,17 @@ def test_build_agents_keyboard_lists_default_and_agents() -> None:
             assert len(button.callback_data.encode()) <= 64
 
 
+def test_build_agents_keyboard_truncates_long_names_with_ellipsis() -> None:
+    long_name = "A" * 80
+
+    keyboard = TelegramBotInstance._build_agents_keyboard(
+        [_agent(1, long_name)], 0, selected_agent_id=None
+    )
+
+    label = keyboard.inline_keyboard[1][0].text
+    assert label == f"{'A' * 57}..."
+
+
 def test_build_agents_keyboard_marks_default_when_no_selection() -> None:
     keyboard = TelegramBotInstance._build_agents_keyboard(
         [_agent(1, "Alpha")], 0, selected_agent_id=None

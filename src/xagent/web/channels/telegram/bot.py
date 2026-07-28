@@ -444,7 +444,7 @@ class TelegramBotInstance:
             [InlineKeyboardButton(text=default_label, callback_data="agsel:default")]
         ]
         for agent in page_agents:
-            label = agent.name[:60]
+            label = agent.name if len(agent.name) <= 60 else f"{agent.name[:57]}..."
             if agent.agent_id == selected_agent_id:
                 label += " ✓"
             rows.append(

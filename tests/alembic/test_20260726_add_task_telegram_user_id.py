@@ -129,9 +129,11 @@ def test_postgresql_offline_concurrent_ddl_escapes_outer_transaction() -> None:
         assert "COMMIT;" in sql[:concurrent_at]
 
 
-def test_postgresql_online_upgrade_rebuilds_an_invalid_index() -> None:
-    """A failed CREATE INDEX CONCURRENTLY leaves the index invalid. IF NOT
-    EXISTS would skip the rebuild, so the retry must drop it first."""
+def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> None:
+    """A failed CREATE INDEX CONCURRENTLY leaves the index invalid, and a
+    same-name index may index the wrong columns. IF NOT EXISTS would skip both
+    rebuilds, so the retry must drop first. Only a valid index with the right
+    definition is accepted as-is."""
 
     migration = _migration_module()
     context = MigrationContext.configure(dialect_name="postgresql")
@@ -143,7 +145,14 @@ def test_postgresql_online_upgrade_rebuilds_an_invalid_index() -> None:
         def __exit__(self, *_exc: object) -> bool:
             return False
 
-    for validity, expect_drop in ((False, True), (None, False), (True, False)):
+    cases = (
+        # (validity, existing_columns, expect_drop, expect_create)
+        (False, (COLUMN,), True, True),  # present but invalid
+        (None, None, False, True),  # absent
+        (True, (COLUMN,), False, False),  # valid and correct
+        (True, ("status",), True, True),  # valid but drifted definition
+    )
+    for validity, existing_columns, expect_drop, expect_create in cases:
         created: list[dict] = []
         dropped: list[dict] = []
         with Operations.context(context):
@@ -154,6 +163,11 @@ def test_postgresql_online_upgrade_rebuilds_an_invalid_index() -> None:
                 patch.object(migration, "_online_columns", return_value={COLUMN}),
                 patch.object(
                     migration, "_postgres_index_validity", return_value=validity
+                ),
+                patch.object(
+                    migration,
+                    "_online_index_columns",
+                    return_value=existing_columns,
                 ),
                 patch.object(
                     migration.op,
@@ -168,9 +182,32 @@ def test_postgresql_online_upgrade_rebuilds_an_invalid_index() -> None:
             ):
                 migration.upgrade()
 
-        assert bool(dropped) is expect_drop, validity
-        if validity is True:
-            # Already usable: no rebuild at all.
-            assert created == []
+        label = (validity, existing_columns)
+        assert bool(dropped) is expect_drop, label
+        if expect_create:
+            assert created == [
+                {"if_not_exists": True, "postgresql_concurrently": True}
+            ], label
         else:
-            assert created == [{"if_not_exists": True, "postgresql_concurrently": True}]
+            assert created == [], label
+
+
+def test_sqlite_online_upgrade_rebuilds_a_drifted_index() -> None:
+    """A same-name index over the wrong columns must be rebuilt, not accepted."""
+
+    migration = _migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text("CREATE TABLE tasks (id INTEGER PRIMARY KEY, status VARCHAR(32))")
+        )
+        connection.execute(sa.text(f"CREATE INDEX {INDEX} ON {TABLE} (status)"))
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        columns = {
+            item["name"]: tuple(item["column_names"])
+            for item in sa.inspect(connection).get_indexes(TABLE)
+        }
+        assert columns[INDEX] == (COLUMN,)

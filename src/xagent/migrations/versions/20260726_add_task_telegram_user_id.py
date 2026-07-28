@@ -57,6 +57,16 @@ def _online_indexes() -> set[str]:
     }
 
 
+def _online_index_columns(index_name: str) -> tuple[str, ...] | None:
+    inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names():
+        return None
+    for item in inspector.get_indexes(TABLE):
+        if item.get("name") == index_name:
+            return tuple(str(name) for name in item.get("column_names") or ())
+    return None
+
+
 def _online_table_exists() -> bool:
     return TABLE in sa.inspect(op.get_bind()).get_table_names()
 
@@ -94,13 +104,17 @@ def upgrade() -> None:
     # tasks table for the whole build, so PostgreSQL builds it concurrently.
     if is_postgresql:
         validity = _postgres_index_validity()
-        if validity is True:
+        existing_columns = _online_index_columns(INDEX)
+        # A same-name index that is valid but indexes the wrong columns would
+        # otherwise be accepted, letting Alembic stamp the revision without the
+        # lookup index this migration exists to create.
+        if validity is True and existing_columns == (COLUMN,):
             return
         with context.autocommit_block():
             # A failed CREATE INDEX CONCURRENTLY leaves the index present but
             # invalid. IF NOT EXISTS would skip the rebuild and let Alembic
             # stamp the revision with an unusable index, so drop it first.
-            if validity is False:
+            if validity is not None or existing_columns is not None:
                 op.drop_index(
                     INDEX,
                     table_name=TABLE,
@@ -116,8 +130,14 @@ def upgrade() -> None:
             )
         return
 
-    if INDEX not in _online_indexes():
-        op.create_index(INDEX, TABLE, [COLUMN])
+    existing_columns = _online_index_columns(INDEX)
+    if existing_columns == (COLUMN,):
+        return
+    if existing_columns is not None:
+        # Drifted same-name index: rebuild it rather than stamping the revision
+        # with an index that does not serve the ownership lookup.
+        op.drop_index(INDEX, table_name=TABLE)
+    op.create_index(INDEX, TABLE, [COLUMN])
 
 
 def downgrade() -> None:

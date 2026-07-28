@@ -1,10 +1,12 @@
 import asyncio
+import errno
 import hashlib
 import html
 import json
 import logging
 import mimetypes
 import os
+from datetime import timezone
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -85,6 +87,15 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Directory fsync is genuinely unavailable on some platforms and filesystems
+# (notably Windows, and a few network mounts). Every other OSError is a real
+# durability failure and must not be reported as a successful save.
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
+    if hasattr(errno, name)
+)
 
 
 class TelegramVoiceTranscriptionError(RuntimeError):
@@ -197,10 +208,13 @@ class TelegramBotInstance:
             os.replace(tmp_path, self.active_tasks_file)
             # Fsyncing the temp file does not commit the renamed directory
             # entry, so a host crash could still lose a selection reported as
-            # durable. Directory fsync is unsupported on some platforms.
+            # durable. Only a genuinely unsupported operation is tolerated:
+            # any other error leaves the save dirty so it is retried.
             try:
                 dir_fd = os.open(str(self.active_tasks_file.parent), os.O_RDONLY)
-            except OSError:
+            except OSError as e:
+                if e.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                    raise
                 logger.debug(
                     "Directory fsync unsupported for Telegram active tasks %s",
                     self.active_tasks_file.parent,
@@ -209,6 +223,14 @@ class TelegramBotInstance:
             else:
                 try:
                     os.fsync(dir_fd)
+                except OSError as e:
+                    if e.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS:
+                        raise
+                    logger.debug(
+                        "Directory fsync unsupported for Telegram active tasks %s",
+                        self.active_tasks_file.parent,
+                        exc_info=True,
+                    )
                 finally:
                     os.close(dir_fd)
             self._active_tasks_unsaved = False
@@ -417,9 +439,26 @@ class TelegramBotInstance:
             "/new — start a new task\n"
             "/list — list your previous tasks\n"
             "/switch &lt;task_id&gt; — switch to a task shown by /list\n"
+            "/agents — choose which agent replies\n"
             "/stop — stop the current run\n"
             "/help — show this help"
         )
+
+    @staticmethod
+    def _format_task_timestamp(timestamp: Any) -> str:
+        """Render a task timestamp as UTC wall time.
+
+        Columns are DateTime(timezone=True), but SQLite returns naive values
+        that this project stores in UTC, while PostgreSQL returns aware values
+        in the session timezone. Aware values are converted so the "UTC" label
+        is never attached to local wall time.
+        """
+
+        if timestamp is None:
+            return "unknown"
+        if getattr(timestamp, "tzinfo", None) is not None:
+            timestamp = timestamp.astimezone(timezone.utc)
+        return timestamp.strftime("%Y-%m-%d %H:%M")
 
     @staticmethod
     def _task_list_line(
@@ -429,8 +468,9 @@ class TelegramBotInstance:
     ) -> str:
         raw_title = " ".join((task.title or "Untitled Task").split())
         title = html.escape(raw_title[:80] + ("…" if len(raw_title) > 80 else ""))
-        timestamp = task.updated_at or task.created_at
-        date_text = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "unknown"
+        date_text = TelegramBotInstance._format_task_timestamp(
+            task.updated_at or task.created_at
+        )
         marker = "● " if is_active else ""
         return (
             f"{marker}<code>{task.task_id}</code> · {title}\n"
@@ -819,7 +859,9 @@ class TelegramBotInstance:
         payload = (callback.data or "").removeprefix("agsel:")
         try:
             if payload == "default":
-                self._set_selected_agent(user_id, None)
+                # Reset first: applying the selection before the reset is
+                # durable would leave it active after a reported failure, so
+                # the next message would start a fresh task with it anyway.
                 _, persisted = self._start_new_conversation(user_id)
                 if not persisted:
                     await callback.answer(
@@ -827,6 +869,7 @@ class TelegramBotInstance:
                         show_alert=True,
                     )
                     return
+                self._set_selected_agent(user_id, None)
                 await callback.answer("Default assistant selected")
                 confirmation = (
                     "Default assistant selected. "
@@ -843,7 +886,6 @@ class TelegramBotInstance:
                         "That agent is no longer available.", show_alert=True
                     )
                     return
-                self._set_selected_agent(user_id, agent.agent_id)
                 _, persisted = self._start_new_conversation(user_id)
                 if not persisted:
                     await callback.answer(
@@ -851,6 +893,7 @@ class TelegramBotInstance:
                         show_alert=True,
                     )
                     return
+                self._set_selected_agent(user_id, agent.agent_id)
                 # answerCallbackQuery rejects texts over 200 characters
                 toast = f"{agent.name} selected"
                 if len(toast) > 200:
@@ -1471,6 +1514,25 @@ class TelegramBotInstance:
                 "<i>I'll update this message as I make progress.</i>",
                 parse_mode=ParseMode.HTML,
             )
+
+            # That send is awaited too, and no trace handler exists yet to
+            # cancel, so a stop landing during it would only be consumed after
+            # the stale message was already delivered. Remove it on stopping.
+            if self._consume_user_stop_request(user_id):
+                try:
+                    await loading_msg.delete()
+                except Exception:
+                    logger.debug(
+                        "Failed to remove the Telegram loading message for "
+                        "stopped task %s",
+                        task_id,
+                        exc_info=True,
+                    )
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
 
             tg_handler = TelegramTraceHandler(
                 task_id,

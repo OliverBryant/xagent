@@ -1,5 +1,6 @@
+import errno
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -752,7 +753,9 @@ def test_save_active_tasks_survives_unsupported_directory_fsync(
 
     def fake_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
         if str(path) == str(tmp_path):
-            raise OSError("directory fsync unsupported")
+            # Only an errno that means "unsupported" may be tolerated; a bare
+            # OSError is indistinguishable from a real durability failure.
+            raise OSError(errno.ENOTSUP, "directory fsync unsupported")
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", fake_open)
@@ -786,3 +789,101 @@ async def test_trace_handler_skips_text_fallback_after_cancellation() -> None:
     await handler._update_message("hello")
 
     assert sent == []
+
+
+def test_agent_selection_is_applied_only_after_a_durable_reset() -> None:
+    """A failed reset must not leave the new agent selected: the next message
+    would otherwise start a fresh task with an agent the user was told failed."""
+
+    import asyncio
+
+    bot = _bot(1)
+    bot.active_tasks[101] = 7
+    bot.selected_agents = {101: 3}
+    bot.user_conversation_generations = {}
+    saved_agents: list[dict] = []
+    bot._save_selected_agents = lambda: saved_agents.append(dict(bot.selected_agents))
+    bot._save_active_tasks = lambda: False
+
+    class _Callback:
+        def __init__(self) -> None:
+            self.from_user = SimpleNamespace(id=101)
+            self.data = "agsel:default"
+            self.message = None
+            self.answers: list[tuple[tuple, dict]] = []
+
+        async def answer(self, *args: object, **kwargs: object) -> None:
+            self.answers.append((args, kwargs))
+
+    callback = _Callback()
+    asyncio.run(bot._handle_agent_selection_callback(callback))  # type: ignore[arg-type]
+
+    assert bot.selected_agents == {101: 3}
+    assert saved_agents == []
+    assert bot.active_tasks[101] == 7
+    assert "couldn't save" in callback.answers[-1][0][0]
+
+
+def test_format_task_timestamp_normalizes_aware_values_to_utc() -> None:
+    from datetime import timedelta
+
+    naive = datetime(2026, 7, 28, 10, 30)
+    aware_utc = datetime(2026, 7, 28, 10, 30, tzinfo=UTC)
+    aware_offset = datetime(2026, 7, 28, 18, 30, tzinfo=timezone(timedelta(hours=8)))
+
+    fmt = TelegramBotInstance._format_task_timestamp
+    # Naive values are the project's SQLite UTC convention; aware values from
+    # PostgreSQL may arrive in a non-UTC session timezone.
+    assert fmt(naive) == "2026-07-28 10:30"
+    assert fmt(aware_utc) == "2026-07-28 10:30"
+    assert fmt(aware_offset) == "2026-07-28 10:30"
+    assert fmt(None) == "unknown"
+
+
+def test_help_text_lists_every_registered_command() -> None:
+    help_text = TelegramBotInstance._help_text()
+    registered = {command.command for command in TelegramBotInstance.bot_commands}
+
+    for name in registered:
+        assert f"/{name}" in help_text, name
+
+
+def test_save_active_tasks_reports_failure_for_real_directory_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a genuinely unsupported fsync is tolerated. A permission or I/O
+    error must leave the save dirty rather than claiming durability."""
+
+    import errno
+    import os as os_module
+
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._active_tasks_unsaved = False
+    del bot._save_active_tasks
+    bot.active_tasks = {101: 7}
+
+    real_open = os_module.open
+
+    def fake_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(tmp_path):
+            raise OSError(errno.EACCES, "permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os_module, "open", fake_open)
+
+    assert TelegramBotInstance._save_active_tasks(bot) is False
+    assert bot._active_tasks_unsaved is True
+
+    # An unsupported operation still counts as a successful save.
+    def unsupported_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(tmp_path):
+            raise OSError(errno.EINVAL, "not supported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os_module, "open", unsupported_open)
+
+    assert TelegramBotInstance._save_active_tasks(bot) is True
+    assert bot._active_tasks_unsaved is False

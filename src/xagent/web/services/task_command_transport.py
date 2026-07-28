@@ -56,6 +56,16 @@ class TaskCommandKind(str, enum.Enum):
     CANCEL = "cancel"
 
 
+class TaskCommandTaskMissing(ValueError):
+    """The target task no longer exists.
+
+    Raised when the row is absent, including when a concurrent delete lands
+    between the existence check and the insert. Callers that tolerate a missing
+    task treat this as the missing-task sentinel rather than a rejection, so a
+    deleted task can be replaced instead of losing the message.
+    """
+
+
 class TaskCommandDeferred(RuntimeError):
     """The command is durable but its downstream handoff is still pending."""
 
@@ -171,10 +181,10 @@ def enqueue_task_command(
     # This id query bypasses the identity map, so it observes a concurrent
     # delete that a cached snapshot would not.
     if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
-        raise ValueError(f"Task {task_id} not found")
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
     task = db.query(Task).filter(Task.id == resolved_task_id).first()
     if task is None:
-        raise ValueError(f"Task {task_id} not found")
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
     existing = (
         db.query(TaskExecutionCommand)
@@ -234,7 +244,7 @@ def enqueue_task_command(
             # idempotency race. The task row was deleted concurrently and the
             # insert violated the foreign key. Surface it as a missing task so
             # callers reach their recovery path instead of NoResultFound.
-            raise ValueError(f"Task {task_id} not found") from None
+            raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,

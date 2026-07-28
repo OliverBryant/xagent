@@ -1,126 +1,143 @@
-"""Metering must survive the production call path, not just the adapter API.
+"""Rerank metering must survive the production search path.
 
-Two modalities previously shipped completely unbilled while their unit tests
-passed, because those tests called the metered method directly and production
-reached the provider another way:
+Rerank previously shipped completely unbilled: the search pipeline unwrapped
+the adapter to reach the raw provider's ``compress_with_scores``, which had no
+metering. A unit test that calls the adapter directly cannot catch that — it
+passes whether or not the orchestration bypasses the adapter.
 
-* rerank — the search pipeline unwrapped the adapter to reach the raw provider
-* embedding — bulk ingestion crossed a ThreadPoolExecutor boundary, which does
-  not propagate the contextvar the usage accumulator lives in
-
-These tests assert at the seam that actually broke, so a regression that
-reintroduces either escape hatch fails here.
+So this drives ``_try_unified_rerank``, the function that actually chooses and
+calls the rerank object. Re-introducing the unwrap there makes these fail.
 """
 
-import concurrent.futures
+from typing import Optional
 from unittest.mock import MagicMock
+
+import pytest
 
 from xagent.core.model.chat.token_context import (
     TokenContextManager,
     aggregate_media_usage_by_model,
-    get_token_usage,
-    set_token_usage,
 )
 from xagent.core.model.model import RerankModelConfig
 from xagent.core.model.rerank.adapter import RerankModelAdapter
 from xagent.core.model.rerank.base import BaseRerank
+from xagent.core.tools.core.RAG_tools.core.schemas import SearchConfig, SearchResult
+from xagent.core.tools.core.RAG_tools.pipelines import document_search
 
 
-def _adapter() -> RerankModelAdapter:
+def _metered_adapter() -> RerankModelAdapter:
+    """The real adapter (which meters) wrapping a faked provider."""
     adapter = RerankModelAdapter.__new__(RerankModelAdapter)
     adapter.model_config = RerankModelConfig(
         id="rr-1", model_name="rerank-v1", api_key="k"
     )
     adapter._rerank_model = MagicMock()
-    adapter._rerank_model.compress.return_value = ["a"]
-    adapter._rerank_model.compress_with_scores.return_value = [("a", 0.9)]
+    adapter._rerank_model.compress.return_value = ["doc-b", "doc-a"]
+    adapter._rerank_model.compress_with_scores.return_value = [
+        ("doc-b", 0.9),
+        ("doc-a", 0.4),
+    ]
     return adapter
 
 
-def test_compress_with_scores_is_reachable_through_the_base_class() -> None:
-    """The search pipeline needs scores; if it can only get them from the raw
-    provider it will keep unwrapping the adapter and skipping metering."""
-    assert hasattr(BaseRerank, "compress_with_scores")
+def _cfg() -> SearchConfig:
+    return SearchConfig(embedding_model_id="emb-1", rerank_model_id="rr-1")
 
 
-def test_scored_rerank_through_adapter_is_metered() -> None:
-    # compress_with_scores is the method the RAG search pipeline calls.
-    adapter = _adapter()
+def _results() -> list[SearchResult]:
+    return [
+        SearchResult(
+            doc_id="d1",
+            chunk_id=f"c{i}",
+            text=text,
+            score=0.5,
+            parse_hash="h",
+            model_tag="emb-1",
+        )
+        for i, text in enumerate(["doc-a", "doc-b"])
+    ]
+
+
+@pytest.fixture
+def patched_resolver(monkeypatch: pytest.MonkeyPatch):
+    """Point the pipeline's resolver at our metered adapter."""
+
+    adapter = _metered_adapter()
+
+    def _resolve(_cfg: Optional[SearchConfig] = None):
+        return adapter
+
+    monkeypatch.setattr(document_search, "_resolve_unified_rerank", _resolve)
+    return adapter
+
+
+def test_search_pipeline_rerank_is_metered(patched_resolver) -> None:
+    """The production rerank entry point must record usage.
+
+    Fails if _try_unified_rerank reaches past the adapter to the raw provider,
+    which is the exact bug this guards.
+    """
+    warnings: list[str] = []
     with TokenContextManager() as manager:
-        adapter.compress_with_scores(["a", "b"], "q")
-        groups = aggregate_media_usage_by_model(manager.get_usage().details)
+        outcome = document_search._try_unified_rerank(
+            _results(), "query", _cfg(), warnings
+        )
+        details = manager.get_usage().details
 
-    assert len(groups) == 1
-    assert groups[0]["call_type"] == "rerank"
+    assert outcome is not None, "rerank did not run; test is not exercising the path"
+    groups = [
+        g for g in aggregate_media_usage_by_model(details) if g["call_type"] == "rerank"
+    ]
+    assert groups, (
+        "rerank ran but recorded no usage — the search pipeline is reaching "
+        "past the metered adapter"
+    )
     assert groups[0]["unit"] == "requests"
     assert groups[0]["quantity"] == 1.0
     assert groups[0]["model_name"] == "rerank-v1"
     assert groups[0]["model_id"] == "rr-1"
 
 
-def test_search_pipeline_does_not_unwrap_the_rerank_adapter() -> None:
-    """Regression guard for the exact bypass: resolving must hand back the
-    adapter (which meters), never its inner provider (which does not)."""
-    from xagent.core.tools.core.RAG_tools.pipelines import document_search
-
-    adapter = _adapter()
-    assert document_search._supports_rerank(adapter)
-    # The resolver's contract is "return something that can score" — the
-    # adapter qualifies, so there is no reason left to reach past it.
-    assert adapter.compress_with_scores(["a"], "q") == [("a", 0.9)]
-
-
-def test_embedding_usage_survives_a_thread_pool_boundary() -> None:
-    """Bulk ingestion encodes batches in a ThreadPoolExecutor. Usage recorded
-    in those workers must land on the caller's TokenUsage, not a per-thread
-    instance that is discarded when the worker returns."""
-    from xagent.core.model.embedding.adapter import EmbeddingModelAdapter
-    from xagent.core.model.model import EmbeddingModelConfig
-
-    adapter = EmbeddingModelAdapter.__new__(EmbeddingModelAdapter)
-    adapter.model_config = EmbeddingModelConfig(
-        id="e-1", model_name="text-embed", api_key="k"
-    )
-    adapter._embedding_model = MagicMock()
-    adapter._embedding_model.encode.return_value = [[0.1]]
-
-    batches = [["chunk-a"], ["chunk-b"], ["chunk-c"], ["chunk-d"]]
-
+def test_rerank_usage_is_recorded_once_per_search(patched_resolver) -> None:
+    """Two searches bill two rerank calls — guards against both double-counting
+    and a silently skipped record."""
+    cfg = _cfg()
     with TokenContextManager() as manager:
-        caller_usage = get_token_usage()
+        document_search._try_unified_rerank(_results(), "q1", cfg, [])
+        document_search._try_unified_rerank(_results(), "q2", cfg, [])
+        details = manager.get_usage().details
 
-        def encode_in_context(batch: list[str]) -> None:
-            # Mirrors the pipeline: bind the caller's usage inside the worker.
-            set_token_usage(caller_usage)
-            adapter.encode(batch)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            list(pool.map(encode_in_context, batches))
-
-        groups = aggregate_media_usage_by_model(manager.get_usage().details)
-
+    groups = [
+        g for g in aggregate_media_usage_by_model(details) if g["call_type"] == "rerank"
+    ]
     assert len(groups) == 1
-    assert groups[0]["call_type"] == "embedding"
-    assert groups[0]["unit"] == "texts"
-    # One text per batch, all four batches accounted for.
-    assert groups[0]["calls"] == len(batches)
-    assert groups[0]["quantity"] == float(len(batches))
+    assert groups[0]["calls"] == 2
+    assert groups[0]["quantity"] == 2.0
 
 
-def test_bare_thread_pool_would_lose_usage() -> None:
-    """Documents *why* the binding above is required: without it the same code
-    records nothing, which is how bulk embedding shipped unbilled."""
-    from xagent.core.model.embedding.adapter import EmbeddingModelAdapter
-    from xagent.core.model.model import EmbeddingModelConfig
+def test_scored_rerank_is_reachable_without_unwrapping() -> None:
+    """`compress_with_scores` on the base is what lets the pipeline get scores
+    without bypassing the adapter. If it moved back to the providers only, the
+    unwrap would return."""
+    assert callable(getattr(BaseRerank, "compress_with_scores", None))
+    adapter = _metered_adapter()
+    assert adapter.compress_with_scores(["doc-a"], "q") == [
+        ("doc-b", 0.9),
+        ("doc-a", 0.4),
+    ]
 
-    adapter = EmbeddingModelAdapter.__new__(EmbeddingModelAdapter)
-    adapter.model_config = EmbeddingModelConfig(
-        id="e-1", model_name="text-embed", api_key="k"
+
+def test_resolver_returns_the_adapter_not_the_inner_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolver must hand back the metered adapter itself."""
+    adapter = _metered_adapter()
+    monkeypatch.setattr(
+        document_search,
+        "resolve_rerank_adapter",
+        lambda **_: (None, adapter),
     )
-    adapter._embedding_model = MagicMock()
-    adapter._embedding_model.encode.return_value = [[0.1]]
 
-    with TokenContextManager() as manager:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            list(pool.map(lambda b: adapter.encode(b), [["x"], ["y"]]))
-        assert manager.get_usage().details == []
+    resolved = document_search._resolve_unified_rerank(_cfg())
+    assert resolved is adapter
+    assert resolved is not adapter._rerank_model

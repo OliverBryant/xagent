@@ -63,6 +63,26 @@ def _supports_rerank(candidate: Any) -> bool:
     )
 
 
+def _rerank_display_name(rerank_model: Any) -> str:
+    """Provider name for user-visible warnings.
+
+    ``type(...).__name__`` used to name the provider, but the resolver now
+    returns a retry-wrapped adapter, so it would surface an implementation
+    detail like "GenericRetryWrapper" into agent-visible text. Prefer the
+    configured model name, then the inner provider's class.
+    """
+    if rerank_model is None:
+        return "Unified"
+    config = getattr(rerank_model, "model_config", None)
+    model_name = getattr(config, "model_name", None)
+    if isinstance(model_name, str) and model_name.strip():
+        return model_name
+    inner = getattr(rerank_model, "_rerank_model", None)
+    if inner is not None:
+        return type(inner).__name__
+    return type(rerank_model).__name__
+
+
 def _resolve_unified_rerank(
     cfg: Optional[SearchConfig] = None,
 ) -> Optional[BaseRerank]:
@@ -139,7 +159,7 @@ def _try_unified_rerank(
         ordered_results = _map_reranked_pairs_to_results(reranked_pairs, results)
 
         if not ordered_results:
-            provider_name = type(rerank_model).__name__
+            provider_name = _rerank_display_name(rerank_model)
             warnings.append(
                 f"{provider_name} rerank returned no recognizable documents; "
                 "falling back to RRF."
@@ -159,7 +179,7 @@ def _try_unified_rerank(
         ValueError,
         TypeError,
     ) as exc:
-        provider_name = type(rerank_model).__name__
+        provider_name = _rerank_display_name(rerank_model)
         logger.warning("%s rerank failed: %s, falling back to RRF", provider_name, exc)
         warnings.append(f"{provider_name} rerank failed: {exc}, using RRF fallback")
         return None
@@ -506,7 +526,7 @@ def _apply_rerank_if_needed(
     unified_result = _try_unified_rerank(results, query_text, cfg, warnings)
     if unified_result:
         rerank_model = _resolve_unified_rerank(cfg)
-        provider_name = type(rerank_model).__name__ if rerank_model else "Unified"
+        provider_name = _rerank_display_name(rerank_model)
         logger.info("Successfully applied %s rerank", provider_name)
         return unified_result
 

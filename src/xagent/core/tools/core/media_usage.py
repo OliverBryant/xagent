@@ -57,13 +57,20 @@ def resolve_billing_model(
     the configured id, fall back to the provider's own ``model_name``/``model``
     attribute, and only then to ``fallback``.
     """
-    if isinstance(configured_id, str) and configured_id.strip():
-        return configured_id
+
+    def _usable(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and value.strip().lower() not in _PLACEHOLDER_MODEL_NAMES
+        )
+
+    # The placeholder filter applies to the configured id too: a config that
+    # literally names the model "default" or "none" must not be billed as one.
+    if _usable(configured_id):
+        return configured_id  # type: ignore[return-value]
     for attr in ("model_name", "model"):
         value = getattr(model, attr, None)
-        if isinstance(value, str) and value.strip().lower() not in (
-            _PLACEHOLDER_MODEL_NAMES
-        ):
+        if _usable(value):
             return value
     return fallback
 

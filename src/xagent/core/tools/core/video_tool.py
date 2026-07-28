@@ -726,8 +726,17 @@ The generated video URL is temporary on the provider side, so completed videos a
             # Video is duration-billed, so always meter in seconds — never
             # switch units when the provider omits a duration (async tasks
             # started with wait_for_result=False have none yet).
+            #
+            # The provider reports one duration but generates n videos and
+            # bills for all of them, so the billable total is duration * n.
+            # Ark rejects n>1; Xinference does not, and previously only the
+            # first video's duration was recorded.
+            per_video_seconds = coerce_duration(result.get("duration"))
+            billable_count = max(1, int(n or 1))
             record_media_seconds(
-                coerce_duration(result.get("duration")),
+                per_video_seconds * billable_count
+                if per_video_seconds is not None
+                else None,
                 model=str(actual_model_id),
                 call_type=MediaCallType.VIDEO,
             )

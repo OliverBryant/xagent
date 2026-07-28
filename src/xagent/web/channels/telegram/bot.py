@@ -717,8 +717,11 @@ class TelegramBotInstance:
         voice_file_ids: list[str],
         uploaded_info: list[dict[str, Any]],
         asr_model: Any,
+        *,
+        owner_user_id: Optional[int] = None,
     ) -> dict[str, str]:
         from ....core.model.asr.usage import record_asr_usage
+        from ...tracking.standalone_usage import usage_scope
 
         uploaded_by_source_id = {
             str(info.get("telegram_file_id")): info
@@ -727,48 +730,52 @@ class TelegramBotInstance:
         }
         transcripts: dict[str, str] = {}
 
-        for voice_file_id in voice_file_ids:
-            file_info = uploaded_by_source_id.get(voice_file_id)
-            if file_info is None:
-                raise TelegramVoiceTranscriptionError(
-                    "Telegram voice input was not downloaded"
-                )
+        # One scope around the whole batch: transcription happens before the
+        # task's TaskTracker starts, so without binding a context here the
+        # recorded usage lands in a throwaway object and voice input is free.
+        with usage_scope(owner_user_id):
+            for voice_file_id in voice_file_ids:
+                file_info = uploaded_by_source_id.get(voice_file_id)
+                if file_info is None:
+                    raise TelegramVoiceTranscriptionError(
+                        "Telegram voice input was not downloaded"
+                    )
 
-            try:
-                result = await asyncio.wait_for(
-                    asr_model.transcribe(
-                        audio=str(file_info["path"]),
-                        format=self._audio_format_from_file_info(file_info),
-                    ),
-                    timeout=self.voice_transcription_timeout_seconds,
-                )
-                # Telegram calls the ASR provider directly rather than going
-                # through audio_tool, so meter here or voice input is free.
-                record_asr_usage(
-                    result,
-                    model_name=str(getattr(asr_model, "model", "") or ""),
-                )
-            except asyncio.TimeoutError as exc:
-                raise TelegramVoiceTranscriptionError(
-                    "Telegram voice transcription timed out"
-                ) from exc
-            except Exception as exc:
-                logger.error(
-                    "Failed to transcribe Telegram voice input %s: %s",
-                    voice_file_id,
-                    exc,
-                )
-                raise TelegramVoiceTranscriptionError(
-                    "Telegram voice transcription failed"
-                ) from exc
+                try:
+                    result = await asyncio.wait_for(
+                        asr_model.transcribe(
+                            audio=str(file_info["path"]),
+                            format=self._audio_format_from_file_info(file_info),
+                        ),
+                        timeout=self.voice_transcription_timeout_seconds,
+                    )
+                    # Telegram calls the ASR provider directly rather than
+                    # going through audio_tool, so meter here too.
+                    record_asr_usage(
+                        result,
+                        model_name=str(getattr(asr_model, "model", "") or ""),
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TelegramVoiceTranscriptionError(
+                        "Telegram voice transcription timed out"
+                    ) from exc
+                except Exception as exc:
+                    logger.error(
+                        "Failed to transcribe Telegram voice input %s: %s",
+                        voice_file_id,
+                        exc,
+                    )
+                    raise TelegramVoiceTranscriptionError(
+                        "Telegram voice transcription failed"
+                    ) from exc
 
-            raw_text = getattr(result, "text", result)
-            transcript = str(raw_text).strip()
-            if not transcript:
-                raise TelegramVoiceTranscriptionError(
-                    "Telegram voice transcription returned empty text"
-                )
-            transcripts[voice_file_id] = transcript
+                raw_text = getattr(result, "text", result)
+                transcript = str(raw_text).strip()
+                if not transcript:
+                    raise TelegramVoiceTranscriptionError(
+                        "Telegram voice transcription returned empty text"
+                    )
+                transcripts[voice_file_id] = transcript
 
         return transcripts
 
@@ -1069,6 +1076,7 @@ class TelegramBotInstance:
                             voice_file_ids,
                             uploaded_info,
                             voice_asr_model,
+                            owner_user_id=owner_user_id,
                         )
                         await self._close_voice_asr_model(voice_asr_model)
                         voice_asr_model = None

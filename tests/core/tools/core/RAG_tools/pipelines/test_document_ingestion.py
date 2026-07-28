@@ -1353,3 +1353,80 @@ def test_batch_embedding_retries_transient_failure(
 
     assert result.status == "success"
     assert calls["n"] == 2  # first attempt raised, retry succeeded
+
+
+def test_batch_embedding_usage_reaches_the_callers_token_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage recorded inside the encode thread pool must reach the caller.
+
+    Drives the real ingestion pipeline with the real (metered)
+    EmbeddingModelAdapter, so this fails if the ``set_token_usage(caller_usage)``
+    binding in ``_encode_batch_in_context`` is removed: ThreadPoolExecutor does
+    not propagate contextvars, so each worker would otherwise record into a
+    fresh TokenUsage that is discarded when the worker returns.
+    """
+    from xagent.core.model.chat.token_context import (
+        TokenContextManager,
+        aggregate_media_usage_by_model,
+    )
+    from xagent.core.model.embedding.adapter import EmbeddingModelAdapter
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    chunks = _make_chunks(6)  # batch_size=2 => 3 batches
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=6, pending_count=6
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    # The real adapter is what records usage; only its inner provider is faked.
+    adapter = EmbeddingModelAdapter.__new__(EmbeddingModelAdapter)
+    adapter.model_config = config
+    adapter._embedding_model = _StubEmbeddingAdapter()
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (config, adapter),
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "write_vectors_to_db",
+        lambda **kwargs: EmbeddingWriteResponse(
+            upsert_count=len(kwargs.get("embeddings", [])),
+            deleted_stale_count=0,
+            index_status="skipped",
+        ).model_dump(),
+    )
+
+    with TokenContextManager() as manager:
+        result = document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.md",
+            config=IngestionConfig(
+                embedding_use_async=False,
+                embedding_batch_size=2,
+                embedding_concurrent=3,
+            ),
+        )
+        details = manager.get_usage().details
+
+    assert result.status == "success"
+    groups = [
+        g
+        for g in aggregate_media_usage_by_model(details)
+        if g["call_type"] == "embedding"
+    ]
+    assert groups, (
+        "no embedding usage reached the caller's TokenUsage — the thread-pool "
+        "context binding in _encode_batch_in_context is broken"
+    )
+    assert sum(g["quantity"] for g in groups) == 6.0  # 6 texts across 3 batches

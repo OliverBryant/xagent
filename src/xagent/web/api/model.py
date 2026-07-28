@@ -982,6 +982,8 @@ async def transcribe_speech_input(
     from xagent.core.model.asr.adapter import get_asr_model_instance
     from xagent.core.model.asr.usage import record_asr_usage
 
+    from ..tracking.standalone_usage import usage_scope
+
     try:
         audio_bytes = await _read_transcribe_upload_with_size_limit(file)
     finally:
@@ -992,21 +994,24 @@ async def transcribe_speech_input(
     db_model = _resolve_asr_model_for_transcription(db, user, model_id)
     asr_model = get_asr_model_instance(db_model)
     try:
-        result = await asyncio.wait_for(
-            asr_model.transcribe(
-                audio_bytes,
-                language=language,
-                format=_format_from_upload(file),
-            ),
-            timeout=180.0,
-        )
-        # Metered here as well as in audio_tool: this endpoint calls the ASR
-        # provider directly, so without this the transcription is never billed.
-        record_asr_usage(
-            result,
-            model_name=str(db_model.model_name),
-            model_id=str(db_model.model_id or ""),
-        )
+        # usage_scope binds a TokenUsage and reports it to the quota hook on
+        # exit. Recording alone is not enough here: this endpoint has no
+        # TaskTracker, so without a bound context the usage would land in a
+        # throwaway object and the transcription would bill nothing.
+        with usage_scope(int(user.id) if user and user.id is not None else None):
+            result = await asyncio.wait_for(
+                asr_model.transcribe(
+                    audio_bytes,
+                    language=language,
+                    format=_format_from_upload(file),
+                ),
+                timeout=180.0,
+            )
+            record_asr_usage(
+                result,
+                model_name=str(db_model.model_name),
+                model_id=str(db_model.model_id or ""),
+            )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:

@@ -53,7 +53,10 @@ def create_rerank_adapter(model_config: RerankModelConfig) -> BaseRerank:
     return create_retry_wrapper(
         RerankModelAdapter(model_config),
         BaseRerank,  # type: ignore[type-abstract]
-        retry_methods={"compress"},
+        # Both entry points must retry: production RAG search calls
+        # compress_with_scores, so listing only compress silently left the
+        # real path with no retry at all.
+        retry_methods={"compress", "compress_with_scores"},
         max_retries=model_config.max_retries,
         retry_on=retry_on,
     )

@@ -36,8 +36,17 @@ class BaseRerank(ABC):
         search pipeline previously recorded no rerank usage at all.
 
         Returns ``(text, relevance_score)`` tuples ordered by descending
-        relevance. The default pairs :meth:`compress` output with a neutral
-        score so implementations without native scores still satisfy the
-        interface.
+        relevance. The default derives descending pseudo-scores from
+        :meth:`compress`'s ordering rather than returning all-zero scores: a
+        caller that writes these into a result's ``score`` field would
+        otherwise silently flatten every result to 0.0 while reporting that
+        reranking succeeded. Ordering is still authoritative; the magnitudes
+        are synthetic, so providers with real relevance scores should override
+        this.
         """
-        return [(text, 0.0) for text in self.compress(documents, query)]
+        ordered = list(self.compress(documents, query))
+        if not ordered:
+            return []
+        # Evenly spaced in (0, 1], preserving the provider's ordering.
+        step = 1.0 / len(ordered)
+        return [(text, 1.0 - index * step) for index, text in enumerate(ordered)]

@@ -79,8 +79,10 @@ from ...services.task_lease_service import TaskLeaseLostError
 from ...services.task_setup_snapshot import load_task_setup_snapshot_sync
 from .handler import TelegramTraceHandler
 from .utils import (
+    CancelledDelivery,
     TelegramFileRef,
     TelegramImageRef,
+    deliver_cancellation_safe,
     markdown_to_tg_html,
     strip_telegram_file_refs,
     strip_telegram_image_refs,
@@ -101,6 +103,12 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
     for name in ("EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
     if hasattr(errno, name)
 )
+
+
+def _never_cancelled() -> bool:
+    """Default latch for callers that do not track cancellation."""
+
+    return False
 
 
 class TelegramVoiceTranscriptionError(RuntimeError):
@@ -1694,62 +1702,105 @@ class TelegramBotInstance:
                 output[i : i + max_len] for i in range(0, len(output), max_len)
             ]
 
+            # Every send below is an awaited round trip, so a cancellation can
+            # land mid-flight. deliver_cancellation_safe() re-checks afterwards
+            # and removes a late success, raising CancelledDelivery so the rest
+            # of the output sequence is abandoned.
+            async def delete_loading(_result: Any) -> None:
+                await loading_msg.delete()
+
+            async def delete_answer(msg: Any) -> None:
+                await msg.delete()
+
             try:
-                html_chunk0 = markdown_to_tg_html(text_chunks[0])
-                await loading_msg.edit_text(html_chunk0, parse_mode=ParseMode.HTML)
-            except Exception as e:
-                if "message is not modified" not in str(e).lower():
-                    # The HTML edit was awaited, so a cancellation may have
-                    # landed while it was in flight.
-                    if is_cancelled():
-                        return
-                    try:
-                        await loading_msg.edit_text(text_chunks[0])
-                    except Exception as e2:
-                        if "message is not modified" not in str(e2).lower():
-                            logger.warning(f"Failed to edit message: {e2}")
-
-            for chunk in text_chunks[1:]:
-                if is_cancelled():
-                    return
                 try:
-                    html_chunk = markdown_to_tg_html(chunk)
-                    await last_message.answer(html_chunk, parse_mode=ParseMode.HTML)
-                except Exception:
-                    if is_cancelled():
-                        return
-                    await last_message.answer(chunk)
+                    html_chunk0 = markdown_to_tg_html(text_chunks[0])
+                    await deliver_cancellation_safe(
+                        lambda: loading_msg.edit_text(
+                            html_chunk0, parse_mode=ParseMode.HTML
+                        ),
+                        is_cancelled=is_cancelled,
+                        delete=delete_loading,
+                        description=f"final text for task {task_id}",
+                    )
+                except CancelledDelivery:
+                    return
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower():
+                        try:
+                            await deliver_cancellation_safe(
+                                lambda: loading_msg.edit_text(text_chunks[0]),
+                                is_cancelled=is_cancelled,
+                                delete=delete_loading,
+                                description=f"final text for task {task_id}",
+                            )
+                        except CancelledDelivery:
+                            return
+                        except Exception as e2:
+                            if "message is not modified" not in str(e2).lower():
+                                logger.warning(f"Failed to edit message: {e2}")
 
-            if is_cancelled():
+                for chunk in text_chunks[1:]:
+                    html_chunk = markdown_to_tg_html(chunk)
+                    try:
+                        await deliver_cancellation_safe(
+                            lambda: last_message.answer(
+                                html_chunk, parse_mode=ParseMode.HTML
+                            ),
+                            is_cancelled=is_cancelled,
+                            delete=delete_answer,
+                            description=f"output chunk for task {task_id}",
+                        )
+                    except CancelledDelivery:
+                        return
+                    except Exception:
+                        await deliver_cancellation_safe(
+                            lambda: last_message.answer(chunk),
+                            is_cancelled=is_cancelled,
+                            delete=delete_answer,
+                            description=f"output chunk for task {task_id}",
+                        )
+            except CancelledDelivery:
                 return
-            if image_refs:
-                failed_image_refs = await self._send_output_images(
-                    image_refs=image_refs,
-                    user_id=owner_user_id,
-                    task_id=task_id,
-                    reply_to=last_message,
-                    is_cancelled=is_cancelled,
-                )
-                if failed_image_refs and not is_cancelled():
-                    await self._send_image_fallback_message(
-                        image_refs=failed_image_refs,
+
+            try:
+                if image_refs:
+                    failed_image_refs = await self._send_output_images(
+                        image_refs=image_refs,
+                        user_id=owner_user_id,
+                        task_id=task_id,
                         reply_to=last_message,
+                        is_cancelled=is_cancelled,
                     )
-            if is_cancelled():
+                    if failed_image_refs:
+                        await deliver_cancellation_safe(
+                            lambda: self._send_image_fallback_message(
+                                image_refs=failed_image_refs,
+                                reply_to=last_message,
+                            ),
+                            is_cancelled=is_cancelled,
+                            description=f"image fallback for task {task_id}",
+                        )
+
+                if file_refs:
+                    failed_file_refs = await self._send_output_files(
+                        file_refs=file_refs,
+                        user_id=owner_user_id,
+                        task_id=task_id,
+                        reply_to=last_message,
+                        is_cancelled=is_cancelled,
+                    )
+                    if failed_file_refs:
+                        await deliver_cancellation_safe(
+                            lambda: self._send_file_fallback_message(
+                                file_refs=failed_file_refs,
+                                reply_to=last_message,
+                            ),
+                            is_cancelled=is_cancelled,
+                            description=f"file fallback for task {task_id}",
+                        )
+            except CancelledDelivery:
                 return
-            if file_refs:
-                failed_file_refs = await self._send_output_files(
-                    file_refs=file_refs,
-                    user_id=owner_user_id,
-                    task_id=task_id,
-                    reply_to=last_message,
-                    is_cancelled=is_cancelled,
-                )
-                if failed_file_refs and not is_cancelled():
-                    await self._send_file_fallback_message(
-                        file_refs=failed_file_refs,
-                        reply_to=last_message,
-                    )
         except TaskLeaseLostError:
             logger.warning(
                 "Telegram execution lost task %s lease; skipping stale result",
@@ -1893,9 +1944,19 @@ class TelegramBotInstance:
                 html.escape(image_ref.alt_text[:512]) if image_ref.alt_text else None
             )
             try:
-                await reply_to.answer_photo(
-                    FSInputFile(image_path), caption=caption or None
+                await deliver_cancellation_safe(
+                    lambda: reply_to.answer_photo(
+                        FSInputFile(image_path), caption=caption or None
+                    ),
+                    is_cancelled=is_cancelled or _never_cancelled,
+                    delete=lambda msg: msg.delete(),
+                    description=f"output image {image_ref.file_id}",
                 )
+            except CancelledDelivery:
+                # The late attachment is already removed. Abandon the rest
+                # instead of reporting them as failures, which would emit a
+                # fallback message into the conversation the user left.
+                return []
             except Exception as e:
                 logger.warning(
                     "Failed to send Telegram output image: file_id=%s error=%s",
@@ -2015,9 +2076,19 @@ class TelegramBotInstance:
             caption_source = file_ref.label or str(record_filename or "file")
             caption = html.escape(caption_source[:1024])
             try:
-                await reply_to.answer_document(
-                    FSInputFile(file_path), caption=caption or None
+                await deliver_cancellation_safe(
+                    lambda: reply_to.answer_document(
+                        FSInputFile(file_path), caption=caption or None
+                    ),
+                    is_cancelled=is_cancelled or _never_cancelled,
+                    delete=lambda msg: msg.delete(),
+                    description=f"output file {file_ref.file_id}",
                 )
+            except CancelledDelivery:
+                # The late attachment is already removed. Abandon the rest
+                # instead of reporting them as failures, which would emit a
+                # fallback message into the conversation the user left.
+                return []
             except Exception as e:
                 logger.warning(
                     "Failed to send Telegram output file: file_id=%s error=%s",

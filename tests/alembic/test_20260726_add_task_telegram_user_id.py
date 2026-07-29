@@ -244,8 +244,14 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
         label = (validity, definition)
         assert bool(dropped) is expect_drop, label
         if expect_create:
+            # Every DDL call is schema-qualified, so reflection, the catalog
+            # lookup, and the rebuild always address the same relation.
             assert created == [
-                {"if_not_exists": True, "postgresql_concurrently": True}
+                {
+                    "schema": "public",
+                    "if_not_exists": True,
+                    "postgresql_concurrently": True,
+                }
             ], label
         else:
             assert created == [], label

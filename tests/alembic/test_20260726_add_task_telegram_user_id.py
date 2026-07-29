@@ -217,6 +217,7 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
             with (
                 patch.object(context, "autocommit_block", _NoopAutocommit),
                 patch.object(migration.op, "get_context", return_value=context),
+                patch.object(migration, "_target_schema", return_value="public"),
                 patch.object(migration, "_online_table_exists", return_value=True),
                 patch.object(migration, "_online_columns", return_value={COLUMN}),
                 patch.object(
@@ -289,3 +290,22 @@ def test_sqlite_online_upgrade_rebuilds_semantically_wrong_indexes(
         assert not any(
             key.endswith("_where") for key in (rebuilt.get("dialect_options") or {})
         )
+
+
+def test_target_schema_resolves_the_visible_tasks_relation() -> None:
+    """version_table_schema names only the Alembic version table and
+    current_schema() is merely the first search_path entry, so neither
+    identifies the relation the unqualified DDL resolves to."""
+
+    migration = _migration_module()
+    sql = str(migration.POSTGRES_VISIBLE_TABLE_SCHEMA_SQL)
+
+    assert "to_regclass" in sql
+    assert "pg_catalog.pg_namespace" in sql
+
+    # Non-PostgreSQL falls back to version_table_schema, and None keeps every
+    # operation on plain unqualified behaviour.
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            assert migration._target_schema() is None

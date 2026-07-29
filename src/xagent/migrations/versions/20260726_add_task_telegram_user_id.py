@@ -38,16 +38,39 @@ POSTGRES_INDEX_VALIDITY_SQL = sa.text(
 )
 
 
-def _target_schema() -> str:
-    """The schema the migration operates on, resolved once per call."""
+# The schema of the *visible* tasks relation. version_table_schema names only
+# the Alembic version table, and current_schema() is merely the first entry on
+# search_path, so neither identifies the relation an unqualified reference
+# actually resolves to. Ask PostgreSQL which one it resolves.
+POSTGRES_VISIBLE_TABLE_SCHEMA_SQL = sa.text(
+    """
+    SELECT ns.nspname
+    FROM pg_catalog.pg_class AS cls
+    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = cls.relnamespace
+    WHERE cls.oid = pg_catalog.to_regclass(:table_name)
+    """
+)
 
+
+def _target_schema() -> str | None:
+    """The schema holding the tasks relation this migration operates on.
+
+    Returns None when it cannot be resolved, so callers fall back to plain
+    unqualified behaviour instead of addressing a guessed schema.
+    """
+
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        resolved = bind.execute(
+            POSTGRES_VISIBLE_TABLE_SCHEMA_SQL, {"table_name": TABLE}
+        ).scalar()
+        if resolved:
+            return str(resolved)
     schema = op.get_context().version_table_schema
-    if schema:
-        return str(schema)
-    return str(op.get_bind().exec_driver_sql("SELECT current_schema()").scalar())
+    return str(schema) if schema else None
 
 
-def _postgres_index_validity() -> bool | None:
+def _postgres_index_validity(schema: str | None) -> bool | None:
     """Return whether the index exists and is usable, or None if absent."""
 
     return (
@@ -57,38 +80,41 @@ def _postgres_index_validity() -> bool | None:
             {
                 "index_name": INDEX,
                 "table_name": TABLE,
-                "schema_name": _target_schema(),
+                "schema_name": schema,
             },
         )
         .scalar_one_or_none()
     )
 
 
-def _online_columns() -> set[str]:
+def _online_columns(schema: str | None) -> set[str]:
     inspector = sa.inspect(op.get_bind())
-    if TABLE not in inspector.get_table_names():
+    if TABLE not in inspector.get_table_names(schema=schema):
         return set()
-    return {str(item["name"]) for item in inspector.get_columns(TABLE)}
+    return {str(item["name"]) for item in inspector.get_columns(TABLE, schema=schema)}
 
 
-def _online_indexes() -> set[str]:
+def _online_indexes(schema: str | None) -> set[str]:
     inspector = sa.inspect(op.get_bind())
-    if TABLE not in inspector.get_table_names():
+    if TABLE not in inspector.get_table_names(schema=schema):
         return set()
     return {
         name
-        for item in inspector.get_indexes(TABLE)
+        for item in inspector.get_indexes(TABLE, schema=schema)
         if (name := item.get("name")) is not None
     }
 
 
-def _online_index_definition(index_name: str) -> dict[str, Any] | None:
+def _online_index_definition(
+    index_name: str,
+    schema: str | None,
+) -> dict[str, Any] | None:
     """Return the reflected definition of a same-name index, if any."""
 
     inspector = sa.inspect(op.get_bind())
-    if TABLE not in inspector.get_table_names():
+    if TABLE not in inspector.get_table_names(schema=schema):
         return None
-    for item in inspector.get_indexes(TABLE):
+    for item in inspector.get_indexes(TABLE, schema=schema):
         if item.get("name") == index_name:
             return item
     return None
@@ -117,8 +143,8 @@ def _index_definition_matches(definition: dict[str, Any] | None) -> bool:
     return True
 
 
-def _online_table_exists() -> bool:
-    return TABLE in sa.inspect(op.get_bind()).get_table_names()
+def _online_table_exists(schema: str | None) -> bool:
+    return TABLE in sa.inspect(op.get_bind()).get_table_names(schema=schema)
 
 
 def upgrade() -> None:
@@ -141,20 +167,28 @@ def upgrade() -> None:
             op.create_index(INDEX, TABLE, [COLUMN])
         return
 
-    if not _online_table_exists():
+    # Address the same relation the catalog lookup inspects, so reflection and
+    # DDL can never diverge onto different schemas.
+    schema = _target_schema()
+
+    if not _online_table_exists(schema):
         return
 
-    if COLUMN not in _online_columns():
-        op.add_column(TABLE, sa.Column(COLUMN, sa.String(length=32), nullable=True))
+    if COLUMN not in _online_columns(schema):
+        op.add_column(
+            TABLE,
+            sa.Column(COLUMN, sa.String(length=32), nullable=True),
+            schema=schema,
+        )
 
-    if COLUMN not in _online_columns():
+    if COLUMN not in _online_columns(schema):
         return
 
     # A plain CREATE INDEX holds a SHARE lock and blocks writes to the live
     # tasks table for the whole build, so PostgreSQL builds it concurrently.
     if is_postgresql:
-        validity = _postgres_index_validity()
-        definition = _online_index_definition(INDEX)
+        validity = _postgres_index_validity(schema)
+        definition = _online_index_definition(INDEX, schema)
         # A same-name index that is valid but has different semantics (wrong
         # columns, UNIQUE, or partial) would otherwise be accepted, letting
         # Alembic stamp the revision without the lookup this migration needs.
@@ -168,6 +202,7 @@ def upgrade() -> None:
                 op.drop_index(
                     INDEX,
                     table_name=TABLE,
+                    schema=schema,
                     if_exists=True,
                     postgresql_concurrently=True,
                 )
@@ -175,19 +210,20 @@ def upgrade() -> None:
                 INDEX,
                 TABLE,
                 [COLUMN],
+                schema=schema,
                 if_not_exists=True,
                 postgresql_concurrently=True,
             )
         return
 
-    definition = _online_index_definition(INDEX)
+    definition = _online_index_definition(INDEX, schema)
     if _index_definition_matches(definition):
         return
     if definition is not None:
         # Drifted same-name index: rebuild it rather than stamping the revision
         # with an index that does not serve the ownership lookup.
-        op.drop_index(INDEX, table_name=TABLE)
-    op.create_index(INDEX, TABLE, [COLUMN])
+        op.drop_index(INDEX, table_name=TABLE, schema=schema)
+    op.create_index(INDEX, TABLE, [COLUMN], schema=schema)
 
 
 def downgrade() -> None:
@@ -207,7 +243,9 @@ def downgrade() -> None:
         op.drop_column(TABLE, COLUMN)
         return
 
-    if not _online_table_exists():
+    schema = _target_schema()
+
+    if not _online_table_exists(schema):
         return
 
     if is_postgresql:
@@ -215,11 +253,12 @@ def downgrade() -> None:
             op.drop_index(
                 INDEX,
                 table_name=TABLE,
+                schema=schema,
                 if_exists=True,
                 postgresql_concurrently=True,
             )
-    elif INDEX in _online_indexes():
-        op.drop_index(INDEX, table_name=TABLE)
+    elif INDEX in _online_indexes(schema):
+        op.drop_index(INDEX, table_name=TABLE, schema=schema)
 
-    if COLUMN in _online_columns():
-        op.drop_column(TABLE, COLUMN)
+    if COLUMN in _online_columns(schema):
+        op.drop_column(TABLE, COLUMN, schema=schema)

@@ -1777,13 +1777,50 @@ def test_enqueue_detects_a_task_deleted_after_the_caller_loaded_it(
     assert db_session.query(TaskExecutionCommand).count() == 0
 
 
-def test_foreign_key_violation_is_not_reported_as_an_idempotency_conflict(
+def test_task_foreign_key_violation_is_reported_as_a_missing_task(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An IntegrityError with no duplicate row means the task row vanished
-    between the existence check and the insert. That must surface as a missing
-    task, not raise NoResultFound from the duplicate lookup."""
+    """When the task really is gone, an IntegrityError with no duplicate row is
+    a task FK failure. It must surface as a missing task so callers reach their
+    recovery path, rather than raising NoResultFound from the duplicate lookup."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    real_flush = db_session.flush
+
+    def flush_raising_fk_error(*args, **kwargs):
+        db_session.flush = real_flush
+        # Delete the task so the post-rollback recheck sees it as absent, the
+        # way a concurrent delete would.
+        db_session.rollback()
+        db_session.query(Task).filter(Task.id == task_id).delete()
+        db_session.commit()
+        raise IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+
+    monkeypatch.setattr(db_session, "flush", flush_raising_fk_error)
+
+    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+        enqueue_task_command(
+            db_session,
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            command_id="pause-fk",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+        )
+
+
+def test_actor_foreign_key_failure_is_not_reported_as_a_missing_task(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The row references both tasks and users. An IntegrityError with no
+    duplicate command does not prove the task caused it: a concurrently deleted
+    actor fails the users FK while the task is still present. That must not be
+    translated into missing-task recovery, which would continue with a cached
+    principal instead of reloading the actor."""
 
     user, task = _create_running_task(db_session)
     task_id = int(task.id)
@@ -1796,12 +1833,12 @@ def test_foreign_key_violation_is_not_reported_as_an_idempotency_conflict(
 
     monkeypatch.setattr(db_session, "flush", flush_raising_fk_error)
 
-    with pytest.raises(ValueError, match=f"Task {task_id} not found"):
+    with pytest.raises(IntegrityError):
         enqueue_task_command(
             db_session,
             task_id=task_id,
             actor_user_id=int(user.id),
-            command_id="pause-fk",
+            command_id="pause-actor-fk",
             kind=TaskCommandKind.PAUSE,
             payload={"type": "pause_task"},
         )

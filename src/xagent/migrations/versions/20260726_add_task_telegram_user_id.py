@@ -6,7 +6,7 @@ Create Date: 2026-07-26
 
 """
 
-from typing import Sequence, Union
+from typing import Any, Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
@@ -20,13 +20,31 @@ TABLE = "tasks"
 COLUMN = "telegram_user_id"
 INDEX = "ix_tasks_telegram_user_id"
 
+# Resolve the index through the catalogs constrained by the target table and
+# schema. to_regclass() follows search_path, so a same-name index in an earlier
+# schema could otherwise be inspected -- and later dropped -- while the real
+# target-schema index stayed invalid.
 POSTGRES_INDEX_VALIDITY_SQL = sa.text(
     """
     SELECT i.indisvalid
     FROM pg_catalog.pg_index AS i
-    WHERE i.indexrelid = pg_catalog.to_regclass(:index_name)
+    JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid
+    JOIN pg_catalog.pg_class AS tbl ON tbl.oid = i.indrelid
+    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = tbl.relnamespace
+    WHERE idx.relname = :index_name
+      AND tbl.relname = :table_name
+      AND ns.nspname = :schema_name
     """
 )
+
+
+def _target_schema() -> str:
+    """The schema the migration operates on, resolved once per call."""
+
+    schema = op.get_context().version_table_schema
+    if schema:
+        return str(schema)
+    return str(op.get_bind().exec_driver_sql("SELECT current_schema()").scalar())
 
 
 def _postgres_index_validity() -> bool | None:
@@ -34,7 +52,14 @@ def _postgres_index_validity() -> bool | None:
 
     return (
         op.get_bind()
-        .execute(POSTGRES_INDEX_VALIDITY_SQL, {"index_name": INDEX})
+        .execute(
+            POSTGRES_INDEX_VALIDITY_SQL,
+            {
+                "index_name": INDEX,
+                "table_name": TABLE,
+                "schema_name": _target_schema(),
+            },
+        )
         .scalar_one_or_none()
     )
 
@@ -57,14 +82,39 @@ def _online_indexes() -> set[str]:
     }
 
 
-def _online_index_columns(index_name: str) -> tuple[str, ...] | None:
+def _online_index_definition(index_name: str) -> dict[str, Any] | None:
+    """Return the reflected definition of a same-name index, if any."""
+
     inspector = sa.inspect(op.get_bind())
     if TABLE not in inspector.get_table_names():
         return None
     for item in inspector.get_indexes(TABLE):
         if item.get("name") == index_name:
-            return tuple(str(name) for name in item.get("column_names") or ())
+            return item
     return None
+
+
+def _index_definition_matches(definition: dict[str, Any] | None) -> bool:
+    """Whether an existing index provides the exact lookup this migration needs.
+
+    Key columns alone are not enough. A UNIQUE index would stop a Telegram
+    sender from owning a second task, and a partial index would not cover every
+    row, so either must be rebuilt rather than accepted.
+    """
+
+    if definition is None:
+        return False
+    if tuple(str(name) for name in definition.get("column_names") or ()) != (COLUMN,):
+        return False
+    if bool(definition.get("unique")):
+        return False
+    dialect_options = definition.get("dialect_options") or {}
+    # A predicate under any dialect key means the index is partial.
+    if any(key.endswith("_where") for key in dialect_options):
+        return False
+    if definition.get("expressions") or definition.get("include_columns"):
+        return False
+    return True
 
 
 def _online_table_exists() -> bool:
@@ -104,17 +154,17 @@ def upgrade() -> None:
     # tasks table for the whole build, so PostgreSQL builds it concurrently.
     if is_postgresql:
         validity = _postgres_index_validity()
-        existing_columns = _online_index_columns(INDEX)
-        # A same-name index that is valid but indexes the wrong columns would
-        # otherwise be accepted, letting Alembic stamp the revision without the
-        # lookup index this migration exists to create.
-        if validity is True and existing_columns == (COLUMN,):
+        definition = _online_index_definition(INDEX)
+        # A same-name index that is valid but has different semantics (wrong
+        # columns, UNIQUE, or partial) would otherwise be accepted, letting
+        # Alembic stamp the revision without the lookup this migration needs.
+        if validity is True and _index_definition_matches(definition):
             return
         with context.autocommit_block():
             # A failed CREATE INDEX CONCURRENTLY leaves the index present but
             # invalid. IF NOT EXISTS would skip the rebuild and let Alembic
             # stamp the revision with an unusable index, so drop it first.
-            if validity is not None or existing_columns is not None:
+            if validity is not None or definition is not None:
                 op.drop_index(
                     INDEX,
                     table_name=TABLE,
@@ -130,10 +180,10 @@ def upgrade() -> None:
             )
         return
 
-    existing_columns = _online_index_columns(INDEX)
-    if existing_columns == (COLUMN,):
+    definition = _online_index_definition(INDEX)
+    if _index_definition_matches(definition):
         return
-    if existing_columns is not None:
+    if definition is not None:
         # Drifted same-name index: rebuild it rather than stamping the revision
         # with an index that does not serve the ownership lookup.
         op.drop_index(INDEX, table_name=TABLE)

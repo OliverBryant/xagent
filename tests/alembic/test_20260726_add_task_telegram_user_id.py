@@ -5,6 +5,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -129,11 +130,56 @@ def test_postgresql_offline_concurrent_ddl_escapes_outer_transaction() -> None:
         assert "COMMIT;" in sql[:concurrent_at]
 
 
+def test_index_definition_matches_only_a_plain_full_index() -> None:
+    """Key columns alone are insufficient: UNIQUE blocks a sender's second task
+    and a partial index does not cover every row."""
+
+    migration = _migration_module()
+    matches = migration._index_definition_matches
+
+    assert matches({"column_names": [COLUMN], "unique": 0}) is True
+    assert matches(None) is False
+    assert matches({"column_names": ["status"], "unique": 0}) is False
+    assert matches({"column_names": [COLUMN], "unique": 1}) is False
+    assert (
+        matches(
+            {
+                "column_names": [COLUMN],
+                "unique": 0,
+                "dialect_options": {"postgresql_where": "x IS NOT NULL"},
+            }
+        )
+        is False
+    )
+    assert (
+        matches(
+            {
+                "column_names": [COLUMN],
+                "unique": 0,
+                "dialect_options": {"sqlite_where": "x IS NOT NULL"},
+            }
+        )
+        is False
+    )
+
+
+def test_postgresql_index_validity_sql_is_scoped_to_the_target_table() -> None:
+    """to_regclass() follows search_path, so the lookup must be constrained by
+    the table and schema instead."""
+
+    migration = _migration_module()
+    sql = str(migration.POSTGRES_INDEX_VALIDITY_SQL)
+
+    assert "to_regclass" not in sql
+    assert "tbl.relname = :table_name" in sql
+    assert "ns.nspname = :schema_name" in sql
+
+
 def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> None:
     """A failed CREATE INDEX CONCURRENTLY leaves the index invalid, and a
-    same-name index may index the wrong columns. IF NOT EXISTS would skip both
-    rebuilds, so the retry must drop first. Only a valid index with the right
-    definition is accepted as-is."""
+    same-name index may have different semantics. IF NOT EXISTS would skip both
+    rebuilds, so the retry must drop first. Only a valid, plain, full index over
+    the right column is accepted as-is."""
 
     migration = _migration_module()
     context = MigrationContext.configure(dialect_name="postgresql")
@@ -145,14 +191,26 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
         def __exit__(self, *_exc: object) -> bool:
             return False
 
+    plain = {"column_names": [COLUMN], "unique": 0}
     cases = (
-        # (validity, existing_columns, expect_drop, expect_create)
-        (False, (COLUMN,), True, True),  # present but invalid
+        # (validity, definition, expect_drop, expect_create)
+        (False, plain, True, True),  # present but invalid
         (None, None, False, True),  # absent
-        (True, (COLUMN,), False, False),  # valid and correct
-        (True, ("status",), True, True),  # valid but drifted definition
+        (True, plain, False, False),  # valid and correct
+        (True, {"column_names": ["status"], "unique": 0}, True, True),  # drifted
+        (True, {"column_names": [COLUMN], "unique": 1}, True, True),  # UNIQUE
+        (
+            True,
+            {
+                "column_names": [COLUMN],
+                "unique": 0,
+                "dialect_options": {"postgresql_where": "x IS NOT NULL"},
+            },
+            True,
+            True,
+        ),  # partial
     )
-    for validity, existing_columns, expect_drop, expect_create in cases:
+    for validity, definition, expect_drop, expect_create in cases:
         created: list[dict] = []
         dropped: list[dict] = []
         with Operations.context(context):
@@ -166,8 +224,8 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
                 ),
                 patch.object(
                     migration,
-                    "_online_index_columns",
-                    return_value=existing_columns,
+                    "_online_index_definition",
+                    return_value=definition,
                 ),
                 patch.object(
                     migration.op,
@@ -182,7 +240,7 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
             ):
                 migration.upgrade()
 
-        label = (validity, existing_columns)
+        label = (validity, definition)
         assert bool(dropped) is expect_drop, label
         if expect_create:
             assert created == [
@@ -192,22 +250,42 @@ def test_postgresql_online_upgrade_rebuilds_unusable_or_drifted_indexes() -> Non
             assert created == [], label
 
 
-def test_sqlite_online_upgrade_rebuilds_a_drifted_index() -> None:
-    """A same-name index over the wrong columns must be rebuilt, not accepted."""
+@pytest.mark.parametrize(
+    "existing_ddl",
+    [
+        f"CREATE INDEX {INDEX} ON {TABLE} (status)",
+        f"CREATE UNIQUE INDEX {INDEX} ON {TABLE} ({COLUMN})",
+        f"CREATE INDEX {INDEX} ON {TABLE} ({COLUMN}) WHERE {COLUMN} IS NOT NULL",
+    ],
+)
+def test_sqlite_online_upgrade_rebuilds_semantically_wrong_indexes(
+    existing_ddl: str,
+) -> None:
+    """A same-name index that is drifted, UNIQUE, or partial must be rebuilt."""
 
     migration = _migration_module()
     engine = sa.create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         connection.execute(
-            sa.text("CREATE TABLE tasks (id INTEGER PRIMARY KEY, status VARCHAR(32))")
+            sa.text(
+                "CREATE TABLE tasks ("
+                "id INTEGER PRIMARY KEY, "
+                "status VARCHAR(32), "
+                f"{COLUMN} VARCHAR(32))"
+            )
         )
-        connection.execute(sa.text(f"CREATE INDEX {INDEX} ON {TABLE} (status)"))
+        connection.execute(sa.text(existing_ddl))
 
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
 
-        columns = {
-            item["name"]: tuple(item["column_names"])
+        rebuilt = next(
+            item
             for item in sa.inspect(connection).get_indexes(TABLE)
-        }
-        assert columns[INDEX] == (COLUMN,)
+            if item["name"] == INDEX
+        )
+        assert tuple(rebuilt["column_names"]) == (COLUMN,)
+        assert not rebuilt["unique"]
+        assert not any(
+            key.endswith("_where") for key in (rebuilt.get("dialect_options") or {})
+        )

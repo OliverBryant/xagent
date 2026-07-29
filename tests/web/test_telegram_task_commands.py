@@ -3,6 +3,7 @@ import os
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -39,6 +40,8 @@ def _bot(channel_id: int) -> TelegramBotInstance:
     bot.user_active_trace_handlers = {}
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
+    bot.user_conversation_generations = {}
+    bot.selected_agents = {}
     bot._accepting = True
     bot.saved = False
 
@@ -887,3 +890,118 @@ def test_save_active_tasks_reports_failure_for_real_directory_errors(
 
     assert TelegramBotInstance._save_active_tasks(bot) is True
     assert bot._active_tasks_unsaved is False
+
+
+def test_active_tasks_store_lives_under_the_storage_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The cwd-relative data/ path is not on the persisted volume, so a
+    container recreation forgot the selection -- and with it the only evidence
+    that can claim legacy telegram_user_id IS NULL tasks."""
+
+    monkeypatch.setattr(
+        "xagent.config.get_storage_root",
+        lambda: tmp_path,
+    )
+
+    keyed = TelegramBotInstance._active_tasks_store_path(7, "token-a")
+    assert keyed == tmp_path / "telegram" / "active_tasks_channel_7.json"
+    assert not str(keyed).startswith("data/")
+
+    # Without a channel id the full token is hashed, so bots whose tokens share
+    # a prefix cannot collide on one file.
+    a = TelegramBotInstance._active_tasks_store_path(None, "prefix-aaaa")
+    b = TelegramBotInstance._active_tasks_store_path(None, "prefix-bbbb")
+    assert a != b
+    assert a.parent == tmp_path / "telegram"
+
+
+def test_switch_fences_in_flight_preparation_before_stopping() -> None:
+    """A batch awaiting prepare_channel_task() must not overwrite the confirmed
+    selection in its is_new_task branch, so the generation is bumped after the
+    save and before the stop is requested."""
+
+    import asyncio
+
+    bot = _bot(1)
+    bot.active_tasks[101] = 7
+    bot.user_conversation_generations = {101: 4}
+    events: list[str] = []
+
+    class _Generations(dict):
+        def __setitem__(self, key: int, value: int) -> None:
+            events.append(f"generation:{value}")
+            super().__setitem__(key, value)
+
+    bot.user_conversation_generations = _Generations({101: 4})
+    original_stop = bot._request_current_conversation_stop
+
+    def tracking_stop(user_id: int, *, reason: str) -> bool:
+        events.append("stop")
+        return original_stop(user_id, reason=reason)
+
+    bot._request_current_conversation_stop = tracking_stop
+
+    snapshot = TelegramChannelTaskSnapshot(
+        task_id=9,
+        title="target",
+        status="completed",
+        created_at=None,
+        updated_at=None,
+    )
+
+    async def load_task(**_kwargs: object) -> TelegramChannelTaskSnapshot:
+        return snapshot
+
+    with patch(
+        "xagent.web.channels.telegram.bot.load_telegram_channel_task",
+        load_task,
+    ):
+        asyncio.run(bot._handle_switch_command(_Message(101, "/switch 9")))  # type: ignore[arg-type]
+
+    assert bot.active_tasks[101] == 9
+    assert bot.user_conversation_generations[101] == 5
+    assert events == ["generation:5", "stop"]
+
+
+def test_directory_fsync_is_skipped_where_it_is_unsupported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows cannot open a directory to fsync it and reports EACCES. Treating
+    that as a durability failure would break /new, /switch, and agent selection
+    on a supported deployment, but EACCES stays a real error on POSIX."""
+
+    import xagent.web.channels.telegram.bot as bot_module
+
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._active_tasks_unsaved = False
+    del bot._save_active_tasks
+    bot.active_tasks = {101: 7}
+
+    real_open = os.open
+    opened: list[str] = []
+
+    def tracking_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path) == str(tmp_path):
+            opened.append(str(path))
+            raise OSError(errno.EACCES, "permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+
+    # Where the directory barrier is unsupported it is not attempted at all.
+    monkeypatch.setattr(bot_module, "_DIRECTORY_FSYNC_SUPPORTED", False)
+    assert TelegramBotInstance._save_active_tasks(bot) is True
+    assert bot._active_tasks_unsaved is False
+    assert opened == []
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
+
+    # Where it is supported, EACCES is a genuine permission failure.
+    monkeypatch.setattr(bot_module, "_DIRECTORY_FSYNC_SUPPORTED", True)
+    assert TelegramBotInstance._save_active_tasks(bot) is False
+    assert bot._active_tasks_unsaved is True
+    assert opened == [str(tmp_path)]

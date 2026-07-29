@@ -88,9 +88,14 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# Directory fsync is genuinely unavailable on some platforms and filesystems
-# (notably Windows, and a few network mounts). Every other OSError is a real
-# durability failure and must not be reported as a successful save.
+# Opening a directory to fsync it is a POSIX idiom. Windows cannot do it at all
+# -- its CRT reports EACCES for os.open() on a directory -- so the barrier is
+# skipped there instead of failing every save. EACCES must stay a real
+# permission error on POSIX, so this is a platform check, not an errno one.
+_DIRECTORY_FSYNC_SUPPORTED = os.name != "nt"
+
+# Some filesystems and network mounts still refuse the operation. Every other
+# OSError is a real durability failure and must not be reported as a success.
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
     getattr(errno, name)
     for name in ("EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
@@ -144,7 +149,10 @@ class TelegramBotInstance:
         self._stop_loop: asyncio.AbstractEventLoop | None = None
 
         # Load active tasks state
-        self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
+        self.active_tasks_file = self._active_tasks_store_path(channel_id, token)
+        self._legacy_active_tasks_file = Path(
+            f"data/telegram_active_tasks_{instance_id}.json"
+        )
         self.active_tasks = self._load_active_tasks()
         # Set when a save failed, so the next batch retries the persist.
         self._active_tasks_unsaved = False
@@ -175,14 +183,20 @@ class TelegramBotInstance:
         self._register_handlers()
 
     def _load_active_tasks(self) -> dict:
-        if self.active_tasks_file.exists():
+        # Read the legacy cwd-relative file when the durable one is absent, so
+        # an upgrade keeps the selection instead of losing the only evidence
+        # that can claim legacy telegram_user_id IS NULL tasks.
+        for path in (self.active_tasks_file, self._legacy_active_tasks_file):
+            if not path.exists():
+                continue
             try:
-                with open(self.active_tasks_file, "r") as f:
+                with open(path, "r") as f:
                     # Convert string keys back to int
                     return {int(k): v for k, v in json.load(f).items()}
             except Exception as e:
                 logger.error(
-                    f"Failed to load Telegram active tasks for {self.instance_id}: {e}"
+                    f"Failed to load Telegram active tasks for {self.instance_id} "
+                    f"from {path}: {e}"
                 )
         return {}
 
@@ -210,6 +224,9 @@ class TelegramBotInstance:
             # entry, so a host crash could still lose a selection reported as
             # durable. Only a genuinely unsupported operation is tolerated:
             # any other error leaves the save dirty so it is retried.
+            if not _DIRECTORY_FSYNC_SUPPORTED:
+                self._active_tasks_unsaved = False
+                return True
             try:
                 dir_fd = os.open(str(self.active_tasks_file.parent), os.O_RDONLY)
             except OSError as e:
@@ -248,6 +265,23 @@ class TelegramBotInstance:
                     exc_info=True,
                 )
             return False
+
+    @staticmethod
+    def _active_tasks_store_path(channel_id: Optional[int], token: str) -> Path:
+        """Durable per-channel active-task store.
+
+        Lives under the storage root for the same reason as the selected-agent
+        store: the cwd-relative ``data/`` path is not on the persisted volume,
+        so a container recreation forgot the selection. That also destroyed the
+        only evidence used to claim legacy ``telegram_user_id IS NULL`` tasks.
+        """
+        from ....config import get_storage_root
+
+        if channel_id is not None:
+            key = f"channel_{int(channel_id)}"
+        else:
+            key = hashlib.sha256(token.encode()).hexdigest()[:16]
+        return Path(get_storage_root()) / "telegram" / f"active_tasks_{key}.json"
 
     @staticmethod
     def _selected_agents_store_path(channel_id: Optional[int], token: str) -> Path:
@@ -604,6 +638,13 @@ class TelegramBotInstance:
                 )
                 return
 
+            # Fence in-flight preparation before requesting the stop. A batch
+            # awaiting prepare_channel_task() would otherwise return with a
+            # still-matching generation and overwrite this confirmed selection
+            # in its is_new_task branch before consuming the stop event.
+            self.user_conversation_generations[telegram_user_id] = (
+                self._conversation_generation(telegram_user_id) + 1
+            )
             self._request_current_conversation_stop(
                 telegram_user_id,
                 reason="Telegram task switch requested",

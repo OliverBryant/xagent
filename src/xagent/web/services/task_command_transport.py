@@ -240,11 +240,16 @@ def enqueue_task_command(
             .one_or_none()
         )
         if raced is None:
-            # No duplicate command exists, so the IntegrityError was not an
-            # idempotency race. The task row was deleted concurrently and the
-            # insert violated the foreign key. Surface it as a missing task so
-            # callers reach their recovery path instead of NoResultFound.
-            raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
+            # No duplicate command exists, so this was not an idempotency race.
+            # The row references two foreign keys, so absence of a duplicate
+            # does not prove the task caused it: a concurrently deleted actor
+            # fails the users FK while the task is still present. Only report a
+            # missing task when the task really is gone; otherwise preserve the
+            # original failure so callers cannot mistake an actor problem for
+            # missing-task recovery.
+            if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
+                raise TaskCommandTaskMissing(f"Task {task_id} not found") from None
+            raise
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,

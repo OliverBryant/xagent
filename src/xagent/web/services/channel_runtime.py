@@ -150,6 +150,10 @@ class TelegramChannelTaskSnapshot:
     status: str
     created_at: Any
     updated_at: Any
+    # The agent this task is bound to, or None for the default assistant.
+    # A switch must adopt it: prepare_channel_task() discards a task whose
+    # agent_id does not match the caller's selection.
+    agent_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +288,7 @@ def _telegram_task_snapshot(task: Task) -> TelegramChannelTaskSnapshot:
         status=str(getattr(task.status, "value", task.status) or "unknown"),
         created_at=task.created_at,
         updated_at=task.updated_at,
+        agent_id=int(task.agent_id) if task.agent_id is not None else None,
     )
 
 

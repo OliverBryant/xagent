@@ -142,6 +142,10 @@ class TelegramBotInstance:
         self.user_active_trace_handlers: Dict[int, TelegramTraceHandler] = {}
         self.user_preparing_executions: set[int] = set()
         self.user_stop_events: Dict[int, asyncio.Event] = {}
+        # Held for the whole /switch transition. Aiogram handles updates
+        # concurrently, so a plain message arriving mid-switch would otherwise
+        # join the old task's queue and be discarded by the stop path.
+        self.user_switch_locks: Dict[int, asyncio.Lock] = {}
         self.user_conversation_generations: Dict[int, int] = {}
         self._accepting = True
         self._ingress_stopped = False
@@ -311,22 +315,26 @@ class TelegramBotInstance:
                 )
         return {}
 
-    def _save_selected_agents(self) -> None:
+    def _save_selected_agents(self) -> bool:
+        """Persist the agent selection. Returns whether it is durable."""
+
         try:
             self.selected_agents_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.selected_agents_file, "w") as f:
                 json.dump(self.selected_agents, f)
+            return True
         except Exception as e:
             logger.error(
                 f"Failed to save Telegram selected agents for {self.instance_id}: {e}"
             )
+            return False
 
-    def _set_selected_agent(self, user_id: int, agent_id: Optional[int]) -> None:
+    def _set_selected_agent(self, user_id: int, agent_id: Optional[int]) -> bool:
         if agent_id is None:
             self.selected_agents.pop(user_id, None)
         else:
             self.selected_agents[user_id] = agent_id
-        self._save_selected_agents()
+        return self._save_selected_agents()
 
     def _register_handlers(self) -> None:
         from aiogram.filters import Command
@@ -455,6 +463,13 @@ class TelegramBotInstance:
                 return
 
             self._enqueue_user_message(user_id, message)
+
+    def _switch_lock_for_user(self, user_id: int) -> asyncio.Lock:
+        lock = self.user_switch_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.user_switch_locks[user_id] = lock
+        return lock
 
     def _enqueue_user_message(self, user_id: int, message: Any) -> bool:
         if not self._accepting:
@@ -594,6 +609,18 @@ class TelegramBotInstance:
             return
 
         telegram_user_id = int(message.from_user.id)
+        # Hold the barrier across the whole transition, including the awaited
+        # lookup: a message arriving mid-switch must not enter the old task's
+        # queue only to be cleared by the stop path below.
+        async with self._switch_lock_for_user(telegram_user_id):
+            await self._switch_to_task(message, telegram_user_id, task_id)
+
+    async def _switch_to_task(
+        self,
+        message: types.Message,
+        telegram_user_id: int,
+        task_id: int,
+    ) -> None:
         try:
             task = await load_telegram_channel_task(
                 channel_id=self.channel_id,
@@ -624,14 +651,27 @@ class TelegramBotInstance:
             # Persistence is the commit point: stopping the old conversation
             # discards its queue, cancels its trace handler, and pauses its
             # run, none of which can be undone by restoring the mapping.
+            #
+            # The agent binding moves with the task. prepare_channel_task()
+            # discards a task whose agent_id does not match the selection, so
+            # keeping the old conversation's agent would silently create a new
+            # task on the next message.
             previous_task_id = self.active_tasks.get(telegram_user_id)
+            previous_agent_id = self.selected_agents.get(telegram_user_id)
             self.active_tasks[telegram_user_id] = task_id
-            if not self._save_active_tasks():
+            agent_persisted = True
+            if previous_agent_id != task.agent_id:
+                agent_persisted = self._set_selected_agent(
+                    telegram_user_id, task.agent_id
+                )
+            if not agent_persisted or not self._save_active_tasks():
                 if previous_task_id is None:
                     self.active_tasks.pop(telegram_user_id, None)
                 else:
                     self.active_tasks[telegram_user_id] = previous_task_id
                 self._save_active_tasks()
+                if previous_agent_id != task.agent_id:
+                    self._set_selected_agent(telegram_user_id, previous_agent_id)
                 await message.answer(
                     "I couldn't save the switch, so the previous task is still "
                     "active. Please try again."

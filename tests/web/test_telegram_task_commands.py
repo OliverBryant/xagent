@@ -41,7 +41,9 @@ def _bot(channel_id: int) -> TelegramBotInstance:
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     bot.user_conversation_generations = {}
+    bot.user_switch_locks = {}
     bot.selected_agents = {}
+    bot._save_selected_agents = lambda: True
     bot._accepting = True
     bot.saved = False
 

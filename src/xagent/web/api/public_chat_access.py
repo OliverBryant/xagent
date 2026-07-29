@@ -8,7 +8,7 @@ import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Protocol, TypeGuard, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -31,6 +31,7 @@ from ..services.connector_runtime import (
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
+from ..services.orphan_upload_gc import TASKLESS_SHARE_UPLOAD_SOURCE
 from ..services.share_rate_limit import (
     get_share_rate_limiter,
     remote_ip_from_request,
@@ -124,6 +125,24 @@ class _ChatAccessContext(Protocol):
 
 
 _ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
+
+
+def _is_strict_int(value: object) -> TypeGuard[int]:
+    """Whether a JWT claim is a real ``int`` — a row id we may query on.
+
+    Every id claim on a widget/share guest token goes through here rather than a
+    bare ``isinstance(..., int)`` (#992). ``bool`` subclasses ``int``, so a
+    ``true`` claim would pass isinstance, and SQLAlchemy renders it as ``= 1``:
+    it resolves to row id 1 *and* then compares equal to an owner id of 1 in
+    Python (``1 == True``), which would admit a guest as the first user. The
+    behaviour is also backend-dependent — SQLite binds and matches where
+    PostgreSQL typically raises — so a bare isinstance check makes an auth
+    decision that varies by database.
+
+    These tokens are server-minted and signed, so no caller can present such a
+    claim today; this keeps every id claim failing closed regardless.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -286,21 +305,27 @@ def get_public_chat_user(
         if auth_mode != "widget":
             raise ValueError("Invalid token payload")
 
-        if not user_id or not guest_id:
+        # Defense in depth (#992): the same guard get_share_chat_user applies.
+        # Without it the two widget branches below disagreed about a string
+        # user_id — the agent branch failed closed on an int/str owner
+        # comparison, while the workforce branch coerced it and admitted the
+        # request. Establishing the type here is what lets both branches pass
+        # ``user_id`` straight to their ``ensure_widget_*_available`` helper.
+        if not _is_strict_int(user_id) or not user_id or not guest_id:
             raise ValueError("Invalid token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise ValueError("User not found")
 
-        if isinstance(widget_workforce_id, int):
+        if _is_strict_int(widget_workforce_id):
             # Workforce widget: re-validate the deployment on every use so
             # disabling the widget or rotating its key cuts off live guests,
             # mirroring the workforce share path.
             ensure_widget_workforce_available(
                 db,
                 widget_workforce_id,
-                int(user_id),
+                user_id,
                 expected_widget_key=widget_key
                 if isinstance(widget_key, str) and widget_key
                 else None,
@@ -318,7 +343,7 @@ def get_public_chat_user(
         # tokens (mirrors the share path). The per-message WS revalidation
         # calls back through here, so live sessions drop on the next inbound
         # message too.
-        if not isinstance(widget_agent_id, int):
+        if not _is_strict_int(widget_agent_id):
             raise ValueError("Invalid widget token payload")
         ensure_widget_agent_available(
             db,
@@ -362,7 +387,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
-        if not isinstance(user_id, int):
+        if not _is_strict_int(user_id):
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
             raise ValueError("Invalid share token payload")
@@ -378,7 +403,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         if not user:
             raise ValueError("User not found")
 
-        if isinstance(share_workforce_id, int):
+        if _is_strict_int(share_workforce_id):
             workforce = ensure_share_workforce_available(
                 db,
                 share_workforce_id,
@@ -392,7 +417,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
                 workforce=workforce,
             )
 
-        if not isinstance(share_agent_id, int):
+        if not _is_strict_int(share_agent_id):
             raise ValueError("Invalid share token payload")
 
         agent = ensure_share_agent_available(
@@ -626,6 +651,25 @@ def get_task_for_share_context(
     return task
 
 
+def _enforce_public_upload_storage_gate(db: Session, owner: User) -> None:
+    """Refuse a public upload when the owner is at their storage limit (#973).
+
+    Mirrors the KB ingest gate: the hook is a no-op in stock xagent and only
+    the cloud app layer registers it. Charged to the share/widget entity
+    OWNER — the same attribution as the run gate and the on-disk write, since
+    the file consumes the owner's storage. Fails open on any error so quota
+    infra problems never block uploads; raises 402 on a truthy reason.
+    """
+    try:
+        from ..services.quota_hooks import check_storage_gate
+
+        reason = check_storage_gate(db, getattr(owner, "id", None))
+    except Exception:
+        reason = None
+    if reason:
+        raise HTTPException(status_code=402, detail=reason)
+
+
 async def upload_public_chat_files(
     *,
     file: UploadFile | None,
@@ -648,6 +692,8 @@ async def upload_public_chat_files(
         raise HTTPException(status_code=422, detail="No files provided")
 
     user_id = int(access_context.user.id)
+    _enforce_public_upload_storage_gate(db, access_context.user)
+
     if not task_id:
         # A workforce widget session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded BEFORE
@@ -661,8 +707,7 @@ async def upload_public_chat_files(
         # Reachable by anyone holding the widget credential before any task
         # (hence any owner association) exists, so cap the per-request file
         # count to blunt the worst abuse case cheaply — mirroring the share
-        # task-less path. Owner storage quota + GC of orphaned (task_id IS
-        # NULL) rows are tracked as hardening in #973.
+        # task-less path.
         if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
             raise HTTPException(
                 status_code=422,
@@ -676,6 +721,9 @@ async def upload_public_chat_files(
                 status_code=503,
                 detail="Upload authorization could not be finalized",
             )
+        # Stamp the task-less provenance marker so orphan GC (#973) can reap
+        # these rows if the guest never completes task creation, without a
+        # coarse task_id-IS-NULL sweep touching other paths' unbound drafts.
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
@@ -683,6 +731,7 @@ async def upload_public_chat_files(
             folder=folder,
             user_id=user_id,
             single_file_mode=file is not None and (not files),
+            upload_source=TASKLESS_SHARE_UPLOAD_SOURCE,
         )
 
     try:
@@ -728,6 +777,8 @@ async def upload_share_chat_files(
         raise HTTPException(status_code=422, detail="No files provided")
 
     user_id = int(access_context.user.id)
+    _enforce_public_upload_storage_gate(db, access_context.user)
+
     if not task_id:
         # A workforce share session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded
@@ -740,8 +791,6 @@ async def upload_share_chat_files(
         # This branch is reachable by anyone holding the public share link
         # before any task (hence any owner association) exists, so cap the
         # per-request file count to blunt the worst abuse case cheaply.
-        # Owner storage quota + GC of orphaned (task_id IS NULL) rows are
-        # tracked as hardening in #973.
         if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
             raise HTTPException(
                 status_code=422,
@@ -755,6 +804,9 @@ async def upload_share_chat_files(
                 status_code=503,
                 detail="Upload authorization could not be finalized",
             )
+        # Stamp the task-less-share provenance marker so orphan GC (#973) can
+        # reap these rows if the guest never completes task creation, without
+        # a coarse task_id-IS-NULL sweep touching other paths' unbound drafts.
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
@@ -762,6 +814,7 @@ async def upload_share_chat_files(
             folder=folder,
             user_id=user_id,
             single_file_mode=file is not None and (not files),
+            upload_source=TASKLESS_SHARE_UPLOAD_SOURCE,
         )
 
     try:

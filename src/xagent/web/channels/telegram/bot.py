@@ -6,7 +6,7 @@ import json
 import logging
 import mimetypes
 import os
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -445,7 +445,7 @@ class TelegramBotInstance:
         )
 
     @staticmethod
-    def _format_task_timestamp(timestamp: Any) -> str:
+    def _format_task_timestamp(timestamp: datetime | None) -> str:
         """Render a task timestamp as UTC wall time.
 
         Columns are DateTime(timezone=True), but SQLite returns naive values
@@ -456,7 +456,7 @@ class TelegramBotInstance:
 
         if timestamp is None:
             return "unknown"
-        if getattr(timestamp, "tzinfo", None) is not None:
+        if timestamp.tzinfo is not None:
             timestamp = timestamp.astimezone(timezone.utc)
         return timestamp.strftime("%Y-%m-%d %H:%M")
 

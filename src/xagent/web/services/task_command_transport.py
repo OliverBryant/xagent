@@ -177,11 +177,7 @@ def enqueue_task_command(
     resolved_task_id = int(task_id)
     # A task snapshot a caller loaded earlier would widen the concurrent-delete
     # window across everything it did in between, so existence is re-checked
-    # here before inserting a command that references the row.
-    # This id query bypasses the identity map, so it observes a concurrent
-    # delete that a cached snapshot would not.
-    if db.query(Task.id).filter(Task.id == resolved_task_id).scalar() is None:
-        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+    # here, by query, before inserting a command that references the row.
     task = db.query(Task).filter(Task.id == resolved_task_id).first()
     if task is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")

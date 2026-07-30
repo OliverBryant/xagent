@@ -787,6 +787,111 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
 
 
 @pytest.mark.asyncio
+async def test_deactivated_feishu_channel_stops_authorizing_senders(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The is_active gate is channel-agnostic and applies to Feishu too.
+
+    Feishu's bot turns ChannelConfigurationError into a config-error reply, so
+    this is a deliberate behavior change rather than a crash.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        feishu = UserChannel(
+            user_id=user_id,
+            channel_type="feishu",
+            channel_name="Feishu",
+            config={"allowed_users": ["open-id-1"]},
+            is_active=True,
+        )
+        db.add(feishu)
+        db.commit()
+        feishu_channel_id = int(feishu.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=feishu_channel_id,
+        external_user_id="open-id-1",
+    )
+    assert snapshot.user_id == user_id
+
+    with SessionLocal() as db:
+        db.query(UserChannel).filter(UserChannel.id == feishu_channel_id).update(
+            {"is_active": False}
+        )
+        db.commit()
+
+    with pytest.raises(channel_runtime.ChannelConfigurationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=feishu_channel_id,
+            external_user_id="open-id-1",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_resumes_claimed_legacy_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """A pre-migration task must be resumed, not abandoned for a fresh one.
+
+    The legacy claim stamps ``telegram_user_id`` on the ORM object only. Sessions
+    run with ``autoflush=False``, so the resume query that filters on that column
+    cannot see the pending UPDATE unless the claim is flushed first.
+    """
+
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    # A task that predates the migration: owned by this channel, no sender stamp.
+    with SessionLocal() as db:
+        legacy = Task(
+            user_id=user_id,
+            title="Legacy conversation",
+            status=TaskStatus.COMPLETED,
+            channel_id=channel_id,
+            telegram_user_id=None,
+        )
+        db.add(legacy)
+        db.commit()
+        legacy_task_id = int(legacy.id)
+
+    resumed = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=legacy_task_id,
+        text="hello again",
+        channel_name="Telegram",
+    )
+
+    assert resumed is not None
+    assert resumed.task_id == legacy_task_id
+    assert resumed.is_new_task is False
+
+    with SessionLocal() as db:
+        claimed = db.query(Task).filter(Task.id == legacy_task_id).one()
+        assert claimed.telegram_user_id == "telegram-user"
+        assert db.query(Task).count() == 1
+
+    assert await resumed.managed_lease.finalize_result(status=TaskStatus.COMPLETED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

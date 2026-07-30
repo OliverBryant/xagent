@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -90,6 +91,10 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Task ids are always ASCII decimals. str.isdigit()/isdecimal() also accept
+# Unicode digit forms, which either crash int() or resolve to an unrelated id.
+_ASCII_TASK_ID_PATTERN = re.compile(r"[0-9]+")
+
 # Opening a directory to fsync it is a POSIX idiom. Windows cannot do it at all
 # -- its CRT reports EACCES for os.open() on a directory -- so the barrier is
 # skipped there instead of failing every save. EACCES must stay a real
@@ -103,12 +108,6 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
     for name in ("EINVAL", "EISDIR", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")
     if hasattr(errno, name)
 )
-
-
-def _never_cancelled() -> bool:
-    """Default latch for callers that do not track cancellation."""
-
-    return False
 
 
 class TelegramVoiceTranscriptionError(RuntimeError):
@@ -473,10 +472,14 @@ class TelegramBotInstance:
             self._enqueue_user_message(user_id, message)
 
     def _switch_lock_for_user(self, user_id: int) -> asyncio.Lock:
-        lock = self.user_switch_locks.get(user_id)
+        locks = getattr(self, "user_switch_locks", None)
+        if locks is None:
+            locks = {}
+            self.user_switch_locks = locks
+        lock = locks.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
-            self.user_switch_locks[user_id] = lock
+            locks[user_id] = lock
         return lock
 
     def _enqueue_user_message(self, user_id: int, message: Any) -> bool:
@@ -551,7 +554,10 @@ class TelegramBotInstance:
                 "Send a message to create one."
             ]
 
-        header = f"<b>Your Telegram tasks</b> ({TELEGRAM_TASK_LIST_LIMIT} most recent)"
+        # Only claim truncation when the list actually hit the limit.
+        header = "<b>Your Telegram tasks</b>"
+        if len(tasks) >= TELEGRAM_TASK_LIST_LIMIT:
+            header += f" ({TELEGRAM_TASK_LIST_LIMIT} most recent)"
         footer = "Use <code>/switch &lt;task_id&gt;</code> to continue one."
         messages: list[str] = []
         current = header
@@ -596,11 +602,20 @@ class TelegramBotInstance:
             await message.answer("🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
             await message.answer("This bot is inactive or not correctly configured.")
+        except Exception:
+            # Match the plain-message path: never leave the command silent.
+            logger.error("Failed to list Telegram tasks", exc_info=True)
+            await message.answer(
+                "Sorry, an error occurred while processing your request."
+            )
 
     @staticmethod
     def _switch_task_id(command_text: str | None) -> int | None:
         parts = (command_text or "").strip().split()
-        if len(parts) != 2 or not parts[1].isdigit():
+        # Require ASCII digits. isdigit() accepts "²", which int() then rejects
+        # with an uncaught ValueError, and other Unicode digit forms ("٣",
+        # "１２") would silently resolve to an unrelated task id.
+        if len(parts) != 2 or not _ASCII_TASK_ID_PATTERN.fullmatch(parts[1]):
             return None
         task_id = int(parts[1])
         return task_id if task_id > 0 else None
@@ -706,6 +721,12 @@ class TelegramBotInstance:
             await message.answer("🚫 You are not authorized to use this bot.")
         except ChannelConfigurationError:
             await message.answer("This bot is inactive or not correctly configured.")
+        except Exception:
+            # Match the plain-message path: never leave the command silent.
+            logger.error("Failed to switch Telegram task %s", task_id, exc_info=True)
+            await message.answer(
+                "Sorry, an error occurred while processing your request."
+            )
 
     def _schedule_user_queue(self, user_id: int) -> bool:
         if not self._accepting:
@@ -745,15 +766,21 @@ class TelegramBotInstance:
         return stopped, True
 
     def _stop_current_conversation(self, user_id: int) -> bool:
+        # discard_output=False: /stop pauses the run but keeps the user in this
+        # conversation, so the partial answer must still be delivered.
         return self._request_current_conversation_stop(
-            user_id, reason="Telegram stop requested"
+            user_id,
+            reason="Telegram stop requested",
+            discard_output=False,
         )
 
-    def _request_current_conversation_stop(self, user_id: int, *, reason: str) -> bool:
+    def _request_current_conversation_stop(
+        self, user_id: int, *, reason: str, discard_output: bool = True
+    ) -> bool:
         queued_messages = self.user_message_queues.pop(user_id, None)
         active_trace_handler = self._active_trace_handlers().get(user_id)
         if active_trace_handler is not None:
-            active_trace_handler.cancel()
+            active_trace_handler.cancel(discard_output=discard_output)
         stopped = self._stop_user_active_execution(user_id, reason=reason)
         preparing = user_id in self.user_preparing_executions
         if preparing and not stopped:
@@ -1379,18 +1406,23 @@ class TelegramBotInstance:
                         )
                         return
 
-                active_task_id = self.active_tasks.get(user_id)
-                prepared_task = await prepare_channel_task(
-                    channel_id=self.channel_id,
-                    external_user_id=str(user_id),
-                    active_task_id=(
-                        int(active_task_id) if active_task_id is not None else None
-                    ),
-                    text=text,
-                    channel_name=self.channel_name,
-                    expected_owner_user_id=expected_owner_user_id,
-                    agent_id=self.selected_agents.get(user_id),
-                )
+                # Take the same barrier /switch holds. Without it a message
+                # arriving during a switch's awaited lookup resolves against
+                # the old task and is then silently dropped by the generation
+                # fence below, leaving the user with no reply at all.
+                async with self._switch_lock_for_user(user_id):
+                    active_task_id = self.active_tasks.get(user_id)
+                    prepared_task = await prepare_channel_task(
+                        channel_id=self.channel_id,
+                        external_user_id=str(user_id),
+                        active_task_id=(
+                            int(active_task_id) if active_task_id is not None else None
+                        ),
+                        text=text,
+                        channel_name=self.channel_name,
+                        expected_owner_user_id=expected_owner_user_id,
+                        agent_id=self.selected_agents.get(user_id),
+                    )
             except ChannelAuthorizationError:
                 await last_message.answer("🚫 You are not authorized to use this bot.")
                 return
@@ -1679,9 +1711,12 @@ class TelegramBotInstance:
                     f"task {task_id} ownership changed before Telegram result"
                 )
 
-            if tg_handler.cancelled:
+            # Only skip when the user actually left this conversation
+            # (/switch, /new). A /stop leaves them here waiting to read the
+            # partial answer, which they got before task switching existed.
+            if tg_handler.discard_output:
                 logger.info(
-                    "Skipping Telegram delivery for cancelled execution of task %s "
+                    "Skipping Telegram delivery for abandoned execution of task %s "
                     "for user %s",
                     task_id,
                     user_id,
@@ -1695,7 +1730,9 @@ class TelegramBotInstance:
                 output = "Task completed."
 
             def is_cancelled() -> bool:
-                return bool(tg_handler is not None and tg_handler.cancelled)
+                # discard_output, not cancelled: a /stop must still deliver
+                # (and keep) this answer for the user who is still here.
+                return bool(tg_handler is not None and tg_handler.discard_output)
 
             max_len = 4000
             text_chunks = [
@@ -1886,7 +1923,7 @@ class TelegramBotInstance:
         user_id: int,
         task_id: int,
         reply_to: types.Message,
-        is_cancelled: Callable[[], bool] | None = None,
+        is_cancelled: Callable[[], bool],
     ) -> list[TelegramImageRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in image_refs))
         failed_refs: list[TelegramImageRef] = []
@@ -1948,7 +1985,7 @@ class TelegramBotInstance:
                     lambda: reply_to.answer_photo(
                         FSInputFile(image_path), caption=caption or None
                     ),
-                    is_cancelled=is_cancelled or _never_cancelled,
+                    is_cancelled=is_cancelled,
                     delete=lambda msg: msg.delete(),
                     description=f"output image {image_ref.file_id}",
                 )
@@ -2028,7 +2065,7 @@ class TelegramBotInstance:
         user_id: int,
         task_id: int,
         reply_to: types.Message,
-        is_cancelled: Callable[[], bool] | None = None,
+        is_cancelled: Callable[[], bool],
     ) -> list[TelegramFileRef]:
         ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in file_refs))
         failed_refs: list[TelegramFileRef] = []
@@ -2080,7 +2117,7 @@ class TelegramBotInstance:
                     lambda: reply_to.answer_document(
                         FSInputFile(file_path), caption=caption or None
                     ),
-                    is_cancelled=is_cancelled or _never_cancelled,
+                    is_cancelled=is_cancelled,
                     delete=lambda msg: msg.delete(),
                     description=f"output file {file_ref.file_id}",
                 )

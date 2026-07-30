@@ -281,6 +281,48 @@ def _claim_legacy_active_telegram_task_sync(
     return True
 
 
+def _resolve_telegram_sender_scope_sync(
+    db: Any,
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    active_task_id: int | None,
+) -> tuple[int, UserChannel]:
+    """Authorize the sender and settle any legacy claim before task queries.
+
+    Shared by the list and single-task loaders, which differ only in the query
+    they run afterwards. Returns the owner id and the resolved channel.
+    """
+
+    owner = _load_channel_owner_sync(
+        db,
+        channel_id=channel_id,
+        external_user_id=external_user_id,
+    )
+    channel = (
+        db.query(UserChannel)
+        .filter(
+            UserChannel.id == channel_id,
+            UserChannel.channel_type == "telegram",
+            UserChannel.is_active.is_(True),
+        )
+        .first()
+    )
+    if channel is None:
+        raise ChannelConfigurationError("Telegram channel is not configured")
+
+    claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+        db,
+        channel=channel,
+        owner_id=owner.user_id,
+        external_user_id=external_user_id,
+        active_task_id=active_task_id,
+    )
+    if claimed_legacy_task:
+        db.commit()
+    return owner.user_id, channel
+
+
 def _telegram_task_snapshot(task: Task) -> TelegramChannelTaskSnapshot:
     return TelegramChannelTaskSnapshot(
         task_id=int(task.id),
@@ -300,36 +342,16 @@ def _load_telegram_channel_tasks_sync(
 ) -> tuple[TelegramChannelTaskSnapshot, ...]:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        owner = _load_channel_owner_sync(
+        owner_id, channel = _resolve_telegram_sender_scope_sync(
             db,
             channel_id=channel_id,
             external_user_id=external_user_id,
-        )
-        channel = (
-            db.query(UserChannel)
-            .filter(
-                UserChannel.id == channel_id,
-                UserChannel.channel_type == "telegram",
-                UserChannel.is_active.is_(True),
-            )
-            .first()
-        )
-        if channel is None:
-            raise ChannelConfigurationError("Telegram channel is not configured")
-
-        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
-            db,
-            channel=channel,
-            owner_id=owner.user_id,
-            external_user_id=external_user_id,
             active_task_id=active_task_id,
         )
-        if claimed_legacy_task:
-            db.commit()
         rows = (
             db.query(Task)
             .filter(
-                Task.user_id == owner.user_id,
+                Task.user_id == owner_id,
                 Task.channel_id == channel.id,
                 Task.telegram_user_id == external_user_id,
                 Task.is_visible.is_(True),
@@ -367,36 +389,17 @@ def _load_telegram_channel_task_sync(
 ) -> TelegramChannelTaskSnapshot | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        owner = _load_channel_owner_sync(
+        owner_id, channel = _resolve_telegram_sender_scope_sync(
             db,
             channel_id=channel_id,
             external_user_id=external_user_id,
-        )
-        channel = (
-            db.query(UserChannel)
-            .filter(
-                UserChannel.id == channel_id,
-                UserChannel.channel_type == "telegram",
-                UserChannel.is_active.is_(True),
-            )
-            .first()
-        )
-        if channel is None:
-            raise ChannelConfigurationError("Telegram channel is not configured")
-        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
-            db,
-            channel=channel,
-            owner_id=owner.user_id,
-            external_user_id=external_user_id,
             active_task_id=active_task_id,
         )
-        if claimed_legacy_task:
-            db.commit()
         task = (
             db.query(Task)
             .filter(
                 Task.id == task_id,
-                Task.user_id == owner.user_id,
+                Task.user_id == owner_id,
                 Task.channel_id == channel.id,
                 Task.telegram_user_id == external_user_id,
                 Task.is_visible.is_(True),
@@ -572,13 +575,20 @@ def _prepare_channel_task_sync(
 
             is_telegram = str(channel.channel_type) == "telegram"
             if is_telegram:
-                _claim_legacy_active_telegram_task_sync(
+                claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
                     db,
                     channel=channel,
                     owner_id=owner_id,
                     external_user_id=external_user_id,
                     active_task_id=active_task_id,
                 )
+                if claimed_legacy_task:
+                    # Sessions run with autoflush=False, so the resume query
+                    # below cannot see the pending sender stamp without this
+                    # flush and would abandon the legacy task for a new one.
+                    # Flush rather than commit: the claim must stay atomic with
+                    # this turn's task creation so both roll back together.
+                    db.flush()
 
             task = None
             if active_task_id is not None and active_task_id != -1:

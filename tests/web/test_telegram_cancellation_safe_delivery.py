@@ -142,6 +142,52 @@ async def test_trace_handler_removes_an_edit_completed_after_cancellation() -> N
 
 
 @pytest.mark.asyncio
+async def test_stop_keeps_a_message_sent_after_cancellation() -> None:
+    """/stop must not delete the streamed message the user is still reading."""
+
+    handler = TelegramTraceHandler(7, bot=None, chat_id=5, message_id=None)  # type: ignore[arg-type]
+    deleted: list[tuple[int, int]] = []
+
+    class _Bot:
+        async def send_message(self, **_kwargs: object) -> SimpleNamespace:
+            # /stop lands while this request is in flight.
+            handler.cancel(discard_output=False)
+            return SimpleNamespace(message_id=99)
+
+        async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+            deleted.append((chat_id, message_id))
+
+    handler.bot = _Bot()  # type: ignore[assignment]
+
+    await handler._update_message("streamed output")
+
+    assert deleted == []
+    assert handler.message_id == 99
+    # Streaming still stops; only the output is kept.
+    assert handler.cancelled is True
+    assert handler.discard_output is False
+
+
+@pytest.mark.asyncio
+async def test_stop_keeps_an_edit_completed_after_cancellation() -> None:
+    handler = TelegramTraceHandler(7, bot=None, chat_id=5, message_id=31)  # type: ignore[arg-type]
+    deleted: list[tuple[int, int]] = []
+
+    class _Bot:
+        async def edit_message_text(self, **_kwargs: object) -> None:
+            handler.cancel(discard_output=False)
+
+        async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+            deleted.append((chat_id, message_id))
+
+    handler.bot = _Bot()  # type: ignore[assignment]
+
+    await handler._update_message("streamed output")
+
+    assert deleted == []
+
+
+@pytest.mark.asyncio
 async def test_trace_handler_keeps_output_when_not_cancelled() -> None:
     handler = TelegramTraceHandler(7, bot=None, chat_id=5, message_id=None)  # type: ignore[arg-type]
     deleted: list[tuple[int, int]] = []

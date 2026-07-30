@@ -28,14 +28,25 @@ class TelegramTraceHandler(TraceHandler):
         self.message_id = message_id
         self.current_text = ""
         self.cancelled = False
+        self.discard_output = False
         self._last_status_update_at = 0.0
         self._last_status_text = ""
         self._activity_items: list[str] = []
 
-    def cancel(self) -> None:
-        """Permanently suppress updates from this execution."""
+    def cancel(self, *, discard_output: bool = True) -> None:
+        """Permanently suppress streaming updates from this execution.
+
+        Args:
+            discard_output: Whether the execution's final answer is stale and
+                must be withheld (and any late delivery compensated). True when
+                the user left the conversation via ``/switch`` or ``/new``.
+                False for ``/stop``, which leaves the user in this same
+                conversation still waiting to read the partial answer.
+        """
 
         self.cancelled = True
+        if discard_output:
+            self.discard_output = True
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
@@ -153,7 +164,10 @@ class TelegramTraceHandler(TraceHandler):
         self.current_text = display_text
 
         def is_cancelled() -> bool:
-            return self.cancelled
+            # Gate compensation on discard_output, not cancelled: /stop halts
+            # streaming but leaves the user in this conversation, so deleting
+            # the message they are reading would be wrong.
+            return self.discard_output
 
         async def delete_sent(msg: Any) -> None:
             await self.bot.delete_message(

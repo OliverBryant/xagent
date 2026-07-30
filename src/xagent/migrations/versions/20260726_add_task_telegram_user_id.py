@@ -1,7 +1,7 @@
 """add Telegram sender ownership to tasks
 
 Revision ID: 20260726_add_task_telegram_user_id
-Revises: 20260725_add_uploaded_file_recovery_index
+Revises: 20260724_add_upload_source_to_uploaded_files
 Create Date: 2026-07-26
 
 """

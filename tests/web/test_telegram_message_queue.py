@@ -31,6 +31,7 @@ def make_bot() -> TelegramBotInstance:
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
     bot.user_conversation_generations = {}
+    bot.user_switch_locks = {}
     bot.selected_agents = {}
     bot._save_selected_agents = lambda: None
     return bot
@@ -333,6 +334,74 @@ async def test_voice_without_asr_is_rejected_before_channel_task_creation(
     assert prepare_calls == 0
     assert len(message.answers) == 1
     assert "no speech recognition model is configured" in message.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_switch_waits_for_in_flight_message_task_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A /switch must not interleave with a message's awaited task resolution.
+
+    Both paths take the same per-user barrier, so a message arriving mid-switch
+    binds to the resolved task instead of being enqueued against the old one and
+    then silently dropped by the generation fence.
+    """
+
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram switch race"
+    bot.active_tasks = {101: 7}
+    bot._save_active_tasks = lambda: True
+    bot._clear_user_stop_request = lambda _user_id: None
+    bot._consume_user_stop_request = lambda _user_id: False
+
+    order: list[str] = []
+    prepare_entered = asyncio.Event()
+    release_prepare = asyncio.Event()
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        order.append("prepare:start")
+        prepare_entered.set()
+        await release_prepare.wait()
+        order.append("prepare:end")
+        # Returning None keeps the batch on the early-exit path, which is
+        # enough to prove where the barrier serialized the two coroutines.
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task",
+        prepare,
+    )
+    bot._extract_message_content = extract_text
+
+    class Message:
+        voice = None
+        chat = SimpleNamespace(id=456)
+
+        async def answer(self, _text: str, **_kwargs) -> None:
+            return None
+
+    batch = asyncio.create_task(
+        bot._process_user_messages_batch(101, [Message()])  # type: ignore[arg-type]
+    )
+    await prepare_entered.wait()
+
+    async def switch() -> None:
+        async with bot._switch_lock_for_user(101):
+            order.append("switch:critical-section")
+
+    switching = asyncio.create_task(switch())
+    # Give the switch a chance to run: it must block on the barrier instead.
+    await asyncio.sleep(0)
+    assert order == ["prepare:start"]
+
+    release_prepare.set()
+    await asyncio.gather(batch, switching)
+
+    assert order == ["prepare:start", "prepare:end", "switch:critical-section"]
 
 
 @pytest.mark.asyncio

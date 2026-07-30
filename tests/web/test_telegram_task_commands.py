@@ -447,9 +447,9 @@ async def test_switch_stops_current_run_clears_queue_and_persists_selection(
     bot.user_active_executions[101] = (int(current.id), service)
 
     class _TraceHandler(TelegramTraceHandler):
-        def cancel(self) -> None:
+        def cancel(self, *, discard_output: bool = True) -> None:
             events.append("cancel-stream")
-            super().cancel()
+            super().cancel(discard_output=discard_output)
 
     trace_handler = _TraceHandler(
         task_id=int(current.id),
@@ -518,7 +518,31 @@ def test_task_list_messages_escape_titles_and_stay_below_telegram_limit() -> Non
     )
     assert all("<unsafe" not in message for message in messages)
     assert any("● <code>2</code>" in message for message in messages)
-    assert any("50 most recent" in message for message in messages)
+    # 8 tasks is well under the limit, so nothing was truncated.
+    assert all("50 most recent" not in message for message in messages)
+
+
+def test_task_list_header_marks_truncation_only_at_the_limit() -> None:
+    bot = _bot(1)
+
+    def _tasks(count: int) -> list[TelegramChannelTaskSnapshot]:
+        return [
+            TelegramChannelTaskSnapshot(
+                task_id=index,
+                title=f"Task {index}",
+                status="completed",
+                updated_at=datetime(2026, 7, 1, tzinfo=UTC),
+                created_at=None,
+            )
+            for index in range(1, count + 1)
+        ]
+
+    limit = channel_runtime.TELEGRAM_TASK_LIST_LIMIT
+    partial = bot._format_task_list_messages(_tasks(3), active_task_id=None)  # type: ignore[arg-type]
+    assert all("most recent" not in message for message in partial)
+
+    full = bot._format_task_list_messages(_tasks(limit), active_task_id=None)  # type: ignore[arg-type]
+    assert any(f"{limit} most recent" in message for message in full)
 
 
 @pytest.mark.parametrize(
@@ -723,6 +747,30 @@ def test_failed_new_conversation_save_keeps_previous_selection() -> None:
     assert bot.active_tasks[101] == 7
     assert bot.user_message_queues[101] == ["pending"]
     assert handler.cancelled is False
+
+
+def test_stop_halts_streaming_but_preserves_the_answer() -> None:
+    """/stop leaves the user in the conversation, so the answer is still theirs."""
+
+    bot = _bot(1)
+    handler = TelegramTraceHandler(7, bot=None, chat_id=1, message_id=1)  # type: ignore[arg-type]
+    bot.user_active_trace_handlers[101] = handler
+
+    bot._stop_current_conversation(101)
+
+    assert handler.cancelled is True
+    assert handler.discard_output is False
+
+
+def test_new_conversation_discards_the_abandoned_answer() -> None:
+    bot = _bot(1)
+    handler = TelegramTraceHandler(7, bot=None, chat_id=1, message_id=1)  # type: ignore[arg-type]
+    bot.user_active_trace_handlers[101] = handler
+
+    bot._start_new_conversation(101)
+
+    assert handler.cancelled is True
+    assert handler.discard_output is True
 
 
 def test_save_active_tasks_tracks_unsaved_state_for_retry(tmp_path: Path) -> None:

@@ -118,6 +118,7 @@ async def test_send_output_files_uploads_documents(tmp_path) -> None:
             user_id=7,
             task_id=423,
             reply_to=reply,  # type: ignore[arg-type]
+            is_cancelled=lambda: False,
         )
 
     assert failed_refs == []

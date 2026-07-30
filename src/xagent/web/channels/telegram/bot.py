@@ -6,7 +6,6 @@ import json
 import logging
 import mimetypes
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -90,10 +89,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Task ids are always ASCII decimals. str.isdigit()/isdecimal() also accept
-# Unicode digit forms, which either crash int() or resolve to an unrelated id.
-_ASCII_TASK_ID_PATTERN = re.compile(r"[0-9]+")
 
 # Opening a directory to fsync it is a POSIX idiom. Windows cannot do it at all
 # -- its CRT reports EACCES for os.open() on a directory -- so the barrier is
@@ -612,10 +607,10 @@ class TelegramBotInstance:
     @staticmethod
     def _switch_task_id(command_text: str | None) -> int | None:
         parts = (command_text or "").strip().split()
-        # Require ASCII digits. isdigit() accepts "²", which int() then rejects
-        # with an uncaught ValueError, and other Unicode digit forms ("٣",
-        # "１２") would silently resolve to an unrelated task id.
-        if len(parts) != 2 or not _ASCII_TASK_ID_PATTERN.fullmatch(parts[1]):
+        # Require ASCII digits. isdigit() alone accepts "²", which int() then
+        # rejects with an uncaught ValueError, and other Unicode digit forms
+        # ("٣", "１２") would silently resolve to an unrelated task id.
+        if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
             return None
         task_id = int(parts[1])
         return task_id if task_id > 0 else None
@@ -632,9 +627,12 @@ class TelegramBotInstance:
             return
 
         telegram_user_id = int(message.from_user.id)
-        # Hold the barrier across the whole transition, including the awaited
-        # lookup: a message arriving mid-switch must not enter the old task's
-        # queue only to be cleared by the stop path below.
+        # Serialize concurrent /switch commands from the same sender: two
+        # transitions interleaving across their awaited lookups would race on
+        # active_tasks and selected_agents. The message path deliberately does
+        # not take this barrier -- a message racing a switch is handled by the
+        # fences in _process_user_messages_batch, which reply to the user
+        # instead of being serialized behind network I/O.
         async with self._switch_lock_for_user(telegram_user_id):
             await self._switch_to_task(message, telegram_user_id, task_id)
 
@@ -886,6 +884,47 @@ class TelegramBotInstance:
             raise TaskLeaseLostError(
                 f"task {task_id} ownership changed before Telegram stop"
             )
+
+    async def _settle_fenced_turn(
+        self,
+        managed_lease: ManagedTaskLease,
+        *,
+        task_id: int,
+        user_id: int,
+        reply_to: types.Message,
+        stop_requested: bool = False,
+    ) -> None:
+        """Settle a turn fenced out by a /switch, /new, or /stop, with a reply.
+
+        A fence must never swallow the message. Three cases differ in what the
+        claim means:
+
+        * ``stop_requested``: the user asked for this run to pause, so pause it
+          even when it is the live conversation -- that is what they requested.
+        * The claim resolved to the conversation the user is in now (they
+          switched *into* it while this turn was being prepared). Pausing it
+          would stop the conversation they are actively using, so the lease is
+          released without a PAUSED transition.
+        * The claim is genuinely stale -- it belongs to a conversation the user
+          has left -- so it is paused as before.
+
+        Every case answers the user, so no message is ever silently dropped.
+        """
+
+        if not stop_requested and task_id == self.active_tasks.get(user_id):
+            # Not stale: release the claim without pausing the live task.
+            await managed_lease.close()
+            await reply_to.answer(
+                "I switched conversations while handling that message, "
+                "so it wasn't sent. Please send it again."
+            )
+            return
+
+        await self._finalize_requested_stop(managed_lease, task_id=task_id)
+        await reply_to.answer(
+            "That message wasn't sent because the conversation was "
+            "paused. Please send it again to continue."
+        )
 
     def _is_stop_request_text(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -1406,23 +1445,18 @@ class TelegramBotInstance:
                         )
                         return
 
-                # Take the same barrier /switch holds. Without it a message
-                # arriving during a switch's awaited lookup resolves against
-                # the old task and is then silently dropped by the generation
-                # fence below, leaving the user with no reply at all.
-                async with self._switch_lock_for_user(user_id):
-                    active_task_id = self.active_tasks.get(user_id)
-                    prepared_task = await prepare_channel_task(
-                        channel_id=self.channel_id,
-                        external_user_id=str(user_id),
-                        active_task_id=(
-                            int(active_task_id) if active_task_id is not None else None
-                        ),
-                        text=text,
-                        channel_name=self.channel_name,
-                        expected_owner_user_id=expected_owner_user_id,
-                        agent_id=self.selected_agents.get(user_id),
-                    )
+                active_task_id = self.active_tasks.get(user_id)
+                prepared_task = await prepare_channel_task(
+                    channel_id=self.channel_id,
+                    external_user_id=str(user_id),
+                    active_task_id=(
+                        int(active_task_id) if active_task_id is not None else None
+                    ),
+                    text=text,
+                    channel_name=self.channel_name,
+                    expected_owner_user_id=expected_owner_user_id,
+                    agent_id=self.selected_agents.get(user_id),
+                )
             except ChannelAuthorizationError:
                 await last_message.answer("🚫 You are not authorized to use this bot.")
                 return
@@ -1451,9 +1485,11 @@ class TelegramBotInstance:
             # this turn was being prepared: settle the stale claim without
             # touching active_tasks or selected_agents.
             if self._conversation_generation(user_id) != conversation_generation:
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    user_id=user_id,
+                    reply_to=last_message,
                 )
                 return
 
@@ -1483,9 +1519,12 @@ class TelegramBotInstance:
                 )
 
             if self._consume_user_stop_request(user_id):
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    user_id=user_id,
+                    reply_to=last_message,
+                    stop_requested=True,
                 )
                 return
 
@@ -1649,9 +1688,12 @@ class TelegramBotInstance:
                         task_id,
                         exc_info=True,
                     )
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    user_id=user_id,
+                    reply_to=last_message,
+                    stop_requested=True,
                 )
                 return
 
@@ -1816,6 +1858,7 @@ class TelegramBotInstance:
                                 reply_to=last_message,
                             ),
                             is_cancelled=is_cancelled,
+                            delete=lambda msg: msg.delete(),
                             description=f"image fallback for task {task_id}",
                         )
 
@@ -1834,6 +1877,7 @@ class TelegramBotInstance:
                                 reply_to=last_message,
                             ),
                             is_cancelled=is_cancelled,
+                            delete=lambda msg: msg.delete(),
                             description=f"file fallback for task {task_id}",
                         )
             except CancelledDelivery:
@@ -1936,12 +1980,12 @@ class TelegramBotInstance:
         file_record_by_id = {record.file_id: record for record in file_records}
 
         # Loading the records is awaited, so re-check before the first send.
-        if is_cancelled is not None and is_cancelled():
+        if is_cancelled():
             return []
 
         sent_file_ids: set[str] = set()
         for image_ref in image_refs:
-            if is_cancelled is not None and is_cancelled():
+            if is_cancelled():
                 return []
             if image_ref.file_id in sent_file_ids:
                 continue
@@ -2044,7 +2088,7 @@ class TelegramBotInstance:
 
     async def _send_image_fallback_message(
         self, *, image_refs: list[TelegramImageRef], reply_to: types.Message
-    ) -> None:
+    ) -> Any:
         subject = "image" if len(image_refs) == 1 else "images"
         lines = [
             f"I couldn't send the {subject} through Telegram, but the file reference is still available:"
@@ -2053,10 +2097,14 @@ class TelegramBotInstance:
             label = image_ref.alt_text or "image"
             lines.append(f"- {label}: file:{image_ref.file_id}")
         text = "\n".join(lines)
+        # Returned so a caller whose cancellation lands mid-send can remove
+        # this notice instead of stranding it in an abandoned conversation.
         try:
-            await reply_to.answer(markdown_to_tg_html(text), parse_mode=ParseMode.HTML)
+            return await reply_to.answer(
+                markdown_to_tg_html(text), parse_mode=ParseMode.HTML
+            )
         except Exception:
-            await reply_to.answer(text)
+            return await reply_to.answer(text)
 
     async def _send_output_files(
         self,
@@ -2078,12 +2126,12 @@ class TelegramBotInstance:
         file_record_by_id = {record.file_id: record for record in file_records}
 
         # Loading the records is awaited, so re-check before the first send.
-        if is_cancelled is not None and is_cancelled():
+        if is_cancelled():
             return []
 
         sent_file_ids: set[str] = set()
         for file_ref in file_refs:
-            if is_cancelled is not None and is_cancelled():
+            if is_cancelled():
                 return []
             if file_ref.file_id in sent_file_ids:
                 continue
@@ -2138,7 +2186,7 @@ class TelegramBotInstance:
 
     async def _send_file_fallback_message(
         self, *, file_refs: list[TelegramFileRef], reply_to: types.Message
-    ) -> None:
+    ) -> Any:
         subject = "file" if len(file_refs) == 1 else "files"
         lines = [
             f"I couldn't send the {subject} through Telegram, but the file reference is still available:"
@@ -2147,10 +2195,14 @@ class TelegramBotInstance:
             label = file_ref.label or "file"
             lines.append(f"- {label}: file:{file_ref.file_id}")
         text = "\n".join(lines)
+        # Returned so a caller whose cancellation lands mid-send can remove
+        # this notice instead of stranding it in an abandoned conversation.
         try:
-            await reply_to.answer(markdown_to_tg_html(text), parse_mode=ParseMode.HTML)
+            return await reply_to.answer(
+                markdown_to_tg_html(text), parse_mode=ParseMode.HTML
+            )
         except Exception:
-            await reply_to.answer(text)
+            return await reply_to.answer(text)
 
     async def start(self) -> None:
         if not self._accepting:
@@ -2213,6 +2265,7 @@ class TelegramBotInstance:
             self.user_preparing_executions.clear()
             self.user_stop_events.clear()
             self.user_conversation_generations.clear()
+            self.user_switch_locks.clear()
 
     async def _stop_ingress(self) -> None:
         try:

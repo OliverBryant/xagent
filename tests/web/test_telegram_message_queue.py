@@ -336,72 +336,282 @@ async def test_voice_without_asr_is_rejected_before_channel_task_creation(
     assert "no speech recognition model is configured" in message.answers[0]
 
 
-@pytest.mark.asyncio
-async def test_switch_waits_for_in_flight_message_task_resolution(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A /switch must not interleave with a message's awaited task resolution.
-
-    Both paths take the same per-user barrier, so a message arriving mid-switch
-    binds to the resolved task instead of being enqueued against the old one and
-    then silently dropped by the generation fence.
-    """
-
+def _fenced_turn_bot(finalized: list, *, active_task_id: int):  # type: ignore[no-untyped-def]
     bot = make_bot()
     bot.channel_id = 1
-    bot.channel_name = "Telegram switch race"
-    bot.active_tasks = {101: 7}
+    bot.channel_name = "Telegram fence"
+    bot.active_tasks = {101: active_task_id}
     bot._save_active_tasks = lambda: True
     bot._clear_user_stop_request = lambda _user_id: None
-    bot._consume_user_stop_request = lambda _user_id: False
+    bot._active_tasks_unsaved = False
+    return bot
 
-    order: list[str] = []
-    prepare_entered = asyncio.Event()
-    release_prepare = asyncio.Event()
+
+class _FenceLease:
+    heartbeat_task = None
+
+    def __init__(self, task_id: int, finalized: list) -> None:  # type: ignore[type-arg]
+        self.lease = TaskLease(
+            task_id=task_id, runner_id="runner-fence", run_id="run-fence"
+        )
+        self._finalized = finalized
+        self.closed = False
+
+    async def finalize_result(self, *, status: TaskStatus, **_kwargs) -> bool:
+        self._finalized.append((self.lease.task_id, status))
+        return True
+
+    async def close(self) -> bool:
+        self.closed = True
+        return True
+
+
+class _FenceMessage:
+    voice = None
+    chat = SimpleNamespace(id=456)
+
+    def __init__(self) -> None:
+        self.answers: list[str] = []
+
+    async def answer(self, text: str, **_kwargs) -> None:
+        self.answers.append(text)
+
+
+@pytest.mark.asyncio
+async def test_message_racing_switch_replies_without_pausing_the_new_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switch-first ordering: the turn resolves to the task the user is now in.
+
+    Pausing it would stop the conversation the user is actively using, and
+    returning silently would swallow their message. The lease is released
+    without a PAUSED transition and the user is told to resend.
+    """
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=7)
+    bot._consume_user_stop_request = lambda _user_id: False
+    lease = _FenceLease(42, finalized)
 
     async def extract_text(_message):  # type: ignore[no-untyped-def]
         return "hello", []
 
     async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
-        order.append("prepare:start")
-        prepare_entered.set()
-        await release_prepare.wait()
-        order.append("prepare:end")
-        # Returning None keeps the batch on the early-exit path, which is
-        # enough to prove where the barrier serialized the two coroutines.
-        return None
+        # The /switch commits while this turn is being prepared.
+        bot.user_conversation_generations[101] = (
+            bot.user_conversation_generations.get(101, 0) + 1
+        )
+        bot.active_tasks[101] = 42
+        return SimpleNamespace(
+            user_id=5,
+            task_id=42,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
 
     monkeypatch.setattr(
-        "xagent.web.channels.telegram.bot.prepare_channel_task",
-        prepare,
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
     )
     bot._extract_message_content = extract_text
 
-    class Message:
-        voice = None
-        chat = SimpleNamespace(id=456)
+    message = _FenceMessage()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
 
-        async def answer(self, _text: str, **_kwargs) -> None:
+    # The task the user just switched into must not be paused.
+    assert finalized == []
+    assert lease.closed is True
+    assert bot.active_tasks[101] == 42
+    assert len(message.answers) == 1
+    assert "send it again" in message.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_stale_fenced_turn_pauses_the_old_task_and_still_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim for a conversation the user left is paused -- but never silently."""
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=99)
+    bot._consume_user_stop_request = lambda _user_id: False
+    lease = _FenceLease(7, finalized)
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        bot.user_conversation_generations[101] = (
+            bot.user_conversation_generations.get(101, 0) + 1
+        )
+        # active_tasks already points elsewhere: task 7 is genuinely stale.
+        return SimpleNamespace(
+            user_id=5,
+            task_id=7,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
+    )
+    bot._extract_message_content = extract_text
+
+    message = _FenceMessage()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
+
+    assert finalized == [(7, TaskStatus.PAUSED)]
+    assert len(message.answers) == 1
+    assert "send it again" in message.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_stop_during_the_loading_message_removes_it_and_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loading message is the first awaited send, before any trace handler.
+
+    It cannot be protected by the cancellation latch, so a stop landing during
+    that send must be caught by the manual re-check: the stale loading message
+    is deleted, the task is paused once, and the user still gets a reply.
+    """
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=42)
+    lease = _FenceLease(42, finalized)
+    loading_deleted: list[bool] = []
+    loading_sent = False
+
+    def consume_stop(_user_id: int) -> bool:
+        # True only once the loading message has been sent -- the exact window
+        # this protection covers, since no trace handler exists yet.
+        return loading_sent
+
+    bot._consume_user_stop_request = consume_stop
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            user_id=5,
+            task_id=42,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+        ),
+    )
+
+    agent_service = SimpleNamespace(
+        set_conversation_history=lambda _messages: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return agent_service
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+
+    async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.persist_channel_user_message",
+        persist_message,
+    )
+    bot._extract_message_content = extract_text
+
+    class LoadingMessage:
+        message_id = 555
+
+        async def delete(self) -> None:
+            loading_deleted.append(True)
+
+    class Message(_FenceMessage):
+        from_user = SimpleNamespace(id=101)
+
+        async def answer(self, text: str, **_kwargs):  # type: ignore[no-untyped-def]
+            nonlocal loading_sent
+            self.answers.append(text)
+            if not loading_sent:
+                loading_sent = True
+                return LoadingMessage()
             return None
 
-    batch = asyncio.create_task(
-        bot._process_user_messages_batch(101, [Message()])  # type: ignore[arg-type]
+    message = Message()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
+
+    assert loading_deleted == [True]
+    assert finalized == [(42, TaskStatus.PAUSED)]
+    # The loading message plus the resend prompt -- never a silent return.
+    assert len(message.answers) == 2
+    assert "send it again" in message.answers[1]
+
+
+@pytest.mark.asyncio
+async def test_stop_request_fence_pauses_and_replies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit /stop pauses the run even when it is the live conversation.
+
+    That is what the user asked for, so unlike the switch-away case the PAUSED
+    transition is correct here -- but the message still must not vanish.
+    """
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=42)
+    stop_checks = 0
+
+    def consume_stop(_user_id: int) -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        return stop_checks == 1
+
+    bot._consume_user_stop_request = consume_stop
+    lease = _FenceLease(42, finalized)
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        # No generation bump: this turn is fenced by the stop request alone.
+        return SimpleNamespace(
+            user_id=5,
+            task_id=42,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
     )
-    await prepare_entered.wait()
+    bot._extract_message_content = extract_text
 
-    async def switch() -> None:
-        async with bot._switch_lock_for_user(101):
-            order.append("switch:critical-section")
+    message = _FenceMessage()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
 
-    switching = asyncio.create_task(switch())
-    # Give the switch a chance to run: it must block on the barrier instead.
-    await asyncio.sleep(0)
-    assert order == ["prepare:start"]
-
-    release_prepare.set()
-    await asyncio.gather(batch, switching)
-
-    assert order == ["prepare:start", "prepare:end", "switch:critical-section"]
+    # The user asked for the pause, so it is applied.
+    assert finalized == [(42, TaskStatus.PAUSED)]
+    assert len(message.answers) == 1
+    assert "send it again" in message.answers[0]
 
 
 @pytest.mark.asyncio
@@ -1613,4 +1823,6 @@ async def test_batch_discards_prepared_task_after_conversation_switch(
     assert finalized == [TaskStatus.PAUSED]
     assert bot.active_tasks[123] == -1
     assert bot.selected_agents == {123: 9}
-    assert answers == []
+    # The fence must not swallow the message: the user is told to resend.
+    assert len(answers) == 1
+    assert "send it again" in answers[0]

@@ -42,6 +42,7 @@ from xagent.web.services.task_command_transport import (
     TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
+    TaskCommandTaskMissing,
     _claim_heartbeat,
     claim_task_command,
     defer_task_command,
@@ -1759,8 +1760,9 @@ def test_enqueue_detects_a_task_deleted_after_the_caller_loaded_it(
 
     user, task = _create_running_task(db_session)
     task_id = int(task.id)
-    # The caller still holds `task` in its identity map, as the websocket
-    # transport does between its permission check and this enqueue.
+    # The task id was validated earlier -- as the websocket transport does
+    # between its permission check and this enqueue -- and the row is gone by
+    # the time the command is written.
     db_session.query(Task).filter(Task.id == task_id).delete()
     db_session.commit()
 
@@ -1775,6 +1777,65 @@ def test_enqueue_detects_a_task_deleted_after_the_caller_loaded_it(
         )
 
     assert db_session.query(TaskExecutionCommand).count() == 0
+
+
+def test_websocket_enqueue_returns_none_when_the_task_vanishes_mid_enqueue(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """allow_missing_task routes a mid-enqueue delete to the recovery sentinel.
+
+    The task exists at the permission check but is gone by the time the command
+    is written. The caller must get None so it creates a replacement task rather
+    than rejecting the delivery.
+    """
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    def raise_missing(*_args, **_kwargs):
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+
+    monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
+
+    result = websocket_api._enqueue_websocket_task_command_sync(
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        actor_is_admin=False,
+        command_id="pause-vanished",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+        allow_missing_task=True,
+    )
+
+    assert result is None
+
+
+def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without allow_missing_task the delivery must be rejected, not silently
+    swallowed as if the command had been accepted."""
+
+    user, task = _create_running_task(db_session)
+    task_id = int(task.id)
+
+    def raise_missing(*_args, **_kwargs):
+        raise TaskCommandTaskMissing(f"Task {task_id} not found")
+
+    monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
+
+    with pytest.raises(TaskCommandTaskMissing):
+        websocket_api._enqueue_websocket_task_command_sync(
+            task_id=task_id,
+            actor_user_id=int(user.id),
+            actor_is_admin=False,
+            command_id="pause-vanished-strict",
+            kind=TaskCommandKind.PAUSE,
+            payload={"type": "pause_task"},
+            allow_missing_task=False,
+        )
 
 
 def test_task_foreign_key_violation_is_reported_as_a_missing_task(

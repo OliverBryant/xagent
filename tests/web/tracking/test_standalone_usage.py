@@ -67,7 +67,9 @@ def test_scope_reports_even_when_the_body_raises(captured) -> None:
     calls, _ = captured
     with pytest.raises(RuntimeError):
         with usage_scope(7):
-            add_media_usage(unit="images", quantity=1, model="i", call_type="edit_image")
+            add_media_usage(
+                unit="images", quantity=1, model="i", call_type="edit_image"
+            )
             raise RuntimeError("downstream failure")
 
     assert len(calls) == 1
@@ -130,9 +132,13 @@ def test_scope_restores_the_previous_context(captured) -> None:
     """A nested scope must not leak its usage object into the outer one."""
     _calls, _ = captured
     with usage_scope(1) as outer:
-        add_media_usage(unit="images", quantity=1, model="a", call_type="generate_image")
+        add_media_usage(
+            unit="images", quantity=1, model="a", call_type="generate_image"
+        )
         with usage_scope(2):
-            add_media_usage(unit="images", quantity=1, model="b", call_type="edit_image")
+            add_media_usage(
+                unit="images", quantity=1, model="b", call_type="edit_image"
+            )
         # Back on the outer usage, and the inner call did not land here.
         assert get_token_usage() is outer
         assert len(outer.details) == 1

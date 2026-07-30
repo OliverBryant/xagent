@@ -36,12 +36,21 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from typing_extensions import TypeGuard
+
 from ...model.chat.token_context import MediaCallType, MediaUnit, add_media_usage
 
 logger = logging.getLogger(__name__)
 
 # Placeholders that must never reach a usage record as a model identity.
 _PLACEHOLDER_MODEL_NAMES = {"", "none", "null", "default"}
+
+
+def _usable_model_name(value: Any) -> TypeGuard[str]:
+    """A real model identity, not a placeholder. TypeGuard so callers narrow."""
+    return (
+        isinstance(value, str) and value.strip().lower() not in _PLACEHOLDER_MODEL_NAMES
+    )
 
 
 def resolve_billing_model(
@@ -58,19 +67,13 @@ def resolve_billing_model(
     attribute, and only then to ``fallback``.
     """
 
-    def _usable(value: Any) -> bool:
-        return (
-            isinstance(value, str)
-            and value.strip().lower() not in _PLACEHOLDER_MODEL_NAMES
-        )
-
     # The placeholder filter applies to the configured id too: a config that
     # literally names the model "default" or "none" must not be billed as one.
-    if _usable(configured_id):
-        return configured_id  # type: ignore[return-value]
+    if _usable_model_name(configured_id):
+        return configured_id
     for attr in ("model_name", "model"):
         value = getattr(model, attr, None)
-        if _usable(value):
+        if _usable_model_name(value):
             return value
     return fallback
 

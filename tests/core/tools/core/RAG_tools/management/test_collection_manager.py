@@ -583,10 +583,8 @@ class TestRebuildCollectionMetadata:
         ]
 
         # Mock count_rows_or_zero - only embeddings table has data
-        mock_vector_store.count_rows_or_zero.side_effect = (
-            lambda table_name, **kwargs: (
-                10 if table_name == "embeddings_test_model" else 0
-            )
+        mock_vector_store.count_rows_or_zero.side_effect = lambda table_name, **kwargs: (
+            10 if table_name == "embeddings_test_model" else 0
         )
 
         # Mock get_vector_dimension

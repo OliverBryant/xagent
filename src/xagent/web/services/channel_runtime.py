@@ -247,6 +247,16 @@ def _load_channel_owner_sync(
 
     allowed_users = channel.config.get("allowed_users")
     if allowed_users is not None:
+        # config is an unconstrained JSON dict, so the allowlist may be a bare
+        # string. Iterating one yields its characters, which would authorize
+        # "1" and deny the intended "101" -- treat it as a single entry.
+        if isinstance(allowed_users, str):
+            allowed_users = [allowed_users]
+        elif not isinstance(allowed_users, (list, tuple, set)):
+            raise ChannelConfigurationError(
+                "Channel allowed_users must be a list of sender ids"
+            )
+        # Ids may be numeric in config while sender ids are always strings.
         allowed_user_ids = {str(value) for value in allowed_users}
         if external_user_id not in allowed_user_ids:
             raise ChannelAuthorizationError("Channel sender is not authorized")
@@ -287,18 +297,17 @@ def _resolve_telegram_sender_scope_sync(
     channel_id: int | None,
     external_user_id: str,
     active_task_id: int | None,
-    claim_legacy_task: bool = True,
 ) -> tuple[int, UserChannel]:
     """Authorize the sender and settle any legacy claim before task queries.
 
     Shared by the list and single-task loaders, which differ only in the query
     they run afterwards. Returns the owner id and the resolved channel.
 
-    Note that ``claim_legacy_task`` makes this a *write* path: a pre-migration
-    task whose ownership the sender's active-task mapping proves is stamped and
-    committed here. Read-only-looking callers such as /list still need it,
-    because without the stamp the sender's own history stays invisible to every
-    subsequent query -- so the write is required to make the read correct.
+    This is a *write* path: a pre-migration task whose ownership the sender's
+    active-task mapping proves is stamped and committed here. Read-only-looking
+    callers such as /list still need it, because without the stamp the sender's
+    own history stays invisible to every subsequent query -- so the write is
+    what makes the read correct.
     """
 
     owner = _load_channel_owner_sync(
@@ -318,16 +327,15 @@ def _resolve_telegram_sender_scope_sync(
     if channel is None:
         raise ChannelConfigurationError("Telegram channel is not configured")
 
-    if claim_legacy_task:
-        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
-            db,
-            channel=channel,
-            owner_id=owner.user_id,
-            external_user_id=external_user_id,
-            active_task_id=active_task_id,
-        )
-        if claimed_legacy_task:
-            db.commit()
+    claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+        db,
+        channel=channel,
+        owner_id=owner.user_id,
+        external_user_id=external_user_id,
+        active_task_id=active_task_id,
+    )
+    if claimed_legacy_task:
+        db.commit()
     return owner.user_id, channel
 
 
@@ -357,7 +365,6 @@ def _load_telegram_channel_tasks_sync(
             channel_id=channel_id,
             external_user_id=external_user_id,
             active_task_id=active_task_id,
-            claim_legacy_task=True,
         )
         rows = (
             db.query(Task)
@@ -407,7 +414,6 @@ def _load_telegram_channel_task_sync(
             channel_id=channel_id,
             external_user_id=external_user_id,
             active_task_id=active_task_id,
-            claim_legacy_task=True,
         )
         task = (
             db.query(Task)

@@ -348,21 +348,45 @@ def _fenced_turn_bot(finalized: list, *, active_task_id: int):  # type: ignore[n
 
 
 class _FenceLease:
+    """Stand-in for ManagedTaskLease that mirrors its settlement semantics.
+
+    ``close()`` is gated on ``_closed`` the way the real lease is, so a caller
+    that closes a still-unsettled claim is visible here as ``closed_unsettled``
+    -- against the real lease that is the RUNNING -> FAILED transition pinned by
+    test_closing_a_running_claim_would_fail_the_task.
+    """
+
     heartbeat_task = None
 
-    def __init__(self, task_id: int, finalized: list) -> None:  # type: ignore[type-arg]
+    def __init__(
+        self,
+        task_id: int,
+        finalized: list,  # type: ignore[type-arg]
+        *,
+        finalize_succeeds: bool = True,
+    ) -> None:
         self.lease = TaskLease(
             task_id=task_id, runner_id="runner-fence", run_id="run-fence"
         )
         self._finalized = finalized
+        self._settled = False
+        self._finalize_succeeds = finalize_succeeds
         self.closed = False
+        self.closed_unsettled = False
 
     async def finalize_result(self, *, status: TaskStatus, **_kwargs) -> bool:
+        if not self._finalize_succeeds:
+            # The unhealthy-heartbeat / TTL-retention path: the run is retained
+            # for recovery rather than settled, so callers see False.
+            return False
+        self._settled = True
         self._finalized.append((self.lease.task_id, status))
         return True
 
     async def close(self) -> bool:
         self.closed = True
+        if not self._settled:
+            self.closed_unsettled = True
         return True
 
 
@@ -426,6 +450,53 @@ async def test_message_racing_switch_pauses_rather_than_failing_the_task(
     # FAILED, so settling first leaves the status resumable.
     assert finalized == [(42, TaskStatus.PAUSED)]
     assert bot.active_tasks[101] == 42
+    assert len(message.answers) == 1
+    assert "send it again" in message.answers[0]
+
+
+@pytest.mark.asyncio
+async def test_fence_replies_even_when_settling_the_claim_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed settle must not swallow the user's message.
+
+    finalize_result returns False on the ordinary unhealthy-heartbeat / TTL
+    path, which makes _finalize_requested_stop raise TaskLeaseLostError. If that
+    unwound past the reply the user would get nothing -- the exact invariant the
+    fence exists to guarantee.
+    """
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=7)
+    bot._consume_user_stop_request = lambda _user_id: False
+    lease = _FenceLease(42, finalized, finalize_succeeds=False)
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        bot.user_conversation_generations[101] = (
+            bot.user_conversation_generations.get(101, 0) + 1
+        )
+        bot.active_tasks[101] = 42
+        return SimpleNamespace(
+            user_id=5,
+            task_id=42,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
+    )
+    bot._extract_message_content = extract_text
+
+    message = _FenceMessage()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
+
+    # The settle failed, so nothing was finalized -- but the user was told.
+    assert finalized == []
     assert len(message.answers) == 1
     assert "send it again" in message.answers[0]
 
@@ -564,9 +635,12 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
 
     assert loading_deleted == [True]
     assert finalized == [(42, TaskStatus.PAUSED)]
-    # The loading message plus the resend prompt -- never a silent return.
+    # The loading message plus an interruption notice -- never a silent return.
     assert len(message.answers) == 2
-    assert "send it again" in message.answers[1]
+    # This checkpoint runs after persist_channel_user_message, so it must not
+    # ask for a resend: complying would duplicate the message in history.
+    assert "was received" in message.answers[1]
+    assert "send it again" not in message.answers[1]
 
 
 @pytest.mark.asyncio

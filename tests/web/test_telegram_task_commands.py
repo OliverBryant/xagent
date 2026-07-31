@@ -395,6 +395,60 @@ async def test_switch_rejects_another_telegram_senders_task(
 
 
 @pytest.mark.asyncio
+async def test_switch_rejects_a_task_whose_bound_agent_is_gone(
+    telegram_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tasks.agent_id has no FK, so the binding can dangle.
+
+    Reporting success here would be a lie: the next message evicts the user
+    into a fresh task, silently undoing the switch they asked for.
+    """
+
+    owner, channel = _owner_and_channel(telegram_db, allowed_users=["101"])
+    target = _task(
+        telegram_db,
+        owner=owner,
+        channel=channel,
+        sender="101",
+        title="bound to a deleted agent",
+    )
+    bot = _bot(int(channel.id))
+
+    snapshot = TelegramChannelTaskSnapshot(
+        task_id=int(target.id),
+        title="bound to a deleted agent",
+        status="completed",
+        created_at=None,
+        updated_at=None,
+        agent_id=4242,
+    )
+
+    async def load_task(**_kwargs: object) -> TelegramChannelTaskSnapshot:
+        return snapshot
+
+    async def missing_agent(**_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_telegram_channel_task",
+        load_task,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_channel_owner_agent",
+        missing_agent,
+    )
+    message = _Message(101, f"/switch {target.id}")
+
+    await bot._handle_switch_command(message)  # type: ignore[arg-type]
+
+    # The selection is untouched and the problem is reported now, not later.
+    assert bot.active_tasks == {}
+    assert len(message.answers) == 1
+    assert "no longer available" in message.answers[0]
+
+
+@pytest.mark.asyncio
 async def test_switch_stops_current_run_clears_queue_and_persists_selection(
     telegram_db: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -629,6 +683,30 @@ async def test_switch_is_not_confirmed_when_selection_cannot_be_persisted(
     assert bot.active_tasks[101] == 7
     assert "couldn't save the switch" in message.answers[-1]
     assert not any("Switched to task" in answer for answer in message.answers)
+
+
+def test_legacy_active_tasks_file_is_retired_after_a_fallback_read(
+    tmp_path: Path,
+) -> None:
+    """The legacy mapping must be readable at most once.
+
+    It is proof-of-ownership for claiming pre-migration tasks, so resurrecting
+    a stale copy later could reassign a task to the wrong current sender.
+    """
+
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._legacy_active_tasks_file = tmp_path / "legacy.json"
+    bot._legacy_active_tasks_file.write_text('{"101": 7}')
+
+    assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
+
+    assert not bot._legacy_active_tasks_file.exists()
+    assert (tmp_path / "legacy.json.migrated").read_text() == '{"101": 7}'
+
+    # A second load cannot resurrect the retired mapping.
+    assert TelegramBotInstance._load_active_tasks(bot) == {}
 
 
 def test_save_active_tasks_is_atomic_and_reports_failure(tmp_path: Path) -> None:

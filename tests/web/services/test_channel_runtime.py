@@ -833,6 +833,51 @@ async def test_numeric_allowed_users_authorizes_the_matching_sender(
 
 
 @pytest.mark.asyncio
+async def test_bare_string_allowed_users_is_not_matched_per_character(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """config is unconstrained JSON, so allowed_users may be a bare string.
+
+    Iterating one yields its characters, which would authorize "1" and deny the
+    intended "101". It must be treated as a single-entry allowlist.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Bare string allowlist",
+            config={"allowed_users": "101"},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="101",
+    )
+    assert snapshot.user_id == user_id
+
+    # A single character of the configured id must not authorize anyone.
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="1",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_closing_a_running_claim_would_fail_the_task(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

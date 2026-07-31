@@ -202,13 +202,40 @@ class TelegramBotInstance:
             try:
                 with open(path, "r") as f:
                     # Convert string keys back to int
-                    return {int(k): v for k, v in json.load(f).items()}
+                    loaded = {int(k): v for k, v in json.load(f).items()}
             except Exception as e:
                 logger.error(
                     f"Failed to load Telegram active tasks for {self.instance_id} "
                     f"from {path}: {e}"
                 )
+                continue
+
+            if path is self._legacy_active_tasks_file:
+                self._retire_legacy_active_tasks_file()
+            return loaded
         return {}
+
+    def _retire_legacy_active_tasks_file(self) -> None:
+        """Rename the legacy file so a fallback read can happen at most once.
+
+        This mapping is proof-of-ownership for claiming pre-migration tasks
+        (``telegram_user_id IS NULL``). If the durable file were later lost
+        while this one survived, a stale mapping would be resurrected and could
+        reassign a task to the wrong current sender.
+        """
+
+        retired = self._legacy_active_tasks_file.with_suffix(
+            f"{self._legacy_active_tasks_file.suffix}.migrated"
+        )
+        try:
+            os.replace(self._legacy_active_tasks_file, retired)
+        except OSError:
+            logger.warning(
+                "Failed to retire the legacy Telegram active-tasks file %s; "
+                "a future load could resurrect a stale mapping",
+                self._legacy_active_tasks_file,
+                exc_info=True,
+            )
 
     def _save_active_tasks(self) -> bool:
         """Persist the active-task mapping atomically.
@@ -375,6 +402,13 @@ class TelegramBotInstance:
             # would be silently overwritten when that lookup resumes.
             async with self._switch_lock_for_user(message.from_user.id):
                 _, persisted = self._start_new_conversation(message.from_user.id)
+                # Inside the lock: the active-task reset and the agent clear are
+                # one update, and keeping them together stays correct if agent
+                # persistence ever becomes async.
+                if persisted:
+                    # Only clear the agent once the reset is durable, so a
+                    # failed save leaves the whole previous selection intact.
+                    self._set_selected_agent(message.from_user.id, None)
             if not persisted:
                 await message.answer(
                     "I couldn't start a new task because the change could not "
@@ -382,9 +416,6 @@ class TelegramBotInstance:
                     "again."
                 )
                 return
-            # Only clear the agent once the reset is durable, so a failed save
-            # leaves the whole previous selection intact.
-            self._set_selected_agent(message.from_user.id, None)
             await message.answer(
                 "Fresh start. Send me what you'd like to work on next."
             )
@@ -664,6 +695,24 @@ class TelegramBotInstance:
                 )
                 return
 
+            # tasks.agent_id has no FK and agent deletion does not check for
+            # referencing tasks, so the binding can dangle. Catch it here:
+            # otherwise /switch reports success and the next message silently
+            # evicts the user into a fresh task, undoing the switch.
+            if task.agent_id is not None:
+                bound_agent = await get_channel_owner_agent(
+                    channel_id=self.channel_id,
+                    external_user_id=str(telegram_user_id),
+                    agent_id=task.agent_id,
+                )
+                if bound_agent is None:
+                    await message.answer(
+                        f"Task <code>{task_id}</code> is bound to an agent that "
+                        "is no longer available, so it can't be resumed. "
+                        "Use /new to start a fresh conversation."
+                    )
+                    return
+
             if self.active_tasks.get(telegram_user_id) == task_id:
                 # A dequeued batch is active work too, even before its
                 # execution is registered.
@@ -908,21 +957,26 @@ class TelegramBotInstance:
         ``already_persisted`` distinguishes the wording only. Once the message is
         in conversation history, asking the user to resend would duplicate it, so
         they are told it was received instead.
+
+        The reply is sent from a ``finally``: settling raises TaskLeaseLostError
+        on the ordinary unhealthy-heartbeat/TTL path, and letting that unwind
+        past the reply would swallow the message -- the exact failure this
+        helper exists to prevent.
         """
 
-        await self._finalize_requested_stop(managed_lease, task_id=task_id)
-
-        if already_persisted:
-            await reply_to.answer(
-                "Your message was received but the conversation was "
-                "interrupted before I could answer. Send anything to continue."
-            )
-            return
-
-        await reply_to.answer(
-            "That message wasn't sent because the conversation was "
-            "paused. Please send it again to continue."
-        )
+        try:
+            await self._finalize_requested_stop(managed_lease, task_id=task_id)
+        finally:
+            if already_persisted:
+                await reply_to.answer(
+                    "Your message was received but the conversation was "
+                    "interrupted before I could answer. Send anything to continue."
+                )
+            else:
+                await reply_to.answer(
+                    "That message wasn't sent because the conversation was "
+                    "paused. Please send it again to continue."
+                )
 
     def _is_stop_request_text(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -1017,13 +1071,15 @@ class TelegramBotInstance:
                 # the next message would start a fresh task with it anyway.
                 async with self._switch_lock_for_user(user_id):
                     _, persisted = self._start_new_conversation(user_id)
+                    # Inside the lock: reset and selection are one update.
+                    if persisted:
+                        self._set_selected_agent(user_id, None)
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
                         show_alert=True,
                     )
                     return
-                self._set_selected_agent(user_id, None)
                 await callback.answer("Default assistant selected")
                 confirmation = (
                     "Default assistant selected. "
@@ -1042,13 +1098,15 @@ class TelegramBotInstance:
                     return
                 async with self._switch_lock_for_user(user_id):
                     _, persisted = self._start_new_conversation(user_id)
+                    # Inside the lock: reset and selection are one update.
+                    if persisted:
+                        self._set_selected_agent(user_id, agent.agent_id)
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
                         show_alert=True,
                     )
                     return
-                self._set_selected_agent(user_id, agent.agent_id)
                 # answerCallbackQuery rejects texts over 200 characters
                 toast = f"{agent.name} selected"
                 if len(toast) > 200:
@@ -1122,8 +1180,15 @@ class TelegramBotInstance:
         These dicts are keyed by Telegram user id, so a long-lived bot serving
         many senders would otherwise accumulate one entry each for the process
         lifetime. Only state that is meaningless while idle is removed: the
-        conversation generation stays, because it fences turns across resets,
-        and a lock that is currently held belongs to an in-flight command.
+        conversation generation stays, because it fences turns across resets.
+
+        ``user_switch_locks`` is deliberately never pruned here. ``Lock.release()``
+        marks the lock unlocked and only *schedules* the next waiter, so a lock
+        with a queued waiter still reports ``locked() is False``. Dropping it in
+        that window would hand the next command a brand-new Lock and break the
+        mutual exclusion between /switch, /new and the /agents callbacks. One
+        Lock per sender is far cheaper than that race; it is released in bulk by
+        the shutdown drain.
         """
 
         if user_id in self.user_preparing_executions:
@@ -1134,10 +1199,6 @@ class TelegramBotInstance:
             return
         if self.user_message_tasks.get(user_id) is not None:
             return
-
-        lock = self.user_switch_locks.get(user_id)
-        if lock is not None and not lock.locked():
-            self.user_switch_locks.pop(user_id, None)
 
         stop_event = self.user_stop_events.get(user_id)
         if stop_event is not None and not stop_event.is_set():
@@ -1451,6 +1512,7 @@ class TelegramBotInstance:
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
         tg_handler: TelegramTraceHandler | None = None
+        agent_service: Any | None = None
         try:
             try:
                 expected_owner_user_id: int | None = None
@@ -1721,6 +1783,7 @@ class TelegramBotInstance:
                     managed_lease,
                     task_id=task_id,
                     reply_to=last_message,
+                    already_persisted=True,
                 )
                 return
 
@@ -1809,6 +1872,12 @@ class TelegramBotInstance:
             text_chunks = [
                 output[i : i + max_len] for i in range(0, len(output), max_len)
             ]
+            # An empty output with no attachments yields no chunks, and the
+            # sends below index [0] unconditionally. The resulting IndexError
+            # lands in a handler that can no longer reply -- the lease is
+            # already settled -- so the user would get nothing at all.
+            if not text_chunks:
+                text_chunks = [""]
 
             # Every send below is an awaited round trip, so a cancellation can
             # land mid-flight. deliver_cancellation_safe() re-checks afterwards
@@ -1981,6 +2050,15 @@ class TelegramBotInstance:
                 active_trace_handlers = self._active_trace_handlers()
                 if active_trace_handlers.get(user_id) is tg_handler:
                     active_trace_handlers.pop(user_id, None)
+
+                # Backstop: the handler is attached before the try/finally that
+                # detaches it, so a raise in between would otherwise leave it on
+                # the tracer for the process lifetime. Tracer has no
+                # remove_handler, so the list is edited directly.
+                tracer = getattr(agent_service, "tracer", None)
+                handlers = getattr(tracer, "handlers", None)
+                if handlers is not None and tg_handler in handlers:
+                    handlers.remove(tg_handler)
 
             async def _cleanup_message_batch() -> None:
                 try:

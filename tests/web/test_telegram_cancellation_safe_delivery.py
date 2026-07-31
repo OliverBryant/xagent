@@ -188,6 +188,36 @@ async def test_stop_keeps_an_edit_completed_after_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_skipped_delivery_is_not_recorded_as_the_current_text() -> None:
+    """current_text is the dedup key, so it must only record real deliveries.
+
+    Recording text whose send was skipped would make the dedup check suppress a
+    later retry of that same text, losing it permanently.
+    """
+
+    handler = TelegramTraceHandler(7, bot=None, chat_id=5, message_id=None)  # type: ignore[arg-type]
+    deleted: list[int] = []
+
+    class _Bot:
+        async def send_message(self, **_kwargs: object) -> SimpleNamespace:
+            # /switch lands while this send is in flight, so the primitive
+            # compensates by deleting it and raises CancelledDelivery.
+            handler.cancel()
+            return SimpleNamespace(message_id=42)
+
+        async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+            deleted.append(message_id)
+
+    handler.bot = _Bot()  # type: ignore[assignment]
+
+    await handler._update_message("streamed output")
+
+    # The message was removed again, so it was never really delivered.
+    assert deleted == [42]
+    assert handler.current_text == ""
+
+
+@pytest.mark.asyncio
 async def test_trace_handler_keeps_output_when_not_cancelled() -> None:
     handler = TelegramTraceHandler(7, bot=None, chat_id=5, message_id=None)  # type: ignore[arg-type]
     deleted: list[tuple[int, int]] = []

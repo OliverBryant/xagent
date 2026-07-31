@@ -161,8 +161,6 @@ class TelegramTraceHandler(TraceHandler):
         if self.current_text == display_text:
             return
 
-        self.current_text = display_text
-
         def is_cancelled() -> bool:
             # Gate compensation on discard_output, not cancelled: /stop halts
             # streaming but leaves the user in this conversation, so deleting
@@ -212,6 +210,10 @@ class TelegramTraceHandler(TraceHandler):
                 if msg is None:
                     return
                 self.message_id = msg.message_id
+                # Recorded only now: a skipped or cancelled send must not be
+                # remembered as delivered, or the dedup check above would
+                # suppress a later retry of the same text.
+                self.current_text = display_text
             else:
                 message_id = self.message_id
 
@@ -257,6 +259,7 @@ class TelegramTraceHandler(TraceHandler):
                             )
                         except CancelledDelivery:
                             return
+                self.current_text = display_text
         except Exception as e:
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Error updating Telegram message: {e}")

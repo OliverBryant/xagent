@@ -378,14 +378,17 @@ class _FenceMessage:
 
 
 @pytest.mark.asyncio
-async def test_message_racing_switch_replies_without_pausing_the_new_task(
+async def test_message_racing_switch_pauses_rather_than_failing_the_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Switch-first ordering: the turn resolves to the task the user is now in.
 
-    Pausing it would stop the conversation the user is actively using, and
-    returning silently would swallow their message. The lease is released
-    without a PAUSED transition and the user is told to resend.
+    Returning silently would swallow the message, and releasing the claim with
+    ManagedTaskLease.close() would persist that task as FAILED, since close()
+    maps RUNNING to FAILED. It must be finalized to the resumable PAUSED
+    instead. See test_closing_a_running_claim_would_fail_the_task in
+    tests/web/services/test_channel_runtime.py, which pins close()'s behaviour
+    against a real lease and database.
     """
 
     finalized: list[tuple[int, TaskStatus]] = []
@@ -418,9 +421,10 @@ async def test_message_racing_switch_replies_without_pausing_the_new_task(
     message = _FenceMessage()
     await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
 
-    # The task the user just switched into must not be paused.
-    assert finalized == []
-    assert lease.closed is True
+    # Finalized to PAUSED before the batch's cleanup calls close(). That
+    # ordering is what makes it safe: close() maps only a *RUNNING* task to
+    # FAILED, so settling first leaves the status resumable.
+    assert finalized == [(42, TaskStatus.PAUSED)]
     assert bot.active_tasks[101] == 42
     assert len(message.answers) == 1
     assert "send it again" in message.answers[0]

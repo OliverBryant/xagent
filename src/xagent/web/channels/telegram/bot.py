@@ -90,6 +90,10 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# tasks.id is a 64-bit signed integer in both supported backends. A /switch
+# argument above this overflows the DB bind rather than missing the lookup.
+_MAX_TASK_ID = 2**63 - 1
+
 # Opening a directory to fsync it is a POSIX idiom. Windows cannot do it at all
 # -- its CRT reports EACCES for os.open() on a directory -- so the barrier is
 # skipped there instead of failing every save. EACCES must stay a real
@@ -366,7 +370,11 @@ class TelegramBotInstance:
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
             )
-            _, persisted = self._start_new_conversation(message.from_user.id)
+            # Same barrier /switch holds: /switch suspends on an awaited
+            # lookup before it writes active_tasks, so an unguarded reset here
+            # would be silently overwritten when that lookup resumes.
+            async with self._switch_lock_for_user(message.from_user.id):
+                _, persisted = self._start_new_conversation(message.from_user.id)
             if not persisted:
                 await message.answer(
                     "I couldn't start a new task because the change could not "
@@ -467,14 +475,10 @@ class TelegramBotInstance:
             self._enqueue_user_message(user_id, message)
 
     def _switch_lock_for_user(self, user_id: int) -> asyncio.Lock:
-        locks = getattr(self, "user_switch_locks", None)
-        if locks is None:
-            locks = {}
-            self.user_switch_locks = locks
-        lock = locks.get(user_id)
+        lock = self.user_switch_locks.get(user_id)
         if lock is None:
             lock = asyncio.Lock()
-            locks[user_id] = lock
+            self.user_switch_locks[user_id] = lock
         return lock
 
     def _enqueue_user_message(self, user_id: int, message: Any) -> bool:
@@ -613,7 +617,12 @@ class TelegramBotInstance:
         if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
             return None
         task_id = int(parts[1])
-        return task_id if task_id > 0 else None
+        # Bound to the column's range: a larger value overflows the SQLite and
+        # PostgreSQL integer binds, surfacing a DataError instead of the normal
+        # "task not found" reply.
+        if not 0 < task_id <= _MAX_TASK_ID:
+            return None
+        return task_id
 
     async def _handle_switch_command(self, message: types.Message) -> None:
         if not self._accepting or message.from_user is None:
@@ -786,11 +795,7 @@ class TelegramBotInstance:
         return bool(queued_messages) or stopped or preparing
 
     def _active_trace_handlers(self) -> Dict[int, TelegramTraceHandler]:
-        handlers = getattr(self, "user_active_trace_handlers", None)
-        if handlers is None:
-            handlers = {}
-            self.user_active_trace_handlers = handlers
-        return handlers
+        return self.user_active_trace_handlers
 
     def _stop_user_active_execution(self, user_id: int, *, reason: str) -> bool:
         active_execution = self.user_active_executions.get(user_id)
@@ -890,37 +895,30 @@ class TelegramBotInstance:
         managed_lease: ManagedTaskLease,
         *,
         task_id: int,
-        user_id: int,
         reply_to: types.Message,
-        stop_requested: bool = False,
+        already_persisted: bool = False,
     ) -> None:
         """Settle a turn fenced out by a /switch, /new, or /stop, with a reply.
 
-        A fence must never swallow the message. Three cases differ in what the
-        claim means:
+        A fence must never swallow the message. The claim is always finalized to
+        PAUSED: the turn is no longer running, and PAUSED is resumable. Notably
+        ``ManagedTaskLease.close()`` must not be used here -- it maps a RUNNING
+        task to FAILED, which would corrupt the very conversation the user is in.
 
-        * ``stop_requested``: the user asked for this run to pause, so pause it
-          even when it is the live conversation -- that is what they requested.
-        * The claim resolved to the conversation the user is in now (they
-          switched *into* it while this turn was being prepared). Pausing it
-          would stop the conversation they are actively using, so the lease is
-          released without a PAUSED transition.
-        * The claim is genuinely stale -- it belongs to a conversation the user
-          has left -- so it is paused as before.
-
-        Every case answers the user, so no message is ever silently dropped.
+        ``already_persisted`` distinguishes the wording only. Once the message is
+        in conversation history, asking the user to resend would duplicate it, so
+        they are told it was received instead.
         """
 
-        if not stop_requested and task_id == self.active_tasks.get(user_id):
-            # Not stale: release the claim without pausing the live task.
-            await managed_lease.close()
+        await self._finalize_requested_stop(managed_lease, task_id=task_id)
+
+        if already_persisted:
             await reply_to.answer(
-                "I switched conversations while handling that message, "
-                "so it wasn't sent. Please send it again."
+                "Your message was received but the conversation was "
+                "interrupted before I could answer. Send anything to continue."
             )
             return
 
-        await self._finalize_requested_stop(managed_lease, task_id=task_id)
         await reply_to.answer(
             "That message wasn't sent because the conversation was "
             "paused. Please send it again to continue."
@@ -1017,7 +1015,8 @@ class TelegramBotInstance:
                 # Reset first: applying the selection before the reset is
                 # durable would leave it active after a reported failure, so
                 # the next message would start a fresh task with it anyway.
-                _, persisted = self._start_new_conversation(user_id)
+                async with self._switch_lock_for_user(user_id):
+                    _, persisted = self._start_new_conversation(user_id)
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
@@ -1041,7 +1040,8 @@ class TelegramBotInstance:
                         "That agent is no longer available.", show_alert=True
                     )
                     return
-                _, persisted = self._start_new_conversation(user_id)
+                async with self._switch_lock_for_user(user_id):
+                    _, persisted = self._start_new_conversation(user_id)
                 if not persisted:
                     await callback.answer(
                         "I couldn't save that change. Please try again.",
@@ -1116,6 +1116,33 @@ class TelegramBotInstance:
                     )
         await callback.answer()
 
+    def _prune_idle_user_state(self, user_id: int) -> None:
+        """Drop per-user bookkeeping once the sender has no work in flight.
+
+        These dicts are keyed by Telegram user id, so a long-lived bot serving
+        many senders would otherwise accumulate one entry each for the process
+        lifetime. Only state that is meaningless while idle is removed: the
+        conversation generation stays, because it fences turns across resets,
+        and a lock that is currently held belongs to an in-flight command.
+        """
+
+        if user_id in self.user_preparing_executions:
+            return
+        if user_id in self.user_active_executions:
+            return
+        if self._active_trace_handlers().get(user_id) is not None:
+            return
+        if self.user_message_tasks.get(user_id) is not None:
+            return
+
+        lock = self.user_switch_locks.get(user_id)
+        if lock is not None and not lock.locked():
+            self.user_switch_locks.pop(user_id, None)
+
+        stop_event = self.user_stop_events.get(user_id)
+        if stop_event is not None and not stop_event.is_set():
+            self.user_stop_events.pop(user_id, None)
+
     async def _process_user_queue(self, user_id: int) -> None:
         while True:
             await asyncio.sleep(self.queue_flush_delay_seconds)
@@ -1131,6 +1158,7 @@ class TelegramBotInstance:
                 self.user_message_tasks.pop(user_id, None)
 
             if not self.user_message_queues.get(user_id):
+                self._prune_idle_user_state(user_id)
                 return
 
             self.user_message_tasks[user_id] = current_task
@@ -1488,7 +1516,6 @@ class TelegramBotInstance:
                 await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
-                    user_id=user_id,
                     reply_to=last_message,
                 )
                 return
@@ -1522,9 +1549,7 @@ class TelegramBotInstance:
                 await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
-                    user_id=user_id,
                     reply_to=last_message,
-                    stop_requested=True,
                 )
                 return
 
@@ -1558,9 +1583,10 @@ class TelegramBotInstance:
             context: dict = {"turn_id": message_turn_id}
 
             if self._consume_user_stop_request(user_id):
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    reply_to=last_message,
                 )
                 return
 
@@ -1645,9 +1671,10 @@ class TelegramBotInstance:
                     context["display_message"] = display_message
 
             if self._consume_user_stop_request(user_id):
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    reply_to=last_message,
                 )
                 return
 
@@ -1663,9 +1690,11 @@ class TelegramBotInstance:
             # landed during it. Otherwise the abandoned conversation gets an
             # orphaned "I'm working on this" message after the switch.
             if self._consume_user_stop_request(user_id):
-                await self._finalize_requested_stop(
+                await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
+                    reply_to=last_message,
+                    already_persisted=True,
                 )
                 return
 
@@ -1691,9 +1720,7 @@ class TelegramBotInstance:
                 await self._settle_fenced_turn(
                     managed_lease,
                     task_id=task_id,
-                    user_id=user_id,
                     reply_to=last_message,
-                    stop_requested=True,
                 )
                 return
 
@@ -1714,9 +1741,11 @@ class TelegramBotInstance:
 
             try:
                 if self._consume_user_stop_request(user_id):
-                    await self._finalize_requested_stop(
+                    await self._settle_fenced_turn(
                         managed_lease,
                         task_id=task_id,
+                        reply_to=last_message,
+                        already_persisted=True,
                     )
                     return
 
@@ -1909,8 +1938,16 @@ class TelegramBotInstance:
                         exc_info=True,
                     )
                 return
-            if stop_requested:
-                return
+            if stop_requested and managed_lease is None:
+                # No lease means setup itself failed, so there is no stale
+                # conversation to protect -- only a real error the user has not
+                # been told about. A pending stop must not silence it.
+                logger.warning(
+                    "Telegram turn for user %s failed during setup while a stop "
+                    "was pending",
+                    user_id,
+                    exc_info=True,
+                )
             if managed_lease is not None:
                 try:
                     finalized = await managed_lease.finalize_result(

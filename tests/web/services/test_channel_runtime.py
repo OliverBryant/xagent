@@ -787,6 +787,96 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
 
 
 @pytest.mark.asyncio
+async def test_numeric_allowed_users_authorizes_the_matching_sender(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """allowed_users is arbitrary JSON, so its ids may be numeric.
+
+    External sender ids are always strings, so an untyped comparison denied
+    every sender for a numeric config. Membership is compared as strings --
+    which widens authorization for numeric configs -- but a non-matching
+    sender must still be denied.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Numeric allowlist",
+            config={"allowed_users": [123, 456]},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="123",
+    )
+    assert snapshot.user_id == user_id
+
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="789",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_closing_a_running_claim_would_fail_the_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """ManagedTaskLease.close() is not status-neutral on a RUNNING task.
+
+    prepare_channel_task commits the claim as RUNNING, and close() maps RUNNING
+    to FAILED. Any caller that means "release without changing the status" must
+    finalize explicitly instead. Pins the behaviour the Telegram fence relies on.
+    """
+
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+    assert prepared is not None
+    with SessionLocal() as db:
+        assert (
+            db.query(Task).filter(Task.id == prepared.task_id).one().status
+            == TaskStatus.RUNNING
+        )
+
+    await prepared.managed_lease.close()
+
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.status == TaskStatus.FAILED
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_deactivated_feishu_channel_stops_authorizing_senders(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

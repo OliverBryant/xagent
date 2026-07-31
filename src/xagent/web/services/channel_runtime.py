@@ -287,11 +287,18 @@ def _resolve_telegram_sender_scope_sync(
     channel_id: int | None,
     external_user_id: str,
     active_task_id: int | None,
+    claim_legacy_task: bool = True,
 ) -> tuple[int, UserChannel]:
     """Authorize the sender and settle any legacy claim before task queries.
 
     Shared by the list and single-task loaders, which differ only in the query
     they run afterwards. Returns the owner id and the resolved channel.
+
+    Note that ``claim_legacy_task`` makes this a *write* path: a pre-migration
+    task whose ownership the sender's active-task mapping proves is stamped and
+    committed here. Read-only-looking callers such as /list still need it,
+    because without the stamp the sender's own history stays invisible to every
+    subsequent query -- so the write is required to make the read correct.
     """
 
     owner = _load_channel_owner_sync(
@@ -311,15 +318,16 @@ def _resolve_telegram_sender_scope_sync(
     if channel is None:
         raise ChannelConfigurationError("Telegram channel is not configured")
 
-    claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
-        db,
-        channel=channel,
-        owner_id=owner.user_id,
-        external_user_id=external_user_id,
-        active_task_id=active_task_id,
-    )
-    if claimed_legacy_task:
-        db.commit()
+    if claim_legacy_task:
+        claimed_legacy_task = _claim_legacy_active_telegram_task_sync(
+            db,
+            channel=channel,
+            owner_id=owner.user_id,
+            external_user_id=external_user_id,
+            active_task_id=active_task_id,
+        )
+        if claimed_legacy_task:
+            db.commit()
     return owner.user_id, channel
 
 
@@ -342,11 +350,14 @@ def _load_telegram_channel_tasks_sync(
 ) -> tuple[TelegramChannelTaskSnapshot, ...]:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
+        # Writes: claims the legacy task the mapping proves, so the sender's
+        # pre-migration history becomes visible to the query below.
         owner_id, channel = _resolve_telegram_sender_scope_sync(
             db,
             channel_id=channel_id,
             external_user_id=external_user_id,
             active_task_id=active_task_id,
+            claim_legacy_task=True,
         )
         rows = (
             db.query(Task)
@@ -389,11 +400,14 @@ def _load_telegram_channel_task_sync(
 ) -> TelegramChannelTaskSnapshot | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
+        # Writes: claims the legacy task the mapping proves, so the sender's
+        # pre-migration history becomes visible to the query below.
         owner_id, channel = _resolve_telegram_sender_scope_sync(
             db,
             channel_id=channel_id,
             external_user_id=external_user_id,
             active_task_id=active_task_id,
+            claim_legacy_task=True,
         )
         task = (
             db.query(Task)
@@ -600,6 +614,10 @@ def _prepare_channel_task_sync(
                     query = query.filter(
                         Task.channel_id == channel_id,
                         Task.telegram_user_id == external_user_id,
+                        # Same visibility boundary as /list and /switch: a task
+                        # hidden in the web UI must stop resuming here too,
+                        # rather than silently continuing to execute.
+                        Task.is_visible.is_(True),
                     )
                 task = query.first()
 

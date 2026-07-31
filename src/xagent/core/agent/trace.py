@@ -954,6 +954,13 @@ class Tracer:
         """Add a trace handler."""
         self.handlers.append(handler)
 
+    def remove_handler(self, handler: TraceHandler) -> None:
+        """Remove a trace handler; a no-op when it is not registered."""
+        try:
+            self.handlers.remove(handler)
+        except ValueError:
+            pass
+
     async def trace_event(
         self,
         event_type: TraceEventType,

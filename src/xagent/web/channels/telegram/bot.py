@@ -163,9 +163,11 @@ class TelegramBotInstance:
         self._legacy_active_tasks_file = Path(
             f"data/telegram_active_tasks_{instance_id}.json"
         )
-        self.active_tasks = self._load_active_tasks()
         # Set when a save failed, so the next batch retries the persist.
+        # Initialized before the load: a legacy-file fallback saves the durable
+        # copy from inside _load_active_tasks.
         self._active_tasks_unsaved = False
+        self.active_tasks = self._load_active_tasks()
 
         # Per-Telegram-user custom agent selection for the next conversation
         self.selected_agents_file = self._selected_agents_store_path(channel_id, token)
@@ -211,7 +213,16 @@ class TelegramBotInstance:
                 continue
 
             if path is self._legacy_active_tasks_file:
-                self._retire_legacy_active_tasks_file()
+                # Persist the durable copy BEFORE retiring the legacy file.
+                # Retiring first would leave a window -- until the next
+                # /switch, /new, or task creation triggers a save -- where a
+                # restart finds neither file and the mapping (the sole
+                # proof-of-ownership for claiming legacy tasks) is gone for
+                # good. If the save fails, keep the legacy file so the next
+                # restart can try again.
+                self.active_tasks = loaded
+                if self._save_active_tasks():
+                    self._retire_legacy_active_tasks_file()
             return loaded
         return {}
 
@@ -674,14 +685,27 @@ class TelegramBotInstance:
         # fences in _process_user_messages_batch, which reply to the user
         # instead of being serialized behind network I/O.
         async with self._switch_lock_for_user(telegram_user_id):
-            await self._switch_to_task(message, telegram_user_id, task_id)
+            confirmation = await self._switch_to_task(
+                message, telegram_user_id, task_id
+            )
+        # The confirmation is a Telegram round trip (60s default timeout) and
+        # the state mutation is already complete, so it must not extend the
+        # lock -- matching /new and both /agents callback sites.
+        if confirmation is not None:
+            await message.answer(confirmation)
 
     async def _switch_to_task(
         self,
         message: types.Message,
         telegram_user_id: int,
         task_id: int,
-    ) -> None:
+    ) -> str | None:
+        """Perform the switch; error replies are sent here, under the lock.
+
+        Returns the success confirmation for the caller to send after the lock
+        is released, or None when an error reply was already sent.
+        """
+
         try:
             task = await load_telegram_channel_task(
                 channel_id=self.channel_id,
@@ -693,7 +717,7 @@ class TelegramBotInstance:
                 await message.answer(
                     "Task not found or not accessible. Use /list to see your tasks."
                 )
-                return
+                return None
 
             # tasks.agent_id has no FK and agent deletion does not check for
             # referencing tasks, so the binding can dangle. Catch it here:
@@ -711,7 +735,7 @@ class TelegramBotInstance:
                         "is no longer available, so it can't be resumed. "
                         "Use /new to start a fresh conversation."
                     )
-                    return
+                    return None
 
             if self.active_tasks.get(telegram_user_id) == task_id:
                 # A dequeued batch is active work too, even before its
@@ -725,7 +749,7 @@ class TelegramBotInstance:
                     f"Task <code>{task_id}</code> is already active{running_suffix}: "
                     f"{html.escape(task.title)}"
                 )
-                return
+                return None
 
             # Persistence is the commit point: stopping the old conversation
             # discards its queue, cancels its trace handler, and pauses its
@@ -755,7 +779,7 @@ class TelegramBotInstance:
                     "I couldn't save the switch, so the previous task is still "
                     "active. Please try again."
                 )
-                return
+                return None
 
             # Fence in-flight preparation before requesting the stop. A batch
             # awaiting prepare_channel_task() would otherwise return with a
@@ -768,7 +792,7 @@ class TelegramBotInstance:
                 telegram_user_id,
                 reason="Telegram task switch requested",
             )
-            await message.answer(
+            return (
                 f"Switched to task <code>{task_id}</code>: "
                 f"{html.escape(task.title)}\n"
                 "Send a message to continue it."
@@ -783,6 +807,7 @@ class TelegramBotInstance:
             await message.answer(
                 "Sorry, an error occurred while processing your request."
             )
+        return None
 
     def _schedule_user_queue(self, user_id: int) -> bool:
         if not self._accepting:
@@ -958,15 +983,25 @@ class TelegramBotInstance:
         in conversation history, asking the user to resend would duplicate it, so
         they are told it was received instead.
 
-        The reply is sent from a ``finally``: settling raises TaskLeaseLostError
-        on the ordinary unhealthy-heartbeat/TTL path, and letting that unwind
-        past the reply would swallow the message -- the exact failure this
-        helper exists to prevent.
+        This helper never raises. The reply is its real contract: a settle
+        failure has no useful handling in the caller -- settling raises
+        TaskLeaseLostError on the ordinary unhealthy-heartbeat/TTL path, and
+        letting any exception unwind would land in the generic error handler,
+        which finalizes the task FAILED (this docstring's own "never") and sends
+        a second, contradictory reply. A failed reply send must likewise not
+        replace the settle outcome; it is logged instead.
         """
 
         try:
             await self._finalize_requested_stop(managed_lease, task_id=task_id)
-        finally:
+        except Exception:
+            logger.warning(
+                "Failed to settle fenced Telegram task %s; the run is retained "
+                "for TTL recovery",
+                task_id,
+                exc_info=True,
+            )
+        try:
             if already_persisted:
                 await reply_to.answer(
                     "Your message was received but the conversation was "
@@ -977,6 +1012,12 @@ class TelegramBotInstance:
                     "That message wasn't sent because the conversation was "
                     "paused. Please send it again to continue."
                 )
+        except Exception:
+            logger.warning(
+                "Failed to deliver the fence notice for Telegram task %s",
+                task_id,
+                exc_info=True,
+            )
 
     def _is_stop_request_text(self, text: str) -> bool:
         normalized = text.strip().lower()
@@ -1042,9 +1083,7 @@ class TelegramBotInstance:
             await message.answer("🚫 You are not authorized to use this bot.")
             return
         except ChannelConfigurationError:
-            await message.answer(
-                "Configuration error: Cannot find the owner of this bot."
-            )
+            await message.answer("This bot is inactive or not correctly configured.")
             return
 
         if not agents:
@@ -1831,8 +1870,7 @@ class TelegramBotInstance:
             finally:
                 if self.user_active_executions.get(user_id) == active_execution:
                     self.user_active_executions.pop(user_id, None)
-                if tg_handler in agent_service.tracer.handlers:
-                    agent_service.tracer.handlers.remove(tg_handler)
+                agent_service.tracer.remove_handler(tg_handler)
 
             projection = project_execution_result_for_channel(result)
             if not await managed_lease.finalize_result(
@@ -1875,9 +1913,13 @@ class TelegramBotInstance:
             # An empty output with no attachments yields no chunks, and the
             # sends below index [0] unconditionally. The resulting IndexError
             # lands in a handler that can no longer reply -- the lease is
-            # already settled -- so the user would get nothing at all.
+            # already settled -- so the user would get nothing at all. The
+            # placeholder must be non-empty: Telegram rejects empty text with
+            # "Bad Request: message text is empty", which would strand the
+            # loading message as the permanent final state. Reuse the
+            # attachment-only wording so both no-text paths converge.
             if not text_chunks:
-                text_chunks = [""]
+                text_chunks = ["Task completed."]
 
             # Every send below is an awaited round trip, so a cancellation can
             # land mid-flight. deliver_cancellation_safe() re-checks afterwards
@@ -2052,13 +2094,11 @@ class TelegramBotInstance:
                     active_trace_handlers.pop(user_id, None)
 
                 # Backstop: the handler is attached before the try/finally that
-                # detaches it, so a raise in between would otherwise leave it on
-                # the tracer for the process lifetime. Tracer has no
-                # remove_handler, so the list is edited directly.
-                tracer = getattr(agent_service, "tracer", None)
-                handlers = getattr(tracer, "handlers", None)
-                if handlers is not None and tg_handler in handlers:
-                    handlers.remove(tg_handler)
+                # detaches it, so a raise in between would otherwise leave it
+                # on the tracer for the process lifetime. remove_handler is a
+                # no-op when the inner finally already detached it.
+                if agent_service is not None:
+                    agent_service.tracer.remove_handler(tg_handler)
 
             async def _cleanup_message_batch() -> None:
                 try:

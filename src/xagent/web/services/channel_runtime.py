@@ -252,6 +252,10 @@ def _load_channel_owner_sync(
         # "1" and deny the intended "101" -- treat it as a single entry.
         if isinstance(allowed_users, str):
             allowed_users = [allowed_users]
+        elif isinstance(allowed_users, dict):
+            # Pre-PR the `in` check matched dict keys; keep that working
+            # rather than locking out a channel configured that way.
+            allowed_users = list(allowed_users)
         elif not isinstance(allowed_users, (list, tuple, set)):
             raise ChannelConfigurationError(
                 "Channel allowed_users must be a list of sender ids"
@@ -623,6 +627,13 @@ def _prepare_channel_task_sync(
                         # Same visibility boundary as /list and /switch: a task
                         # hidden in the web UI must stop resuming here too,
                         # rather than silently continuing to execute.
+                        #
+                        # Deliberately Telegram-only: it pairs with the
+                        # sender-scoped /list + /switch surface that only
+                        # Telegram has. Extending it to Feishu would change
+                        # Feishu's resume behavior for hidden tasks in a
+                        # Telegram feature change; do that consciously with the
+                        # generic channel identity work, not here.
                         Task.is_visible.is_(True),
                     )
                 task = query.first()

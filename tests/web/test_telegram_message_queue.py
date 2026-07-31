@@ -33,7 +33,7 @@ def make_bot() -> TelegramBotInstance:
     bot.user_conversation_generations = {}
     bot.user_switch_locks = {}
     bot.selected_agents = {}
-    bot._save_selected_agents = lambda: None
+    bot._save_selected_agents = lambda: True
     return bot
 
 
@@ -364,6 +364,7 @@ class _FenceLease:
         finalized: list,  # type: ignore[type-arg]
         *,
         finalize_succeeds: bool = True,
+        finalize_raises: Exception | None = None,
     ) -> None:
         self.lease = TaskLease(
             task_id=task_id, runner_id="runner-fence", run_id="run-fence"
@@ -371,10 +372,13 @@ class _FenceLease:
         self._finalized = finalized
         self._settled = False
         self._finalize_succeeds = finalize_succeeds
+        self._finalize_raises = finalize_raises
         self.closed = False
         self.closed_unsettled = False
 
     async def finalize_result(self, *, status: TaskStatus, **_kwargs) -> bool:
+        if self._finalize_raises is not None:
+            raise self._finalize_raises
         if not self._finalize_succeeds:
             # The unhealthy-heartbeat / TTL-retention path: the run is retained
             # for recovery rather than settled, so callers see False.
@@ -499,6 +503,76 @@ async def test_fence_replies_even_when_settling_the_claim_fails(
     assert finalized == []
     assert len(message.answers) == 1
     assert "send it again" in message.answers[0]
+
+
+def test_prune_idle_user_state_keeps_locks_and_drops_stop_events() -> None:
+    """Pruning must never remove a lock: Lock.release() only schedules the
+    next waiter, so locked() can be False while a waiter is queued -- dropping
+    the lock there would hand the next command a fresh one and break the
+    /switch-vs-/new mutual exclusion."""
+
+    bot = make_bot()
+    lock = asyncio.Lock()
+    bot.user_switch_locks[101] = lock
+    stop_event = asyncio.Event()
+    bot.user_stop_events[101] = stop_event
+
+    bot._prune_idle_user_state(101)
+
+    assert bot.user_switch_locks[101] is lock
+    assert 101 not in bot.user_stop_events
+
+    # In-flight work blocks pruning entirely.
+    bot.user_stop_events[101] = stop_event
+    bot.user_preparing_executions.add(101)
+    bot._prune_idle_user_state(101)
+    assert 101 in bot.user_stop_events
+
+
+@pytest.mark.asyncio
+async def test_fence_settle_exception_does_not_reach_the_generic_error_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising settle must not unwind into the generic error handler.
+
+    That handler finalizes the task FAILED -- which _settle_fenced_turn's own
+    docstring forbids -- and sends a second, contradictory "Sorry..." reply.
+    The fence notice must be the only reply the user sees.
+    """
+
+    finalized: list[tuple[int, TaskStatus]] = []
+    bot = _fenced_turn_bot(finalized, active_task_id=7)
+    bot._consume_user_stop_request = lambda _user_id: False
+    lease = _FenceLease(42, finalized, finalize_raises=RuntimeError("db write failed"))
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        bot.user_conversation_generations[101] = (
+            bot.user_conversation_generations.get(101, 0) + 1
+        )
+        bot.active_tasks[101] = 42
+        return SimpleNamespace(
+            user_id=5,
+            task_id=42,
+            is_new_task=False,
+            managed_lease=lease,
+            requested_agent_missing=False,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", prepare
+    )
+    bot._extract_message_content = extract_text
+
+    message = _FenceMessage()
+    await bot._process_user_messages_batch(101, [message])  # type: ignore[arg-type]
+
+    assert finalized == []
+    assert len(message.answers) == 1
+    assert "send it again" in message.answers[0]
+    assert not any("Sorry" in answer for answer in message.answers)
 
 
 @pytest.mark.asyncio
@@ -1306,6 +1380,145 @@ async def test_manager_stop_is_single_flight_per_telegram_bot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_output_edits_the_loading_message_with_a_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty output must not leave the loading message as the final state.
+
+    Telegram rejects empty text with "Bad Request: message text is empty", so
+    editing with "" would fail silently and strand "Got it, I'm working on
+    this now." forever. The placeholder must be non-empty.
+    """
+
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram empty output"
+    bot.active_tasks = {}
+    bot.bot = object()
+    bot._save_active_tasks = lambda: True
+    bot._consume_user_stop_request = lambda _user_id: False
+    bot._clear_user_stop_request = lambda _user_id: None
+
+    lease = TaskLease(task_id=44, runner_id="runner-a", run_id="run-a")
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def close(self) -> bool:
+            return True
+
+        async def finalize_result(self, *, status: TaskStatus, **_kwargs) -> bool:
+            return True
+
+    class FakeTracer:
+        def add_handler(self, _handler: object) -> None:
+            return None
+
+        def remove_handler(self, _handler: object) -> None:
+            return None
+
+    agent_service = SimpleNamespace(
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return agent_service
+
+        def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
+            async def run() -> str:
+                return "raw result"
+
+            return run()
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def await_execution(_user_id, execution, *, reason):  # type: ignore[no-untyped-def]
+        return await execution
+
+    async def fake_prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            user_id=5,
+            task_id=44,
+            is_new_task=True,
+            managed_lease=FakeManagedLease(),
+            requested_agent_missing=False,
+        )
+
+    async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", fake_prepare
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.persist_channel_user_message",
+        persist_message,
+    )
+    # The execution produced no visible text and no attachments.
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.project_execution_result_for_channel",
+        lambda _result: SimpleNamespace(
+            visible_text="",
+            task_status=TaskStatus.COMPLETED,
+            transcript_content="",
+            interactions=[],
+            message_type="assistant_message",
+        ),
+    )
+    bot._extract_message_content = extract_text
+    bot._await_execution_with_stop_monitor = await_execution
+
+    edits: list[str] = []
+
+    class LoadingMessage:
+        message_id = 77
+
+        async def edit_text(self, text: str, **_kwargs) -> None:
+            edits.append(text)
+
+        async def delete(self) -> None:
+            return None
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+        chat = SimpleNamespace(id=456)
+
+        def __init__(self) -> None:
+            self.answers: list[str] = []
+
+        async def answer(self, text: str, **_kwargs) -> LoadingMessage:
+            self.answers.append(text)
+            return LoadingMessage()
+
+    message = Message()
+    await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
+
+    assert len(edits) == 1
+    assert edits[0].strip() != ""
+    assert "Task completed." in edits[0]
+
+
+@pytest.mark.asyncio
 async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1349,6 +1562,10 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
         def add_handler(self, handler: object) -> None:
             self.handlers.append(handler)
+
+        def remove_handler(self, handler: object) -> None:
+            if handler in self.handlers:
+                self.handlers.remove(handler)
 
     agent_service = SimpleNamespace(
         tracer=FakeTracer(),

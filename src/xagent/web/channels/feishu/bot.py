@@ -213,7 +213,7 @@ class FeishuBotInstance:
                 except ChannelConfigurationError:
                     await self._send_text(
                         chat_id,
-                        "Configuration error: Cannot find the owner of this bot.",
+                        "This bot is inactive or not correctly configured.",
                     )
                     return
 
@@ -251,7 +251,7 @@ class FeishuBotInstance:
             except ChannelConfigurationError:
                 await self._send_text(
                     chat_id,
-                    "Configuration error: Cannot find the owner of this bot.",
+                    "This bot is inactive or not correctly configured.",
                 )
                 return
 

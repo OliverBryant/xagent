@@ -833,6 +833,50 @@ async def test_numeric_allowed_users_authorizes_the_matching_sender(
 
 
 @pytest.mark.asyncio
+async def test_dict_allowed_users_still_authorizes_by_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pre-PR, `in` on a dict config matched keys; that must keep working.
+
+    Hard-failing would lock out a channel configured as {"id": "label"} via
+    the API, a regression the type guard must not introduce.
+    """
+
+    engine, SessionLocal, user_id, _ = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+
+    with SessionLocal() as db:
+        channel = UserChannel(
+            user_id=user_id,
+            channel_type="telegram",
+            channel_name="Dict allowlist",
+            config={"allowed_users": {"123": "alice"}},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        channel_id = int(channel.id)
+
+    snapshot = await channel_runtime.authorize_channel_sender(
+        channel_id=channel_id,
+        external_user_id="123",
+    )
+    assert snapshot.user_id == user_id
+
+    with pytest.raises(channel_runtime.ChannelAuthorizationError):
+        await channel_runtime.authorize_channel_sender(
+            channel_id=channel_id,
+            external_user_id="alice",
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_bare_string_allowed_users_is_not_matched_per_character(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

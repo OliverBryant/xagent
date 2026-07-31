@@ -699,14 +699,42 @@ def test_legacy_active_tasks_file_is_retired_after_a_fallback_read(
     bot.active_tasks_file = tmp_path / "active.json"
     bot._legacy_active_tasks_file = tmp_path / "legacy.json"
     bot._legacy_active_tasks_file.write_text('{"101": 7}')
+    # The real save must run: retiring before the durable copy exists would
+    # open a window where a restart finds neither file.
+    del bot._save_active_tasks
 
     assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
 
+    # The durable file exists BEFORE the legacy one is retired, so a restart
+    # at any point still finds the mapping.
+    assert bot.active_tasks_file.read_text() == '{"101": 7}'
     assert not bot._legacy_active_tasks_file.exists()
     assert (tmp_path / "legacy.json.migrated").read_text() == '{"101": 7}'
 
-    # A second load cannot resurrect the retired mapping.
-    assert TelegramBotInstance._load_active_tasks(bot) == {}
+    # A restart re-reads the durable copy; the retired file is never consulted.
+    assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
+
+
+def test_legacy_active_tasks_file_survives_a_failed_durable_save(
+    tmp_path: Path,
+) -> None:
+    """If the durable copy cannot be written, the legacy file must remain.
+
+    Retiring it anyway would lose the mapping permanently on the next restart.
+    """
+
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot._legacy_active_tasks_file = tmp_path / "legacy.json"
+    bot._legacy_active_tasks_file.write_text('{"101": 7}')
+    bot._save_active_tasks = lambda: False
+
+    assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
+
+    # Not retired: the next restart can still fall back to it.
+    assert bot._legacy_active_tasks_file.read_text() == '{"101": 7}'
+    assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
 
 
 def test_save_active_tasks_is_atomic_and_reports_failure(tmp_path: Path) -> None:

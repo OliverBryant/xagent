@@ -36,6 +36,7 @@ from ..services.share_rate_limit import (
     get_share_rate_limiter,
     remote_ip_from_request,
 )
+from ..services.task_runtime import sanitize_client_agent_config
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
@@ -166,14 +167,19 @@ def ensure_widget_agent_available(
     Mirrors :func:`ensure_share_agent_available` for the widget channel. The
     guest JWT is long-lived (30-day TTL), so access is re-derived from the
     agent's *current* widget state on every request rather than trusted from
-    the token alone: disabling the widget (``widget_enabled = False``) or
-    rotating ``widget_key`` cuts off outstanding guest tokens on their next
-    request.
+    the token alone. Three owner-side levers cut off outstanding guest tokens
+    on their next request: disabling the widget (``widget_enabled = False``),
+    rotating ``widget_key``, and unpublishing the agent (#1055).
+
+    Publication is checked here rather than by having ``unpublish_agent`` clear
+    ``widget_enabled``, so that the gate is re-derived per request and covers
+    every code path that takes an agent out of ``PUBLISHED`` — and so that
+    re-publishing restores the widget without the owner re-deploying it.
 
     ``expected_widget_key`` is the key carried by the guest JWT; when present
     it must still match the agent's live key. Tokens minted before the key was
     embedded carry no key and skip that comparison — they stay gated on
-    ``widget_enabled`` so the disable path still revokes them.
+    ``widget_enabled`` and publication so those paths still revoke them.
     """
     agent = db.query(Agent).filter(Agent.id == widget_agent_id).first()
     if (
@@ -182,6 +188,7 @@ def ensure_widget_agent_available(
         or agent.user_id != user_id
         or not agent.widget_enabled
         or not agent.widget_key
+        or agent.status != AgentStatus.PUBLISHED
         or (expected_widget_key is not None and agent.widget_key != expected_widget_key)
     ):
         raise HTTPException(status_code=403, detail="Widget is unavailable")
@@ -898,6 +905,11 @@ async def create_public_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if request.runtime_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Task runtime extensions are not supported for public widget tasks.",
+        )
     if access_context.widget_workforce_id is not None:
         return await _create_workforce_widget_chat_task(
             request=request, access_context=access_context, db=db
@@ -912,7 +924,10 @@ async def create_public_chat_task(
     )
     channel_name = channel.channel_name if channel else default_channel_name
 
-    agent_config = dict(request.agent_config or {})
+    # Sanitize the client dict *before* the server keys go on: the strip can
+    # then never reach a server-assigned value, and the server keys still win
+    # on collision.
+    agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["guest_id"] = access_context.guest_id
     agent_config["auth_mode"] = "widget"
     if access_context.widget_agent_id is not None:
@@ -1035,6 +1050,11 @@ async def create_share_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if request.runtime_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Task runtime extensions are not supported for shared-link tasks.",
+        )
     if access_context.workforce is not None:
         return await _create_workforce_share_chat_task(
             request=request, access_context=access_context, db=db
@@ -1051,10 +1071,11 @@ async def create_share_chat_task(
     elif agent_id != share_agent_id:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
 
-    # Server keys are assigned AFTER copying the client dict so they win on
-    # collision — a client-supplied guest_id can never override the
-    # server-minted one carried on the validated access context (#973).
-    agent_config = dict(request.agent_config or {})
+    # The client dict is sanitized of server-owned reserved keys first, then
+    # the server keys are assigned on top so they win on collision — a
+    # client-supplied guest_id can never override the server-minted one carried
+    # on the validated access context (#973).
+    agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["auth_mode"] = "share"
     agent_config["share_agent_id"] = share_agent_id
     agent_config["guest_id"] = access_context.guest_id
@@ -1330,6 +1351,7 @@ async def share_chat_websocket_endpoint(
                     turn_id=str(client_message_id or ""),
                     accepted=False,
                     message=rate_limited_message,
+                    rejection_outcome="not_accepted",
                 )
                 # send_message_delivery no-ops without a client_message_id, so
                 # a client that didn't tag the turn would otherwise get zero

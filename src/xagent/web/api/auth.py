@@ -7,7 +7,7 @@ import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, cast
+from typing import Annotated, Any, Dict, Literal, Optional, cast
 
 import requests
 
@@ -17,7 +17,7 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -330,12 +330,19 @@ class RefreshTokenRequest(BaseModel):
 class RefreshTokenResponse(BaseModel):
     """Refresh token response model"""
 
-    success: bool
+    success: Literal[True]
     message: str
-    access_token: Optional[str] = None
-    refresh_token: Optional[str] = None
-    expires_in: Optional[int] = None
-    refresh_expires_in: Optional[int] = None
+    access_token: Annotated[StrictStr, Field(min_length=1)]
+    refresh_token: Annotated[StrictStr, Field(min_length=1)]
+    expires_in: Annotated[StrictInt, Field(gt=0)]
+    refresh_expires_in: Annotated[StrictInt, Field(gt=0)]
+
+    @field_validator("access_token", "refresh_token")
+    @classmethod
+    def tokens_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Token must not be blank")
+        return value
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -1397,12 +1404,30 @@ def generic_oauth_callback(
                             status_code=400,
                         )
             else:
+                from ..mcp_apps import requires_app_scoped_oauth_grant
+
                 apps = [
                     app
                     for app in get_all_mcp_apps(db)
                     if app.get("provider") == provider
                 ]
                 for app_info in apps:
+                    # This bare app_id-less login only ever requests
+                    # db_provider.default_scopes (see the app_scopes=None
+                    # branch above), never an app's own oauth_scopes. Creating
+                    # a UserMCPServer row here for an app that requires an
+                    # app-scoped grant would leave an orphan the agent runtime
+                    # picks up directly (bypassing the connected-state check)
+                    # and can never resolve a token for; see
+                    # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                    if requires_app_scoped_oauth_grant(app_info.get("id")):
+                        logger.info(
+                            "Skipping app-scoped-only app %s during bare %s "
+                            "OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
                     # A mis-tagged non-oauth app sharing this provider must not
                     # abort the whole batch login: skip it and keep connecting
                     # the legitimate oauth apps under the same provider. Only the

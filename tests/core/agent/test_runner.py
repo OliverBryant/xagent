@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,6 +16,7 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -273,6 +275,38 @@ class TracerCheckpointStore:
         return dict(payload) if payload is not None else None
 
 
+class EmptyCanonicalCheckpointStore:
+    def __init__(self) -> None:
+        self.legacy_reads = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        return None
+
+    def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.legacy_reads += 1
+        raise AssertionError("canonical empty result must end checkpoint lookup")
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
+    checkpoint_store = EmptyCanonicalCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=checkpoint_store,
+    )
+
+    context = await runner.inject_user_message(
+        "missing-execution",
+        "Continue",
+        request_interrupt=False,
+    )
+
+    assert context is None
+    assert checkpoint_store.legacy_reads == 0
+
+
 @pytest.mark.asyncio
 async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None:
     workspace_manager = FakeWorkspaceManager(tmp_path)
@@ -523,6 +557,7 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
 ) -> None:
     checkpoint_context = ExecutionContext(execution_id="exec-resume")
     checkpoint_context.add_user_message("Original task")
+    checkpoint_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["text"]
     checkpoint = {
         "context": checkpoint_context.to_dict(),
         "pattern": "StatefulPattern",
@@ -539,16 +574,107 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
         task="Should not be appended",
         execution_id="exec-resume",
         checkpoint=checkpoint,
+        metadata={PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"]},
     )
 
     assert result["success"] is True
     assert result["output"] == "restored"
     assert result["message_count"] == 1
     assert pattern.state == {"output": "restored"}
+    assert result["context"].metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] == [
+        "image"
+    ]
     assert [message.content for message in result["context"].messages] == [
         "Original task",
         "restored",
     ]
+
+
+@pytest.mark.asyncio
+async def test_runner_clears_checkpointed_modality_preference(
+    tmp_path: Path,
+) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-clear-modality")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Should not be appended",
+        execution_id="exec-clear-modality",
+        checkpoint=checkpoint,
+        metadata={PREFERRED_INPUT_MODALITIES_METADATA_KEY: []},
+    )
+
+    assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in result["context"].metadata
+
+
+def test_merge_context_metadata_restored_clears_absent_modality_key(
+    tmp_path: Path,
+) -> None:
+    """Restored merges clear the modality key just like fresh-context merges."""
+
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-merge-absent")
+    context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["image"]
+    context.metadata["execution_type"] = "checkpointed"
+
+    runner._merge_context_metadata(context, {}, restored=True)
+
+    assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in context.metadata
+    assert context.metadata["execution_type"] == "checkpointed"
+
+
+@pytest.mark.asyncio
+async def test_runner_empty_resume_metadata_preserves_non_modality_metadata(
+    tmp_path: Path,
+) -> None:
+    """Resume metadata is authoritative for the modality key only.
+
+    Every other checkpointed metadata entry survives an empty resume metadata
+    mapping; the modality preference is cleared because the current run did not
+    declare one.
+    """
+
+    checkpoint_context = ExecutionContext(execution_id="exec-preserve-metadata")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint_context.metadata.update(
+        {
+            PREFERRED_INPUT_MODALITIES_METADATA_KEY: ["image"],
+            "execution_type": "checkpointed",
+        }
+    )
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Should not be appended",
+        execution_id="exec-preserve-metadata",
+        checkpoint=checkpoint,
+        metadata={},
+    )
+
+    assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in result["context"].metadata
+    assert result["context"].metadata["execution_type"] == "checkpointed"
 
 
 @pytest.mark.asyncio
@@ -803,14 +929,20 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         callbacks=[FailingUserMessageCallback()],
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
+    failing_runner.pause = MagicMock(return_value=True)
 
-    with pytest.raises(RuntimeError, match="trace callback failed"):
-        await failing_runner.post_user_message(
-            execution_id,
-            "Choose B",
-            turn_id="a2a:42:msg-1",
-            request_interrupt=False,
-        )
+    accepted = await failing_runner.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="a2a:42:msg-1",
+        request_interrupt=True,
+    )
+
+    assert accepted is not None
+    failing_runner.pause.assert_called_once_with(
+        execution_id,
+        reason="new user message",
+    )
 
     failing_runner.context_manager.remove_context(execution_id)
     retry_runner = AgentRunner(

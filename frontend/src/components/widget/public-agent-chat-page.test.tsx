@@ -19,6 +19,9 @@ const app = vi.hoisted(() => ({
     token: string
     transport?: AppProviderTransportConfig
   },
+  startScreenProps: null as null | {
+    voiceInputEnabled?: boolean
+  },
 }))
 
 const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
@@ -45,6 +48,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
       sendMessage: app.sendMessage,
       setTaskId: app.setTaskId,
       connectionError: app.connectionError,
+      voiceInputEnabled:
+        app.provider?.transport?.capabilities?.voice !== "disabled",
     }
   },
 }))
@@ -54,23 +59,29 @@ vi.mock("@/contexts/i18n-context", () => ({
 }))
 
 vi.mock("@/components/chat/ChatStartScreen", () => ({
-  ChatStartScreen: ({ onSend, title }: { onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>; title: string }) => (
-    <button
-      type="button"
-      onClick={() => {
-        // The real component surfaces a failed send via createTaskError state;
-        // swallow the rejection here so a deliberate task-create failure under
-        // test doesn't register as an unhandled promise rejection.
-        void onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
-      }}
-    >
-      start:{title}
-    </button>
-  ),
+  ChatStartScreen: (props: {
+    onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
+    title: string
+    voiceInputEnabled?: boolean
+  }) => {
+    app.startScreenProps = props
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          void props.onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
+        }}
+      >
+        start:{props.title}
+      </button>
+    )
+  },
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: () => <div data-testid="conversation-panel" />,
+  TaskConversationPanel: ({ showProcessView }: { showProcessView?: boolean }) => (
+    <div data-testid="conversation-panel" data-show-process-view={String(showProcessView)} />
+  ),
 }))
 
 vi.mock("@/lib/utils", async () => {
@@ -154,17 +165,25 @@ async function expectWidgetAuthFailure(detail: string) {
 }
 
 function expectPublicProviderToken() {
-  expect(sessionStorage.getItem("xagent_public_access_token")).toBe("public-access-token")
+  expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.provider).toMatchObject({ token: "public-access-token" })
+  expect(app.provider?.transport?.capabilities).toEqual({
+    agentCards: "disabled",
+    voice: "disabled",
+  })
+  expect(app.startScreenProps?.voiceInputEnabled).toBe(false)
   expect(app.provider?.transport?.buildWebSocketUrl?.({
     baseUrl: "wss://api.example",
     taskId: 42,
     token: app.provider?.token,
   })).toBe("wss://api.example/api/widget/chat/ws/42?token=public-access-token")
-}
-
-function seedStalePublicToken() {
-  sessionStorage.setItem("xagent_public_access_token", "stale-public-token")
+  expect(app.provider?.transport?.fileAccess?.inlinePreviewUrl("public-file")).toBe(
+    "https://api.example/api/files/public/preview/public-file?token=public-access-token",
+  )
+  expect(app.provider?.transport?.fileAccess?.inlineDownloadUrl("public-file")).toBe(
+    "https://api.example/api/files/public/download/public-file?token=public-access-token",
+  )
+  expect(app.provider?.transport?.uploadFiles).toEqual(expect.any(Function))
 }
 
 function widgetTaskResponse(taskId: number, status: "pending" | "running") {
@@ -213,6 +232,7 @@ describe("PublicAgentChatPage", () => {
     }
     app.rerender = null
     app.provider = null
+    app.startScreenProps = null
     sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
@@ -273,7 +293,6 @@ describe("PublicAgentChatPage", () => {
   it("fails closed for an invalid direct widget key", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(jsonResponse({ detail: "Invalid widget key" }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({ widgetKey: "wk-not-a-real-key" })
 
@@ -300,7 +319,6 @@ describe("PublicAgentChatPage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       detail: "Domain not allowed: embedded.example",
     }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({ embedTicket: "domain-bound-ticket", widgetKey: "widget-secret" })
 
@@ -329,7 +347,6 @@ describe("PublicAgentChatPage", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       detail: "Widget is disabled for this agent",
     }, 403))
-    seedStalePublicToken()
 
     renderWidgetPage({
       embedTicket: "ticket-issued-before-disable",
@@ -362,8 +379,10 @@ describe("PublicAgentChatPage", () => {
 
     renderWidgetPage()
 
-    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    const panel = await screen.findByTestId("conversation-panel")
     expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    // A widget visitor gets the answer, never the execution trace.
+    expect(panel).toHaveAttribute("data-show-process-view", "false")
   })
 
   it("shows the start screen and defers task creation until the first agent message", async () => {
@@ -373,6 +392,47 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    // No conversation yet — nothing to end.
+    expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
+  })
+
+  it("ends the conversation and returns to the start screen", async () => {
+    const taskKey = "widget_task_17_guest-1"
+    localStorage.setItem(taskKey, "71")
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderWidgetPage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    // The persisted id is dropped, so a reload cannot resurrect the old task,
+    // and the next message goes through the fresh-task path in handleSend.
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(localStorage.getItem(taskKey)).toBeNull()
+  })
+
+  it("clears processing state when ending a conversation mid-run", async () => {
+    localStorage.setItem("widget_task_17_guest-1", "71")
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+    // The agent is still streaming: isProcessing was set by a WS event, and
+    // once taskId nulls the socket closes, so no terminal event will ever
+    // reset it — the reset must come from the button handler itself, or the
+    // start screen's composer stays disabled forever.
+    app.state = { ...app.state, isProcessing: true }
+
+    renderWidgetPage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_PROCESSING", payload: false })
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_CURRENT_TASK", payload: null })
+    // The onConnect timer that normally clears this may never have been
+    // scheduled, so the reset must clear it or the header sticks on
+    // "Initializing".
+    expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_HISTORY_LOADING", payload: false })
   })
 
   it("creates an agent task and then sends its opening message", async () => {
@@ -601,8 +661,33 @@ describe("PublicAgentChatPage", () => {
 
     renderSharePage()
 
-    expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
+    const panel = await screen.findByTestId("conversation-panel")
     expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
+    expect(fetchMock).not.toHaveBeenCalled()
+    // Hiding the trace is scoped to the widget (#1041); share links keep it.
+    expect(panel).toHaveAttribute("data-show-process-view", "true")
+  })
+
+  it("ends a share conversation and returns to the start screen", async () => {
+    localStorage.clear()
+    const token = makeShareJwt({ guest_id: "guest-A", exp: futureExp() })
+    localStorage.setItem(
+      SHARE_AUTH_KEY,
+      JSON.stringify({ ...successfulAgentAuth, access_token: token }),
+    )
+    const taskKey = "share_task_share-tok_17_guest-A"
+    localStorage.setItem(taskKey, "71")
+
+    renderSharePage()
+
+    await screen.findByTestId("conversation-panel")
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(localStorage.getItem(taskKey)).toBeNull()
+    // Only the task pointer is dropped — the guest auth survives, so no re-auth.
+    expect(localStorage.getItem(SHARE_AUTH_KEY)).not.toBeNull()
     expect(fetchMock).not.toHaveBeenCalled()
   })
 

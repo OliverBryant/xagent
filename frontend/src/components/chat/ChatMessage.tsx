@@ -6,11 +6,18 @@ import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRend
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
+import {
+  sanitizeFilesDisabledPresentationText,
+  serializeFilesDisabledPresentation,
+} from "@/lib/files-disabled-presentation";
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
-import { resolveTraceProcessStatus } from "@/lib/trace-process-status";
+import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
+
+const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
 
 interface ToolArgs {
   code?: string;
@@ -78,16 +85,8 @@ export interface ChatMessageProps {
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
-function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latestTitle?: string, taskStatus?: string, errorMessage?: string }) {
+function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
   const { t } = useI18n();
-
-  if (taskStatus === 'failed') {
-    return (
-      <div className="py-3 text-sm leading-relaxed text-red-500">
-        <span>{errorMessage || t("common.errors.unknown")}</span>
-      </div>
-    );
-  }
 
   const displayTitle = taskStatus === 'paused'
     ? t("common.taskPaused")
@@ -98,7 +97,7 @@ function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latest
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["failed", "paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
+      {!["paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />
@@ -137,7 +136,13 @@ function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latest
   );
 }
 
-function ExpandableMessage({ content }: { content: string }) {
+function ExpandableMessage({
+  content,
+  filesDisabled,
+}: {
+  content: string;
+  filesDisabled: boolean;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -166,8 +171,19 @@ function ExpandableMessage({ content }: { content: string }) {
 
   if (!content) return null;
 
-  const markdownRegex = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
-  const backtickRegex = /`([^`]+)`/g;
+  if (filesDisabled) {
+    const inertContent = sanitizeFilesDisabledPresentationText(content);
+    return (
+      <div className="relative max-w-full min-w-0">
+        <div className="max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] py-[2px]">
+          {inertContent}
+        </div>
+      </div>
+    );
+  }
+
+  const markdownRegex = new RegExp(MARKDOWN_FILE_REF_RE);
+  const backtickRegex = new RegExp(BACKTICK_FILE_REF_RE);
 
   const segments: React.ReactNode[] = [];
   let lastIndex = 0;
@@ -275,7 +291,9 @@ export function ChatMessage({
   content,
   rawContent,
   traceEvents,
-  showProcessView,
+  // Default matches TaskConversationPanelProps: an unwired caller gets the
+  // internal-page behavior; public surfaces opt out explicitly.
+  showProcessView = true,
   taskStatus,
   processStatus,
   timestamp,
@@ -287,26 +305,17 @@ export function ChatMessage({
   onSendInteraction,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
-  const { openFilePreview } = useApp();
+  const { filesDisabled, openFilePreview } = useApp();
   const router = useRouter();
   const isUser = role === "user";
   const [copied, setCopied] = useState(false);
-
-  const copyableContent = typeof content === "string" ? content : rawContent;
-
-  const handleCopy = () => {
-    if (copyableContent) {
-      navigator.clipboard.writeText(copyableContent);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  };
 
   const handleAgentClick = (agentId: string, agentName: string) => {
     router.push(`/agent/${agentId}`);
   };
 
   const handleFileClick = (filePath: string, fileName: string) => {
+    if (filesDisabled) return;
     openFilePreview?.(filePath, fileName, [{ fileName, fileId: filePath }]);
   };
 
@@ -320,12 +329,8 @@ export function ChatMessage({
     })
     : "";
 
-  const shouldShowProcess =
-    !!showProcessView &&
-    Array.isArray(traceEvents) &&
-    traceEvents.length > 0;
-  const isProcessOnlyMessage =
-    shouldShowProcess && !isUser && !content && showEmptyStatus === false;
+  const hasTraceEvents = Array.isArray(traceEvents) && traceEvents.length > 0;
+  const shouldShowProcess = !!showProcessView && hasTraceEvents;
 
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
@@ -350,8 +355,30 @@ export function ChatMessage({
     traceEvents,
   });
 
+  // A turn that stopped without an answer — failed, paused, or waiting for
+  // user input — must leave a visible mark once the trace is hidden: dropping
+  // its bubble too would show the visitor's question followed by nothing.
+  const isStoppedWithoutAnswer =
+    isStoppedTraceProcessStatus(resolvedProcessStatus) &&
+    resolvedProcessStatus !== "completed";
+
+  // A trace-only turn carries no answer text and no status line of its own, so
+  // its bubble would render as a bare avatar. Drop it whether the trace above
+  // was rendered (internal pages) or suppressed (embedded chat) — keying this
+  // off the events themselves rather than off shouldShowProcess. Stopped
+  // unanswered turns are the exception once the trace is hidden (see above).
+  const isProcessOnlyMessage =
+    hasTraceEvents &&
+    !isUser &&
+    !content &&
+    showEmptyStatus === false &&
+    (showProcessView || !isStoppedWithoutAnswer);
+
+  // The trace carries the backend's raw error string (a Python exception, more
+  // often than not). With the trace hidden the failure line must not become its
+  // replacement channel, so only mine the events when the process view is on.
   let errorMessage = "";
-  if (resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
+  if (showProcessView && resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
@@ -360,10 +387,51 @@ export function ChatMessage({
       }
     }
   }
+  const failureText =
+    errorMessage
+    || (showProcessView ? t("common.errors.unknown") : t("common.errors.taskFailed"));
+  // A failed turn's content is failure text by construction (final_answer_error
+  // streams str(exc); the terminal handler stores the reason verbatim), so with
+  // the trace hidden it needs the same generic replacement as mined errors.
   const failedMessageText =
-    typeof content === "string" && content.trim()
+    showProcessView && typeof content === "string" && content.trim()
       ? content
-      : errorMessage || t("common.errors.unknown");
+      : failureText;
+
+  // The copy button must not hand out what the bubble refuses to show: on a
+  // failed turn, copy exactly the (possibly redacted) text that is displayed.
+  const isAssistantFailure = !isUser && resolvedProcessStatus === "failed";
+  const copyableContent = isAssistantFailure
+    ? failedMessageText
+    : typeof content === "string" ? content : rawContent;
+  const displayCopyableContent = filesDisabled && copyableContent
+    ? serializeFilesDisabledPresentation(copyableContent)
+    : copyableContent;
+
+  const handleCopy = () => {
+    if (displayCopyableContent) {
+      navigator.clipboard.writeText(displayCopyableContent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  // latestTitle names the running step ("calling web_search"), which is part of
+  // the trace: with the trace hidden it would leak the very detail the status
+  // line replaces.
+  const statusTitle = showProcessView
+    ? latestTitle
+    : resolvedProcessStatus === "completed"
+      ? t("common.statusDone")
+      : t("common.thinking");
+
+  // Neither the trace nor the bubble is going to render, so there is nothing
+  // left to wrap. Bail out rather than emit an empty div: the timeline
+  // separates children with space-y-*, so a childless wrapper still takes its
+  // gap, and a stray rawContent would leave the copy button floating alone.
+  if (isProcessOnlyMessage && !shouldShowProcess) {
+    return null;
+  }
 
   return (
     <div className="w-full space-y-2 animate-fade-in group">
@@ -406,31 +474,44 @@ export function ChatMessage({
 
             {/* Message content */}
             <div className={cn("flex-1 min-w-0")}>
-              {!isUser && resolvedProcessStatus === "failed" ? (
+              {isAssistantFailure ? (
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
-                  {failedMessageText}
+                  {displayCopyableContent}
                 </div>
               ) : content ? (
                 typeof content === "string" ? (
                   isUser ? (
-                    <ExpandableMessage content={content} />
+                    <ExpandableMessage
+                      content={content}
+                      filesDisabled={filesDisabled}
+                    />
                   ) : (
                     <MarkdownRenderer
                       content={content}
                       className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
+                      filesDisabled={filesDisabled}
                       onAgentClick={handleAgentClick}
-                      onFileClick={handleFileClick}
+                      onFileClick={filesDisabled ? undefined : handleFileClick}
                     />
                   )
                 ) : (
                   <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
                 )
               ) : (
-                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={resolvedProcessStatus || taskStatus} errorMessage={errorMessage} />
+                // A past paused/waiting turn has showEmptyStatus=false, but with
+                // the trace hidden its status line is all that marks the turn.
+                !isUser && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
+                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
+                )
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">
-                  <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
+                  <ClarificationForm
+                    interactions={interactions}
+                    active={interactionsActive}
+                    filesDisabled={filesDisabled}
+                    onSend={onSendInteraction}
+                  />
                 </div>
               )}
             </div>

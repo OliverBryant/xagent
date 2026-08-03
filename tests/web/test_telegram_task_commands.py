@@ -395,6 +395,35 @@ async def test_switch_rejects_another_telegram_senders_task(
 
 
 @pytest.mark.asyncio
+async def test_switch_confirmation_is_suppressed_when_no_longer_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent /switch confirmations are unordered sends outside the lock.
+
+    A confirmation for a selection that a later switch already replaced must
+    not be sent: "Switched to task A" landing last while B is active misleads
+    the user, even though the state itself is correct.
+    """
+
+    bot = _bot(1)
+
+    async def switch_then_superseded(
+        _message: object, telegram_user_id: int, task_id: int
+    ) -> str:
+        # A second /switch wins the race while this one's confirmation is
+        # still pending: the active task is no longer the one confirmed here.
+        bot.active_tasks[telegram_user_id] = task_id + 1
+        return f"Switched to task <code>{task_id}</code>"
+
+    bot._switch_to_task = switch_then_superseded
+    message = _Message(101, "/switch 9")
+
+    await bot._handle_switch_command(message)  # type: ignore[arg-type]
+
+    assert message.answers == []
+
+
+@pytest.mark.asyncio
 async def test_switch_rejects_a_task_whose_bound_agent_is_gone(
     telegram_db: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -703,16 +732,53 @@ def test_legacy_active_tasks_file_is_retired_after_a_fallback_read(
     # open a window where a restart finds neither file.
     del bot._save_active_tasks
 
+    # Pin the ordering directly: at the moment of retirement, the durable
+    # copy must already be on disk. Final-state assertions alone would pass a
+    # retire-then-save implementation too.
+    real_retire = TelegramBotInstance._retire_legacy_active_tasks_file
+    durable_existed_at_retire: list[bool] = []
+
+    def observing_retire() -> None:
+        durable_existed_at_retire.append(bot.active_tasks_file.exists())
+        real_retire(bot)
+
+    bot._retire_legacy_active_tasks_file = observing_retire
+
     assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
 
-    # The durable file exists BEFORE the legacy one is retired, so a restart
-    # at any point still finds the mapping.
+    assert durable_existed_at_retire == [True]
     assert bot.active_tasks_file.read_text() == '{"101": 7}'
     assert not bot._legacy_active_tasks_file.exists()
     assert (tmp_path / "legacy.json.migrated").read_text() == '{"101": 7}'
 
     # A restart re-reads the durable copy; the retired file is never consulted.
     assert TelegramBotInstance._load_active_tasks(bot) == {101: 7}
+
+
+def test_leftover_legacy_file_is_retired_after_a_durable_read(
+    tmp_path: Path,
+) -> None:
+    """A legacy file superseded by the durable copy must not linger.
+
+    Were the durable file later lost, the next restart would fall back to the
+    stale legacy mapping and could hand a task to the wrong sender.
+    """
+
+    bot = _bot(1)
+    bot.instance_id = "inst"
+    bot.active_tasks_file = tmp_path / "active.json"
+    bot.active_tasks_file.write_text('{"101": 9}')
+    bot._legacy_active_tasks_file = tmp_path / "legacy.json"
+    bot._legacy_active_tasks_file.write_text('{"101": 7}')
+
+    # The durable copy wins, and the stale legacy file is retired unread.
+    assert TelegramBotInstance._load_active_tasks(bot) == {101: 9}
+    assert not bot._legacy_active_tasks_file.exists()
+    assert (tmp_path / "legacy.json.migrated").read_text() == '{"101": 7}'
+
+    # Even with the durable file gone, the retired mapping stays retired.
+    bot.active_tasks_file.unlink()
+    assert TelegramBotInstance._load_active_tasks(bot) == {}
 
 
 def test_legacy_active_tasks_file_survives_a_failed_durable_save(

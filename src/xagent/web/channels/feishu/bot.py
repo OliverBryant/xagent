@@ -369,11 +369,8 @@ class FeishuBotInstance:
                         task_lease_heartbeat_task=managed_lease.heartbeat_task,
                     )
             finally:
-                if (
-                    fs_handler is not None
-                    and fs_handler in agent_service.tracer.handlers
-                ):
-                    agent_service.tracer.handlers.remove(fs_handler)
+                if fs_handler is not None:
+                    agent_service.tracer.remove_handler(fs_handler)
 
             projection = project_execution_result_for_channel(result)
             if not await managed_lease.finalize_result(

@@ -1,7 +1,7 @@
 """add Telegram sender ownership to tasks
 
 Revision ID: 20260726_add_task_telegram_user_id
-Revises: 20260728_add_facebook_pages_read_user_content_scope
+Revises: 20260802_add_workforce_run_last_activity_at
 Create Date: 2026-07-26
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260726_add_task_telegram_user_id"
-down_revision: Union[str, None] = "20260728_add_facebook_pages_read_user_content_scope"
+down_revision: Union[str, None] = "20260802_add_workforce_run_last_activity_at"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

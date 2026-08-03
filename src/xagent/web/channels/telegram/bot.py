@@ -223,6 +223,13 @@ class TelegramBotInstance:
                 self.active_tasks = loaded
                 if self._save_active_tasks():
                     self._retire_legacy_active_tasks_file()
+            elif self._legacy_active_tasks_file.exists():
+                # The durable copy already supersedes the legacy file, so a
+                # leftover one is pure hazard: were the durable file later
+                # lost, the next restart would resurrect this stale mapping
+                # and could hand a task to the wrong sender. No save is
+                # needed first -- the durable read just succeeded.
+                self._retire_legacy_active_tasks_file()
             return loaded
         return {}
 
@@ -690,8 +697,14 @@ class TelegramBotInstance:
             )
         # The confirmation is a Telegram round trip (60s default timeout) and
         # the state mutation is already complete, so it must not extend the
-        # lock -- matching /new and both /agents callback sites.
-        if confirmation is not None:
+        # lock -- matching /new and both /agents callback sites. Concurrent
+        # /switch commands serialize on the lock but their confirmations are
+        # unordered sends, so only confirm a selection that is still current:
+        # otherwise "Switched to task A" can land last while B is active.
+        if (
+            confirmation is not None
+            and self.active_tasks.get(telegram_user_id) == task_id
+        ):
             await message.answer(confirmation)
 
     async def _switch_to_task(
@@ -983,21 +996,33 @@ class TelegramBotInstance:
         in conversation history, asking the user to resend would duplicate it, so
         they are told it was received instead.
 
-        This helper never raises. The reply is its real contract: a settle
-        failure has no useful handling in the caller -- settling raises
-        TaskLeaseLostError on the ordinary unhealthy-heartbeat/TTL path, and
-        letting any exception unwind would land in the generic error handler,
-        which finalizes the task FAILED (this docstring's own "never") and sends
-        a second, contradictory reply. A failed reply send must likewise not
-        replace the settle outcome; it is logged instead.
+        This helper does not raise -- except asyncio.CancelledError, which is a
+        BaseException and deliberately propagates so cancellation is never
+        absorbed. The reply is the real contract: a settle failure has no
+        useful handling in the caller -- settling raises TaskLeaseLostError on
+        the ordinary unhealthy-heartbeat/TTL path, and letting any exception
+        unwind would land in the generic error handler, which finalizes the
+        task FAILED (this docstring's own "never") and sends a second,
+        contradictory reply. A failed reply send must likewise not replace the
+        settle outcome; it is logged instead.
         """
 
         try:
             await self._finalize_requested_stop(managed_lease, task_id=task_id)
+        except TaskLeaseLostError:
+            # The routine path, not a failure: the lease was lost either to
+            # another runner (which now owns settlement) or to the unhealthy-
+            # heartbeat TTL retention (recovery settles the run). Neither
+            # warrants a warning with a traceback.
+            logger.info(
+                "Fenced Telegram task %s lost its lease before the fence "
+                "could settle it; settlement belongs to the new owner or "
+                "TTL recovery",
+                task_id,
+            )
         except Exception:
             logger.warning(
-                "Failed to settle fenced Telegram task %s; the run is retained "
-                "for TTL recovery",
+                "Failed to settle fenced Telegram task %s",
                 task_id,
                 exc_info=True,
             )

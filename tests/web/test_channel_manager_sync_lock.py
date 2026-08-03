@@ -25,9 +25,16 @@ from xagent.web.channels.feishu.bot import FeishuChannelManager
 from xagent.web.channels.telegram.bot import TelegramChannelManager
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
 
+# Bound every wait so a regression that stops a sync from reaching the drain
+# fails the test instead of hanging the CI job (no global pytest timeout is
+# configured for this project).
+_TEST_TIMEOUT_SECONDS = 5.0
+
 
 @pytest.mark.asyncio
-async def test_telegram_sync_does_not_interleave_with_a_pending_stop() -> None:
+async def test_telegram_sync_does_not_interleave_with_a_pending_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = TelegramChannelManager()
     token = "tg-token"
     # A bot is running for a token the database no longer lists.
@@ -63,25 +70,25 @@ async def test_telegram_sync_does_not_interleave_with_a_pending_stop() -> None:
 
     manager._stop_bot_for_token = stop_bot  # type: ignore[method-assign]
     manager._start_bot_for_token = start_bot  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_active_channel_configs",
+        load_configs,
+    )
 
-    import xagent.web.channels.telegram.bot as telegram_bot
+    # Sync A: token absent from the DB, so it stops the running bot.
+    first = asyncio.create_task(manager._sync_bots_async())
+    await asyncio.wait_for(drain_entered.wait(), timeout=_TEST_TIMEOUT_SECONDS)
 
-    original_loader = telegram_bot.load_active_channel_configs
-    telegram_bot.load_active_channel_configs = load_configs  # type: ignore[assignment]
-    try:
-        # Sync A: token absent from the DB, so it stops the running bot.
-        first = asyncio.create_task(manager._sync_bots_async())
-        await drain_entered.wait()
+    # The token is re-enabled while A is suspended mid-stop.
+    active_tokens.append(token)
+    second = asyncio.create_task(manager._sync_bots_async())
+    await asyncio.sleep(0)
+    # Pin the intent rather than relying on one scheduler step being enough:
+    # B must be parked on the lock, not past it.
+    assert manager._sync_lock.locked()
 
-        # The token is re-enabled while A is suspended mid-stop.
-        active_tokens.append(token)
-        second = asyncio.create_task(manager._sync_bots_async())
-        await asyncio.sleep(0)
-
-        release_drain.set()
-        await asyncio.gather(first, second)
-    finally:
-        telegram_bot.load_active_channel_configs = original_loader  # type: ignore[assignment]
+    release_drain.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=_TEST_TIMEOUT_SECONDS)
 
     # B must observe the completed stop and start the re-enabled token.
     assert started == [token]
@@ -89,7 +96,9 @@ async def test_telegram_sync_does_not_interleave_with_a_pending_stop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_feishu_sync_does_not_interleave_with_a_pending_stop() -> None:
+async def test_feishu_sync_does_not_interleave_with_a_pending_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = FeishuChannelManager()
     app_id = "cli_123"
     manager.bots[app_id] = object()  # type: ignore[assignment]
@@ -123,23 +132,21 @@ async def test_feishu_sync_does_not_interleave_with_a_pending_stop() -> None:
 
     manager._stop_bot_for_appid = stop_bot  # type: ignore[method-assign]
     manager._start_bot_for_appid = start_bot  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "xagent.web.channels.feishu.bot.load_active_channel_configs",
+        load_configs,
+    )
 
-    import xagent.web.channels.feishu.bot as feishu_bot
+    first = asyncio.create_task(manager._sync_bots_async())
+    await asyncio.wait_for(drain_entered.wait(), timeout=_TEST_TIMEOUT_SECONDS)
 
-    original_loader = feishu_bot.load_active_channel_configs
-    feishu_bot.load_active_channel_configs = load_configs  # type: ignore[assignment]
-    try:
-        first = asyncio.create_task(manager._sync_bots_async())
-        await drain_entered.wait()
+    active_ids.append(app_id)
+    second = asyncio.create_task(manager._sync_bots_async())
+    await asyncio.sleep(0)
+    assert manager._sync_lock.locked()
 
-        active_ids.append(app_id)
-        second = asyncio.create_task(manager._sync_bots_async())
-        await asyncio.sleep(0)
-
-        release_drain.set()
-        await asyncio.gather(first, second)
-    finally:
-        feishu_bot.load_active_channel_configs = original_loader  # type: ignore[assignment]
+    release_drain.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=_TEST_TIMEOUT_SECONDS)
 
     assert started == [app_id]
     assert app_id in manager.bots

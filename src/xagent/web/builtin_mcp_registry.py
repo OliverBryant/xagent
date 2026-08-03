@@ -112,6 +112,46 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "email_path": "email",
             "default_scopes": ["public_profile"],
         },
+        {
+            "provider_name": "slack",
+            "name": "Slack",
+            "client_id": os.environ.get("SLACK_CLIENT_ID", ""),
+            "client_secret": os.environ.get("SLACK_CLIENT_SECRET", ""),
+            "auth_url": "https://slack.com/oauth/v2/authorize",
+            "token_url": "https://slack.com/api/oauth.v2.access",
+            "redirect_uri": os.environ.get("SLACK_REDIRECT_URI", ""),
+            "userinfo_url": "https://slack.com/api/auth.test",
+            # auth.test never returns an email for a bot token; the workspace
+            # name ("team") is deliberately stored in the email slot because
+            # UserOAuth.email is only consumed as the "connected account"
+            # display label for non-gmail providers — without it the Slack
+            # connection would show up unlabeled in the connector UI.
+            "user_id_path": "team_id",
+            "email_path": "team",
+            "default_scopes": ["chat:write", "chat:write.public", "channels:read"],
+        },
+        {
+            "provider_name": "zoom",
+            "name": "Zoom",
+            "client_id": os.environ.get("ZOOM_CLIENT_ID", ""),
+            "client_secret": os.environ.get("ZOOM_CLIENT_SECRET", ""),
+            "auth_url": "https://zoom.us/oauth/authorize",
+            "token_url": "https://zoom.us/oauth/token",
+            "redirect_uri": os.environ.get("ZOOM_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.zoom.us/v2/users/me",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Identity-only for this connector, similar in spirit to google
+            # (userinfo.email/profile) and meta (public_profile) — though
+            # it isn't a strict rule across every provider here (linkedin's
+            # default_scopes includes the functional w_member_social write
+            # scope). The functional scopes this connector actually calls
+            # live on the app row's oauth_scopes below and are merged in at
+            # authorize time by _merge_oauth_scopes, so listing them here
+            # too would just be a second place scope changes have to be
+            # kept in sync.
+            "default_scopes": ["user:read:user"],
+        },
     ]
 
 
@@ -239,6 +279,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "google-analytics",
+            "name": "Google Analytics",
+            "description": "Connect to Google Analytics (GA4) to list properties and run performance reports.",
+            "icon": "https://www.google.com/s2/favicons?domain=analytics.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            "category": "Marketing",
+            "oauth_scopes": ["https://www.googleapis.com/auth/analytics.readonly"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_analytics"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "hubspot",
             "name": "HubSpot",
             "description": "Connect to HubSpot CRM to search, create, and update contacts and companies, read deals, and log notes.",
@@ -363,6 +419,29 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "zoom",
+            "name": "Zoom",
+            "description": "Connect to Zoom to look up meetings, and read cloud recordings and transcripts.",
+            "icon": "https://www.google.com/s2/favicons?domain=zoom.us&sz=128",
+            "transport": "oauth",
+            "provider_name": "zoom",
+            "category": "Scheduling",
+            "oauth_scopes": [
+                "meeting:read:meeting",
+                "meeting:read:list_meetings",
+                "meeting:read:past_meeting",
+                "cloud_recording:read:list_recording_files",
+                "cloud_recording:read:meeting_transcript",
+                "user:read:user",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.zoom"],
+                "env_mapping": {"ZOOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
             "app_id": "google-maps",
             "name": "Google Maps",
             "description": "Geocoding, directions, place search, and more via the Google Maps APIs.",
@@ -378,6 +457,66 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "npx",
                 "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
                 "required_env": ["GOOGLE_MAPS_API_KEY"],
+            },
+        },
+        {
+            "app_id": "slack",
+            "name": "Slack",
+            "description": "Connect to Slack to list channels and post messages, e.g. incident summaries and recommended fixes.",
+            "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "slack",
+            "category": "Communication",
+            "oauth_scopes": ["chat:write", "chat:write.public", "channels:read"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.slack"],
+                "env_mapping": {"SLACK_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "granola",
+            "name": "Granola",
+            "description": "Connect to Granola to search and read your meeting notes, transcripts and action items through Granola's hosted MCP server.",
+            "icon": "https://www.google.com/s2/favicons?domain=granola.ai&sz=128",
+            "transport": "streamable_http",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Remote MCP (mcp_oauth): Granola hosts the MCP server itself and
+            # exposes its own tools — there is no local module to launch. Users
+            # connect via POST /api/mcp/apps/{id}/oauth/connect (per-user OAuth
+            # Authorization Code + PKCE); Granola issues no static client
+            # credentials, so the flow relies on Dynamic Client Registration.
+            "launch_config": {
+                "url": "https://mcp.granola.ai/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        },
+        {
+            "app_id": "aws",
+            "name": "AWS",
+            "description": "Connect to AWS to check CloudWatch alarms/metrics/logs, DynamoDB health, and SQS queue depth.",
+            "icon": "https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Operations",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like google-maps: the user supplies an
+            # access key at connect time. Cross-account access goes through the
+            # per-call role_arn tool parameter (STS AssumeRole inside the MCP
+            # module), not a fourth env key — required_env has no optional slots.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.aws"],
+                "required_env": [
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_REGION",
+                ],
             },
         },
     ]

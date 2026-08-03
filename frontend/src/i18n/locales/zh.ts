@@ -217,29 +217,22 @@ const zh = {
       startingPrompts: "快捷指令",
       chatWithAgents: "与智能体聊天",
     },
-    cards: {
-      research: {
-        title: "深入研究一个话题",
-      },
-      linkedin: {
-        title: "撰写 LinkedIn 动态",
-      },
-      poster: {
-        title: "设计活动海报",
-      },
-      compare: {
-        title: "深度对比产品",
-      },
-      visual: {
-        title: "为话题创建可视化图表",
-      },
-      presentation: {
-        title: "将话题转化为演示文稿",
-      }
+    templateQuickAccess: {
+      featuredLabel: "推荐",
+      categoryHeading: "{category} 智能体",
+      allTemplates: "全部模板 →",
+      usingTemplateLabel: "智能体模板：",
+      agentCreatedToast: "已根据模板创建智能体 \"{name}\"",
+      viewInAgents: "在智能体中查看",
+      createAgentError: "无法根据该模板创建智能体，请重试。",
+      loading: "正在加载模板...",
+      loadError: "模板加载失败。",
+      retry: "重试",
     },
     input: {
       placeholder: "描述您的任务...",
       processing: "处理中",
+      usingAgentLabel: "使用",
       actions: {
         config: "配置模型",
         upload: "上传文件",
@@ -511,6 +504,13 @@ const zh = {
     add_telegram: "添加 Telegram",
     feishu_bots: "飞书机器人",
     add_feishu: "添加飞书",
+    slack_bots: "Slack 机器人",
+    add_slack: "添加 Slack",
+    connect_slack: "添加到 Slack",
+    slack_connecting: "连接中...",
+    slack_manual_setup: "手动配置",
+    slack_workspace: "工作区",
+    slack_connected_via_oauth: "已通过 Slack OAuth 安全连接",
     title: "渠道与机器人",
     description: "配置您的专属 {platform}。",
     add_channel: "添加渠道",
@@ -530,11 +530,15 @@ const zh = {
       platform: "平台",
       telegram_bot: "Telegram 机器人",
       feishu_bot: "飞书机器人",
+      slack_bot: "Slack 机器人",
       name: "渠道名称",
       name_placeholder: "例如：我的客服",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",
+      slack_app_token: "App-Level Token",
+      slack_socket_mode_help: "请启用 Socket Mode，并使用包含 connections:write 权限的 App-Level Token。",
+      slack_permissions_help: "Bot 权限需包含 app_mentions:read、chat:write、files:read、files:write、im:history、mpim:history、channels:history、groups:history；订阅 app_mention、message.im、message.mpim、message.channels、message.groups 事件后重新安装应用。",
       allowed_users: "允许使用的用户",
       allowed_users_placeholder: "英文逗号分隔的用户 ID。留空以允许所有用户。",
       active: "启用状态",
@@ -547,6 +551,9 @@ const zh = {
       update_success: "渠道更新成功",
       fill_required: "请填写所有必填字段",
       save_failed: "保存渠道失败",
+      slack_popup_blocked: "请允许浏览器弹窗以连接 Slack 工作区。",
+      slack_connect_success: "Slack 工作区连接成功",
+      slack_connect_failed: "Slack 工作区连接失败",
       delete_confirm: "确定要删除这个渠道吗？",
       delete_success: "渠道删除成功",
       delete_failed: "删除渠道失败",
@@ -1550,6 +1557,7 @@ const zh = {
     categoryTitles: {
       all: "全部",
       featured: "推荐模板",
+      general: "通用",
       sales: "销售",
       marketing: "营销",
       support: "支持",
@@ -3634,21 +3642,34 @@ const zh = {
       scheduledName: "Schedule",
       gmailName: "Gmail"
     },
-    overview: {
-      info: "Triggers 定义此 Agent 什么时候运行。启用一个或多个触发方式，让外部事件或定时计划自动启动 Agent。"
-    },
     cards: {
       webhook: {
         title: "API / Webhook",
-        description: "通过 REST API 调用或 incoming webhook 触发"
+        description: "通过 REST API 调用或 incoming webhook 触发",
+        empty: {
+          title: "还没有 Webhook",
+          description: "创建一个 webhook，让其他应用可以启动此 Agent —— 例如表单提交或收到新线索时。",
+          cta: "创建 webhook"
+        }
       },
       scheduled: {
         title: "Schedule",
-        description: "按固定时间间隔自动运行 Agent"
+        description: "按固定时间间隔自动运行 Agent",
+        empty: {
+          title: "还没有定时计划",
+          description: "创建一个定时计划，让此 Agent 自动运行 —— 例如每日摘要或每周报告。",
+          cta: "添加定时计划"
+        }
       },
       gmail: {
         title: "Gmail",
-        description: "当 Gmail 收到新邮件时运行 Agent"
+        description: "当 Gmail 收到新邮件时运行 Agent",
+        addTrigger: "添加 Gmail 触发器",
+        empty: {
+          title: "尚未连接 Gmail 账号",
+          description: "连接一个 Gmail 账号并选择哪些邮件应触发此 Agent。每个账号有独立的设置。",
+          cta: "使用 Google 登录"
+        }
       },
       activeCount: "{count} Active"
     },
@@ -3660,7 +3681,6 @@ const zh = {
       configure: "配置 Trigger"
     },
     staging: {
-      info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
       webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
       failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
@@ -3691,34 +3711,94 @@ const zh = {
       name: "名称",
       namePlaceholder: "日报、CRM webhook...",
       type: "类型",
-      intervalSeconds: "每多少秒重复",
-      nextRunAt: "首次运行时间",
       secret: "Webhook Secret",
       secretPlaceholder: "留空则自动生成",
       secretEditPlaceholder: "留空则保留当前 secret",
-      watchLabel: "监听标签 / 文件夹",
-      watchLabelPlaceholder: "INBOX",
-      watchLabelHelp: "使用 * 或 all 可匹配任意标签。该值不区分大小写。",
+      watchLabel: "监听标签或文件夹（可选）",
+      watchLabelPlaceholder: "例如 Support —— 留空则监听所有收到的邮件",
+      watchLabelHelp: "留空则监听所有收到的邮件（始终不包括已发送、草稿、垃圾邮件和回收站）。标签不区分大小写。",
       gmailAccount: "Gmail 账号",
       gmailAccountPlaceholder: "选择要监听的 Gmail 账号",
       gmailAccountHelp: "此触发器只会响应所选邮箱中的邮件。",
+      webhookNamePlaceholder: "例如：网站新线索",
+      scheduleNamePlaceholder: "例如：晨间摘要报告",
+      webhookPrompt: "提示词模板 —— 此 webhook 被调用时 Agent 应该做什么？",
+      webhookPromptPlaceholder: "例如：来了一个新线索 —— 调研该公司并起草一封介绍邮件",
+      schedulePrompt: "每次运行时 Agent 应该做什么？",
+      schedulePromptPlaceholder: "例如：生成今天的日报并邮件发送给团队",
+      gmailPrompt: "收到邮件时 Agent 应该做什么？",
+      gmailPromptPlaceholder: "例如：阅读邮件并起草一封友好的回复供我审核",
+      gmailPromptHelp: "每次运行时，邮件的发件人、主题和正文会自动提供给 Agent。",
+      generateSecret: "生成 secret",
+      secretGeneratedHint: "该 secret 保存后仅显示这一次 —— 请立即复制并妥善保存。",
       senderFilter: "按发件人过滤（可选）",
       senderFilterPlaceholder: "例如 @acme.com 或 boss@company.com",
       subjectKeyword: "按主题关键词过滤（可选）",
-      subjectKeywordPlaceholder: "例如 [SUPPORT]，留空则全部触发",
-      promptTemplate: "提示词模板",
-      promptPlaceholder: "可使用 {{payload}}、{{trigger_type}}、{{source_event_id}} 和 {{test}}。"
+      subjectKeywordPlaceholder: "例如 [SUPPORT]，留空则全部触发"
     },
     actions: {
       new: "新建",
+      edit: "编辑",
       delete: "删除",
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
-      test: "测试触发",
-      addAnother: "新增",
+      test: "保存并测试",
+      addAnotherWebhook: "添加另一个 webhook",
+      addAnotherSchedule: "添加另一个定时计划",
+      addAnotherGmail: "添加另一个 Gmail 触发器",
       retry: "重试",
       discard: "丢弃",
-      confirmDiscard: "确认丢弃"
+      confirmDiscard: "确认丢弃",
+      saveWebhook: "保存 webhook",
+      saveSchedule: "保存定时计划",
+      saveSettings: "保存设置"
+    },
+    editor: {
+      webhookNew: "新建 webhook",
+      webhookEdit: "编辑 webhook",
+      scheduledNew: "新建定时计划",
+      scheduledEdit: "编辑定时计划",
+      gmailNew: "新建 Gmail 触发器",
+      gmailEdit: "编辑 Gmail 触发器"
+    },
+    item: {
+      gmailAllEmails: "所有收到的邮件"
+    },
+    schedule: {
+      nameLabel: "定时计划名称",
+      recurrenceLabel: "多久运行一次？",
+      hourly: "每小时",
+      daily: "每天",
+      weekly: "每周",
+      monthly: "每月",
+      custom: "自定义",
+      atWhatTime: "在什么时间？",
+      onWhichDays: "在哪几天？",
+      onWhichDayOfMonth: "每月的哪一天？",
+      runEvery: "每隔",
+      customHelp: "例如每 30 分钟一次，或每 3 天一次。",
+      customUnitMinutes: "分钟",
+      customUnitHours: "小时",
+      customUnitDays: "天",
+      startCheckbox: "此定时计划何时开始？",
+      startFrom: "从",
+      weekdayMon: "周一",
+      weekdayTue: "周二",
+      weekdayWed: "周三",
+      weekdayThu: "周四",
+      weekdayFri: "周五",
+      weekdaySat: "周六",
+      weekdaySun: "周日",
+      summaryHourly: "每小时运行一次",
+      summaryDaily: "每天 {time} 运行",
+      summaryWeekly: "每周 {days} 的 {time} 运行",
+      summaryMonthly: "每月 {day} 的 {time} 运行",
+      summaryCustom: "每 {amount} {unit}运行一次",
+      summaryStartsOnly: "{base}，从 {date} 开始",
+      summaryStartsWithTime: "{base}，从 {date} {time} 开始",
+      summaryWithTimezone: "{base}（{timezone}）",
+      timezoneLabel: "时区：{timezone}",
+      runsImmediatelyHint: "由于所选的开始时间已过，保存后将立即运行一次。"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。",
@@ -3726,22 +3806,22 @@ const zh = {
     },
     webhook: {
       title: "Webhook 地址",
-      secretHeader: "每次请求需用 HMAC-SHA256 签名：以 secret 为密钥对 `{timestamp}.{原始请求体}` 计算十六进制摘要放入 x-xagent-signature header，并在 x-xagent-timestamp header 传入 Unix 时间戳。"
+      secretHeader: "每次请求需用 HMAC-SHA256 签名：以 secret 为密钥对 `{timestamp}.{原始请求体}` 计算十六进制摘要放入 x-xagent-signature header，并在 x-xagent-timestamp header 传入 Unix 时间戳。",
+      pendingSave: "Webhook 地址和签名 secret 将在保存后生成。"
     },
     gmail: {
-      connected: "Gmail 已连接",
-      connectedDescription: "当前工作区已有可用的 Gmail 账号连接。",
       notConnected: "连接 Gmail 后才能启用此触发器",
       notConnectedDescription: "依赖新邮件事件前，请先连接官方 Gmail Connector。",
       connect: "连接 Gmail",
       noAccounts: "尚未连接 Gmail 账号",
-      accountMissing: "之前选择的 Gmail 账号已断开连接，请重新选择。"
+      accountMissing: "之前选择的 Gmail 账号已断开连接，请重新选择。",
+      changeAccount: "更换账号",
+      optionalFilters: "可选过滤条件 —— 只响应特定发件人或主题"
     },
     test: {
-      title: "测试运行",
-      subtitle: "使用示例 payload 启动一次 trigger run。",
-      sourceEventId: "Source event ID",
-      sourceEventPlaceholder: "可选事件 ID"
+      running: "测试运行中…",
+      stagedPreviewNote: "Agent 尚未创建，此为本地试运行 —— 以下即该触发器实际会发送给 Agent 的内容。",
+      stagedPromptLabel: "渲染后的提示词"
     },
     runs: {
       title: "最近运行",
@@ -3758,10 +3838,9 @@ const zh = {
       nameLength: "Trigger 名称最多 200 个字符",
       interval: "重复间隔必须是正整数",
       nextRunAt: "首次运行时间无效",
-      scheduleRequired: "定时 Trigger 需要重复间隔或首次运行时间",
-      watchLabel: "Gmail Trigger 需要监听的标签或文件夹",
-      gmailAccount: "请选择此 Trigger 要监听的 Gmail 账号",
-      testPayload: "测试 payload 必须是 JSON object"
+      scheduleRequired: "每周计划需至少选择一个星期几",
+      startDate: "请选择定时计划的开始日期",
+      gmailAccount: "请选择此 Trigger 要监听的 Gmail 账号"
     },
     messages: {
       loadFailed: "加载 Triggers 失败",
@@ -3883,6 +3962,31 @@ const zh = {
         copied: "已复制到剪贴板",
       },
     },
+    deployHub: {
+      title: "部署 Workforce",
+      options: {
+        embed: {
+          title: "嵌入组件",
+          desc: "通过一段脚本代码，把聊天组件添加到任意网站",
+          action: "获取代码",
+        },
+        api: {
+          title: "REST API",
+          desc: "从你的后端或应用程序中以编程方式调用该 Workforce",
+          action: "查看接口",
+        },
+        share: {
+          title: "分享链接",
+          desc: "生成一个公开链接，任何人都可以打开并与该 Workforce 对话",
+          action: "生成链接",
+        },
+        webhook: {
+          title: "Webhook",
+          desc: "通过外部系统的 Webhook 事件触发 Workforce 运行",
+          action: "配置",
+        },
+      },
+    },
     fields: {
       name: "名称",
       description: "描述",
@@ -3942,7 +4046,20 @@ const zh = {
       page: "第 {page} 页，共 {pages} 页",
       next: "下一页"
     },
+    getStarted: {
+      title: "快速上手",
+      steps: {
+        name: "填写 Workforce 名称",
+        lead: "选择 Workforce Lead",
+        agents: "为团队添加 agent",
+        delegation: "为每个 agent 设置委派规则",
+        test: "发送一条测试消息",
+        publish: "发布你的 Workforce",
+      },
+    },
     create: {
+      unsavedBadge: "未保存",
+      discardDraftConfirm: "这个 Workforce 还没有创建，现在离开会丢弃当前草稿，确定继续吗？",
       backToWorkforces: "返回 Workforces",
       backToCreate: "返回创建",
       title: "创建 Workforce",
@@ -4070,12 +4187,15 @@ const zh = {
       readyTitle: "随时准备就绪",
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
       inactiveDisabled: "请先发布这个 Workforce 再运行。",
-      archivedDisabled: "已归档的 Workforce 不能运行。"
+      archivedDisabled: "已归档的 Workforce 不能运行。",
+      createToTest: "先选择 Manager 并添加至少一个 Worker 才能测试。"
+    },
+    deploy: {
+      inactiveDisabled: "请先发布这个 Workforce 再部署。",
+      archivedDisabled: "已归档的 Workforce 不能部署。"
     },
     runs: {
       title: "运行记录",
-      historyTitle: "历史运行",
-      historyHint: "这个 Workforce 的历史运行记录。点击某次运行可重新打开对应会话。",
       loading: "正在加载运行记录...",
       loadError: "加载运行记录失败",
       retry: "重试",
@@ -4099,6 +4219,7 @@ const zh = {
     },
     canvas: {
       title: "Workforce 流程",
+      configure: "配置",
       backToDetails: "返回详情",
       connections: "连接",
       noConnections: "暂未配置连接。",
@@ -4111,6 +4232,14 @@ const zh = {
         reportsTo: "汇报给",
         activeDelegation: "活跃委派",
         completed: "已完成",
+      },
+      chooseLead: {
+        title: "选择 Workforce Lead",
+        hint: "Lead 会接收你的请求，并把任务委派给下方的 agent。",
+      },
+      addFirstAgent: {
+        title: "添加第一个 agent",
+        hint: "Lead 可以委派任务的子 agent",
       },
     },
     detail: {
@@ -4127,6 +4256,7 @@ const zh = {
       addMemberTitle: "添加成员",
       changeLeadTitle: "选择 Workforce 负责人",
       createNewAgent: "创建新 Agent",
+      discardEditConfirm: "Workforce 详情有未保存的修改，切换视图会丢弃这些修改，确定继续吗？",
     },
     loading: {
       list: "正在加载 Workforces...",
@@ -4164,7 +4294,8 @@ const zh = {
       canvasUnavailable: "画布不可用。",
       publish: "发布 Workforce 失败",
       unpublish: "取消发布 Workforce 失败",
-      archive: "归档 Workforce 失败"
+      archive: "归档 Workforce 失败",
+      editDiscardedByArchive: "该修改尚未保存时 Workforce 已被归档,修改已被丢弃。"
     }
   },
   adminMcp: {

@@ -1320,14 +1320,20 @@ def generic_oauth_callback(
         data = {
             "grant_type": "authorization_code",
             "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
             "redirect_uri": redirect_uri,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        auth: tuple[str, str] | None = None
+        if provider.lower() == "zoom":
+            # Zoom's token endpoint requires HTTP Basic Auth for client
+            # credentials (client_id:client_secret, base64).
+            auth = (client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
 
         token_response = requests.post(
-            token_url, data=data, headers=headers, timeout=10.0
+            token_url, data=data, headers=headers, timeout=10.0, auth=auth
         )
         token_data = token_response.json()
 
@@ -1354,6 +1360,25 @@ def generic_oauth_callback(
             info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
             if info_response.status_code == 200:
                 info_data = info_response.json()
+                if isinstance(info_data, dict) and info_data.get("ok") is False:
+                    # Slack-style APIs answer HTTP 200 with {"ok": false,
+                    # "error": ...} on failure; a status check alone would
+                    # treat a bad/revoked token as success and persist a
+                    # "connected" account with no identity. Fail the
+                    # callback instead. Providers without Slack semantics
+                    # never carry an "ok" key, so they are unaffected.
+                    import html
+
+                    escaped_error = html.escape(
+                        str(info_data.get("error") or "unknown error")
+                    )
+                    return HTMLResponse(
+                        content=(
+                            "<h1>Error verifying the connected account</h1>"
+                            f"<p>The provider reported: {escaped_error}</p>"
+                        ),
+                        status_code=400,
+                    )
                 provider_user_id = info_data.get(db_provider.user_id_path or "id")
                 email = info_data.get(db_provider.email_path or "email")
 

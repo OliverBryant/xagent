@@ -106,6 +106,7 @@ BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
@@ -139,6 +140,10 @@ GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECO
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
+SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
+SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
+SLACK_APP_TOKEN = "XAGENT_SLACK_APP_TOKEN"
+SLACK_REDIRECT_URI = "XAGENT_SLACK_REDIRECT_URI"
 SMTP_HOST = "XAGENT_SMTP_HOST"
 SMTP_PORT = "XAGENT_SMTP_PORT"
 SMTP_USERNAME = "XAGENT_SMTP_USERNAME"
@@ -364,6 +369,40 @@ def get_password_reset_expire_minutes() -> int:
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
     return _normalized_env_url(APP_BASE_URL)
+
+
+def get_slack_client_id() -> str | None:
+    """Return the Slack app client ID used by the workspace OAuth flow."""
+    value = (os.getenv(SLACK_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_slack_client_secret() -> str | None:
+    """Return the Slack app client secret used to exchange OAuth codes."""
+    value = (os.getenv(SLACK_CLIENT_SECRET) or "").strip()
+    return value or None
+
+
+def get_slack_app_token() -> str | None:
+    """Return the shared Slack Socket Mode app-level token."""
+    value = (os.getenv(SLACK_APP_TOKEN) or "").strip()
+    return value or None
+
+
+def get_slack_oauth_redirect_uri() -> str | None:
+    """Return the externally reachable Slack OAuth callback URL.
+
+    An explicit redirect URI wins. Otherwise derive the callback from the
+    public backend base URL so all advertised provider callbacks share the
+    same deployment-level source of truth.
+    """
+    explicit = _normalized_env_url(SLACK_REDIRECT_URI)
+    if explicit is not None:
+        return explicit
+    public_base_url = get_public_api_base_url()
+    if public_base_url is None:
+        return None
+    return f"{public_base_url}/api/channels/slack/oauth/callback"
 
 
 def get_smtp_host() -> str:
@@ -698,6 +737,27 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_workforce_preview_run_stale_seconds() -> int:
+    """Age after which an abandoned builder preview run is GC-eligible.
+
+    Preview runs (workforce builder "test before save", ``is_preview`` true —
+    either an ephemeral create-mode draft or an edit-mode test against an
+    already-saved workforce) are only invalidated client-side when the draft
+    changes; a closed tab, crashed browser, or network drop leaves the run
+    (and its hidden Task) active server-side forever with no owner left to
+    invalidate it. Rows still non-terminal past this age are reaped by the
+    scheduled sweep.
+
+    Priority:
+        1. XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS environment variable
+        2. Default 7200 (2 hours)
+
+    Clamped to a minimum of 300 seconds (5 minutes), so a misconfigured tiny
+    value can't reap a preview run that is still genuinely in progress.
+    """
+    return _get_positive_int_env(WORKFORCE_PREVIEW_RUN_STALE_SECONDS, 7200, minimum=300)
 
 
 def get_trigger_dispatcher_enabled() -> bool:

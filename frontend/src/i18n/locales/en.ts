@@ -217,29 +217,22 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       chatWithAgents: "CHAT WITH AGENTS",
     },
-    cards: {
-      research: {
-        title: "Research a topic in depth",
-      },
-      linkedin: {
-        title: "Write a LinkedIn post about an achievement",
-      },
-      poster: {
-        title: "Design a poster for an event",
-      },
-      compare: {
-        title: "Compare products with deep research",
-      },
-      visual: {
-        title: "Create visual for a topic",
-      },
-      presentation: {
-        title: "Turn a topic into a presentation deck",
-      }
+    templateQuickAccess: {
+      featuredLabel: "Featured",
+      categoryHeading: "{category} AI Agents",
+      allTemplates: "All templates →",
+      usingTemplateLabel: "Agent template:",
+      agentCreatedToast: "Agent \"{name}\" created from template",
+      viewInAgents: "View in Agents",
+      createAgentError: "Couldn't create the agent from this template. Please try again.",
+      loading: "Loading templates...",
+      loadError: "Couldn't load templates.",
+      retry: "Retry",
     },
     input: {
       placeholder: "Describe your task...",
       processing: "Processing",
+      usingAgentLabel: "Using",
       actions: {
         config: "Configure Model",
         upload: "Upload",
@@ -511,6 +504,13 @@ Build when you need.`,
     add_telegram: "Add Telegram",
     feishu_bots: "Feishu Bots",
     add_feishu: "Add Feishu",
+    slack_bots: "Slack Bots",
+    add_slack: "Add Slack",
+    connect_slack: "Add to Slack",
+    slack_connecting: "Connecting...",
+    slack_manual_setup: "Manual setup",
+    slack_workspace: "Workspace",
+    slack_connected_via_oauth: "Connected securely with Slack OAuth",
     title: "Channels & Bots",
     description: "Configure your personal {platform}.",
     add_channel: "Add Channel",
@@ -530,11 +530,15 @@ Build when you need.`,
       platform: "Platform",
       telegram_bot: "Telegram Bot",
       feishu_bot: "Feishu Bot",
+      slack_bot: "Slack Bot",
       name: "Channel Name",
       name_placeholder: "e.g. My Customer Service",
       bot_token: "Bot Token",
       app_id: "App ID",
       app_secret: "App Secret",
+      slack_app_token: "App-Level Token",
+      slack_socket_mode_help: "Enable Socket Mode and use an app-level token with the connections:write scope.",
+      slack_permissions_help: "Bot scopes: app_mentions:read, chat:write, files:read, files:write, im:history, mpim:history, channels:history, groups:history. Subscribe to app_mention, message.im, message.mpim, message.channels, and message.groups events, then reinstall the app.",
       allowed_users: "Allowed Users",
       allowed_users_placeholder: "Comma separated User IDs. Leave empty to allow all.",
       active: "Active",
@@ -547,6 +551,9 @@ Build when you need.`,
       update_success: "Channel updated successfully",
       fill_required: "Please fill in all required fields",
       save_failed: "Failed to save channel",
+      slack_popup_blocked: "Allow popups to connect a Slack workspace.",
+      slack_connect_success: "Slack workspace connected successfully",
+      slack_connect_failed: "Failed to connect the Slack workspace",
       delete_confirm: "Are you sure you want to delete this channel?",
       delete_success: "Channel deleted successfully",
       delete_failed: "Failed to delete channel",
@@ -1550,6 +1557,7 @@ Build when you need.`,
     categoryTitles: {
       featured: "Featured Templates",
       all: "All",
+      general: "General",
       sales: "Sales",
       marketing: "Marketing",
       support: "Support",
@@ -3634,21 +3642,34 @@ Build when you need.`,
       scheduledName: "Schedule",
       gmailName: "Gmail"
     },
-    overview: {
-      info: "Triggers define when this agent runs. Enable one or more ways to automatically activate the agent in response to external events or schedules."
-    },
     cards: {
       webhook: {
         title: "API / Webhook",
-        description: "Trigger via REST API call or incoming webhook"
+        description: "Trigger via REST API call or incoming webhook",
+        empty: {
+          title: "No webhooks yet",
+          description: "Create a webhook so other apps can start this agent — for example when a form is submitted or a new lead comes in.",
+          cta: "Create a webhook"
+        }
       },
       scheduled: {
         title: "Schedule",
-        description: "Run the agent automatically on a recurring interval"
+        description: "Run the agent automatically on a recurring interval",
+        empty: {
+          title: "No schedules yet",
+          description: "Create a schedule so this agent can run automatically — for example a daily summary or weekly report.",
+          cta: "Add schedule"
+        }
       },
       gmail: {
         title: "Gmail",
-        description: "Run the agent when a new email arrives in Gmail"
+        description: "Run the agent when a new email arrives in Gmail",
+        addTrigger: "Add Gmail trigger",
+        empty: {
+          title: "No Gmail accounts connected",
+          description: "Connect a Gmail account and choose which emails should start this agent. Each account gets its own settings.",
+          cta: "Sign in with Google"
+        }
       },
       activeCount: "{count} Active"
     },
@@ -3660,7 +3681,6 @@ Build when you need.`,
       configure: "Configure trigger"
     },
     staging: {
-      info: "Triggers configured here are saved with the draft and created automatically together with the agent.",
       webhookPending: "The webhook URL and signing secret will be generated after the agent is created.",
       failedTitle: "Some triggers could not be created. Their configuration is kept — retry or discard."
     },
@@ -3691,34 +3711,94 @@ Build when you need.`,
       name: "Name",
       namePlaceholder: "Daily report, CRM webhook...",
       type: "Type",
-      intervalSeconds: "Repeat every seconds",
-      nextRunAt: "First run at",
       secret: "Webhook secret",
       secretPlaceholder: "Leave blank to generate one",
       secretEditPlaceholder: "Leave blank to keep the current secret",
-      watchLabel: "Watch label / folder",
-      watchLabelPlaceholder: "INBOX",
-      watchLabelHelp: "Use * or all to match any label. Value is case-insensitive.",
+      watchLabel: "Watched label or folder (optional)",
+      watchLabelPlaceholder: "e.g. Support — leave blank to watch all incoming emails",
+      watchLabelHelp: "Blank watches every incoming email (sent, draft, spam, and trash are always excluded). A label is case-insensitive.",
       gmailAccount: "Gmail account",
       gmailAccountPlaceholder: "Select a Gmail account",
       gmailAccountHelp: "This trigger only fires for email in the selected mailbox.",
+      webhookNamePlaceholder: "e.g. New lead from website",
+      scheduleNamePlaceholder: "e.g. Morning summary report",
+      webhookPrompt: "Prompt template — what should the agent do when this webhook is called?",
+      webhookPromptPlaceholder: "e.g. A new lead just came in — research the company and draft an intro email",
+      schedulePrompt: "What should the agent do on each run?",
+      schedulePromptPlaceholder: "e.g. Generate today's daily summary report and email it to the team",
+      gmailPrompt: "What should the agent do with each email?",
+      gmailPromptPlaceholder: "e.g. Read the email and draft a friendly reply for my review",
+      gmailPromptHelp: "The email's sender, subject, and message are automatically shared with the agent on each run.",
+      generateSecret: "Generate secret",
+      secretGeneratedHint: "This secret is shown only once after saving — copy it now and keep it somewhere safe.",
       senderFilter: "Filter by sender (optional)",
       senderFilterPlaceholder: "e.g. @acme.com or boss@company.com",
       subjectKeyword: "Filter by subject keyword (optional)",
-      subjectKeywordPlaceholder: "e.g. [SUPPORT] or leave blank for all",
-      promptTemplate: "Prompt template",
-      promptPlaceholder: "Use {{payload}}, {{trigger_type}}, {{source_event_id}}, and {{test}}."
+      subjectKeywordPlaceholder: "e.g. [SUPPORT] or leave blank for all"
     },
     actions: {
       new: "New",
+      edit: "Edit",
       delete: "Delete",
       confirmDelete: "Confirm delete",
       rotateSecret: "Rotate secret",
-      test: "Test trigger",
-      addAnother: "Add",
+      test: "Save & test",
+      addAnotherWebhook: "Add another webhook",
+      addAnotherSchedule: "Add another schedule",
+      addAnotherGmail: "Add another Gmail trigger",
       retry: "Retry",
       discard: "Discard",
-      confirmDiscard: "Confirm discard"
+      confirmDiscard: "Confirm discard",
+      saveWebhook: "Save webhook",
+      saveSchedule: "Save schedule",
+      saveSettings: "Save settings"
+    },
+    editor: {
+      webhookNew: "New webhook",
+      webhookEdit: "Edit webhook",
+      scheduledNew: "New schedule",
+      scheduledEdit: "Edit schedule",
+      gmailNew: "New Gmail trigger",
+      gmailEdit: "Edit Gmail trigger"
+    },
+    item: {
+      gmailAllEmails: "All incoming emails"
+    },
+    schedule: {
+      nameLabel: "Schedule name",
+      recurrenceLabel: "How often should it run?",
+      hourly: "Hourly",
+      daily: "Daily",
+      weekly: "Weekly",
+      monthly: "Monthly",
+      custom: "Custom",
+      atWhatTime: "At what time?",
+      onWhichDays: "On which days?",
+      onWhichDayOfMonth: "On which day of the month?",
+      runEvery: "Run every",
+      customHelp: "For example every 30 minutes, or every 3 days.",
+      customUnitMinutes: "minutes",
+      customUnitHours: "hours",
+      customUnitDays: "days",
+      startCheckbox: "When should this schedule start?",
+      startFrom: "from",
+      weekdayMon: "Mon",
+      weekdayTue: "Tue",
+      weekdayWed: "Wed",
+      weekdayThu: "Thu",
+      weekdayFri: "Fri",
+      weekdaySat: "Sat",
+      weekdaySun: "Sun",
+      summaryHourly: "Runs every hour",
+      summaryDaily: "Runs every day at {time}",
+      summaryWeekly: "Runs weekly on {days} at {time}",
+      summaryMonthly: "Runs on the {day} of every month at {time}",
+      summaryCustom: "Runs every {amount} {unit}",
+      summaryStartsOnly: "{base} - starts {date}",
+      summaryStartsWithTime: "{base} - starts {date} at {time}",
+      summaryWithTimezone: "{base} ({timezone})",
+      timezoneLabel: "Timezone: {timezone}",
+      runsImmediatelyHint: "This will run immediately after saving, since the start time you picked has already passed."
     },
     secret: {
       title: "Copy this secret now. It is shown only once.",
@@ -3726,22 +3806,22 @@ Build when you need.`,
     },
     webhook: {
       title: "Webhook endpoint",
-      secretHeader: "Sign each request with HMAC-SHA256: put the hex digest of `{timestamp}.{raw body}` keyed by the secret in the x-xagent-signature header, and the unix timestamp in x-xagent-timestamp."
+      secretHeader: "Sign each request with HMAC-SHA256: put the hex digest of `{timestamp}.{raw body}` keyed by the secret in the x-xagent-signature header, and the unix timestamp in x-xagent-timestamp.",
+      pendingSave: "The webhook URL and signing secret are generated when you save."
     },
     gmail: {
-      connected: "Gmail connected",
-      connectedDescription: "A Gmail account is connected for this workspace.",
       notConnected: "Connect Gmail to activate this trigger",
       notConnectedDescription: "Connect the official Gmail connector before relying on incoming email events.",
       connect: "Connect Gmail",
       noAccounts: "No Gmail accounts connected",
-      accountMissing: "The selected Gmail account is no longer connected. Choose another account."
+      accountMissing: "The selected Gmail account is no longer connected. Choose another account.",
+      changeAccount: "Change account",
+      optionalFilters: "Optional filters — only react to certain senders or subjects"
     },
     test: {
-      title: "Test run",
-      subtitle: "Start a trigger run with a sample payload.",
-      sourceEventId: "Source event ID",
-      sourceEventPlaceholder: "optional-event-id"
+      running: "Running test…",
+      stagedPreviewNote: "The agent isn't created yet, so this is a local dry run — below is exactly what this trigger will send to the agent.",
+      stagedPromptLabel: "Rendered prompt"
     },
     runs: {
       title: "Recent runs",
@@ -3758,10 +3838,9 @@ Build when you need.`,
       nameLength: "Trigger name must be at most 200 characters",
       interval: "Interval must be a positive integer",
       nextRunAt: "First run time is invalid",
-      scheduleRequired: "Scheduled triggers need an interval or a first run time",
-      watchLabel: "Gmail triggers need a label or folder to watch",
-      gmailAccount: "Select the Gmail account this trigger should watch",
-      testPayload: "Test payload must be a JSON object"
+      scheduleRequired: "Weekly schedules need at least one weekday selected",
+      startDate: "Pick a start date for the schedule",
+      gmailAccount: "Select the Gmail account this trigger should watch"
     },
     messages: {
       loadFailed: "Failed to load triggers",
@@ -3883,6 +3962,31 @@ Build when you need.`,
         copied: "Copied to clipboard",
       },
     },
+    deployHub: {
+      title: "Deploy Workforce",
+      options: {
+        embed: {
+          title: "Embed Widget",
+          desc: "Add a chat widget to any website with a single script tag",
+          action: "Get snippet",
+        },
+        api: {
+          title: "REST API",
+          desc: "Call this workforce programmatically from your backend or app",
+          action: "View endpoints",
+        },
+        share: {
+          title: "Shareable Link",
+          desc: "Generate a public URL anyone can open to chat with this workforce",
+          action: "Generate link",
+        },
+        webhook: {
+          title: "Webhook",
+          desc: "Trigger workforce runs via webhook events from external systems",
+          action: "Configure",
+        },
+      },
+    },
     fields: {
       name: "Name",
       description: "Description",
@@ -3942,7 +4046,20 @@ Build when you need.`,
       page: "Page {page} of {pages}",
       next: "Next"
     },
+    getStarted: {
+      title: "Get started",
+      steps: {
+        name: "Name your workforce",
+        lead: "Choose a Workforce Lead",
+        agents: "Add agents to your team",
+        delegation: "Set a delegation rule for each agent",
+        test: "Send a test message",
+        publish: "Publish your workforce",
+      },
+    },
     create: {
+      unsavedBadge: "Unsaved",
+      discardDraftConfirm: "This workforce hasn't been created yet — leaving now will discard your draft. Continue?",
       backToWorkforces: "Back to Workforces",
       backToCreate: "Back to Create",
       title: "Create a Workforce",
@@ -4070,12 +4187,15 @@ Build when you need.`,
       readyTitle: "Ready when you are",
       readyDesc: "Send a message and {manager} will coordinate the team to complete your request.",
       inactiveDisabled: "Publish this workforce before running it.",
-      archivedDisabled: "Archived workforces cannot run."
+      archivedDisabled: "Archived workforces cannot run.",
+      createToTest: "Choose a manager and add at least one worker to test it."
+    },
+    deploy: {
+      inactiveDisabled: "Publish this workforce before deploying it.",
+      archivedDisabled: "Archived workforces cannot be deployed."
     },
     runs: {
       title: "Runs",
-      historyTitle: "Run history",
-      historyHint: "Previous runs of this workforce. Click a run to reopen its conversation.",
       loading: "Loading runs...",
       loadError: "Failed to load runs",
       retry: "Retry",
@@ -4099,6 +4219,7 @@ Build when you need.`,
     },
     canvas: {
       title: "Workforce flow",
+      configure: "Configure",
       backToDetails: "Back to details",
       connections: "Connections",
       noConnections: "No connections configured.",
@@ -4111,6 +4232,14 @@ Build when you need.`,
         reportsTo: "Reports to",
         activeDelegation: "Active delegation",
         completed: "Completed",
+      },
+      chooseLead: {
+        title: "Choose a Workforce Lead",
+        hint: "The lead receives your request and delegates tasks to the agents below.",
+      },
+      addFirstAgent: {
+        title: "Add your first agent",
+        hint: "Sub-agents the lead can delegate tasks to",
       },
     },
     detail: {
@@ -4127,6 +4256,7 @@ Build when you need.`,
       addMemberTitle: "Add a Member",
       changeLeadTitle: "Choose a Workforce Lead",
       createNewAgent: "Create new agent",
+      discardEditConfirm: "You have unsaved changes to the Workforce Details. Switch views and discard them?",
     },
     loading: {
       list: "Loading workforces...",
@@ -4164,7 +4294,8 @@ Build when you need.`,
       canvasUnavailable: "Canvas unavailable.",
       publish: "Failed to publish workforce",
       unpublish: "Failed to unpublish workforce",
-      archive: "Failed to archive workforce"
+      archive: "Failed to archive workforce",
+      editDiscardedByArchive: "Workforce was archived before this change could save, so it was discarded."
     }
   },
   adminMcp: {

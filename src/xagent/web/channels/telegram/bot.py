@@ -1603,8 +1603,12 @@ class TelegramChannelManager:
         self._bot_stop_tasks: Dict[str, asyncio.Task[None]] = {}
         self.enabled = True  # Always enabled, we load dynamically
         # Channel CRUD endpoints fire sync as a background task, so two syncs
-        # can interleave at the awaits below and act on a stale view of
-        # self.bots -- starting a duplicate bot or stopping a live one.
+        # can interleave. _stop_bot_for_token awaits the shutdown drain and
+        # only removes the bot from self.bots afterwards, so a second sync
+        # entering that window sees a token that is still present but already
+        # being torn down: it skips starting it, the first sync completes the
+        # removal, and a re-enabled channel ends up neither running nor
+        # tracked until some later sync happens to run.
         self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:

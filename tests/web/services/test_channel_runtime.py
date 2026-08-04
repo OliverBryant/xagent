@@ -115,6 +115,191 @@ async def test_prepare_channel_task_binds_owned_agent(
     engine.dispose()
 
 
+def _set_channel_config_value(SessionLocal, channel_id: int, key: str, value) -> None:
+    with SessionLocal() as db:
+        channel = db.query(UserChannel).filter(UserChannel.id == channel_id).one()
+        channel.config = {**channel.config, key: value}
+        db.commit()
+
+
+@pytest.mark.asyncio
+async def test_prepare_channel_task_uses_channel_default_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """A transport that passes no agent selection binds the channel's
+    configured default agent (config key ``default_agent_id``)."""
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Toby")
+    _set_channel_config_value(SessionLocal, channel_id, "default_agent_id", agent_id)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+
+    assert prepared is not None
+    assert prepared.requested_agent_missing is False
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.agent_id == agent_id
+
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_agent_selection_wins_over_channel_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    default_agent_id = _add_agent(SessionLocal, user_id=user_id, name="Toby")
+    explicit_agent_id = _add_agent(SessionLocal, user_id=user_id, name="Research Agent")
+    _set_channel_config_value(
+        SessionLocal, channel_id, "default_agent_id", default_agent_id
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+        agent_id=explicit_agent_id,
+    )
+
+    assert prepared is not None
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.agent_id == explicit_agent_id
+
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", ["not-a-number", True, None, {"id": 1}])
+async def test_malformed_channel_default_agent_degrades_to_no_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+    bad_value,
+) -> None:
+    """config is free-form JSON: a malformed default must not fail the turn."""
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    _set_channel_config_value(SessionLocal, channel_id, "default_agent_id", bad_value)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+
+    assert prepared is not None
+    assert prepared.requested_agent_missing is False
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.agent_id is None
+
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_channel_default_agent_falls_back_to_default_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """A default pointing at a deleted/unowned agent degrades to the default
+    assistant with an operator-facing log — WITHOUT raising the missing-agent
+    flag, which drives user-facing "your selected agent is gone" UX for
+    selections the user actually made (e.g. Telegram clears the stored pick)."""
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    _set_channel_config_value(SessionLocal, channel_id, "default_agent_id", 999_999)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+    )
+
+    assert prepared is not None
+    assert prepared.requested_agent_missing is False
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == prepared.task_id).one()
+        assert task.agent_id is None
+
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_stale_selection_still_reports_missing_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """The user-facing missing-agent contract for explicit selections must
+    survive the default-agent fallback."""
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    monkeypatch.setattr(
+        "xagent.web.services.channel_runtime.get_session_local",
+        lambda: SessionLocal,
+    )
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=None,
+        text="hello",
+        channel_name="Telegram",
+        agent_id=999_999,
+    )
+
+    assert prepared is not None
+    assert prepared.requested_agent_missing is True
+
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("foreign_owner", [False, True])
 async def test_prepare_channel_task_falls_back_when_agent_not_selectable(

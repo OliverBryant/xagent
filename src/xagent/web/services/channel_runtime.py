@@ -64,6 +64,10 @@ class ChannelOwnerSnapshot:
     """Detached owner identity after channel authorization."""
 
     user_id: int
+    # Optional per-channel default Agent Builder agent (``config`` key
+    # ``default_agent_id``): used by ``prepare_channel_task`` when the
+    # transport passes no explicit agent selection.
+    default_agent_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -303,7 +307,25 @@ def _load_channel_owner_sync(
         allowed_user_ids = {str(value) for value in allowed_users}
         if external_user_id not in allowed_user_ids:
             raise ChannelAuthorizationError("Channel sender is not authorized")
-    return ChannelOwnerSnapshot(user_id=owner_id)
+    return ChannelOwnerSnapshot(
+        user_id=owner_id,
+        default_agent_id=_coerce_agent_id(channel.config.get("default_agent_id")),
+    )
+
+
+def _coerce_agent_id(value: object) -> int | None:
+    """Best-effort int coercion for the free-form config value.
+
+    ``config`` is an unconstrained JSON dict, so the id may arrive as a
+    string or garbage; a malformed value must degrade to "no default"
+    rather than fail every turn on the channel.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _claim_legacy_active_telegram_task_sync(
@@ -635,6 +657,13 @@ def _prepare_channel_task_sync(
                 raise ChannelAuthorizationError(
                     "Channel owner changed during sender authorization"
                 )
+            explicit_agent_requested = agent_id is not None
+            if agent_id is None:
+                # No explicit selection from the transport (Slack has no agent
+                # picker; Telegram only passes one after /agents): fall back to
+                # the channel's configured default. A stale id degrades through
+                # the missing-agent path below, never fails the turn.
+                agent_id = owner.default_agent_id
 
             is_telegram = str(channel.channel_type) == "telegram"
             if is_telegram:
@@ -690,7 +719,18 @@ def _prepare_channel_task_sync(
                     .filter(Agent.id == int(agent_id))
                     .first()
                 )
-                requested_agent_missing = agent_row is None
+                # The missing-agent flag drives transport UX for a selection
+                # the USER made (Telegram clears the stored pick and says so).
+                # A stale channel-config default is an operator concern, not a
+                # user action — log it instead of blaming the user's choice.
+                requested_agent_missing = agent_row is None and explicit_agent_requested
+                if agent_row is None and not explicit_agent_requested:
+                    logger.warning(
+                        "Channel %s default_agent_id %s is not selectable; "
+                        "falling back to the default assistant",
+                        channel_id,
+                        agent_id,
+                    )
                 if task is not None:
                     if agent_row is None:
                         # Evict to a clean default task; never fail the turn.

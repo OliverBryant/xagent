@@ -67,6 +67,10 @@ SLACK_OAUTH_SCOPES = (
     "mpim:history",
     "channels:history",
     "groups:history",
+    # Sender-identity resolution (users.info): lets the agent address the
+    # person it is talking to. Installs that predate this scope degrade to
+    # unattributed messages until reinstalled.
+    "users:read",
 )
 
 

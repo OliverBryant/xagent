@@ -70,6 +70,9 @@ _CONTROL_START_COMMANDS = {"/start", "start"}
 _CONTROL_NEW_COMMANDS = {"/new", "new", "new task"}
 _MAX_FILE_DOWNLOAD_REDIRECTS = 5
 _MAX_RECENT_EVENT_IDS = 1000
+# Senders whose resolved identity headers are kept per bot instance. Bounded
+# only as a runaway guard; real workspaces stay far below this.
+_MAX_SENDER_CONTEXT_CACHE = 10_000
 # Slack rejects message text over 4000 characters. Chunk the source below that
 # and clamp again after conversion, since entity escaping can expand text.
 _MAX_SOURCE_CHUNK_CHARS = 3500
@@ -166,6 +169,11 @@ class SlackBotInstance:
         self.event_tasks: dict[str, asyncio.Task[None]] = {}
         self._recent_event_ids: deque[str] = deque(maxlen=_MAX_RECENT_EVENT_IDS)
         self._recent_event_id_set: set[str] = set()
+        # slack_user_id -> "[From: ...]" header (None = resolution failed).
+        # Failures are cached too: a workspace whose install predates the
+        # users:read scope must degrade to unattributed messages, not one
+        # failing API call per message.
+        self._sender_contexts: dict[str, str | None] = {}
         self._accepting = True
         self._deactivation_sync_task: asyncio.Task[None] | None = None
         self._run_forever = asyncio.Event()
@@ -414,6 +422,48 @@ class SlackBotInstance:
             value = event.get("thread_ts") or event.get("ts")
         return str(value) if value else None
 
+    async def _resolve_sender_context(self, slack_user_id: str) -> str | None:
+        """A one-line identity header for the agent-facing prompt.
+
+        Slack events carry only the sender's opaque user id, so without this
+        the agent cannot address the person or tell workspace members apart
+        in a shared channel. The profile is fetched once per sender per
+        instance; a failed lookup (most commonly an install that predates the
+        users:read scope) is cached as None so the turn proceeds
+        unattributed instead of retrying the API on every message.
+        """
+        if slack_user_id in self._sender_contexts:
+            return self._sender_contexts[slack_user_id]
+        sender_context: str | None = None
+        try:
+            response = await self.web_client.users_info(user=slack_user_id)
+            user = response.get("user")
+            user = user if isinstance(user, dict) else {}
+            profile = user.get("profile")
+            profile = profile if isinstance(profile, dict) else {}
+            name = str(
+                profile.get("display_name")
+                or profile.get("real_name")
+                or user.get("real_name")
+                or user.get("name")
+                or ""
+            ).strip()
+            if name:
+                title = str(profile.get("title") or "").strip()
+                sender_context = (
+                    f"[From: {name} ({title})]" if title else f"[From: {name}]"
+                )
+        except Exception:
+            logger.info(
+                "Slack users.info failed for %s; messages will be unattributed"
+                " (is the users:read scope granted?)",
+                slack_user_id,
+                exc_info=True,
+            )
+        if len(self._sender_contexts) < _MAX_SENDER_CONTEXT_CACHE:
+            self._sender_contexts[slack_user_id] = sender_context
+        return sender_context
+
     async def _process_event(
         self,
         conversation_key: str,
@@ -521,7 +571,13 @@ class SlackBotInstance:
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
             display_message = text
-            execution_text = prompt_text
+            # Agent-facing text only: the persisted transcript and the Slack
+            # UI keep the raw message; the identity header lets the agent
+            # address the sender and tell workspace members apart.
+            sender_context = await self._resolve_sender_context(slack_user_id)
+            execution_text = (
+                f"{sender_context}\n{prompt_text}" if sender_context else prompt_text
+            )
             persisted_attachments: list[dict[str, Any]] = []
 
             if files:
@@ -542,7 +598,7 @@ class SlackBotInstance:
                     names = ", ".join(str(item["name"]) for item in uploaded_info)
                     display_message = f"Attached file(s): {names}"
                 execution_text = append_uploaded_files_context(
-                    prompt_text,
+                    execution_text,
                     build_uploaded_files_context(uploaded_info),
                 )
                 if is_new_task:

@@ -59,6 +59,7 @@ def make_bot() -> SlackBotInstance:
     bot._recent_event_ids = []
     bot._recent_event_id_set = set()
     bot._accepting = True
+    bot._sender_contexts = {}
     return bot
 
 
@@ -1332,3 +1333,219 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         }
     ]
     assert managed.closed is True
+
+
+def _run_turn_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    bot: SlackBotInstance,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Wire the minimal fakes for a full _process_event turn and return the
+    (execute_task kwargs, persisted messages) recorders."""
+    bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
+    lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def finalize_result(self, **_kwargs: Any) -> bool:
+            return True
+
+        async def close(self) -> bool:
+            return True
+
+    async def prepare(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            user_id=5,
+            task_id=45,
+            is_new_task=True,
+            managed_lease=FakeManagedLease(),
+        )
+
+    class FakeTracer:
+        def __init__(self) -> None:
+            self.handlers: list[Any] = []
+
+        def add_handler(self, handler: Any) -> None:
+            self.handlers.append(handler)
+
+    agent_service = SimpleNamespace(
+        workspace=None,
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+    executed: list[dict[str, Any]] = []
+    persisted: list[dict[str, Any]] = []
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            return agent_service
+
+        async def execute_task(self, **kwargs: Any) -> dict[str, Any]:
+            executed.append(kwargs)
+            return {"success": True, "output": "Slack reply"}
+
+    async def persist(**kwargs: Any) -> None:
+        persisted.append(kwargs)
+
+    async def send_text(*_args: Any, **_kwargs: Any) -> str:
+        return "loading-ts"
+
+    async def send_final_text(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("xagent.web.channels.slack.bot.prepare_channel_task", prepare)
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.persist_channel_user_message", persist
+    )
+    bot._send_text = send_text  # type: ignore[method-assign]
+    bot._send_final_text = send_final_text  # type: ignore[method-assign]
+    return executed, persisted
+
+
+def _im_event(user: str = "U1", text: str = "hello") -> dict[str, Any]:
+    return {
+        "type": "message",
+        "channel_type": "im",
+        "channel": "D1",
+        "user": user,
+        "ts": "1.0",
+        "text": text,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sender_identity_prefixes_the_agent_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The agent sees who is talking; the persisted transcript keeps the raw
+    message the user actually typed."""
+    bot = make_bot()
+    executed, persisted = _run_turn_harness(monkeypatch, bot)
+    calls: list[str] = []
+
+    async def users_info(*, user: str) -> dict[str, Any]:
+        calls.append(user)
+        return {
+            "user": {
+                "name": "dana",
+                "profile": {"display_name": "Dana Reyes", "title": "Data Scientist"},
+            }
+        }
+
+    bot.web_client = SimpleNamespace(users_info=users_info)  # type: ignore[assignment]
+
+    await bot._process_event("T1:D1:U1:direct", {}, _im_event())
+    bot.active_tasks.clear()
+    await bot._process_event("T1:D1:U1:direct", {}, _im_event(text="second"))
+
+    assert executed[0]["task"] == "[From: Dana Reyes (Data Scientist)]\nhello"
+    assert executed[1]["task"] == "[From: Dana Reyes (Data Scientist)]\nsecond"
+    assert persisted[0]["content"] == "hello"
+    assert persisted[1]["content"] == "second"
+    assert calls == ["U1"]  # cached after the first resolution
+
+
+@pytest.mark.asyncio
+async def test_sender_identity_failure_degrades_to_unattributed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing users.info (e.g. an install predating the users:read scope)
+    must not fail the turn, and must not retry the API per message."""
+    bot = make_bot()
+    executed, persisted = _run_turn_harness(monkeypatch, bot)
+    calls: list[str] = []
+
+    async def users_info(*, user: str) -> dict[str, Any]:
+        calls.append(user)
+        raise RuntimeError("missing_scope")
+
+    bot.web_client = SimpleNamespace(users_info=users_info)  # type: ignore[assignment]
+
+    await bot._process_event("T1:D1:U1:direct", {}, _im_event())
+    bot.active_tasks.clear()
+    await bot._process_event("T1:D1:U1:direct", {}, _im_event(text="second"))
+
+    assert executed[0]["task"] == "hello"
+    assert executed[1]["task"] == "second"
+    assert persisted[0]["content"] == "hello"
+    assert calls == ["U1"]  # the failure is cached, not retried per message
+
+
+@pytest.mark.asyncio
+async def test_sender_identity_without_title_uses_name_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    executed, _persisted = _run_turn_harness(monkeypatch, bot)
+
+    async def users_info(*, user: str) -> dict[str, Any]:
+        del user
+        return {"user": {"real_name": "Gerard Soto", "profile": {}}}
+
+    bot.web_client = SimpleNamespace(users_info=users_info)  # type: ignore[assignment]
+
+    await bot._process_event("T1:D1:U1:direct", {}, _im_event())
+
+    assert executed[0]["task"] == "[From: Gerard Soto]\nhello"
+
+
+@pytest.mark.asyncio
+async def test_sender_identity_survives_the_attachment_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The uploaded-files context is appended to the attributed text; building
+    it from the raw prompt would silently drop the identity header whenever a
+    message carries attachments."""
+    bot = make_bot()
+    executed, _persisted = _run_turn_harness(monkeypatch, bot)
+
+    async def users_info(*, user: str) -> dict[str, Any]:
+        del user
+        return {"user": {"profile": {"display_name": "Dana Reyes"}}}
+
+    bot.web_client = SimpleNamespace(users_info=users_info)  # type: ignore[assignment]
+
+    async def download(**_kwargs: Any) -> list[dict[str, Any]]:
+        return [
+            {
+                "file_id": "f1",
+                "name": "report.pdf",
+                "path": "/tmp/report.pdf",
+                "type": "application/pdf",
+                "size": 10,
+            }
+        ]
+
+    bot._download_and_register_files = download  # type: ignore[method-assign]
+
+    async def update_fields(**_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.update_channel_task_fields", update_fields
+    )
+
+    event = _im_event(text="please review")
+    event["files"] = [{"id": "F1", "name": "report.pdf"}]
+    await bot._process_event("T1:D1:U1:direct", {}, event)
+
+    task_text = executed[0]["task"]
+    assert task_text.startswith("[From: Dana Reyes]\nplease review")
+    assert "report.pdf" in task_text  # the files context still follows

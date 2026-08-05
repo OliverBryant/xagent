@@ -70,8 +70,8 @@ _CONTROL_START_COMMANDS = {"/start", "start"}
 _CONTROL_NEW_COMMANDS = {"/new", "new", "new task"}
 _MAX_FILE_DOWNLOAD_REDIRECTS = 5
 _MAX_RECENT_EVENT_IDS = 1000
-# Senders whose resolved identity headers are kept per bot instance. Bounded
-# only as a runaway guard; real workspaces stay far below this.
+# Senders whose resolved identity headers are kept per bot instance. At the
+# cap the oldest entry is evicted (FIFO); real workspaces stay far below this.
 _MAX_SENDER_CONTEXT_CACHE = 10_000
 # Slack rejects message text over 4000 characters. Chunk the source below that
 # and clamp again after conversion, since entity escaping can expand text.
@@ -460,8 +460,12 @@ class SlackBotInstance:
                 slack_user_id,
                 exc_info=True,
             )
-        if len(self._sender_contexts) < _MAX_SENDER_CONTEXT_CACHE:
-            self._sender_contexts[slack_user_id] = sender_context
+        if len(self._sender_contexts) >= _MAX_SENDER_CONTEXT_CACHE:
+            # Evict the oldest entry (dicts preserve insertion order) so
+            # senders arriving after the cap still get cached instead of
+            # paying a users.info call on every message.
+            self._sender_contexts.pop(next(iter(self._sender_contexts)))
+        self._sender_contexts[slack_user_id] = sender_context
         return sender_context
 
     async def _process_event(

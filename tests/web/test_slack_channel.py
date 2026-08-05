@@ -1549,3 +1549,30 @@ async def test_sender_identity_survives_the_attachment_context(
     task_text = executed[0]["task"]
     assert task_text.startswith("[From: Dana Reyes]\nplease review")
     assert "report.pdf" in task_text  # the files context still follows
+
+
+@pytest.mark.asyncio
+async def test_sender_identity_cache_evicts_oldest_when_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full cache must rotate out the oldest sender, not stop caching:
+    a refuse-to-cache guard would make every sender past the cap pay a
+    users.info call on each of their messages, forever."""
+    bot = make_bot()
+
+    calls: list[str] = []
+
+    async def users_info(*, user: str) -> dict[str, Any]:
+        calls.append(user)
+        return {"user": {"profile": {"display_name": f"Person {user}"}}}
+
+    bot.web_client = SimpleNamespace(users_info=users_info)  # type: ignore[assignment]
+    monkeypatch.setattr("xagent.web.channels.slack.bot._MAX_SENDER_CONTEXT_CACHE", 2)
+
+    assert await bot._resolve_sender_context("U1") == "[From: Person U1]"
+    assert await bot._resolve_sender_context("U2") == "[From: Person U2]"
+    assert await bot._resolve_sender_context("U3") == "[From: Person U3]"
+    assert list(bot._sender_contexts) == ["U2", "U3"]  # U1 was evicted
+
+    assert await bot._resolve_sender_context("U3") == "[From: Person U3]"
+    assert calls == ["U1", "U2", "U3"]  # the repeat U3 lookup hit the cache

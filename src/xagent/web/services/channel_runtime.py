@@ -314,18 +314,24 @@ def _load_channel_owner_sync(
 
 
 def _coerce_agent_id(value: object) -> int | None:
-    """Best-effort int coercion for the free-form config value.
+    """Strict int coercion for the free-form config value.
 
     ``config`` is an unconstrained JSON dict, so the id may arrive as a
     string or garbage; a malformed value must degrade to "no default"
-    rather than fail every turn on the channel.
+    rather than fail every turn on the channel. Only true integers and
+    integer strings are accepted — ``int(12.5)`` would silently truncate
+    to a valid but WRONG agent id, which is worse than no default.
     """
-    if value is None or isinstance(value, bool):
+    if isinstance(value, bool):
         return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _claim_legacy_active_telegram_task_sync(

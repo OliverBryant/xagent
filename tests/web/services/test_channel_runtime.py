@@ -196,7 +196,7 @@ async def test_explicit_agent_selection_wins_over_channel_default(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_value", ["not-a-number", True, None, {"id": 1}])
+@pytest.mark.parametrize("bad_value", ["not-a-number", True, None, {"id": 1}, 12.5])
 async def test_malformed_channel_default_agent_degrades_to_no_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

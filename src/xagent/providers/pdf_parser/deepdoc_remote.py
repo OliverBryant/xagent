@@ -110,7 +110,7 @@ SaveImage = Callable[[bytes], str]
 class DeepDocRemoteError(Exception):
     """Remote parsing failed and the caller should fall back to local parsing.
 
-    Every failure mode -- unreachable host, timeout, 4xx/5xx, unparseable or
+    Every failure mode -- unreachable host, timeout, 4xx/5xx, unparsable or
     malformed body, undecodable image, failed image write -- is reported as
     this single type so callers need only one ``except`` clause.
     """

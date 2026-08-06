@@ -228,7 +228,8 @@ def _normalize_elements(
 
     Raises:
         ValueError: If the payload does not carry a list of elements that each
-            look like a parsed element.
+            look like a parsed element, or if an element's image decodes to no
+            bytes at all.
         binascii.Error: If an element's image is not valid base64.
     """
     elements = payload.get("elements")
@@ -255,7 +256,17 @@ def _normalize_elements(
         normalized_element = dict(element)
         image_base64 = normalized_element.pop("image_base64", None)
         if image_base64:
-            normalized_element["image"] = save_image(base64.b64decode(image_base64))
+            # validate=True rejects non-alphabet characters instead of dropping
+            # them. Without it a corrupt-but-right-length payload decodes to
+            # b"" and gets written out as a zero-byte PNG, so the caller
+            # receives a broken image path rather than falling back to local
+            # parsing.
+            image_bytes = base64.b64decode(image_base64, validate=True)
+            if not image_bytes:
+                raise ValueError(
+                    f"Remote DeepDoc element {index} carries an empty image"
+                )
+            normalized_element["image"] = save_image(image_bytes)
         else:
             normalized_element["image"] = None
         normalized.append(normalized_element)

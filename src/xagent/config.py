@@ -60,6 +60,9 @@ FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFI
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_URL = "XAGENT_DEEPDOC_XINFERENCE_URL"
+DEEPDOC_XINFERENCE_API_KEY = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+DEEPDOC_XINFERENCE_TIMEOUT_SECONDS = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -1851,6 +1854,41 @@ def get_kb_collections_timeout_seconds() -> int:
         Per-scan timeout in seconds
     """
     return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
+
+
+def get_deepdoc_xinference_url() -> str | None:
+    """Return the Xinference base URL that DeepDoc parsing is offloaded to.
+
+    Leaving this unset keeps document parsing entirely local. It must
+    otherwise be an absolute http:// or https:// base URL carrying no query
+    or fragment, since request paths are appended to it. A malformed value
+    raises rather than silently downgrading to local parsing, so the
+    misconfiguration surfaces instead of showing up only as unexplained
+    slowness.
+    """
+    return _normalized_http_env_url(DEEPDOC_XINFERENCE_URL)
+
+
+def get_deepdoc_xinference_api_key() -> str | None:
+    """Return the API key for remote DeepDoc parsing, if one is configured.
+
+    A dedicated key wins over the bare ``XINFERENCE_API_KEY`` shared with the
+    other Xinference clients. Returning None is valid: a self-hosted
+    Xinference deployment often runs without authentication.
+    """
+    value = (os.getenv(DEEPDOC_XINFERENCE_API_KEY) or "").strip()
+    if value:
+        return value
+    return (os.getenv("XINFERENCE_API_KEY") or "").strip() or None
+
+
+def get_deepdoc_xinference_timeout_seconds() -> int:
+    """Return the read timeout for one remote DeepDoc document parse.
+
+    Parsing a large PDF can take minutes, so the default matches the
+    ``timeout=1800`` precedent in deepdoc-lib's own remote API client.
+    """
+    return _get_positive_int_env(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, 1800)
 
 
 def get_default_sqlite_db_path() -> str:

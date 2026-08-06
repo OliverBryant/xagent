@@ -22,6 +22,9 @@ from xagent.config import (
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
     DB_POOL_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_API_KEY,
+    DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -112,6 +115,9 @@ from xagent.config import (
     get_db_pool_timeout_seconds,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
+    get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_timeout_seconds,
+    get_deepdoc_xinference_url,
     get_external_skills_dirs,
     get_external_upload_dirs,
     get_file_delivery_accel_redirect_enabled,
@@ -1210,6 +1216,80 @@ class TestGetKbCollectionsTimeoutSeconds:
     def test_non_positive_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(KB_COLLECTIONS_TIMEOUT_SECONDS, "0")
         assert get_kb_collections_timeout_seconds() == 30
+
+
+class TestDeepDocRemoteParsingConfig:
+    """Test the remote DeepDoc parsing (Xinference) configuration getters."""
+
+    def test_env_var_constants(self):
+        assert DEEPDOC_XINFERENCE_URL == "XAGENT_DEEPDOC_XINFERENCE_URL"
+        assert DEEPDOC_XINFERENCE_API_KEY == "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+        assert (
+            DEEPDOC_XINFERENCE_TIMEOUT_SECONDS
+            == "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+        )
+
+    def test_url_unset_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_URL, raising=False)
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_blank_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "   ")
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_strips_whitespace_and_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, " http://gpu-host:9997/ ")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "gpu-host:9997",
+            "ftp://gpu-host:9997",
+            "https:///missing-host",
+            "http://gpu-host:9997?model=deepdoc",
+            "http://gpu-host:9997#deepdoc",
+            "http://gpu-host:9997/v1/deepdoc?model=deepdoc",
+        ],
+    )
+    def test_url_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, value)
+
+        with pytest.raises(ValueError, match="XAGENT_DEEPDOC_XINFERENCE_URL"):
+            get_deepdoc_xinference_url()
+
+    def test_api_key_dedicated_var_wins(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, " deepdoc-key ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "deepdoc-key"
+
+    def test_api_key_falls_back_to_shared_xinference_key(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.setenv("XINFERENCE_API_KEY", " shared-key ")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_blank_dedicated_var_falls_back(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, "  ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_unset_means_no_auth(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.delenv("XINFERENCE_API_KEY", raising=False)
+        assert get_deepdoc_xinference_api_key() is None
+
+    def test_timeout_default(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, raising=False)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_timeout_env_override(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, "600")
+        assert get_deepdoc_xinference_timeout_seconds() == 600
+
+    @pytest.mark.parametrize("value", ["not-a-number", "", "0", "-1"])
+    def test_timeout_invalid_or_non_positive_falls_back(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, value)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
 
 
 class TestGetDefaultSqliteDbPath:

@@ -1,70 +1,68 @@
-"""HTTP client for offloading DeepDoc document parsing to a remote Xinference server.
+"""HTTP client for offloading DeepDoc parsing to Xinference's OCR endpoint.
 
-Set ``XAGENT_DEEPDOC_XINFERENCE_URL`` to route every format ``DeepDocParser``
-supports to a GPU host instead of running local ONNX inference. Any failure
-raises :class:`DeepDocRemoteError`, which the caller treats as "fall back to
-local parsing" -- fallback is always on, which is what makes the switch
-transparent.
+Set ``XAGENT_DEEPDOC_XINFERENCE_URL`` to route parsing to a GPU host instead of
+running local ONNX inference. Any failure raises :class:`DeepDocRemoteError`,
+which the caller treats as "fall back to local parsing" -- fallback is always
+on, which is what makes the switch transparent.
 
 This module deliberately depends on nothing but ``httpx`` and
 ``xagent.config``. In particular it must not import ``deepdoc.py``: the
 image-saving function is injected by the caller instead, which keeps the import
 graph acyclic and lets the client be tested without loading any parser.
 
-Proposed server API contract (v1)
----------------------------------
+Server API contract
+-------------------
 
-Xinference has no DeepDoc serving capability today; the endpoint below is a
-proposal tracked alongside this client, mirrored from
-``docs/deepdoc-remote-parsing.md`` section 6.
+Xinference ships DeepDoc as an *image/OCR model*, not as a whole-document parse
+API (xorbitsai/inference#5230). There is no ``/v1/document/parse``. The real,
+measured endpoint is:
 
 .. code-block:: text
 
-    POST {base_url}/v1/document/parse
-    Authorization: Bearer <api_key>          # omitted when the client has no key
+    POST {base_url}/v1/images/ocr
+    Authorization: Bearer <jwt or api key>    # omitted when unauthenticated
 
     Request (multipart/form-data):
-      file         binary  required            original file; filename preserved
-                                               (server dispatches on the extension)
-      zoomin       int     default 3           PDF only, forwarded to parse_into_bboxes
-      image_scope  str     default table_figure    table_figure | all | none
+      model   str     required    the launched model UID, e.g. "DeepDoc"
+      image   binary  required    the document; PDFs are rasterized server-side
+      kwargs  str     optional    a JSON *string*; supports task, pages, dpi,
+                                  return_dict, threshold
 
     Response 200 application/json:
-    {
-      "filename": "report.pdf",
-      "file_type": ".pdf",
-      "elapsed_ms": 45210,
-      "elements": [
-        {
-          "type": "text",              // "text" | "table" | "figure"
-          "text": "...",               // HTML for tables, matching local behavior
-          "image_base64": null,        // PNG base64 for table/figure, null otherwise
-          "metadata": { ... }          // format specific, see the doc
-        }
-      ]
-    }
+    {"pages": [{"page": 1, "result": {"task": ..., <task payload>}}]}
 
-    Errors: 400 invalid/unsupported file, 401 auth failure, 413 file too large,
-            500 inference failure. Body is always {"detail": "..."}.
+The per-task payloads this client uses:
 
-Per-format server behavior and the ``metadata`` keys each format must supply
-are tabulated in the requirements doc. The intent is semantic parity with
-xagent's local parsing so remote and local results stay interchangeable when
-fallback kicks in: ``.pdf`` comes from ``parse_into_bboxes(zoomin)`` and
-carries ``page_number``, ``x0``, ``x1``, ``top``, ``bottom``, ``layout_type``,
-``col_id`` and ``positions``; ``.xlsx`` emits one element per row with
-``sheet_name``, ``row_number`` and ``row_type``; the remaining formats follow
-their local counterparts.
+- ``task=ocr`` with ``return_dict=true`` yields ``lines``, each
+  ``{"box": [[x, y] * 4], "text": ..., "score": ...}``. ``box`` is a
+  quadrilateral, not an axis-aligned rectangle.
+- ``task=layout`` yields ``layouts``, each
+  ``{"type": ..., "bbox": [x0, y0, x1, y1], "score": ...}``. ``type`` comes
+  from DeepDoc's label set, lower-cased: ``text``, ``title``, ``figure``,
+  ``figure caption``, ``table``, ``table caption``, ``header``, ``footer``,
+  ``reference``, ``equation``.
 
-Only ``table`` and ``figure`` elements carry an image, because that is all the
-downstream translation consumes -- stripping text-element crops cuts the
-payload substantially.
+Neither task returns text grouped into blocks, so this client issues both and
+joins them spatially. That is sound because the two tasks were measured to
+share one coordinate space (both are reported in the rasterized page's pixel
+space at the same DPI).
+
+Authentication is a JWT obtained from ``POST {base_url}/token`` with
+``{"username", "password"}``. A deployment that issues a static API key instead
+can configure that key directly and it is used as the bearer verbatim.
+
+Capability gap versus local parsing
+-----------------------------------
+
+The OCR endpoint returns neither table HTML, nor image crops, nor DeepDoc's
+XGBoost cross-line paragraph merging, so remote elements are coarser than local
+ones: a table's text is its OCR lines rather than reconstructed HTML, ``image``
+is always ``None``, and blocks are never merged across pages. See
+``docs/deepdoc-remote-parsing.md``.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import logging
 import time
@@ -76,32 +74,70 @@ import httpx
 
 from ...config import (
     get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_model_uid,
+    get_deepdoc_xinference_password,
     get_deepdoc_xinference_timeout_seconds,
     get_deepdoc_xinference_url,
+    get_deepdoc_xinference_username,
 )
 
 logger = logging.getLogger(__name__)
 
-PARSE_ENDPOINT = "/v1/document/parse"
+OCR_ENDPOINT = "/v1/images/ocr"
+TOKEN_ENDPOINT = "/token"
 
 # Connecting to and writing headers against a reachable host is fast; only the
-# parse itself is slow, so the connect/pool budgets stay short regardless of
+# inference itself is slow, so the connect/pool budgets stay short regardless of
 # how long the configured read timeout is.
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _POOL_TIMEOUT_SECONDS = 10.0
+# The token exchange is a trivial round trip, so it must not inherit the
+# document-sized read timeout: a hung auth endpoint should fail fast into the
+# local fallback rather than stall the parse for half an hour.
+_TOKEN_TIMEOUT_SECONDS = 30.0
 
 _MIME_TYPES = {
     ".pdf": "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".xls": "application/vnd.ms-excel",
-    ".csv": "text/csv",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".html": "text/html",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
 }
 _DEFAULT_MIME_TYPE = "application/octet-stream"
+
+# DeepDoc's layout label set, lower-cased as the server reports it, mapped onto
+# the three element types the downstream translator understands. Anything not
+# listed -- including "text", "title", "header", "footer", "reference" and
+# "equation" -- becomes a text element, which is the conservative choice: text
+# is the only type whose payload is never dropped downstream.
+_LAYOUT_TYPE_TO_ELEMENT_TYPE = {
+    "table": "table",
+    "figure": "figure",
+    "figure caption": "figure",
+}
+
+# DeepDoc's layout blocks overlap: a caption is routinely reported at the exact
+# coordinates of the text or title block covering the same lines, and both would
+# otherwise claim those lines and duplicate the text. Blocks are therefore
+# ranked and each line is claimed at most once, by the highest-ranked block
+# containing it.
+#
+# Captions rank *below* everything, which was chosen from measured output rather
+# than from taste: on the sample document the layout model emitted "table
+# caption" over blocks the same model had also classified "title" and "text",
+# and those latter labels were the correct ones. Letting a caption lose keeps
+# the better label, and costs nothing when the caption is genuine -- the text is
+# still emitted, just under a plainer type.
+_LAYOUT_TYPE_PRIORITY = {
+    "table": 3,
+    "figure": 3,
+    "figure caption": 1,
+    "table caption": 1,
+}
+_DEFAULT_LAYOUT_PRIORITY = 2
 
 ProgressCallback = Callable[[float, str], None]
 SaveImage = Callable[[bytes], str]
@@ -111,8 +147,8 @@ class DeepDocRemoteError(Exception):
     """Remote parsing failed and the caller should fall back to local parsing.
 
     Every failure mode -- unreachable host, timeout, 4xx/5xx, unparsable or
-    malformed body, undecodable image, failed image write -- is reported as
-    this single type so callers need only one ``except`` clause.
+    malformed body -- is reported as this single type so callers need only one
+    ``except`` clause.
     """
 
 
@@ -132,12 +168,48 @@ def is_remote_configured() -> bool:
         return False
 
 
-def _build_headers() -> dict[str, str]:
-    """Return the auth headers, which are empty when no API key is configured."""
+def _get_access_token(client: httpx.Client, base_url: str) -> Optional[str]:
+    """Return the bearer token to authenticate with, or None when unauthenticated.
+
+    A configured key is used verbatim: Xinference accepts both a JWT and a
+    static API key in the ``Authorization`` header, and the client cannot tell
+    them apart, so it does not try. Only when no key is set and a username and
+    password are does it exchange them at ``/token``.
+
+    Args:
+        client: The HTTP client to exchange credentials on.
+        base_url: Xinference base URL.
+
+    Raises:
+        httpx.HTTPError: On any transport failure or non-2xx status.
+        ValueError: If the token response is not a JSON object carrying a
+            non-empty string ``access_token``.
+    """
     api_key = get_deepdoc_xinference_api_key()
     if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
-    return {}
+        return api_key
+
+    username = get_deepdoc_xinference_username()
+    password = get_deepdoc_xinference_password()
+    if not username or not password:
+        return None
+
+    response = client.post(
+        f"{base_url}{TOKEN_ENDPOINT}",
+        json={"username": username, "password": password},
+        timeout=_TOKEN_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Remote DeepDoc token response is {type(payload).__name__}, "
+            "expected a JSON object"
+        )
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise ValueError("Remote DeepDoc token response carries no 'access_token'")
+    return token
 
 
 def _mime_type_for(ext: str) -> str:
@@ -145,55 +217,55 @@ def _mime_type_for(ext: str) -> str:
     return _MIME_TYPES.get(ext.lower(), _DEFAULT_MIME_TYPE)
 
 
-def _post_document(
+def _post_ocr_task(
+    client: httpx.Client,
     file_path: str | BytesIO,
     *,
+    base_url: str,
     ext: str,
-    zoomin: int,
-    transport: Optional[httpx.BaseTransport],
+    task: str,
+    headers: dict[str, str],
 ) -> dict[str, Any]:
-    """Upload the document and return the decoded JSON response body.
+    """Run one OCR-endpoint task over the document and return the decoded body.
+
+    The file handle is opened per call rather than shared, because a multipart
+    upload consumes it and the caller runs two tasks over the same document.
 
     Args:
+        client: The HTTP client to send on.
         file_path: Path to the original file, or its bytes in memory.
+        base_url: Xinference base URL.
         ext: Lower-cased file extension, used for the MIME type and for the
             synthetic filename of an in-memory document.
-        zoomin: PDF render scale forwarded to the server.
-        transport: Optional transport override. This is the seam tests use to
-            install an ``httpx.MockTransport`` instead of reaching the network.
+        task: The DeepDoc task to run, ``"ocr"`` or ``"layout"``.
+        headers: Auth headers, empty when unauthenticated.
 
     Raises:
         httpx.HTTPError: On any transport failure or non-2xx status.
         ValueError: If the body is not JSON, or is JSON but not an object.
         OSError: If a file path cannot be read.
     """
-    base_url = get_deepdoc_xinference_url()
-    if base_url is None:
-        raise ValueError("Remote DeepDoc parsing is not configured")
-
-    timeout_seconds = float(get_deepdoc_xinference_timeout_seconds())
-    timeout = httpx.Timeout(
-        connect=_CONNECT_TIMEOUT_SECONDS,
-        read=timeout_seconds,
-        write=timeout_seconds,
-        pool=_POOL_TIMEOUT_SECONDS,
-    )
-    data = {"zoomin": str(zoomin)}
+    kwargs: dict[str, Any] = {"task": task}
+    if task == "ocr":
+        # Without this the server returns bare tuples, which carry the same
+        # information but positionally; the dict form is what was measured.
+        kwargs["return_dict"] = True
+    # kwargs is a JSON *string* form field, not a nested multipart structure.
+    data = {"model": get_deepdoc_xinference_model_uid(), "kwargs": json.dumps(kwargs)}
     mime_type = _mime_type_for(ext)
 
     def _send(filename: str, fh: Any) -> dict[str, Any]:
-        with httpx.Client(timeout=timeout, transport=transport) as client:
-            response = client.post(
-                f"{base_url}{PARSE_ENDPOINT}",
-                headers=_build_headers(),
-                data=data,
-                files={"file": (filename, fh, mime_type)},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        response = client.post(
+            f"{base_url}{OCR_ENDPOINT}",
+            headers=headers,
+            data=data,
+            files={"image": (filename, fh, mime_type)},
+        )
+        response.raise_for_status()
+        payload = response.json()
         if not isinstance(payload, dict):
             raise ValueError(
-                f"Remote DeepDoc response body is {type(payload).__name__}, "
+                f"Remote DeepDoc {task} response body is {type(payload).__name__}, "
                 "expected a JSON object"
             )
         return payload
@@ -212,66 +284,321 @@ def _post_document(
         return _send(Path(file_path).name, fh)
 
 
-def _normalize_elements(
-    payload: dict[str, Any], save_image: SaveImage
-) -> list[dict[str, Any]]:
-    """Validate the response elements and materialize their images on disk.
-
-    Each element's ``image_base64`` is replaced by an ``image`` key holding the
-    path string of the saved file, or ``None`` when the element carries no
-    image. A path string is exactly what the caller's existing image handling
-    already accepts, so no downstream change is needed.
+def _iter_pages(payload: dict[str, Any], task: str) -> list[tuple[int, dict[str, Any]]]:
+    """Return ``(page_number, result)`` pairs from one task's response.
 
     Args:
         payload: Decoded response body.
-        save_image: Writes decoded image bytes and returns the resulting path.
+        task: The task the payload came from, for error messages.
 
     Raises:
-        ValueError: If the payload does not carry a list of elements that each
-            look like a parsed element, or if an element's image decodes to no
-            bytes at all.
-        binascii.Error: If an element's image is not valid base64.
+        ValueError: If the payload does not carry a list of page objects.
     """
-    elements = payload.get("elements")
-    if not isinstance(elements, list):
+    pages = payload.get("pages")
+    if not isinstance(pages, list):
         raise ValueError(
-            "Remote DeepDoc response is missing an 'elements' list "
-            f"(got {type(elements).__name__})"
+            f"Remote DeepDoc {task} response is missing a 'pages' list "
+            f"(got {type(pages).__name__})"
         )
 
-    normalized: list[dict[str, Any]] = []
-    for index, element in enumerate(elements):
-        if not isinstance(element, dict):
+    parsed: list[tuple[int, dict[str, Any]]] = []
+    for index, page in enumerate(pages):
+        if not isinstance(page, dict):
             raise ValueError(
-                f"Remote DeepDoc element {index} is {type(element).__name__}, "
+                f"Remote DeepDoc {task} page {index} is {type(page).__name__}, "
                 "expected an object"
             )
-        missing = [key for key in ("type", "text") if key not in element]
-        if missing:
+        result = page.get("result")
+        if not isinstance(result, dict):
             raise ValueError(
-                f"Remote DeepDoc element {index} is missing "
-                f"{', '.join(repr(key) for key in missing)}"
+                f"Remote DeepDoc {task} page {index} is missing a 'result' object "
+                f"(got {type(result).__name__})"
+            )
+        # Fall back to the 1-based ordinal so a server that omits the page
+        # number still produces monotonically increasing pages.
+        page_number = page.get("page", index + 1)
+        if not isinstance(page_number, int) or isinstance(page_number, bool):
+            raise ValueError(
+                f"Remote DeepDoc {task} page {index} has a non-integer page number "
+                f"({page_number!r})"
+            )
+        parsed.append((page_number, result))
+    return parsed
+
+
+def _quad_to_rect(box: Any, page_number: int) -> tuple[float, float, float, float]:
+    """Return the axis-aligned ``(x0, top, x1, bottom)`` bounds of an OCR quad.
+
+    OCR boxes are four corner points because recognized text can be skewed. The
+    downstream metadata is rectangular, so the quad is reduced to its bounding
+    box, which is what local DeepDoc reports too.
+
+    Raises:
+        ValueError: If the box is not a sequence of at least three numeric
+            ``(x, y)`` points.
+    """
+    if not isinstance(box, (list, tuple)) or len(box) < 3:
+        raise ValueError(
+            f"Remote DeepDoc ocr page {page_number} has a malformed line box ({box!r})"
+        )
+    xs: list[float] = []
+    ys: list[float] = []
+    for point in box:
+        if (
+            not isinstance(point, (list, tuple))
+            or len(point) < 2
+            or isinstance(point[0], bool)
+            or isinstance(point[1], bool)
+            or not isinstance(point[0], (int, float))
+            or not isinstance(point[1], (int, float))
+        ):
+            raise ValueError(
+                f"Remote DeepDoc ocr page {page_number} has a malformed line box "
+                f"point ({point!r})"
+            )
+        xs.append(float(point[0]))
+        ys.append(float(point[1]))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _collect_ocr_lines(
+    ocr_pages: list[tuple[int, dict[str, Any]]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Return per-page OCR lines reduced to rectangles, in reading order.
+
+    Raises:
+        ValueError: If a page's ``lines`` are missing or malformed.
+    """
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for page_number, result in ocr_pages:
+        lines = result.get("lines")
+        if not isinstance(lines, list):
+            raise ValueError(
+                f"Remote DeepDoc ocr page {page_number} is missing a 'lines' list "
+                f"(got {type(lines).__name__})"
+            )
+        page_lines: list[dict[str, Any]] = []
+        for line in lines:
+            if not isinstance(line, dict):
+                raise ValueError(
+                    f"Remote DeepDoc ocr page {page_number} has a "
+                    f"{type(line).__name__} line, expected an object"
+                )
+            text = line.get("text")
+            if not isinstance(text, str):
+                raise ValueError(
+                    f"Remote DeepDoc ocr page {page_number} has a line without "
+                    "string 'text'"
+                )
+            x0, top, x1, bottom = _quad_to_rect(line.get("box"), page_number)
+            if not text.strip():
+                # A blank recognition carries no content but would still occupy
+                # a slot in a joined block, so it is dropped rather than joined.
+                continue
+            page_lines.append(
+                {
+                    "text": text,
+                    "x0": x0,
+                    "x1": x1,
+                    "top": top,
+                    "bottom": bottom,
+                }
+            )
+        # A page repeated across responses would otherwise lose lines.
+        by_page.setdefault(page_number, []).extend(page_lines)
+
+    # Sorted after accumulation, not per batch: a page split across two response
+    # entries must end up in one reading order, not two concatenated ones.
+    for page_lines in by_page.values():
+        page_lines.sort(key=lambda item: (item["top"], item["x0"]))
+    return by_page
+
+
+def _collect_layout_blocks(
+    layout_pages: list[tuple[int, dict[str, Any]]],
+) -> dict[int, list[dict[str, Any]]]:
+    """Return per-page layout blocks, ordered so the most specific claims first.
+
+    Raises:
+        ValueError: If a page's ``layouts`` are missing or malformed.
+    """
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for page_number, result in layout_pages:
+        layouts = result.get("layouts")
+        if not isinstance(layouts, list):
+            raise ValueError(
+                f"Remote DeepDoc layout page {page_number} is missing a 'layouts' "
+                f"list (got {type(layouts).__name__})"
+            )
+        page_blocks: list[dict[str, Any]] = []
+        for block in layouts:
+            if not isinstance(block, dict):
+                raise ValueError(
+                    f"Remote DeepDoc layout page {page_number} has a "
+                    f"{type(block).__name__} block, expected an object"
+                )
+            bbox = block.get("bbox")
+            if (
+                not isinstance(bbox, (list, tuple))
+                or len(bbox) < 4
+                or any(isinstance(value, bool) for value in bbox[:4])
+                or not all(isinstance(value, (int, float)) for value in bbox[:4])
+            ):
+                raise ValueError(
+                    f"Remote DeepDoc layout page {page_number} has a malformed "
+                    f"bbox ({bbox!r})"
+                )
+            layout_type = block.get("type")
+            if not isinstance(layout_type, str):
+                layout_type = "text"
+            x0, top, x1, bottom = (float(value) for value in bbox[:4])
+            page_blocks.append(
+                {
+                    "layout_type": layout_type.strip().lower(),
+                    # Normalize inverted bounds so containment tests are honest.
+                    "x0": min(x0, x1),
+                    "x1": max(x0, x1),
+                    "top": min(top, bottom),
+                    "bottom": max(top, bottom),
+                }
+            )
+        by_page.setdefault(page_number, []).extend(page_blocks)
+
+    # Specific types claim their lines before the plain text block that overlaps
+    # them; ties keep reading order so the join is deterministic. Sorted after
+    # accumulation so a page split across two response entries is ranked as one.
+    for page_blocks in by_page.values():
+        page_blocks.sort(
+            key=lambda item: (
+                -_LAYOUT_TYPE_PRIORITY.get(
+                    item["layout_type"], _DEFAULT_LAYOUT_PRIORITY
+                ),
+                item["top"],
+                item["x0"],
+            )
+        )
+    return by_page
+
+
+def _build_element(
+    *,
+    element_type: str,
+    layout_type: str,
+    text: str,
+    page_number: int,
+    x0: float,
+    x1: float,
+    top: float,
+    bottom: float,
+) -> dict[str, Any]:
+    """Return one element in the shape ``_translate_remote_elements`` consumes."""
+    return {
+        "type": element_type,
+        "text": text,
+        # The OCR endpoint returns no image bytes at all, for any element type.
+        "image": None,
+        "metadata": {
+            "page_number": page_number,
+            "x0": x0,
+            "x1": x1,
+            "top": top,
+            "bottom": bottom,
+            "layout_type": layout_type,
+            "col_id": 0,
+            # _build_element_metadata inserts col_id at index 1 when enriching.
+            "positions": [[page_number, x0, x1, top, bottom]],
+        },
+    }
+
+
+def _join_ocr_and_layout(
+    ocr_pages: list[tuple[int, dict[str, Any]]],
+    layout_pages: list[tuple[int, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Group OCR lines into layout blocks and return elements in reading order.
+
+    Both tasks report coordinates in the same rasterized page space, so a line
+    belongs to the block whose bbox contains the line's center point. Each line
+    is claimed at most once, and a line no block claims becomes its own text
+    element: losing recognized text would be strictly worse than emitting it
+    unstructured.
+
+    Args:
+        ocr_pages: ``(page_number, result)`` pairs from the ``ocr`` task.
+        layout_pages: ``(page_number, result)`` pairs from the ``layout`` task.
+
+    Returns:
+        Elements sorted by ``(page, top, x0)``.
+
+    Raises:
+        ValueError: If either task's page payloads are malformed.
+    """
+    lines_by_page = _collect_ocr_lines(ocr_pages)
+    blocks_by_page = _collect_layout_blocks(layout_pages)
+
+    elements: list[dict[str, Any]] = []
+    for page_number in sorted(set(lines_by_page) | set(blocks_by_page)):
+        page_lines = lines_by_page.get(page_number, [])
+        claimed = [False] * len(page_lines)
+
+        for block in blocks_by_page.get(page_number, []):
+            members: list[dict[str, Any]] = []
+            for index, line in enumerate(page_lines):
+                if claimed[index]:
+                    continue
+                center_x = (line["x0"] + line["x1"]) / 2.0
+                center_y = (line["top"] + line["bottom"]) / 2.0
+                if (
+                    block["x0"] <= center_x <= block["x1"]
+                    and block["top"] <= center_y <= block["bottom"]
+                ):
+                    claimed[index] = True
+                    members.append(line)
+            if not members:
+                # A block with no text of its own -- a bare figure, or a caption
+                # already claimed by a more specific block -- carries nothing
+                # downstream, so it is not emitted.
+                continue
+            # page_lines is already in reading order, so members inherits it.
+            elements.append(
+                _build_element(
+                    element_type=_LAYOUT_TYPE_TO_ELEMENT_TYPE.get(
+                        block["layout_type"], "text"
+                    ),
+                    layout_type=block["layout_type"],
+                    text="\n".join(member["text"] for member in members),
+                    page_number=page_number,
+                    x0=min(member["x0"] for member in members),
+                    x1=max(member["x1"] for member in members),
+                    top=min(member["top"] for member in members),
+                    bottom=max(member["bottom"] for member in members),
+                )
             )
 
-        normalized_element = dict(element)
-        image_base64 = normalized_element.pop("image_base64", None)
-        if image_base64:
-            # validate=True rejects non-alphabet characters instead of dropping
-            # them. Without it a corrupt-but-right-length payload decodes to
-            # b"" and gets written out as a zero-byte PNG, so the caller
-            # receives a broken image path rather than falling back to local
-            # parsing.
-            image_bytes = base64.b64decode(image_base64, validate=True)
-            if not image_bytes:
-                raise ValueError(
-                    f"Remote DeepDoc element {index} carries an empty image"
+        for index, line in enumerate(page_lines):
+            if claimed[index]:
+                continue
+            elements.append(
+                _build_element(
+                    element_type="text",
+                    layout_type="text",
+                    text=line["text"],
+                    page_number=page_number,
+                    x0=line["x0"],
+                    x1=line["x1"],
+                    top=line["top"],
+                    bottom=line["bottom"],
                 )
-            normalized_element["image"] = save_image(image_bytes)
-        else:
-            normalized_element["image"] = None
-        normalized.append(normalized_element)
+            )
 
-    return normalized
+    elements.sort(
+        key=lambda element: (
+            element["metadata"]["page_number"],
+            element["metadata"]["top"],
+            element["metadata"]["x0"],
+        )
+    )
+    return elements
 
 
 def parse_document_remote(
@@ -283,56 +610,91 @@ def parse_document_remote(
     zoomin: int = 3,
     _transport: Optional[httpx.BaseTransport] = None,
 ) -> list[dict[str, Any]]:
-    """Parse a document on the remote DeepDoc server.
+    """Parse a document on the remote DeepDoc OCR endpoint.
+
+    Two requests are sent over one connection: ``task=ocr`` for the text and
+    ``task=layout`` for the block structure. Their results are joined spatially.
 
     Args:
         file_path: Path to the original file, or its bytes in memory.
         ext: File extension of the document, for example ``".pdf"``.
-        save_image: Writes decoded image bytes and returns the resulting path.
-            Injected by the caller so this module stays independent of the
-            parser that owns the artifact directory layout.
+        save_image: Accepted for signature compatibility with the local path and
+            never called -- the OCR endpoint returns no image bytes.
         callback: Optional progress sink taking ``(fraction, message)``. The
             ``"message (1.23s)"`` shape of the completion notice matches what
             local DeepDoc emits, so the existing progress adapter strips the
             timing suffix and dedupes statuses without any change.
-        zoomin: PDF render scale forwarded to the server.
+        zoomin: Accepted for signature compatibility. The server rasterizes the
+            document itself and takes a ``dpi`` rather than a scale factor, so
+            this value is not forwarded.
         _transport: Test-only transport override.
 
     Returns:
-        The parsed elements, each with an ``image`` path string or ``None``.
+        The parsed elements, each with ``image`` set to ``None``.
 
     Raises:
         DeepDocRemoteError: On any failure. Callers fall back to local parsing.
     """
+    del save_image, zoomin  # Signature compatibility only; see above.
+
     started = time.monotonic()
     if callback is not None:
         callback(0.05, "Uploading document to remote DeepDoc server")
 
     try:
-        payload = _post_document(
-            file_path, ext=ext, zoomin=zoomin, transport=_transport
+        base_url = get_deepdoc_xinference_url()
+        if base_url is None:
+            raise ValueError("Remote DeepDoc parsing is not configured")
+
+        timeout_seconds = float(get_deepdoc_xinference_timeout_seconds())
+        timeout = httpx.Timeout(
+            connect=_CONNECT_TIMEOUT_SECONDS,
+            read=timeout_seconds,
+            write=timeout_seconds,
+            pool=_POOL_TIMEOUT_SECONDS,
         )
-        elements = _normalize_elements(payload, save_image)
+        with httpx.Client(timeout=timeout, transport=_transport) as client:
+            token = _get_access_token(client, base_url)
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+            ocr_payload = _post_ocr_task(
+                client,
+                file_path,
+                base_url=base_url,
+                ext=ext,
+                task="ocr",
+                headers=headers,
+            )
+            if callback is not None:
+                callback(0.5, "Recognizing document layout on remote DeepDoc server")
+            layout_payload = _post_ocr_task(
+                client,
+                file_path,
+                base_url=base_url,
+                ext=ext,
+                task="layout",
+                headers=headers,
+            )
+
+        elements = _join_ocr_and_layout(
+            _iter_pages(ocr_payload, "ocr"),
+            _iter_pages(layout_payload, "layout"),
+        )
     except httpx.HTTPError as exc:
         raise DeepDocRemoteError(f"Remote DeepDoc request failed: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise DeepDocRemoteError(
             f"Remote DeepDoc returned a non-JSON response: {exc}"
         ) from exc
-    except binascii.Error as exc:
-        raise DeepDocRemoteError(
-            f"Remote DeepDoc returned an undecodable image: {exc}"
-        ) from exc
     except ValueError as exc:
         raise DeepDocRemoteError(
             f"Remote DeepDoc returned an unusable response: {exc}"
         ) from exc
     except OSError as exc:
-        # Covers both an unreadable source file and a failed image write.
         raise DeepDocRemoteError(f"Remote DeepDoc parse failed: {exc}") from exc
     except Exception as exc:
-        # save_image is caller-supplied, so it may fail in ways this module
-        # cannot enumerate. Fallback must still be the outcome.
+        # Anything unforeseen must still end in the local fallback rather than
+        # propagating out of the parser.
         raise DeepDocRemoteError(f"Remote DeepDoc parse failed: {exc}") from exc
 
     elapsed = time.monotonic() - started

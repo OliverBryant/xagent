@@ -12,9 +12,12 @@ Two facts shape this design:
 - `deepdoc-lib` 0.2.2 has **no usable remote inference path**. The
   `TENSORRT_DLA_SVR` hook in `vision/layout_recognizer.py` imports
   `deepdoc.vision.dla_cli`, a module that does not ship in the package.
-- Xinference has no DeepDoc serving capability today. The server-side API in
-  section 6 is a **proposal** to be implemented by the Xinference team (the same
-  team maintains both projects).
+- Xinference ships DeepDoc as an **image/OCR model**, not as a whole-document
+  parse API (xorbitsai/inference#5230). An earlier revision of this document
+  proposed a `POST /v1/document/parse` endpoint returning fully structured
+  elements. **That endpoint does not exist.** Section 6 now documents the real
+  `POST /v1/images/ocr` contract, measured against a running server, and
+  section 8 records what is lost by building on it.
 
 ## 2. Goals
 
@@ -45,9 +48,10 @@ flowchart TD
     A[KB upload / parse request] --> B[Parser registry selects deepdoc]
     B --> C{XAGENT_DEEPDOC_XINFERENCE_URL<br/>set and valid?}
     C -- no --> L[Local deepdoc-lib parse<br/>PDF: OCR/Layout/TSR ONNX<br/>other formats: CPU parse]
-    C -- yes --> R[POST /v1/document/parse<br/>multipart upload of the original file]
-    R --> S{Remote succeeded?}
-    S -- yes --> T[Translate unified elements<br/>decode base64 images to artifacts/]
+    C -- yes --> R[POST /v1/images/ocr twice<br/>task=ocr, then task=layout]
+    R --> J[Spatial join:<br/>group OCR lines into layout blocks]
+    J --> S{Remote succeeded?}
+    S -- yes --> T[Translate joined elements]
     S -- "no (unreachable / timeout / 4xx / 5xx / bad body)" --> W[warning log + progress notice] --> L
     L --> U[Existing per-format local translation]
     T --> P[ParseResult -> ParsedParagraph -> LanceDB]
@@ -64,11 +68,17 @@ sequenceDiagram
     participant XI as Xinference (GPU host)
     W->>DP: parse(file, progress_callback)
     DP->>RC: parse_document_remote(file, ext)
-    RC->>XI: POST /v1/document/parse (multipart, Bearer key)
-    Note over XI: deepdoc-lib dispatches by format<br/>PDF uses parse_into_bboxes (GPU)
-    XI-->>RC: 200 JSON elements (images base64)
-    RC->>RC: base64 -> PNG saved under<br/>artifacts/providers/deepdoc/{doc_id}/images/
-    RC-->>DP: elements (image replaced by local path)
+    opt no API key, username+password set
+        RC->>XI: POST /token {username, password}
+        XI-->>RC: 200 {"access_token": "..."}
+    end
+    RC->>XI: POST /v1/images/ocr (model, image, kwargs task=ocr)
+    Note over XI: PDF rasterized page by page,<br/>text recognition on GPU
+    XI-->>RC: 200 {"pages": [{page, result.lines}]}
+    RC->>XI: POST /v1/images/ocr (model, image, kwargs task=layout)
+    XI-->>RC: 200 {"pages": [{page, result.layouts}]}
+    RC->>RC: join lines into blocks by center-point containment
+    RC-->>DP: elements (image always None)
     DP->>DP: _translate_remote_elements -> ParseResult
     DP-->>W: ParseResult
     Note over DP,RC: any failure -> DeepDocRemoteError -><br/>warning -> local fallback (same as today)
@@ -79,71 +89,148 @@ sequenceDiagram
 | Environment variable | Required | Default | Notes |
 |---|---|---|---|
 | `XAGENT_DEEPDOC_XINFERENCE_URL` | yes, to enable remote | unset (= local mode) | Xinference base URL, e.g. `http://gpu-host:9997`. Validated as `http`/`https`, trailing slash stripped. |
-| `XAGENT_DEEPDOC_XINFERENCE_API_KEY` | no | falls back to bare `XINFERENCE_API_KEY`, then no auth header | Self-hosted Xinference without auth can leave this unset. |
-| `XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS` | no | `1800` | Read timeout for one whole-document parse, matching the `timeout=1800` precedent in deepdoc-lib's own MinerU API client. |
+| `XAGENT_DEEPDOC_XINFERENCE_MODEL_UID` | no | `DeepDoc` | The `model` form field: the UID the DeepDoc model was launched under. |
+| `XAGENT_DEEPDOC_XINFERENCE_API_KEY` | no | falls back to bare `XINFERENCE_API_KEY`, then to the username/password exchange, then no auth header | Sent as the bearer token verbatim. Xinference accepts both a static API key and a JWT here, and the client does not try to tell them apart. |
+| `XAGENT_DEEPDOC_XINFERENCE_USERNAME` | no | unset | Used only when no API key is set. Both this and the password must be present for the `/token` exchange to be attempted. |
+| `XAGENT_DEEPDOC_XINFERENCE_PASSWORD` | no | unset | Paired with the username. Not whitespace-stripped, since whitespace can be part of a password. |
+| `XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS` | no | `1800` | Read timeout for one whole-document parse, matching the `timeout=1800` precedent in deepdoc-lib's own MinerU API client. The `/token` exchange uses a fixed 30s instead, so a hung auth endpoint fails fast into the fallback. |
 
 There is deliberately **no fallback toggle**: fallback is always on, which is what
 makes the switch transparent. A malformed URL degrades to local mode with a
 warning rather than failing every parse.
 
-## 6. Proposed server API contract (v1)
+## 6. Server API contract (measured)
+
+This is the real, shipped endpoint, verified against a running Xinference with a
+GPU-backed DeepDoc.
 
 ```
-POST {base_url}/v1/document/parse
-Authorization: Bearer <api_key>          # omitted when the client has no key
+POST {base_url}/v1/images/ocr
+Authorization: Bearer <jwt or api key>     # omitted when unauthenticated
 
 Request (multipart/form-data):
-  file         binary  required            original file; filename preserved
-                                           (server dispatches on the extension)
-  zoomin       int     default 3           PDF only, forwarded to parse_into_bboxes
-  image_scope  str     default table_figure    table_figure | all | none
+  model   str     required   the launched model UID, e.g. "DeepDoc"
+  image   binary  required   the document; a PDF part must carry
+                             Content-Type: application/pdf
+  kwargs  str     optional   a JSON *string*, not a nested structure.
+                             Supports task, pages, dpi, return_dict, threshold.
 
 Response 200 application/json:
-{
-  "filename": "report.pdf",
-  "file_type": ".pdf",
-  "elapsed_ms": 45210,
-  "elements": [
-    {
-      "type": "text",              // "text" | "table" | "figure"
-      "text": "…",                 // HTML for tables, matching local behavior
-      "image_base64": null,        // PNG base64 for table/figure, null otherwise
-      "metadata": { ... }          // format specific, see the table below
-    }
-  ]
-}
-
-Errors: 400 invalid/unsupported file, 401 auth failure, 413 file too large,
-        500 inference failure. Body is always {"detail": "..."}.
+{"pages": [{"page": 1, "result": {"task": "...", ...}}]}
 ```
 
-Per-format server behavior and required metadata. The goal is semantic parity
-with xagent's existing local parsing so remote and local results are
-interchangeable when fallback kicks in.
+PDFs are handled entirely server-side: the server rasterizes page by page and
+merges the per-page results. `dpi` controls the raster resolution; there is no
+`zoomin` scale factor, so the client's `zoomin` argument is not forwarded.
 
-| Format | Server-side parsing | Required `element.metadata` keys |
-|---|---|---|
-| `.pdf` | `RAGFlowPdfParser().parse_into_bboxes(zoomin)`. Coerce numpy scalars to Python numbers, drop the internal `position_tag`, and encode images only for table/figure elements — upstream attaches a crop to every bbox, but the client only consumes table/figure images, so stripping text images cuts the payload substantially. | `page_number`, `x0`, `x1`, `top`, `bottom`, `layout_type`, `col_id`, `positions` (`[[page, left, right, top, bottom], …]`) |
-| `.docx` | `DoclingParser` (fall back to python-docx when unavailable), including images and captions | text sections: `style`; images emitted as `figure` elements |
-| `.xlsx` | One text element per row, mirroring xagent's `_parse_xlsx_rows` semantics: title/header/data row classification, `header: value \| …` joining, sheet-name prefix when multiple sheets | `sheet_name`, `row_number`, `row_type` (`title` \| `header` \| `data`) |
-| `.xls`, `.csv` | deepdoc `ExcelParser` | `sheet_name` (best effort) |
-| `.md` | `extract_tables_and_remainder`; tables become their own elements | tables emitted with `type: "table"` |
-| `.txt`, `.json`, `.html` | corresponding parser / direct read | none required |
+### 6.1 Task payloads
 
-Progress: v1 is a single synchronous request and the client uses a long read
-timeout. An asynchronous variant (`202` plus
-`/v1/document/parse/jobs/{id}`) is a possible v2 extension and does not break
-this contract, since xagent only surfaces coarse status strings today.
+`task=ocr` with `{"return_dict": true}` — recognized text lines:
 
-## 7. Acceptance criteria
+```json
+{"pages": [{"page": 1, "result": {"task": "ocr", "lines": [
+  {"box": [[197,213],[712,220],[711,275],[196,268]],
+   "text": "Sample Document", "score": 0.9995}]}}]}
+```
+
+`box` is a **four-point quadrilateral**, not `x0/x1/top/bottom`, because
+recognized text can be skewed. The client reduces it to its bounding rectangle.
+
+`task=layout` — block structure, with no text:
+
+```json
+{"pages": [{"page": 1, "result": {"task": "layout", "layouts": [
+  {"type": "title", "bbox": [197.18, 214.05, 713.41, 275.98], "score": 0.9397}]}}]}
+```
+
+`bbox` is `[x0, y0, x1, y1]`. `type` is DeepDoc's label set, lower-cased:
+`_background_`, `text`, `title`, `figure`, `figure caption`, `table`,
+`table caption`, `header`, `footer`, `reference`, `equation`.
+
+`task=table` — raw cell/row/column boxes, in `x0/x1/top/bottom` form, with
+**no table HTML**. The client does not use this task: without HTML it adds
+nothing the layout task does not already give.
+
+### 6.2 Authentication
+
+Authentication is a JWT, not a static key:
+
+```
+POST {base_url}/token
+{"username": "...", "password": "..."}   ->   {"access_token": "..."}
+```
+
+On a fresh deployment the first admin is created once via
+`POST /v1/admin/setup`. A deployment that issues a static API key instead can
+configure that key directly; the client sends whatever it is given as the bearer
+token verbatim and does not try to distinguish the two.
+
+### 6.3 The spatial join
+
+Neither task returns text grouped into blocks: `ocr` gives lines without
+structure, `layout` gives structure without text. The client therefore issues
+both over one connection and joins them.
+
+The join is sound because the two tasks were **measured to share one coordinate
+space** — on the sample document, `ocr` spanned x∈[193,1499] y∈[213,1804] and
+`layout` spanned x∈[196,1503] y∈[214,1803], with the first line of each covering
+the same region.
+
+The algorithm, per page:
+
+1. Rank layout blocks. `table` and `figure` rank highest, plain blocks next,
+   `figure caption` and `table caption` lowest. Captions rank last from measured
+   behavior, not taste: the layout model emitted `table caption` over blocks it
+   had also labelled `title` and `text`, and those labels were the better ones.
+2. In rank order, each block claims the still-unclaimed OCR lines whose **center
+   point** falls inside its bbox. Center-point containment means a line poking
+   slightly out of its block still belongs to it, and each line is claimed at
+   most once, so overlapping blocks cannot duplicate text.
+3. Claimed lines are joined with `"\n"` in reading order (sorted by `y`, then
+   `x`). The element's bounds are the union of its lines, describing the text
+   rather than the detector's guess.
+4. `type` is mapped from the layout label: `table` → `table`,
+   `figure`/`figure caption` → `figure`, everything else → `text`.
+5. Any line **no block claimed becomes its own text element**. Dropping
+   recognized text would be strictly worse than emitting it unstructured, so the
+   join never loses content.
+6. Elements are sorted by `(page, top, x0)`.
+
+Each element carries `page_number`, `x0`, `x1`, `top`, `bottom`, `layout_type`
+(the raw label), `col_id: 0`, and `positions: [[page, x0, x1, top, bottom]]`,
+which is what `_build_element_metadata` in `deepdoc.py` consumes. `image` is
+always `null`.
+
+## 7. Capability differences vs local parsing
+
+Remote mode is a **real downgrade in output fidelity**, traded for speed. Enable
+it knowingly. Building on an OCR endpoint rather than a document-parse endpoint
+means the following are simply not available:
+
+| Capability | Local | Remote | Consequence |
+|---|---|---|---|
+| Table HTML | Table structure recognition reconstructs `<table>` markup with merged-cell headers | Not available — the `table` task returns only cell boxes | A table's text is its OCR lines joined by newline. Row/column structure is lost, so retrieval over tabular data degrades. |
+| Figure and table images | Crops saved under `artifacts/providers/deepdoc/{doc_id}/images/` | Not available — no image bytes are returned | `image_path` is `None` on every element. Anything downstream that displays or re-analyzes a crop has nothing to work with. |
+| Cross-line paragraph merging | An XGBoost model merges lines into semantic paragraphs, including across column and page breaks | Not available — blocks are whatever the layout model drew | Paragraph boundaries follow layout detection alone, so a paragraph split across two detected blocks stays split. |
+| Cross-page coordinate accumulation | Positions accumulate into a continuous document-level space | Not available — coordinates are per-page, in rasterized pixel space | `positions` are page-local and in a different unit than local output. PDF highlight overlays built for local coordinates will not line up. |
+| `col_id` (two-column layout) | Derived from column detection | Always `0` | Multi-column reading order is approximated by the `(page, y, x)` sort. |
+
+Non-PDF formats (`.docx`, `.xlsx`, `.csv`, `.md`, …) are **not** served by an
+image OCR endpoint at all. Measured: uploading `test.docx` returns
+`500 {"detail": "cannot identify image file ..."}`. They are still routed
+remotely when the URL is set, so each one costs a wasted round trip before the
+standard fallback parses it locally. The outcome is correct but the trip is
+pointless; restricting remote mode to PDFs and images is the obvious next step.
+
+## 8. Acceptance criteria
 
 1. **Env unset** — behavior is byte-for-byte the current behavior (fully local).
-2. **Env set, service healthy** — every DeepDoc-supported format is parsed
-   remotely; local ONNX models are **not loaded** and no ModelScope download is
-   triggered; results (text segments, tables, figures, their metadata,
-   `positions`, saved images) are semantically equivalent to local output so
-   downstream chunking/embedding/retrieval is unaffected; result metadata
-   carries `deepdoc_backend=remote`.
+2. **Env set, service healthy** — parsing is routed remotely; local ONNX models
+   are **not loaded** and no ModelScope download is triggered; **no recognized
+   text is lost or duplicated** by the join; elements carry the metadata shape
+   `_build_element_metadata` expects; result metadata carries
+   `deepdoc_backend=remote`. Note that output is *not* semantically equivalent
+   to local output — see section 7.
 3. **Env set, service unreachable / timing out / 5xx / bad body** — a warning is
    logged, a progress notice is emitted, parsing falls back to local and
    succeeds, and metadata carries `deepdoc_backend=local`.
@@ -151,3 +238,26 @@ this contract, since xagent only surfaces coarse status strings today.
 5. **Progress** — remote mode reports "Uploading…" and "Remote parse finished";
    on fallback the failure notice is followed by the normal local progress
    stream.
+
+## 9. Measured results
+
+Against a live Xinference (DeepDoc on GPU) parsing the 3-page
+`tests/resources/test_files/test.pdf`:
+
+| | Remote | Local fallback (URL pointed at a dead port) |
+|---|---|---|
+| `deepdoc_backend` | `remote` | `local` |
+| Local parser instantiated | no | yes |
+| Wall time | 2.6s (two calls plus the token exchange) | ~40s |
+| Text segments / tables / figures | 22 / 2 / 2 | 48 / 2 / 2 |
+| Extracted characters | 2606 | 3331 |
+| Table output | OCR lines joined by newline | reconstructed `<table>` HTML |
+
+Join fidelity: the server returned **103 non-blank OCR lines** and the join
+emitted **103** — zero lost, zero duplicated. Blocks were labelled sensibly
+(`title` for headings, `table` for both tables, `figure` for both images), and
+the two-column section on page 3 correctly produced two separate elements.
+
+The character difference is not text loss: remote joins lines into blocks (one
+element per paragraph), local emits one element per line, and local
+additionally emits table HTML markup, which inflates its count.

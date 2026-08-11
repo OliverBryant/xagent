@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
@@ -14,6 +15,11 @@ import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
+import { LocalBrowserMenu, type LocalBrowserTarget } from "./LocalBrowserMenu";
+import {
+  hasTaskRuntimeComposerExtension,
+  type TaskRuntimeComposerSelection,
+} from "@/lib/task-runtime-ui-extension";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -111,6 +117,7 @@ interface AgentConfig {
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
   clientMessageId?: string;
+  runtimeExtensions?: Record<string, Record<string, unknown>>;
 }
 
 interface ModelRecord {
@@ -158,6 +165,10 @@ export function ChatInput({
   const [isFocused, setIsFocused] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [localBrowserTarget, setLocalBrowserTarget] =
+    useState<LocalBrowserTarget | null>(null);
+  const [taskRuntimeSelection, setTaskRuntimeSelection] =
+    useState<TaskRuntimeComposerSelection | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLDivElement>(null);
@@ -166,6 +177,7 @@ export function ChatInput({
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
+  const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
 
@@ -575,6 +587,19 @@ export function ChatInput({
     !!isLoading &&
     !allowsLiveGuidanceInput &&
     !isStoppedTaskStatus(normalizedTaskStatus);
+  const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
+  const showTaskRuntimeExtension =
+    hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
+  const activeLocalBrowserTarget = showLocalBrowser ? localBrowserTarget : null;
+  const activeTaskRuntimeSelection = showTaskRuntimeExtension
+    ? taskRuntimeSelection
+    : null;
+  useEffect(() => {
+    if (!showLocalBrowser) setLocalBrowserTarget(null);
+  }, [showLocalBrowser]);
+  useEffect(() => {
+    if (!showTaskRuntimeExtension) setTaskRuntimeSelection(null);
+  }, [showTaskRuntimeExtension]);
   const voiceInputLabel =
     voiceInput.status === "recording"
       ? t("voiceInput.stop")
@@ -674,8 +699,12 @@ export function ChatInput({
       const trimmed = message.trim();
       const messageToSend = trimmed;
       const executionMode = taskConfig?.executionMode;
+      const extraRuntimeExtensions = activeLocalBrowserTarget
+        ? { local_browser: { ...activeLocalBrowserTarget } }
+        : activeTaskRuntimeSelection?.runtimeExtensions;
       const deliveryKey = JSON.stringify([
         messageToSend,
+        extraRuntimeExtensions || null,
         enabledFiles.map((file) => [
           file.name,
           file.size,
@@ -691,6 +720,14 @@ export function ChatInput({
       const configToSend = {
         ...agentConfig,
         clientMessageId,
+        ...(extraRuntimeExtensions
+          ? {
+              runtimeExtensions: {
+                ...(agentConfig.runtimeExtensions || {}),
+                ...extraRuntimeExtensions,
+              },
+            }
+          : {}),
         ...(executionMode
           ? {
               executionMode:
@@ -703,6 +740,8 @@ export function ChatInput({
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      setLocalBrowserTarget(null);
+      setTaskRuntimeSelection(null);
       fileMention.resetMention();
 
       if (isControlled) {
@@ -1098,30 +1137,37 @@ export function ChatInput({
                     )}
                   </>
                 )}
-                {/* Upload button - adjacent to bottom toolbar */}
-                {!hideFileUpload && !filesDisabled && (
+                {/* Add files or bind this new task to a local host window. */}
+                {(!hideFileUpload && !filesDisabled)
+                  || showLocalBrowser
+                  || showTaskRuntimeExtension ? (
                   <>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      onChange={handleFileSelect}
-                      className="hidden"
-                      accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
-                    />
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
-                      onClick={() => fileInputRef.current?.click()}
+                    {!hideFileUpload && !filesDisabled && (
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        onChange={handleFileSelect}
+                        className="hidden"
+                        accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                      />
+                    )}
+                    <LocalBrowserMenu
                       disabled={isInputBusy}
-                      title={t("chatPage.input.actions.upload")}
-                    >
-                      <Paperclip className="h-4 w-4" />
-                    </Button>
+                      selectedTarget={localBrowserTarget}
+                      onTargetChange={setLocalBrowserTarget}
+                      extensionSelection={taskRuntimeSelection}
+                      onExtensionSelectionChange={setTaskRuntimeSelection}
+                      onAddFiles={
+                        !hideFileUpload && !filesDisabled
+                          ? () => fileInputRef.current?.click()
+                          : undefined
+                      }
+                      showLocalBrowser={showLocalBrowser}
+                      showTaskRuntimeExtension={showTaskRuntimeExtension}
+                    />
                   </>
-                )}
+                ) : null}
               </div>
 
               <div className="flex items-center gap-2">

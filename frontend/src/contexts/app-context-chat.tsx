@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
 import {
   AgentCardPresentationCapability,
+  LinksOpenInNewTabCapability,
   resolveAgentCardPresentationCapability,
 } from "@/contexts/presentation-capabilities"
 import {
@@ -597,6 +598,17 @@ interface Message {
   isOptimistic?: boolean
 }
 
+export type TaskRuntimeExtensions = Record<string, Record<string, unknown>>
+
+const normalizeTaskRuntimeExtensions = (value: unknown): TaskRuntimeExtensions => {
+  if (!isJsonRecord(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, Record<string, unknown>] => (
+      isJsonRecord(entry[1])
+    )),
+  )
+}
+
 export interface Task {
   id: string
   title: string
@@ -618,6 +630,7 @@ export interface Task {
   agentId?: number
   agentName?: string
   agentLogoUrl?: string
+  runtimeExtensionBindings?: string[]
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
   runId?: string | null
@@ -736,6 +749,7 @@ const taskFromTaskInfoData = (
   agentId: taskData.agent_id as number | undefined,
   agentName: taskData.agent_name as string | undefined,
   agentLogoUrl: taskData.agent_logo_url as string | undefined,
+  runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
   waitingQuestion: taskData.waiting_question as string | undefined,
   waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
   runId: taskData.run_id as string | null | undefined,
@@ -805,6 +819,7 @@ interface DAGExecution {
 interface AppState {
   messages: Message[]
   currentTask: Task | null
+  taskRuntimeExtensions: TaskRuntimeExtensions
   dagExecution: DAGExecution | null
   steps: StepExecution[]
   traceEvents: TraceEvent[]
@@ -856,6 +871,7 @@ type AppAction =
   | { type: "ADD_MESSAGE"; payload: Message }
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
+  | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
@@ -898,6 +914,7 @@ type AppAction =
 const createInitialState = (): AppState => ({
   messages: [],
   currentTask: null,
+  taskRuntimeExtensions: {},
   dagExecution: null,
   steps: [],
   traceEvents: [],
@@ -963,7 +980,14 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       const taskChanged = state.taskId !== action.payload
       const messages = taskChanged ? [] : state.messages
       const contextUsage = taskChanged ? null : state.contextUsage
-      const newState = { ...state, taskId: action.payload, messages, contextUsage }
+      const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
+      const newState = {
+        ...state,
+        taskId: action.payload,
+        messages,
+        contextUsage,
+        taskRuntimeExtensions,
+      }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
 
@@ -972,6 +996,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         ...state,
         taskId: action.payload.taskId,
         currentTask: action.payload.task,
+        taskRuntimeExtensions: {},
       }
 
     case "RESET_SESSION_CONVERSATION":
@@ -1133,6 +1158,13 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           : state.isProcessing,
       }
     }
+
+    case "SET_TASK_RUNTIME_EXTENSIONS":
+      if (state.taskId !== action.payload.taskId) return state
+      return {
+        ...state,
+        taskRuntimeExtensions: action.payload.extensions,
+      }
 
     case "UPDATE_TASK_STATUS": {
       if (!state.currentTask) {
@@ -1510,6 +1542,10 @@ export interface AppProviderTransportCapabilities {
   agentCards?: TransportCapabilityState
   voice?: TransportCapabilityState
   taskControls?: TransportCapabilityState
+  // Unlike the capabilities above, this defaults closed for every transport
+  // (including "page"): only the embedded Chat Widget opts in, since that is
+  // the only surface where an in-tab navigation abandons the visitor's iframe.
+  linksOpenInNewTab?: TransportCapabilityState
 }
 
 export interface AppProviderTransportConfig {
@@ -1672,6 +1708,11 @@ export function AppProvider({
     filesDisabled,
     requestedAgentCardsEnabled,
   )
+  // Deliberately not resolveTransportCapability: that helper defaults every
+  // other capability to "enabled" for non-session transports, which is the
+  // wrong default here — this must stay off everywhere except the transports
+  // that explicitly request it.
+  const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -1836,6 +1877,50 @@ export function AppProvider({
       )
     }
   }, [discardSessionPreAdoptionBuffer, rejectSessionResetFlight])
+
+  useEffect(() => {
+    const taskId = state.taskId
+    const hasRuntimeExtensionBinding = (
+      state.currentTask?.id === String(taskId)
+      && (state.currentTask.runtimeExtensionBindings?.length || 0) > 0
+    )
+    if (taskId === null || sessionTransport || !hasRuntimeExtensionBinding) return
+
+    let cancelled = false
+    const loadRuntimeExtensions = async () => {
+      try {
+        const response = await apiRequest(
+          `${getApiUrl()}/api/chat/task/${taskId}/runtime-extensions`,
+          { cache: "no-store" },
+        )
+        if (!response || !response.ok) return
+        const payload = await response.json()
+        if (cancelled) return
+        dispatch({
+          type: "SET_TASK_RUNTIME_EXTENSIONS",
+          payload: {
+            taskId,
+            extensions: normalizeTaskRuntimeExtensions(payload?.runtime_extensions),
+          },
+        })
+      } catch (error) {
+        // Runtime metadata only decorates the transcript. A temporary metadata
+        // failure must not block loading or running the task itself.
+        console.warn("Failed to load task runtime metadata", error)
+      }
+    }
+    void loadRuntimeExtensions()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    dispatch,
+    sessionTransport,
+    state.currentTask?.id,
+    state.currentTask?.runtimeExtensionBindings,
+    state.taskId,
+  ])
 
   useEffect(() => {
     const previousIdentity = previousSessionConnectionIdentityRef.current
@@ -2269,7 +2354,6 @@ export function AppProvider({
               type: "SET_CURRENT_TASK",
               payload: task,
             })
-
             // Check if this is a new task (created within last 5 seconds)
             // If so, we don't expect historical messages, so stop loading
             // We do NOT stop loading here for new tasks anymore.
@@ -5587,6 +5671,9 @@ export function AppProvider({
         if (config?.agentConfig) {
           requestBody.agent_config = config.agentConfig
         }
+        if (config?.runtimeExtensions) {
+          requestBody.runtime_extensions = config.runtimeExtensions
+        }
 
         const response = await apiRequest(`${apiUrl}/api/chat/task/create`, {
           method: 'POST',
@@ -5608,6 +5695,14 @@ export function AppProvider({
           console.log('🎯 About to call setTaskId with payload:', newTaskId)
           setTaskId(newTaskId)
           console.log('🎯 setTaskId completed')
+
+          dispatch({
+            type: "SET_TASK_RUNTIME_EXTENSIONS",
+            payload: {
+              taskId: newTaskId,
+              extensions: normalizeTaskRuntimeExtensions(taskData.runtime_extensions),
+            },
+          })
 
           // Create a new task from response
           const newTask: Task = {
@@ -5994,48 +6089,50 @@ export function AppProvider({
 
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
-      <FileAccessProvider policy={transport?.fileAccess}>
-        <AppContext.Provider
-        value={{
-        state,
-        dispatch,
-        filesDisabled,
-        agentCardsEnabled,
-        voiceInputEnabled,
-        taskControlsEnabled,
-        sendMessage,
-        executeTask,
-        pauseTask,
-        resumeTask,
-        selectStep,
-        clearMessages,
-        isConnected,
-        connectionError,
-        startNewConversation,
-        isConversationResetPending:
-          state.sessionConversation.phase === "reset_requested",
-        isMessageDeliveryPending: messageDeliveryCount > 0,
-        isSessionInteractionLocked:
-          state.sessionConversation.phase === "reload_required",
-        sessionConversationState: state.sessionConversation.phase,
-        setTaskId,
-        requestStatus,
-        getFilePreviewUrl,
-        getFileDownloadUrl,
-        openFilePreview,
-        switchFilePreview,
-        closeFilePreview,
-        startReplay,
-        stopReplay,
-        setReplayPlaying,
-        setReplaySpeed,
-        setReplayProgress,
-        setPendingMessage,
-        }}
-      >
-        {children}
-        </AppContext.Provider>
-      </FileAccessProvider>
+      <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
+        <FileAccessProvider policy={transport?.fileAccess}>
+          <AppContext.Provider
+          value={{
+          state,
+          dispatch,
+          filesDisabled,
+          agentCardsEnabled,
+          voiceInputEnabled,
+          taskControlsEnabled,
+          sendMessage,
+          executeTask,
+          pauseTask,
+          resumeTask,
+          selectStep,
+          clearMessages,
+          isConnected,
+          connectionError,
+          startNewConversation,
+          isConversationResetPending:
+            state.sessionConversation.phase === "reset_requested",
+          isMessageDeliveryPending: messageDeliveryCount > 0,
+          isSessionInteractionLocked:
+            state.sessionConversation.phase === "reload_required",
+          sessionConversationState: state.sessionConversation.phase,
+          setTaskId,
+          requestStatus,
+          getFilePreviewUrl,
+          getFileDownloadUrl,
+          openFilePreview,
+          switchFilePreview,
+          closeFilePreview,
+          startReplay,
+          stopReplay,
+          setReplayPlaying,
+          setReplaySpeed,
+          setReplayProgress,
+          setPendingMessage,
+          }}
+        >
+          {children}
+          </AppContext.Provider>
+        </FileAccessProvider>
+      </LinksOpenInNewTabCapability.Provider>
     </AgentCardPresentationCapability.Provider>
   )
 }

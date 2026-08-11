@@ -25,6 +25,7 @@ from typing import (
     Mapping,
     Optional,
     TypeVar,
+    cast,
 )
 
 import httpx
@@ -191,6 +192,7 @@ def _refresh_delegated_mcp_connection_from_snapshot(
     connection_snapshot: Mapping[str, Any],
     runtime_bindings: Any,
     allow_delegated_authorization: bool,
+    agent_team_id: int | None = None,
 ) -> dict[str, Any] | None:
     """Refresh delegated MCP headers without retaining construction objects."""
     if task_id is None or user_id is None:
@@ -204,6 +206,7 @@ def _refresh_delegated_mcp_connection_from_snapshot(
             task_id=task_id,
             turn_id=turn_id,
             user_id=user_id,
+            agent_team_id=agent_team_id,
         )
     runtime_values = runtime_view.get(f"mcp:{server_id}")
     runtime_headers = WebToolConfig._runtime_transport_headers(
@@ -275,6 +278,10 @@ class _ToolFactoryRuntimeLoadPlan:
     load_video: bool
     load_audio: bool
     published_agent_policy: Any | None
+    # The governing agent's owning team, detached from the ORM row. ``None``
+    # is the fail-closed default: an un-migrated construction site (or a run
+    # with no governing agent) resolves personal-only connectors.
+    connector_team_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -690,6 +697,7 @@ def _load_custom_api_runtime_view_sync(
     task_id: str | None,
     connector_runtime_turn_id: str | None,
     user_id: int | None,
+    agent_team_id: int | None = None,
 ) -> dict[str, Any]:
     numeric_task_id = _parse_custom_api_task_id(task_id)
     if numeric_task_id is None or user_id is None:
@@ -702,6 +710,7 @@ def _load_custom_api_runtime_view_sync(
             task_id=numeric_task_id,
             turn_id=connector_runtime_turn_id,
             user_id=user_id,
+            agent_team_id=agent_team_id,
         )
     except ConnectorRuntimeError:
         raise
@@ -725,6 +734,7 @@ def _load_custom_api_factory_inputs(
     user_id: int | None,
     task_id: str | None,
     connector_runtime_turn_id: str | None,
+    connector_team_id: int | None = None,
 ) -> list[dict[str, Any]]:
     if user_id is None:
         return []
@@ -747,6 +757,7 @@ def _load_custom_api_factory_inputs(
         task_id=task_id,
         connector_runtime_turn_id=connector_runtime_turn_id,
         user_id=user_id,
+        agent_team_id=connector_team_id,
     )
     configs: list[dict[str, Any]] = []
     for user_api in user_apis:
@@ -919,6 +930,7 @@ def _load_tool_factory_runtime_snapshot(
                 user_id=plan.user_id,
                 task_id=plan.task_id,
                 connector_runtime_turn_id=plan.connector_runtime_turn_id,
+                connector_team_id=plan.connector_team_id,
             ),
             [],
             propagated_exceptions=(ConnectorRuntimeError,),
@@ -1113,10 +1125,6 @@ def _load_tool_runtime_policy_snapshot(
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
-    @staticmethod
-    def _coerce_user_id(value: Any) -> Optional[int]:
-        return value if isinstance(value, int) else None
-
     def __init__(
         self,
         db: Any,
@@ -1150,6 +1158,7 @@ class WebToolConfig(BaseToolConfig):
         mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
         mcp_load_summary_tracer: Optional[Any] = None,
         mcp_load_summary_trace_task_id: Optional[str] = None,
+        connector_team_id: Optional[int] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1160,27 +1169,27 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_failure_policy = mcp_failure_policy
         self._mcp_load_summary_tracer = mcp_load_summary_tracer
         self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
+        # The governing agent's owning team, never the acting/request user's
+        # own team membership. ``None`` is the closed default: no request
+        # path ever supplies this directly, it is read off a loaded ``Agent``
+        # row (or a frozen snapshot of one) by the caller.
+        self._connector_team_id = connector_team_id
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
         self.request = request
-        self._user_id = (
-            user_id if user_id is not None else self._get_user_id_from_request(request)
-        )
-        # Tri-state: an explicit ``is_admin`` (including ``False``) is
-        # authoritative and is NOT OR-ed with the request's admin flag. This
-        # is the privilege-isolation boundary: when the runtime builds a tool
-        # config for a task owner (passing ``is_admin=bool(owner.is_admin)``),
-        # an admin *actor* on the request must not silently widen the config
-        # to admin scope. Only when ``is_admin`` is unset do we fall back to
-        # the request.
-        self._is_admin_value = (
-            bool(is_admin)
-            if is_admin is not None
-            else self._get_is_admin_from_request(request)
-        )
+        self._user_id = user_id
+        # No identity can carry administrative privilege. For identified
+        # configs, an explicit value remains authoritative; only an unset value
+        # may fall back to the authenticated request user.
+        if self._user_id is None:
+            self._is_admin_value = False
+        elif is_admin is not None:
+            self._is_admin_value = bool(is_admin)
+        else:
+            self._is_admin_value = self._get_is_admin_from_request(request)
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
             workspace_config = {}
@@ -1294,38 +1303,6 @@ class WebToolConfig(BaseToolConfig):
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
         return ",".join(unique_dirs)
-
-    def _get_user_id_from_request(self, request: Any) -> int:
-        """Extract user ID from request using JWT authentication."""
-        try:
-            from ..auth_dependencies import get_user_from_websocket_token
-
-            # Check if this is a FastAPI request with proper authentication
-            if hasattr(request, "headers") and hasattr(request, "query_params"):
-                # Try to extract user from Authorization header
-                auth_header = request.headers.get("authorization")
-                if auth_header:
-                    user = get_user_from_websocket_token(auth_header, self.db)
-                    if user is not None:
-                        user_id = self._coerce_user_id(getattr(user, "id", None))
-                        if user_id is not None:
-                            return user_id
-
-            # If request has a user attribute directly, use it
-            if hasattr(request, "user") and request.user:
-                user_id = self._coerce_user_id(getattr(request.user, "id", None))
-                if user_id is not None:
-                    return user_id
-
-            # If no authentication, this should raise an exception
-            raise ValueError("Authentication required")
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.error(f"Failed to get user ID from request: {e}")
-            # Fallback to default user ID for backward compatibility
-            # In production, this should raise an exception instead
-            return 1
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
@@ -1470,6 +1447,9 @@ class WebToolConfig(BaseToolConfig):
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
+        if self._user_id is None:
+            return []
+
         if not self._include_mcp_tools:
             return []
 
@@ -1484,6 +1464,12 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _serialize_mcp_user_id(self) -> str:
+        """Return the explicit identity used to isolate an MCP config."""
+        if self._user_id is None:
+            raise RuntimeError("MCP configs require a user identity")
+        return str(self._user_id)
 
     def _mcp_config_cache_is_valid(self) -> bool:
         # MCP config caching is aware of hook-supplied token expiry only. The
@@ -1542,6 +1528,7 @@ class WebToolConfig(BaseToolConfig):
                 task_id=task_id,
                 turn_id=self._connector_runtime_turn_id,
                 user_id=int(self._user_id),
+                agent_team_id=self._connector_team_id,
             )
         except ConnectorRuntimeError:
             raise
@@ -1736,6 +1723,11 @@ class WebToolConfig(BaseToolConfig):
             connection_snapshot=connection_snapshot,
             runtime_bindings=copy.deepcopy(runtime_bindings),
             allow_delegated_authorization=allow_delegated_authorization,
+            # Memoised at build time: the whole tool set is built for one
+            # agent, so this avoids re-deriving the agent's team id from the
+            # ORM row per tool. The team hook itself still runs on every
+            # per-tool-call refresh -- nothing in that chain caches it.
+            agent_team_id=self._connector_team_id,
         )
 
     def _mcp_auth_context_for_server(
@@ -1952,6 +1944,7 @@ class WebToolConfig(BaseToolConfig):
             user_id=int(self._user_id) if self._user_id is not None else None,
             task_id=self._task_id,
             connector_runtime_turn_id=self._connector_runtime_turn_id,
+            connector_team_id=self._connector_team_id,
             load_policy=(self._user_id is not None and has_user_tool_policy_hooks()),
             load_basic=(wants_category("basic") or wants_category("web_search")),
             load_sql=wants_category("database"),
@@ -2131,7 +2124,7 @@ class WebToolConfig(BaseToolConfig):
             policy_snapshot = await run_db_io_cancellation_safe(
                 lambda: _load_tool_runtime_policy_snapshot(
                     session_factory,
-                    int(self._user_id),
+                    int(cast(int, self._user_id)),
                 )
             )
 
@@ -2850,13 +2843,14 @@ class WebToolConfig(BaseToolConfig):
         normalized_failure_code = normalize_tool_failure_code(failure_code)
         if normalized_failure_code is not None:
             inner_config["failure_code"] = normalized_failure_code
+        serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),
             "transport": "unavailable",
             "description": getattr(server, "description", None),
             "config": inner_config,
-            "user_id": str(self._user_id),
-            "allow_users": [str(self._user_id)],
+            "user_id": serialized_user_id,
+            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -3227,7 +3221,7 @@ class WebToolConfig(BaseToolConfig):
                     registration_generation=registration_generation,
                     resolved=remote_hook_token,
                     providers=remote_providers_to_resolve,
-                    user_id=int(self._user_id),
+                    user_id=int(cast(int, self._user_id)),
                     scope=self.get_execution_scope(),
                     resource=remote_configured_resource,
                     non_auth_connection=self._non_auth_mcp_connection(
@@ -3331,8 +3325,9 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        config["user_id"] = str(self._user_id)
-        config["allow_users"] = [str(self._user_id)]  # Only allow current user
+        serialized_user_id = self._serialize_mcp_user_id()
+        config["user_id"] = serialized_user_id
+        config["allow_users"] = [serialized_user_id]  # Only allow current user
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
@@ -3366,29 +3361,70 @@ class WebToolConfig(BaseToolConfig):
                 reason="config_load_failed",
             )
 
+    def _visible_mcp_server_query(self, team_mcp_ids: frozenset[int]) -> Any:
+        """Compile the production semi-join query for visible MCP servers.
+
+        No join on ``user_mcpservers`` -- an inner join would drop every
+        team-only server before the visibility predicate's ``OR`` could be
+        evaluated. Extracted to its own method so a compiled-query test can
+        exercise the exact object ``_load_mcp_server_configs`` uses, not a
+        parallel reconstruction of it.
+        """
+        from ...web.models.mcp import MCPServer
+        from ..services.connector_team_scope import visible_mcp_server_clause
+
+        return (
+            self.db.query(MCPServer)
+            .filter(visible_mcp_server_clause(self._user_id, team_mcp_ids))
+            .order_by(MCPServer.id)
+        )
+
     async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
-        """Load MCP server configurations from database with user context."""
+        """Load MCP server configurations visible to this run: the user's
+        personal servers, unioned with the governing agent's team-owned
+        servers when a team-scope hook is installed."""
         self._mcp_oauth_diagnostics = []
         self._reset_mcp_config_load_cache_state()
 
+        # Resolved before the guarded region below: that region reports
+        # "every selected server is unavailable", which is the wrong answer
+        # for "the scope could not be resolved". The typed error is what
+        # survives the tool-creator frame -- an untyped one is dropped there
+        # with a WARNING and no tool set at all.
         try:
-            from ...web.models.mcp import MCPServer, UserMCPServer
+            from ..services.connector_team_scope import team_connector_ids
+
+            team_mcp_ids = frozenset(
+                team_connector_ids(self.db, team_id=self._connector_team_id)["mcp"]
+            )
+        except ConnectorRuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve team connector scope for user %s",
+                self._user_id,
+                exc_info=True,
+            )
+            raise ConnectorRuntimeError(
+                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+                "Connector team scope is unavailable.",
+                details={"reason": "team_scope_resolution_failed"},
+                status_code=503,
+            ) from exc
+
+        try:
             from ..services.mcp_runtime import (
                 load_shared_env_overrides,
                 load_user_env_overrides,
                 load_user_env_sources,
             )
 
-            servers = (
-                self.db.query(MCPServer)
-                .join(UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id)
-                .filter(UserMCPServer.user_id == self._user_id, UserMCPServer.is_active)
-                .all()
-            )
+            servers = self._visible_mcp_server_query(team_mcp_ids).all()
             logger.info(
-                "Found %s active MCP servers for user %s",
+                "Found %s visible MCP servers for user %s (connector_team_id=%s)",
                 len(servers),
                 self._user_id,
+                self._connector_team_id,
             )
 
             # Prefetch shared runtime state once before entering the isolated

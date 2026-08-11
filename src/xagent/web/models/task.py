@@ -105,6 +105,27 @@ class Task(Base):  # type: ignore
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     last_checkpoint_event_id = Column(String(255), nullable=True)
+    # Exact-row anchor: the primary key of the trace_events row that
+    # last_checkpoint_event_id names. Readers that find this set can load the
+    # checkpoint by primary key instead of re-resolving the legacy string
+    # column against the row set. This FK forms a cycle with
+    # trace_events.task_id -> tasks.id: it must be named, or an unnamed
+    # constraint in that cycle raises CircularDependencyError on backends
+    # whose create_all/drop_all doesn't go through Alembic (e.g. PostgreSQL
+    # in this repo's CI and dev paths); and it must be use_alter=True, or
+    # SQLAlchemy can't topologically sort DROP order across the cycle and a
+    # SQLite database with FK enforcement on (this repo's default -- see
+    # apply_sqlite_concurrency_pragmas) fails mid-drop_all with a DROP TABLE
+    # error on an unrelated table further down the (corrupted) drop order.
+    last_checkpoint_trace_event_id = Column(
+        Integer,
+        ForeignKey(
+            "trace_events.id",
+            name="fk_tasks_last_checkpoint_trace_event_id",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     # Monotonic task-control identity. ``run_id`` changes for each new turn,
     # while pause/resume transitions retain it and advance ``state_version``.
     # Clients use the version to ignore stale WebSocket status events.
@@ -113,6 +134,17 @@ class Task(Base):  # type: ignore
     control_state = Column(
         String(32), nullable=False, default="idle", server_default="idle"
     )
+    # Identity of the lease attempt that currently owns this row. Written
+    # only by acquire_task_lease_no_commit (a fresh uuid per claim) and
+    # cleared by the lease release/recovery writers. A non-NULL value does
+    # not mean that attempt is still running -- it means no writer has
+    # cleared it since. Readers that need liveness must consult runner_id
+    # and lease_expires_at, not this column.
+    #
+    # Deliberately a bare nullable column: no FK, no CHECK, no UNIQUE. It is
+    # never a WHERE predicate -- consumers read the row by primary key and
+    # compare in Python -- so an index would be pure write cost.
+    lease_attempt_id = Column(String(64), nullable=True)
 
     # Model configuration
     model_name = Column(String(255), nullable=True)  # Main model used for the task
@@ -185,8 +217,9 @@ class Task(Base):  # type: ignore
     error_message = Column(Text, nullable=True)
 
     # Call origin classifier: 'internal' (web UI / WS / legacy),
-    # 'sdk' (POST /v1/chat/tasks), 'trigger' (agent triggers),
-    # 'widget' (embedded chat widget), or 'shared_link' (public share chat).
+    # 'sdk' (POST /v1/chat/tasks), 'a2a' (agent-to-agent calls),
+    # 'trigger' (agent triggers), 'widget' (embedded chat widget), or
+    # 'shared_link' (public share chat).
     # Default 'internal' so legacy code paths -- which never specify
     # this field on Task(...) -- are auto-classified correctly. Both
     # ``default`` (Python-level, fires on ORM INSERT) and
@@ -450,8 +483,11 @@ class TraceEvent(Base):  # type: ignore
     )  # Parent event ID for hierarchy
     data = Column(JSON, nullable=False)  # Event data payload
 
-    # Relationships
-    task = relationship("Task")
+    # Relationships. foreign_keys is explicit because tasks and trace_events
+    # now have two FK paths between them (this task_id, and
+    # Task.last_checkpoint_trace_event_id pointing back) -- without it,
+    # SQLAlchemy can't pick a join condition for this relationship.
+    task = relationship("Task", foreign_keys=[task_id])
 
     def __repr__(self) -> str:
         return f"<TraceEvent(id={self.id}, event_type='{self.event_type}', task_id={self.task_id})>"

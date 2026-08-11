@@ -20,7 +20,32 @@ import threading
 
 GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED = "gmail_oidc_service_account_unverified"
 CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
+CHECKPOINT_LEGACY_POINTER_AMBIGUOUS = "checkpoint_legacy_pointer_ambiguous"
 CHECKPOINT_LOAD_UNAVAILABLE = "checkpoint_load_unavailable"
+CHECKPOINT_PK_ANCHOR_DANGLING = "checkpoint_pk_anchor_dangling"
+CHECKPOINT_PRUNE_FAILED = "checkpoint_prune_failed"
+# Set when the interaction rollout gate (or /ready, in native mode) finds
+# task_interaction_requests missing; cleared at either site once the table
+# is observed to exist.
+INTERACTION_ROLLOUT_SCHEMA_ABSENT = "interaction_rollout_schema_absent"
+# Set when the interaction rollout gate sees a Task.source value that does
+# not normalize to a known origin. Deliberately not paired with a clear
+# site, unlike every other signal in this module: an unrecognized source is
+# a property of persisted data, and no in-process signal can observe that
+# data being fixed. Auto-clearing would assert "the data got fixed" without
+# evidence for it.
+INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE = "interaction_rollout_unknown_task_source"
+# interaction_handoff (task_interaction_staging.py) degrades instead of
+# losing a caller's turn on five expected failures, sharing this signal.
+INTERACTION_HANDOFF_DEGRADED = "interaction_handoff_degraded"
+# A sixth, separately addressable signal for InteractionRunPartitionMismatch
+# specifically: degrading rather than propagating that one exception is an
+# override with no production reachability data behind it (see
+# interaction_handoff's docstring), so it stays distinguishable on /health
+# from the other five.
+INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
+    "interaction_run_partition_mismatch_degraded"
+)
 
 _signals: dict[str, str] = {}
 _lock = threading.Lock()

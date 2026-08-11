@@ -234,8 +234,18 @@ const zh = {
       processing: "处理中",
       usingAgentLabel: "使用",
       actions: {
+        add: "添加",
         config: "配置模型",
         upload: "上传文件",
+      },
+      localBrowser: {
+        label: "本机浏览器",
+        chipLabel: "操作浏览器",
+        checking: "正在检查 Xagent 主机...",
+        chooseWindow: "选择一个浏览器窗口",
+        windowIdentifier: "窗口 {id}",
+        controlScope: "仅通过系统辅助功能控制这个浏览器窗口，不会连接 Chrome 调试。",
+        unavailable: "此 Xagent 主机不可用",
       },
       noModel: "暂无模型",
       noModelAlert: "暂无模型，请先配置模型",
@@ -1138,6 +1148,7 @@ const zh = {
           team: "归属团队",
         },
         configure: "配置",
+        connectSuccess: "已连接 {name}",
         disconnect: "断开连接",
         disconnectSuccess: "已成功断开 {name} 的连接",
         disconnectFailed: "断开 {name} 的连接失败",
@@ -1274,6 +1285,9 @@ const zh = {
         nameRequired: "服务器名称不能为空",
         nameInvalidFormat: "名称只能包含大小写英文字母、数字、连字符(-)和下划线(_)",
         saveFailed: "保存失败",
+        connectTimedOut: "连接超时，请重试",
+        shareTimedOut: "已连接，但分享给团队超时——可稍后在其设置中重新分享",
+        closeBlockedWhileConnecting: "正在连接中，请稍候再关闭",
         deleteFailed: "删除失败",
         toggleFailed: "切换状态失败",
         atLeastOneSecret: "至少需要一个有效的密钥",
@@ -1572,6 +1586,21 @@ const zh = {
       knowledge: "知识与研究",
       sales: "销售与外联"
     },
+    typeFilter: {
+      all: "全部类型",
+      agent: "智能体",
+      workforce: "工作组"
+    },
+    workforceBadge: "工作组",
+    agentsCountOne: "{count} 个智能体",
+    agentsCountOther: "{count} 个智能体",
+    creatingWorkforce: "创建中…",
+    errors: {
+      useWorkforceFailed: "从该模版创建工作组失败，请重试。",
+      useWorkforceAccessDenied: "你没有权限创建工作组。",
+      useWorkforceRetry: "该模版当前并发请求过多，请重试。",
+      useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
+    }
   },
   sidebar: {
     tasks: {
@@ -1862,22 +1891,28 @@ const zh = {
   },
   kb: {
     ownership: {
+      label: "归属",
       personal: "个人",
       team: "团队",
+      personalDesc: "仅你自己可见",
+      teamDesc: "团队成员都可见",
       makeTeam: "转为团队知识库",
       makePersonal: "转回个人",
       teamSuccess: "知识库已共享给团队。",
       personalSuccess: "知识库已转回个人。",
       failed: "更新知识库归属失败",
+      reserveFailed: "无法为团队登记该名称",
+      releaseFailed: "名称“{name}”的团队登记未能释放，用你的账号再次创建会沿用这条登记。",
     },
     errors: {
       loadFailed: "知识库加载失败",
-      nameRequired: "请输入知识库名称",
+      nameRequired: "知识库名称不能为空",
       createFailed: "创建知识库失败",
       uploadFileRequired: "请选择要上传的文件",
-      multiFileNameRequired: "上传多个文件前，请先填写统一的知识库名称",
       uploadFailedFile: "上传文件失败: {name}",
       uploadFailed: "上传失败",
+      nameUnavailable: "该知识库名称不可用",
+      nameUnavailableHint: "请换一个知识库名称后重试。",
       embeddingModelUnavailable: "知识库导入失败：未配置可用的嵌入模型",
       embeddingModelUnavailableHint: "请先在模型设置中配置默认嵌入模型，或在索引设置中选择一个可用的嵌入模型后重试。",
       rollbackFailed: "知识库导入失败，清理未完全完成",
@@ -1983,8 +2018,7 @@ const zh = {
       basicInfo: {
         title: "基本信息",
         nameLabel: "知识库名称",
-        namePlaceholder: "留空将使用文件名或 URL 作为知识库名称",
-        multiFileRequiredHint: "上传多个文件时，必须填写同一个明确的知识库名称。",
+        namePlaceholder: "请输入知识库名称",
         descriptionLabel: "描述",
         descriptionPlaceholder: "知识库描述（可选）",
       },
@@ -2452,6 +2486,7 @@ const zh = {
         unknown: "发生未知错误",
         notFound: "Agent 不存在",
         notFoundDesc: "该 Agent 不存在或已被删除",
+        templateIsWorkforce: "该模版会创建一个工作组，而不是单个智能体，请在 Templates 页面使用它。",
       },
       kbToolWarning: {
         title: "需要启用知识库工具",

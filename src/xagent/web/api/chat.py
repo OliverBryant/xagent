@@ -45,6 +45,7 @@ from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
 )
+from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
@@ -68,7 +69,11 @@ from ..sandbox_keys import (
 )
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.agent_access import list_accessible_published_agents
-from ..services.agent_team_scope import get_agent_team_scope, owned_agent_clause
+from ..services.agent_team_scope import (
+    get_agent_team_scope,
+    owned_agent_clause,
+    resolve_authorized_agent,
+)
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
@@ -587,6 +592,7 @@ async def create_default_tools(
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     mcp_load_summary_tracer: Optional[Any] = None,
     mcp_load_summary_trace_task_id: Optional[str] = None,
+    connector_team_id: Optional[int] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -595,6 +601,11 @@ async def create_default_tools(
     can skip creators (and their internal DB / network I/O) for tool
     categories / MCP servers the agent does not need. ``None`` preserves
     the original "build everything" behavior for backward compat.
+
+    ``connector_team_id`` is the *governing agent's* owning team, never the
+    calling user's own team membership. It threads into ``WebToolConfig`` so
+    the connector-visibility team-scope hook (when installed) resolves that
+    team's connectors instead of the run owner's personal set only.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -659,6 +670,7 @@ async def create_default_tools(
         mcp_failure_policy=mcp_failure_policy,
         mcp_load_summary_tracer=mcp_load_summary_tracer,
         mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
+        connector_team_id=connector_team_id,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -991,28 +1003,126 @@ def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
         return int(user_id) if user_id is not None else None
 
 
-def _load_task_share_quota_config_isolated(task_id: int) -> dict[str, Any] | None:
-    """Load the share-quota markers (#973) in a worker-owned short Session.
+def _load_task_public_run_quota_config_isolated(
+    task_id: int,
+) -> dict[str, Any] | None:
+    """Load the public-run-quota markers in a worker-owned short Session.
 
-    Returns the task's ``agent_config`` only when it marks a share task
-    (``auth_mode == "share"``); ``None`` skips the share quota gate. Kept
-    separate from :func:`_load_task_run_gate_user_id_isolated` so the owner
-    gate's return contract (an ``int | None`` that tests monkeypatch) stays
-    untouched.
+    Returns the task's ``agent_config`` only when it marks a public run that
+    bills the owner — a share task (``auth_mode == "share"``, #973) or a widget
+    task (``auth_mode == "widget"``, #1108); ``None`` skips the quota gate for
+    everything else. Kept separate from
+    :func:`_load_task_run_gate_user_id_isolated` so the owner gate's return
+    contract (an ``int | None`` that tests monkeypatch) stays untouched.
     """
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
-    with SessionLocal() as share_db:
+    with SessionLocal() as quota_db:
         agent_config = (
-            share_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
+            quota_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
         )
-        if (
-            isinstance(agent_config, Mapping)
-            and agent_config.get("auth_mode") == "share"
+        if isinstance(agent_config, Mapping) and agent_config.get("auth_mode") in (
+            "share",
+            "widget",
         ):
             return dict(agent_config)
         return None
+
+
+def _coerce_optional_entity_id(value: Any) -> int | None:
+    """Coerce an agent_config entity marker to a positive ``int``, else ``None``.
+
+    Entity markers are database primary keys — always positive integers — so
+    this accepts only a non-``bool`` ``int`` or an all-digits string, both
+    ``> 0``. Anything else (a float like ``1.9`` that would silently truncate
+    onto a real entity's bucket, ``0`` / negatives that mint impossible
+    buckets, ``inf`` whose ``int()`` raises ``OverflowError``, or injected
+    junk) degrades to "unkeyable" — the caller then admits that one task —
+    rather than keying the wrong bucket or raising into the chokepoint's broad
+    ``except``, which would log a scary "failed open" and disable the gate.
+    ``bool`` is rejected explicitly: ``True`` is an ``int`` subclass that would
+    otherwise coerce to ``1``.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _public_run_denial_channel(quota_config: Mapping[str, Any]) -> str | None:
+    """Charge the run quota for a public (share/widget) task; name any refusal.
+
+    NOT a speculative query despite the name: admitting consumes a slot in
+    every bucket consulted (``allow_run`` / ``widget_run_denial_reason`` hit
+    them on the admit path), so calling this twice charges twice.
+
+    Returns the quota that refused the run — ``"share"``, ``"widget"`` (the
+    owner's budget for that embed), or ``"widget-ip"`` (the per-caller
+    sub-quota within one widget) — so the caller can pick a message the reader
+    can actually act on, or ``None`` when the run is admitted (or cannot be
+    keyed, matching the original share behaviour of falling through rather
+    than blocking a run it cannot attribute).
+
+    Share tasks carry a server-minted ``guest_id`` and are gated per link +
+    per guest (#973). Widget tasks are gated per entity plus the creator IP
+    the backend stamped into ``agent_config`` at task creation (#1108) — their
+    ``guest_id`` is client-supplied (rotatable at will), so the stamped IP is
+    the per-abuser dimension; without it a single-IP caller could drain the
+    whole rolling entity quota and lock every other visitor out (a multi-IP
+    abuser rotating ~entity/ip addresses still can, same as the share path's
+    per-guest quota). Tasks created before the IP marker existed carry ``None``
+    and are bounded by the entity quota alone.
+
+    Entity markers are coerced defensively: the widget-create path stamps them
+    server-side and the sanitizer strips the client copies, but a malformed
+    value must degrade to "unkeyable → admit this task" here rather than take
+    the gate down.
+    """
+    from ..services.share_rate_limit import (
+        entity_rate_limit_key,
+        get_share_rate_limiter,
+    )
+
+    auth_mode = quota_config.get("auth_mode")
+    limiter = get_share_rate_limiter()
+
+    if auth_mode == "widget":
+        entity_key = entity_rate_limit_key(
+            _coerce_optional_entity_id(quota_config.get("widget_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("widget_workforce_id")),
+        )
+        if entity_key is None:
+            return None
+        client_ip = quota_config.get("widget_client_ip")
+        reason = limiter.widget_run_denial_reason(
+            entity_key, client_ip if isinstance(client_ip, str) and client_ip else None
+        )
+        if reason is None:
+            return None
+        return "widget-ip" if reason == "ip" else "widget"
+
+    if auth_mode == "share":
+        guest_id = quota_config.get("guest_id")
+        share_key = entity_rate_limit_key(
+            _coerce_optional_entity_id(quota_config.get("share_agent_id")),
+            _coerce_optional_entity_id(quota_config.get("share_workforce_id")),
+        )
+        if not share_key or not isinstance(guest_id, str) or not guest_id:
+            return None
+        return None if limiter.allow_run(share_key, guest_id) else "share"
+
+    # The loader only returns share/widget configs; admit anything else so a
+    # future auth mode fails open here (visibly unmetered) rather than
+    # silently borrowing another channel's buckets.
+    logger.warning(
+        "Public run quota gate saw unexpected auth_mode %r; admitting", auth_mode
+    )
+    return None
 
 
 def _check_task_run_gate_on_event_loop(
@@ -1806,12 +1916,33 @@ class AgentServiceManager:
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
+            connector_team_id = (
+                task_setup_snapshot.agent.team_id
+                if task_setup_snapshot.agent is not None
+                else None
+            )
         else:
             if db is None:
                 raise ValueError("Database session or task snapshot is required")
             workforce_runtime = resolve_workforce_task_runtime(db, task)
             excluded_agent_id = None
             current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+            # Hardening, not a pinned invariant: this branch is not reachable
+            # from production today (the only caller always supplies a
+            # snapshot). Capture the team id before the exclusion branches
+            # below can reassign ``current_agent`` to an unpublished preview
+            # agent, so a future snapshot-less path cannot silently key the
+            # tool set on the preview agent's team instead of the governing
+            # agent's.
+            # Explicit int(...)/None-check here, unlike the two snapshot-branch
+            # sites above and below: current_agent is a live ORM row (its
+            # team_id is a Column), not the frozen AgentRuntimeFields snapshot
+            # those two already read as a typed Optional[int].
+            connector_team_id = (
+                int(current_agent.team_id)
+                if current_agent is not None and current_agent.team_id is not None
+                else None
+            )
             if current_agent and _is_published_agent(current_agent):
                 excluded_agent_id = int(current_agent.id)
                 logger.info(
@@ -1821,16 +1952,10 @@ class AgentServiceManager:
                 )
             elif agent_config and agent_config.get("preview_agent_id"):
                 preview_user_id = int(task.user_id)
-                current_agent = (
-                    db.query(Agent)
-                    .filter(
-                        Agent.id == agent_config["preview_agent_id"],
-                        owned_agent_clause(
-                            preview_user_id,
-                            get_agent_team_scope(db, preview_user_id),
-                        ),
-                    )
-                    .first()
+                current_agent = resolve_authorized_agent(
+                    db,
+                    preview_user_id,
+                    agent_config.get("preview_agent_id"),
                 )
                 if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                     excluded_agent_id = int(current_agent.id)
@@ -1904,6 +2029,7 @@ class AgentServiceManager:
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
+            connector_team_id=connector_team_id,
         )
 
     async def get_agent_for_task(
@@ -2448,45 +2574,6 @@ class AgentServiceManager:
                         "will exclude from agent tools"
                     )
 
-                # Inline preview_agent_id case (#459 build-preview): the
-                # snapshot path doesn't cover this because it resolves
-                # excluded_agent_id only through ``task.agent_id``; the
-                # preview agent is referenced inside the inline
-                # ``agent_config`` dict on tasks with ``agent_id=None``.
-                # Run this in addition to (not instead of) the snapshot
-                # value above -- they're mutually exclusive by design
-                # (either task has an agent_id OR has inline preview).
-                if (
-                    excluded_agent_id is None
-                    and snapshot is None
-                    and agent_config
-                    and agent_config.get("preview_agent_id")
-                ):
-                    from ..models.agent import AgentStatus
-
-                    if task is None:
-                        raise ValueError(
-                            f"Task {task_id} missing while resolving preview agent"
-                        )
-                    preview_user_id = int(task.user_id)
-                    assert db is not None
-                    current_agent = (
-                        db.query(Agent)
-                        .filter(
-                            Agent.id == agent_config["preview_agent_id"],
-                            owned_agent_clause(
-                                preview_user_id,
-                                get_agent_team_scope(db, preview_user_id),
-                            ),
-                        )
-                        .first()
-                    )
-                    if current_agent and current_agent.status == AgentStatus.PUBLISHED:
-                        excluded_agent_id = int(current_agent.id)
-                        logger.info(
-                            f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
-                        )
-
                 workforce_runtime = (
                     snapshot.workforce_runtime
                     if snapshot is not None
@@ -2580,6 +2667,11 @@ class AgentServiceManager:
                     ),
                     mcp_load_summary_tracer=tracer,
                     mcp_load_summary_trace_task_id=str(task_id),
+                    connector_team_id=(
+                        snapshot.agent.team_id
+                        if snapshot is not None and snapshot.agent is not None
+                        else None
+                    ),
                 )
 
                 with UserContext(runtime_user_id):
@@ -2915,57 +3007,80 @@ class AgentServiceManager:
                     raise
                 logger.warning("Quota gate check failed open", exc_info=True)
 
-        # Per-share run quota (#973): the run gate above bounds the OWNER's
-        # team quota, but every anonymous share run bills the owner, so one
-        # public link could still drain the whole team quota. This adds a
-        # per-link + per-guest rolling ceiling on top, keyed off the share
-        # markers PR1 stamped into agent_config. Only share tasks are gated;
-        # fails open (availability) like the run gate above, with the same
-        # pool-timeout escalation so a stalled pool doesn't cascade.
+        # Per-link run quota (#973 share, #1108 widget): the run gate above
+        # bounds the OWNER's team quota, but every anonymous public run bills
+        # the owner, so one public link could still drain the whole team quota.
+        # This adds a rolling per-entity ceiling on top, keyed off the markers
+        # stamped into agent_config at task creation. Only public tasks are
+        # gated; fails open (availability) like the run gate above, with the
+        # same pool-timeout escalation so a stalled pool doesn't cascade.
         if tracker_task_id:
+            quota_config: Mapping[str, Any] | None = None
             try:
-                share_config = await run_db_io_cancellation_safe(
-                    lambda: _load_task_share_quota_config_isolated(int(tracker_task_id))
+                quota_config = await run_db_io_cancellation_safe(
+                    lambda: _load_task_public_run_quota_config_isolated(
+                        int(tracker_task_id)
+                    )
                 )
-                if share_config is not None:
-                    from ..services.share_rate_limit import (
-                        entity_rate_limit_key,
-                        get_share_rate_limiter,
-                    )
-
-                    guest_id = share_config.get("guest_id")
-                    workforce_id = share_config.get("share_workforce_id")
-                    agent_share_id = share_config.get("share_agent_id")
-                    share_key = entity_rate_limit_key(
-                        int(agent_share_id) if agent_share_id is not None else None,
-                        int(workforce_id) if workforce_id is not None else None,
-                    )
-                    if share_key and isinstance(guest_id, str) and guest_id:
-                        if not get_share_rate_limiter().allow_run(share_key, guest_id):
-                            reason_message = (
-                                "This shared link has reached its usage limit. "
-                                "Please try again later."
-                            )
-                            return {
-                                "success": False,
-                                "status": "quota_exceeded",
-                                "output": reason_message,
-                                "error": reason_message,
-                                "error_code": "share_run_quota_exceeded",
-                                "error_details": None,
-                            }
+                denied_channel = (
+                    _public_run_denial_channel(quota_config)
+                    if quota_config is not None
+                    else None
+                )
+                if denied_channel is not None:
+                    # Channel-specific copy + error_code: a widget visitor on a
+                    # third-party page has no "shared link", and analytics need
+                    # to tell which public channel was throttled. The per-caller
+                    # sub-quota gets its own copy because it is the one refusal
+                    # the reader can act on — waiting clears it, whereas an
+                    # exhausted owner budget does not.
+                    if denied_channel == "widget-ip":
+                        reason_message = (
+                            "Too many requests from your network. "
+                            "Please wait a little while and try again."
+                        )
+                        quota_error_code = "widget_run_ip_quota_exceeded"
+                    elif denied_channel == "widget":
+                        reason_message = (
+                            "This widget has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "widget_run_quota_exceeded"
+                    else:
+                        reason_message = (
+                            "This shared link has reached its usage limit. "
+                            "Please try again later."
+                        )
+                        quota_error_code = "share_run_quota_exceeded"
+                    return {
+                        "success": False,
+                        "status": "quota_exceeded",
+                        "output": reason_message,
+                        "error": reason_message,
+                        "error_code": quota_error_code,
+                        "error_details": None,
+                    }
             except Exception as exc:
                 if is_database_pool_timeout(exc):
                     logger.error(
-                        "task_id=%s component=share-quota-gate database pool "
-                        "checkout timed out; terminating before further runtime "
-                        "database work: %s",
+                        "task_id=%s component=public-run-quota-gate database "
+                        "pool checkout timed out; terminating before further "
+                        "runtime database work: %s",
                         tracker_task_id,
                         exc,
                         exc_info=True,
                     )
                     raise
-                logger.warning("Share run quota check failed open", exc_info=True)
+                failed_mode = (
+                    quota_config.get("auth_mode")
+                    if isinstance(quota_config, Mapping)
+                    else None
+                )
+                logger.warning(
+                    "Public run quota check failed open (auth_mode=%s)",
+                    failed_mode,
+                    exc_info=True,
+                )
 
         if manage_task_lease and tracker_task_id:
             from ..services.task_execution_controller import (
@@ -3995,6 +4110,10 @@ async def create_task(
 
     except HTTPException:
         raise
+    except ConnectorRuntimeError as exc:
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.safe_message
+        ) from exc
     except Exception as e:
         logger.error(f"Create task failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

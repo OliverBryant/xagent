@@ -53,8 +53,13 @@ from ...context.enrichment import (
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
+from ...grounding import grounding_rule
 from ...language import final_answer_language_rule
-from ...result import tool_result_succeeded, unwrap_final_answer_content
+from ...result import (
+    CONTROL_TOOL_NAMES,
+    tool_result_succeeded,
+    unwrap_final_answer_content,
+)
 from ...runtime import (
     ExecutionInterrupted,
     LLMCallInterrupted,
@@ -758,6 +763,7 @@ class ReActPattern(AgentPattern):
                 "tool-call markup as plain text. Set outcome=completed only when "
                 "every requested action or verification succeeded; otherwise set "
                 "outcome=partial or outcome=blocked and say what remains. "
+                f"{grounding_rule(can_call_tools=False)} "
                 f"{final_answer_language_rule()}"
             )
         elif has_tools:
@@ -783,11 +789,8 @@ class ReActPattern(AgentPattern):
                 "tutorial or example. Treat the latest user message as the controlling "
                 "instruction for follow-up requests. If the user corrects a previous "
                 "assumption, especially about dates or freshness, revise the answer "
-                "instead of restating prior content. Do not introduce specific "
-                "entities, incidents, dates, sources, or causal explanations "
-                "that are not supported by the conversation, retrieved "
-                "context, or tool results. If available context is insufficient, "
-                "say so or use an appropriate tool to verify. "
+                "instead of restating prior content. "
+                f"{grounding_rule()} "
                 f"Current date (UTC): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
                 "date when forming search queries and judging source relevance. Only call "
@@ -803,6 +806,9 @@ class ReActPattern(AgentPattern):
                 "Never call a tool name that is not in this list."
             )
         else:
+            # Reachable only with tool_choice="none", which no production
+            # construction site sets. If that ever changes, this branch needs
+            # grounding_rule() too -- it emits a final answer without it today.
             return messages
         completion_instruction = self._completion_evidence_instruction(context)
         if completion_instruction:
@@ -1658,7 +1664,7 @@ class ReActPattern(AgentPattern):
         return [*external_tools, *self._builtin_tool_schemas()]
 
     def _control_tool_names(self) -> set[str]:
-        return {"final_answer", "send_message", "ask_user_question"}
+        return set(CONTROL_TOOL_NAMES)
 
     async def _handle_control_tool(
         self,
@@ -2458,6 +2464,13 @@ class ReActPattern(AgentPattern):
             "In the tool arguments, write reason and missing_verification before "
             "action so you assess completion before committing to the decision. "
             "Use an empty missing_verification only when no work remains. "
+            "Audit every explicit deliverable in the latest request against a "
+            "successful tool result before choosing final_answer. Model-only or "
+            "private observations are evidence for reasoning, not user-visible "
+            "deliverables. A requested computer screenshot is complete only when "
+            "the computer result marks it as a user-visible artifact and returns "
+            "its file reference. For other file or media tools, a successful "
+            "artifact, file_ref, or markdown_link is sufficient evidence. "
             "Do not call work tools in this decision. Do not put user-facing final "
             "answer text in this decision; the next normal ReAct step will produce "
             "the final answer if you choose final_answer. Treat the completed-call "

@@ -61,7 +61,6 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
-from ..auth_dependencies import get_user_from_websocket_token
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -163,7 +162,10 @@ from ..services.task_lease_service import (
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
-from ..services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
+from ..services.task_runtime import (
+    SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    task_extension_bindings_from_agent_config,
+)
 from ..services.uploaded_file_store import (
     StagedUploadedFile,
     SupersededObjectCleanupClaim,
@@ -185,6 +187,11 @@ from .public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
     public_task_trace_filter,
+)
+from .websocket_auth import (
+    WebSocketPrincipal,
+    _WebSocketAuthenticationTerminated,
+    get_authenticated_user,
 )
 
 logger = logging.getLogger(__name__)
@@ -2095,6 +2102,10 @@ def _task_lease_snapshot(task: Any) -> TaskLease | None:
     if task_id is None or runner_id is None or run_id is None:
         return None
     return TaskLease(
+        # attempt_id is left at its None default on purpose: every field here
+        # comes from the task row, so reading lease_attempt_id from that same
+        # row would make any later attempt check compare a value against
+        # itself. See TaskLease's docstring in task_lease_service.py.
         task_id=int(task_id),
         runner_id=str(runner_id),
         run_id=str(run_id),
@@ -4876,62 +4887,6 @@ def _register_uploaded_files_for_agent(
         )
 
 
-@dataclass(frozen=True)
-class WebSocketPrincipal:
-    """The complete authenticated identity needed by WebSocket transports."""
-
-    id: int
-    is_admin: bool
-    # Per-guest isolation credential for public widget/share transports
-    # (#973). ``None`` for owner-authenticated sockets, which have no guest.
-    guest_id: str | None = None
-    # Widget entity scope ("agent:<id>" / "workforce:<id>") for widget
-    # transports; ``None`` elsewhere. Carried as the turn rate-limit key
-    # (#1056): the widget ``guest_id`` above is client-supplied (rotatable at
-    # will), so widget throttles key on the entity + caller IP instead.
-    widget_entity_key: str | None = None
-
-
-def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:
-    """Authenticate one token inside a worker-owned short Session."""
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        user = get_user_from_websocket_token(token, db)
-        if user is None or user.id is None:
-            return None
-        return WebSocketPrincipal(
-            id=int(user.id),
-            is_admin=bool(user.is_admin),
-        )
-
-
-async def get_authenticated_user(
-    websocket: WebSocket, token: Optional[str] = None
-) -> Optional[WebSocketPrincipal]:
-    """
-    Get authenticated user from WebSocket connection
-
-    Args:
-        websocket: WebSocket connection
-        token: Optional authentication token
-
-    Returns:
-        Frozen WebSocket principal if authenticated, None otherwise
-    """
-    del websocket
-    if not token:
-        return None
-
-    try:
-        return await run_db_io_cancellation_safe(
-            lambda: _load_websocket_principal_sync(token)
-        )
-    except Exception as e:
-        logger.error(f"Error authenticating WebSocket user: {e}")
-        return None
-
-
 async def handle_chat_message(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -5234,6 +5189,9 @@ def _load_websocket_task_routing_snapshot(
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,
+                "runtime_extension_bindings": list(
+                    task_extension_bindings_from_agent_config(task.agent_config)
+                ),
                 "is_dag": (
                     agent_execution_mode == "think"
                     if agent_execution_mode is not None
@@ -6463,6 +6421,9 @@ def _load_legacy_execute_task_request_sync(
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,
+                "runtime_extension_bindings": list(
+                    task_extension_bindings_from_agent_config(task.agent_config)
+                ),
                 "created_at": safe_timestamp_to_unix(task.created_at)
                 if task.created_at
                 else None,
@@ -7217,7 +7178,10 @@ async def websocket_chat_endpoint(
 ) -> None:
     """WebSocket unified endpoint - handle chat, execution status, and DAG intervention"""
     # Verify user identity
-    user = await get_authenticated_user(websocket, token)
+    try:
+        user = await get_authenticated_user(websocket, token)
+    except _WebSocketAuthenticationTerminated:
+        return
     if not user:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -8066,7 +8030,10 @@ async def websocket_builder_chat_endpoint(
     token: Optional[str] = Query(None, description="Authentication token"),
 ) -> None:
     """WebSocket endpoint for AI Agent Builder Assistant chat."""
-    user = await get_authenticated_user(websocket, token)
+    try:
+        user = await get_authenticated_user(websocket, token)
+    except _WebSocketAuthenticationTerminated:
+        return
     if not user:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -8508,7 +8475,10 @@ async def websocket_build_preview_endpoint(
 ) -> None:
     """WebSocket endpoint for build page agent preview using normal task execution."""
     # Verify user identity
-    user = await get_authenticated_user(websocket, token)
+    try:
+        user = await get_authenticated_user(websocket, token)
+    except _WebSocketAuthenticationTerminated:
+        return
     if not user:
         await websocket.close(code=4001, reason="Authentication required")
         return

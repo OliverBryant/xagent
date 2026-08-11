@@ -107,10 +107,11 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # the re-layer never fires here. So reserving ``is_preview`` or
 # ``preview_agent_id`` would still silently strip them from this config with
 # nothing to restore them, breaking agent-builder preview. That it cannot be
-# reserved is not a statement that it is safe: three of its readers resolve it
-# through an ownership-scoped query, but the SSH tools' ``_agent_id_from_task``
-# reads it with no such check and uses it to pick which targets a task may
-# reach, so the answer for that key has to be reader-side (issue #1136).
+# reserved is not a statement that it is safe: every authorization-sensitive
+# reader must treat it as an untrusted persisted candidate and route it through
+# ``agent_team_scope.resolve_authorized_agent`` using the task owner. The SSH
+# reader also rejects archived agents before it constructs an execution
+# identity, so malformed or out-of-scope values cannot select SSH targets.
 #
 # Before adding a key here: (1) confirm no server writer reaches this column
 # *through* the sanitizer (the preview path above is the only known case);
@@ -149,11 +150,36 @@ SELECTED_FILE_IDS_AGENT_CONFIG_KEY = "selected_file_ids"
 # ``pop`` in ``_build_task_agent_config`` stays: that boundary substitutes a
 # recomputed list rather than only dropping the client's, and keeping it means
 # the substitution does not depend on this set's contents.
+#
+# The public-channel identity/quota markers (#1108) qualify under the same
+# three checks. The widget/share run quota reads ``auth_mode`` and the entity
+# ids back as authoritative at the ``execute_task`` chokepoint (the id selects
+# which quota bucket the run bills), and ``guest_id`` is the per-guest quota
+# key, so an anonymous widget/share guest must not pre-seed any of them. (1) No
+# server writer reaches this column *through* the sanitizer for these keys --
+# the public agent paths sanitize then stamp what they own, and the preview
+# path sets only ``is_preview``/``preview_agent_id``; (2) they are
+# server-minted identity/routing values no request body legitimately carries;
+# (3) the widget/share workforce paths pass them as ``extra_agent_config=``
+# server literals, which ``_merge_agent_config`` places *under* the built
+# config, and the snapshot never sets these keys, so no client can win a
+# collision. All four public task-create paths -- widget and share, agent and
+# workforce -- additionally stamp both of their channel's entity markers
+# explicitly (the inapplicable one as ``None``) as belt-and-suspenders, so
+# those boundaries stay correct even if this set changes (#1132).
 CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+        "auth_mode",
+        "guest_id",
+        "widget_agent_id",
+        "widget_workforce_id",
+        "widget_client_ip",
+        "share_agent_id",
+        "share_workforce_id",
+        "share_token",
     }
 )
 logger = logging.getLogger(__name__)
@@ -239,17 +265,10 @@ def _get_task_runtime_hook_executor() -> ThreadPoolExecutor:
         return _task_runtime_hook_executor
 
 
-def register_task_extension(
+def _validate_task_extension_provider(
     name: str,
     provider: TaskRuntimeExtensionProvider,
-) -> None:
-    """Register one process-wide task runtime provider.
-
-    Registration is deliberately not idempotent: re-registering a name raises
-    so a second provider cannot silently shadow the first. Replacing a live
-    provider is an ``unregister_task_extension`` followed by a fresh register.
-    """
-
+) -> str:
     normalized = _normalize_extension_name(name)
     missing = [
         method
@@ -261,8 +280,41 @@ def register_task_extension(
             "Task runtime extension provider is missing callable method(s): "
             + ", ".join(missing)
         )
+    return normalized
+
+
+def register_task_extension(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register one process-wide task runtime provider.
+
+    Registration is deliberately not idempotent: re-registering a name raises
+    so a second provider cannot silently shadow the first. Replacing a live
+    provider is an ``unregister_task_extension`` followed by a fresh register.
+    """
+
+    normalized = _validate_task_extension_provider(name, provider)
     with _task_runtime_extensions_lock:
         if normalized in _task_runtime_extensions:
+            raise ValueError(
+                f"Task runtime extension '{normalized}' is already registered"
+            )
+        _task_runtime_extensions[normalized] = provider
+
+
+def _register_task_extension_idempotently(
+    name: str,
+    provider: TaskRuntimeExtensionProvider,
+) -> None:
+    """Register ``provider`` once while rejecting a different owner."""
+
+    normalized = _validate_task_extension_provider(name, provider)
+    with _task_runtime_extensions_lock:
+        existing = _task_runtime_extensions.get(normalized)
+        if existing is provider:
+            return
+        if existing is not None:
             raise ValueError(
                 f"Task runtime extension '{normalized}' is already registered"
             )

@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
@@ -37,6 +38,8 @@ FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
+INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
+INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -47,6 +50,25 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
+NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
+NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
+BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
+BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
+BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
+BROWSER_CUA_DRIVER_MAX_ELEMENTS = "XAGENT_BROWSER_CUA_DRIVER_MAX_ELEMENTS"
+SUPPORTED_NATIVE_BROWSER_APP_NAMES = frozenset(
+    {
+        "Brave Browser",
+        "Google Chrome",
+        "Google Chrome Canary",
+        "Chromium",
+        "Microsoft Edge",
+        "Vivaldi",
+    }
+)
+_NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD = {
+    name.casefold(): name for name in SUPPORTED_NATIVE_BROWSER_APP_NAMES
+}
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
@@ -60,6 +82,7 @@ FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFI
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
+KB_SEARCH_TIMEOUT_SECONDS = "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
 DEEPDOC_XINFERENCE_URL = "XAGENT_DEEPDOC_XINFERENCE_URL"
 DEEPDOC_XINFERENCE_API_KEY = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
 DEEPDOC_XINFERENCE_TIMEOUT_SECONDS = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
@@ -84,6 +107,7 @@ SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
 SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
+SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -134,6 +158,12 @@ WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
 WIDGET_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT"
 WIDGET_WS_TURN_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT"
 WIDGET_WS_TURN_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_RATE_LIMIT"
+WIDGET_AUTH_RATE_LIMIT = "XAGENT_WIDGET_AUTH_RATE_LIMIT"
+WIDGET_AUTH_IP_RATE_LIMIT = "XAGENT_WIDGET_AUTH_IP_RATE_LIMIT"
+WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
+WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
+WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
+WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -199,6 +229,46 @@ def get_agent_runtime() -> Literal["v1", "v2"]:
         return "v2"
     logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
     return "v1"
+
+
+def get_interaction_protocol_mode() -> str:
+    """Raw XAGENT_INTERACTION_PROTOCOL_MODE reading: stripped and lowercased.
+
+    Returns the env value normalized for whitespace and case, or "legacy" if
+    the variable is unset or blank. Does not check that the result is one
+    of the three valid modes -- validating the parsed value and building a
+    policy out of it belongs to the interaction rollout policy owner
+    (``web/services/interaction_rollout.py``), not to this module. Unlike
+    ``get_agent_runtime`` above, an unrecognized value is not this
+    function's problem to warn about or fall back from.
+    """
+    value = os.getenv(INTERACTION_PROTOCOL_MODE)
+    if value is None or not value.strip():
+        return "legacy"
+    return value.strip().lower()
+
+
+def get_interaction_native_sources() -> list[str]:
+    """Raw XAGENT_INTERACTION_NATIVE_SOURCES reading: a normalized token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens -- the same shape ``get_external_upload_dirs`` below uses
+    for its own comma-separated list. Duplicate tokens are preserved and
+    tokens are not checked against any vocabulary here: deduplication and
+    vocabulary validation need to raise two distinguishable errors, and
+    producing those belongs to the interaction rollout policy owner, not to
+    this module.
+    """
+    raw = os.getenv(INTERACTION_NATIVE_SOURCES, "")
+    if not raw:
+        return []
+
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if token:
+            result.append(token)
+    return result
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
@@ -600,6 +670,64 @@ def get_task_runtime_hook_queue_timeout_seconds() -> int:
     return _get_positive_int_env(TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS, 30)
 
 
+def get_native_browser_enabled() -> bool:
+    """Whether tasks may control a browser on the interactive Xagent host."""
+
+    return _get_bool_env(NATIVE_BROWSER_ENABLED, False)
+
+
+def get_native_browser_app_name() -> str:
+    """Browser application exposed by the Local browser runtime."""
+
+    configured = (
+        os.getenv(NATIVE_BROWSER_APP_NAME, "Google Chrome").strip() or "Google Chrome"
+    )
+    canonical = _NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD.get(configured.casefold())
+    if canonical is None:
+        supported = ", ".join(sorted(SUPPORTED_NATIVE_BROWSER_APP_NAMES))
+        raise ValueError(
+            f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
+        )
+    return canonical
+
+
+def get_browser_cua_driver_command() -> str:
+    """Executable used to start the Local browser cua-driver MCP server."""
+
+    return os.getenv(BROWSER_CUA_DRIVER_COMMAND, "cua-driver").strip() or "cua-driver"
+
+
+def get_browser_cua_driver_socket() -> str | None:
+    """Optional cua-driver daemon socket endpoint for Local browser."""
+
+    value = os.getenv(BROWSER_CUA_DRIVER_SOCKET, "").strip()
+    return value or None
+
+
+def get_browser_cua_driver_timeout_seconds() -> float:
+    """Per-call timeout for the Local browser driver."""
+
+    raw_value = os.getenv(BROWSER_CUA_DRIVER_TIMEOUT_SECONDS, "30").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 30.0
+    if value > 0:
+        return value
+    logger.warning(
+        "Invalid %s=%r; falling back to 30 seconds",
+        BROWSER_CUA_DRIVER_TIMEOUT_SECONDS,
+        raw_value,
+    )
+    return 30.0
+
+
+def get_browser_cua_driver_max_elements() -> int:
+    """Maximum AX elements requested for one Local browser observation."""
+
+    return _get_positive_int_env(BROWSER_CUA_DRIVER_MAX_ELEMENTS, 2_000)
+
+
 def get_checkpoint_encoding_v2_enabled() -> bool:
     """Whether checkpoint trace events use the v2 storage encoding.
 
@@ -983,6 +1111,114 @@ def get_widget_ws_turn_rate_limit() -> str:
     legitimate guests).
     """
     return _get_rate_limit(WIDGET_WS_TURN_RATE_LIMIT, "240/minute")
+
+
+def get_widget_auth_rate_limit() -> str:
+    """Per-widget-entity limit on widget auth + embed-ticket minting (#1108).
+
+    The loose aggregate backstop bounding total auth/ticket volume through one
+    embedded agent/workforce across all callers. Deliberately loose: both
+    endpoints fire on every widget page load and the entity key is shared by
+    all of a widget's visitors, so a tight per-entity bucket would 429
+    ordinary visitors on a busy embed. The per-IP limit below is the tight
+    per-visitor / per-abuser bound. Kept at the same 4:1 entity:IP ratio as
+    the sibling widget upload / ws-turn gates — and auth is the one gate whose
+    denial is fail-closed client-side (the widget never loads), so its
+    aggregate backstop is deliberately the most tolerant, not the tightest.
+    Raise this for very high-traffic embeds.
+    """
+    return _get_rate_limit(WIDGET_AUTH_RATE_LIMIT, "1200/minute")
+
+
+def get_widget_auth_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget auth + embed-ticket minting (#1108).
+
+    The tight per-visitor / per-abuser bound (visitors have distinct IPs):
+    bounds one caller minting guest tokens / embed tickets (each call does DB
+    lookups and signs a JWT) regardless of how many widget keys or tickets
+    they cycle through, since the IP is not cheaply rotatable. Raise this
+    where many genuine visitors share one address (corporate NAT, carrier
+    CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy
+    — otherwise every caller resolves to the proxy's IP and this becomes one
+    global cap. (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_widget_task_create_rate_limit() -> str:
+    """Per-widget-entity limit on public widget task creation (#1108).
+
+    The loose backstop bounding total task-create volume through one embedded
+    agent/workforce across all callers (one widget serves many legitimate
+    guests). The per-IP bucket below is the tighter per-abuser gate; unlike the
+    share path this cannot key on the guest, whose id is client-supplied and
+    rotatable at will. Kept at the 4:1 entity:IP ratio shared by every widget
+    gate: the entity bucket only accumulates on admitted requests, so ``ratio``
+    cooperating under-cap IPs are needed to saturate it — 4 here, not 2, on the
+    surface where each admitted request spawns an owner-billed run.
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_RATE_LIMIT, "240/minute")
+
+
+def get_widget_task_create_ip_rate_limit() -> str:
+    """Per-caller-IP limit on public widget task creation (#1108).
+
+    The tighter bucket: task creation is the costly surface (each spawns an
+    owner-billed run), and the caller IP is the only trustworthy per-abuser
+    key on the widget path. Numerically matches the widget upload/turn IP
+    default. Raise this where many genuine visitors share one address
+    (corporate NAT, carrier CGNAT), and set XAGENT_TRUSTED_PROXY_HOPS correctly
+    behind a reverse proxy — otherwise every caller resolves to the proxy's IP
+    and this becomes one global cap. (example.env carries the same caveat for
+    all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_TASK_CREATE_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_run_quota() -> str:
+    """Per-widget-entity rolling run quota (#1108).
+
+    The widget mirror of :func:`get_share_run_quota`, in its own bucket so a
+    popular/abused widget cannot drain the owner's whole team quota. Keyed on
+    the embedded agent/workforce, with a per-creating-IP sub-quota
+    (:func:`get_widget_run_ip_quota`) as the per-abuser dimension — the widget
+    ``guest_id`` is client-supplied (rotatable at will), so unlike the share
+    path there is no per-guest sub-quota. NOTE: this quota applies to
+    already-live widget tasks as soon as it deploys (their ``agent_config``
+    carries the widget markers); the only opt-out is raising the env var.
+    """
+    return _get_rate_limit(WIDGET_RUN_QUOTA, "500/day")
+
+
+def get_widget_run_ip_quota() -> str:
+    """Per-creating-IP, per-widget rolling run sub-quota (#1108).
+
+    The per-abuser sub-quota under :func:`get_widget_run_quota`, mirroring the
+    share path's per-guest window. Its bucket is keyed ``entity|ip``, i.e.
+    scoped to one widget: a caller's budget on one embedded agent/workforce is
+    independent of every other widget on the instance. That scoping matters
+    because this quota is charged per *turn* — a bare-IP bucket would make one
+    NAT/CGNAT egress share a single turn budget across unrelated widgets.
+
+    Sizing: this is a share of a rolling owner-billed budget, not a burst
+    throttle, so it is deliberately far below the per-minute burst gates
+    (widget WS turn / task-create, both 60/minute per IP) and instead sized as
+    a fraction of :func:`get_widget_run_quota` — at the defaults one caller
+    needs several sustained hours to drain a widget's daily budget. It does
+    NOT stop a multi-IP abuser: roughly ``entity_quota / ip_quota`` IPs, each
+    staying under its own window, still exhaust the entity quota —
+    structurally the same limit as the share path's per-guest quota.
+
+    The IP is the one the server observed at task creation (stamped into
+    ``agent_config``, never client-supplied); tasks created before this deploy
+    carry no marker and are bounded by the entity quota alone. Raise it for
+    deployments fronted by large shared egress (corporate NAT, carrier CGNAT),
+    where many genuine visitors present one address, and set
+    XAGENT_TRUSTED_PROXY_HOPS correctly behind a reverse proxy — otherwise
+    every caller resolves to the proxy's IP and this becomes one global cap.
+    (example.env carries the same caveat for all per-IP buckets.)
+    """
+    return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
 
 
 def get_share_run_quota() -> str:
@@ -1859,6 +2095,37 @@ def get_kb_collections_timeout_seconds() -> int:
     return _get_positive_int_env(KB_COLLECTIONS_TIMEOUT_SECONDS, 30)
 
 
+def get_kb_search_timeout_seconds() -> int:
+    """Get the deadline for searching a single knowledge base collection.
+
+    Bounds one ``run_document_search`` call so an agent's knowledge_search does
+    not wait forever on a stuck backend. The collections of one search run
+    concurrently, so each of them holds a shared default-executor worker for as
+    long as it runs; without a deadline an agent bound to N knowledge bases can
+    pin N workers indefinitely. The default is generous because the budget has
+    to cover embedding the query, the LanceDB scan and an optional rerank round
+    trip.
+
+    Known limitation, same as the collection listing endpoint: cancelling the
+    ``asyncio.wait_for`` coroutine does not stop the underlying ``to_thread``
+    worker, so a timed-out search keeps running to completion in the default
+    executor. The deadline frees the caller, not the worker. A worker stuck in
+    rerank outlives it by that model's own budget (``RerankModelConfig.timeout``,
+    180s by default), so it can outlast this deadline threefold.
+
+    Priority:
+        1. XAGENT_KB_SEARCH_TIMEOUT_SECONDS environment variable
+        2. Default of 60 seconds
+
+    Returns:
+        Per-collection search timeout in seconds
+    """
+    # ponytail: the rerank budget is not clamped to this one - clamping means
+    # threading a per-call timeout through SearchConfig into the rerank adapter.
+    # Do it if leaked workers actually starve the executor.
+    return _get_positive_int_env(KB_SEARCH_TIMEOUT_SECONDS, 60)
+
+
 def get_deepdoc_xinference_url() -> str | None:
     """Return the Xinference base URL that DeepDoc parsing is offloaded to.
 
@@ -2182,6 +2449,56 @@ def get_sandbox_host_storage_root() -> Path | None:
     if env_str:
         return Path(os.path.expandvars(env_str.strip()))
     return None
+
+
+_SANDBOX_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def validate_sandbox_namespace(namespace: str) -> None:
+    """Validate a sandbox ownership namespace.
+
+    Enforces the Docker Compose project-name grammar (lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit). Callers that accept a namespace from outside the environment
+    (e.g. the Docker sandbox service constructor) must run this so a
+    malformed value can never recreate a shared ownership domain.
+
+    Raises:
+        ValueError: The value does not match the grammar.
+    """
+    if not _SANDBOX_NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(
+            f"Invalid sandbox namespace {namespace!r}: must match the Docker "
+            "Compose project-name grammar (lowercase letters, digits, dashes, "
+            "underscores; start with a letter or digit)"
+        )
+
+
+def get_sandbox_namespace() -> str | None:
+    """Get the stable per-deployment namespace for sandbox resources.
+
+    The namespace is the ownership boundary between deployments that share one
+    Docker daemon: every sandbox container (physical name and owner labels)
+    a deployment creates is scoped to it, and every lookup/list/cleanup
+    operation is restricted to it. It must be stable across restarts and
+    unique per deployment; the Docker Compose project name
+    (``COMPOSE_PROJECT_NAME``) is the canonical source.
+
+    Accepts the Docker Compose project-name grammar: lowercase letters,
+    decimal digits, dashes and underscores, beginning with a lowercase letter
+    or digit.
+
+    Returns:
+        The configured namespace, or None when unset/empty.
+
+    Raises:
+        ValueError: The variable is set but does not match the grammar.
+    """
+    raw = os.getenv(SANDBOX_NAMESPACE, "").strip()
+    if not raw:
+        return None
+    validate_sandbox_namespace(raw)
+    return raw
 
 
 def get_boxlite_home_dir() -> Path | None:

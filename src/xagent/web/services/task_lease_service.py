@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Any, Callable, Coroutine, Iterator, TypeVar, cast
 
 from sqlalchemy import and_, case, func, or_, update
+from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import Query, Session
 
 from ...config import (
@@ -29,6 +30,10 @@ from .db_runtime import (
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
+)
+from .ops_signals import (
+    CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+    register_degradation,
 )
 from .task_execution_controller import control_state_for_status
 
@@ -45,9 +50,45 @@ def _rowcount(result: Any) -> int:
 
 @dataclass(frozen=True)
 class TaskLease:
+    """One runner's claim on one task row.
+
+    ``attempt_id`` names the exact acquisition that produced this lease. It
+    is minted fresh by ``acquire_task_lease_no_commit`` on every successful
+    claim and mirrored into ``tasks.lease_attempt_id`` in the same UPDATE, so
+    a holder can later prove the row still belongs to *its* attempt rather
+    than to a successor that reused the same ``(runner_id, run_id)`` tuple.
+
+    ``attempt_id is None`` is a fail-open sentinel with two distinct sources:
+
+    * a lease acquired by a worker running code from before this column
+      existed -- a rolling-restart window that closes on its own once every
+      worker has restarted; and
+    * ``_task_lease_snapshot`` in ``websocket.py``, which reconstructs an
+      ambient lease from an already-loaded task row. That one carries None
+      permanently and on purpose: every one of its fields is read from the
+      task row, so populating ``attempt_id`` from the same row would make any
+      later ``task.lease_attempt_id != lease.attempt_id`` check compare a
+      value against itself -- an always-passing fence, which is strictly
+      worse than an explicit None that callers can detect and skip. Today
+      that snapshot only feeds checkpoint fencing via
+      ``bind_task_lease_context`` and never reaches a settlement path, so
+      the permanent None also has no behavioural cost.
+
+    Consumers must therefore treat None as "cannot prove attempt identity"
+    and fall back to whatever fence they already had, never as "matches".
+
+    The existing lease writers (refresh, release, fail-and-release) do not
+    fence on this column yet, deliberately: rejecting a stale attempt there
+    turns its refresh into a LOST classification and an active cancellation,
+    which is a behavior change that belongs to the first consumer of this
+    column, with its own tests. Until then the pre-existing
+    ``(runner_id, run_id)`` fences are the only guards on those paths.
+    """
+
     task_id: int
     runner_id: str
     run_id: str | None = None
+    attempt_id: str | None = None
 
 
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
@@ -89,6 +130,7 @@ class TaskLeaseRecoveryCandidate:
     lease_expires_at: datetime
     state_version: int
     last_checkpoint_event_id: str | None
+    last_checkpoint_trace_event_id: int | None
 
     @property
     def cursor(self) -> tuple[datetime, int]:
@@ -210,30 +252,49 @@ def task_lease_expires_at(now: datetime | None = None) -> datetime:
     return (now or utc_now()) + timedelta(seconds=get_task_lease_ttl_seconds())
 
 
-def has_recoverable_agent_checkpoint(
-    db: Session,
-    candidate: TaskLeaseRecoveryCandidate,
-) -> bool:
-    """Return whether the candidate points at a checkpoint for its current run.
+class CheckpointRecoveryVerdict(str, Enum):
+    """Result of resolving one recovery candidate's checkpoint pointer.
 
-    Recovery fails closed for events written before run provenance was
-    introduced: an exact pointer alone cannot prove that the checkpoint belongs
-    to the expired run. New-run claims clear the pointer before execution starts.
+    ``RECOVERABLE`` and ``NOT_RECOVERABLE`` both mean the checkpoint's row
+    identity was authoritatively resolved (found-and-valid, or found-invalid,
+    or provably absent); the caller acts on the candidate immediately,
+    recovering to PAUSED or FAILED respectively. ``INDETERMINATE`` means row
+    identity itself could not be established this round (an ambiguous legacy
+    match) -- the caller must leave the candidate's lease and status
+    untouched so the next sweep can retry, never fold this into FAILED.
     """
 
-    if candidate.last_checkpoint_event_id is None:
-        return False
-    row = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == candidate.task_id,
-            TraceEvent.build_id.is_(None),
-            TraceEvent.event_id == candidate.last_checkpoint_event_id,
-            TraceEvent.event_type == "system_update_general",
-        )
-        .one_or_none()
-    )
-    if row is None:
+    RECOVERABLE = "recoverable"
+    NOT_RECOVERABLE = "not_recoverable"
+    INDETERMINATE = "indeterminate"
+
+
+def _checkpoint_row_matches_candidate(
+    row: TraceEvent, candidate: TaskLeaseRecoveryCandidate
+) -> bool:
+    """Validate an already-identified trace_events row against the fields a
+    recoverable checkpoint must satisfy for this candidate's run.
+
+    Shared by both the PK-anchored and legacy resolution paths: the legacy
+    path's query already filters task_id/build_id/event_type, so those
+    checks are redundant there, but the PK path loads a row by raw primary
+    key with no such filter, so it needs the full set. A mismatch here is
+    corruption of the row the pointer names, not a cue to search elsewhere.
+
+    A ``False`` here always resolves the candidate to NOT_RECOVERABLE
+    (lease recovery fails the task). The checkpoint reader's own PK-anchor
+    validation (``_load_pk_anchored_checkpoint`` in ``trace_handlers.py``)
+    checks the same kind of row mismatch but calls it corrupt
+    (``CheckpointCorruptError``) instead -- two call sites judging the same
+    condition through different vocabularies for their own callers, not an
+    inconsistency to reconcile.
+    """
+
+    if (
+        row.task_id != candidate.task_id
+        or row.event_type != "system_update_general"
+        or row.build_id is not None
+    ):
         return False
     data: dict[str, Any] = (
         cast(dict[str, Any], row.data) if isinstance(row.data, dict) else {}
@@ -244,6 +305,96 @@ def has_recoverable_agent_checkpoint(
     if checkpoint_run_id is None:
         return False
     return candidate.run_id is not None and str(checkpoint_run_id) == candidate.run_id
+
+
+def _resolve_legacy_checkpoint_recovery(
+    db: Session,
+    candidate: TaskLeaseRecoveryCandidate,
+) -> CheckpointRecoveryVerdict:
+    """Resolve the candidate's legacy ``event_id`` string against the row it
+    names, within the same partition (task, root scope, checkpoint type)
+    today's query has always used.
+
+    An unset pointer or a zero-row match is an authoritative absence: the
+    candidate's run has no checkpoint to recover to, so this is
+    NOT_RECOVERABLE (FAILED), not INDETERMINATE. Only two-or-more rows
+    sharing the same event_id inside this partition make the row's identity
+    itself ambiguous -- that is the case this resolver cannot decide and
+    defers to the next sweep instead of guessing or failing the task.
+    """
+
+    if candidate.last_checkpoint_event_id is None:
+        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    query = db.query(TraceEvent).filter(
+        TraceEvent.task_id == candidate.task_id,
+        TraceEvent.build_id.is_(None),
+        TraceEvent.event_id == candidate.last_checkpoint_event_id,
+        TraceEvent.event_type == "system_update_general",
+    )
+    try:
+        row = query.one_or_none()
+    except MultipleResultsFound:
+        logger.warning(
+            "Task %s legacy checkpoint event_id %s matches more than one "
+            "trace_events row; skipping this recovery candidate for the "
+            "next sweep",
+            candidate.task_id,
+            candidate.last_checkpoint_event_id,
+        )
+        # An ambiguity nothing in this process can resolve: every later
+        # sweep re-selects the same candidate and re-hits it. A log line
+        # alone leaves that invisible to monitoring, so it rides /health
+        # until a sweep completes without seeing one.
+        register_degradation(
+            CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+            f"task {candidate.task_id}: legacy checkpoint event_id "
+            f"{candidate.last_checkpoint_event_id} matches more than one row",
+        )
+        return CheckpointRecoveryVerdict.INDETERMINATE
+    if row is None:
+        return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    return (
+        CheckpointRecoveryVerdict.RECOVERABLE
+        if _checkpoint_row_matches_candidate(row, candidate)
+        else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def resolve_checkpoint_recovery(
+    db: Session,
+    candidate: TaskLeaseRecoveryCandidate,
+) -> CheckpointRecoveryVerdict:
+    """Resolve whether the candidate's checkpoint pointer identifies a
+    recoverable checkpoint for its current run.
+
+    Recovery fails closed for events written before run provenance was
+    introduced: an exact pointer alone cannot prove that the checkpoint
+    belongs to the expired run. New-run claims clear both pointer columns
+    before execution starts.
+
+    The exact-row pointer is tried first when set: a hit is authoritative
+    (validated, never searched past). A pointer whose row is gone is not a
+    validation failure -- it is only reachable on a database upgraded
+    without this column's FK (a compatibility-window state, see the
+    migration) -- so it falls back to the legacy string resolution below
+    instead of failing the candidate outright.
+    """
+
+    if candidate.last_checkpoint_trace_event_id is not None:
+        row = db.get(TraceEvent, candidate.last_checkpoint_trace_event_id)
+        if row is not None:
+            return (
+                CheckpointRecoveryVerdict.RECOVERABLE
+                if _checkpoint_row_matches_candidate(row, candidate)
+                else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            )
+        logger.warning(
+            "Task %s checkpoint pointer trace_event_id=%s has no matching "
+            "trace_events row; falling back to the legacy event_id scan",
+            candidate.task_id,
+            candidate.last_checkpoint_trace_event_id,
+        )
+    return _resolve_legacy_checkpoint_recovery(db, candidate)
 
 
 def _nullable_match(column: Any, value: Any) -> Any:
@@ -276,18 +427,40 @@ def lease_state_version_case(
     )
 
 
+def _checkpoint_pointer_clearing_predicate() -> Any:
+    """WHERE condition shared by both checkpoint-pointer SET case() builders:
+    true when the row is not a live RUNNING row with a run id, i.e. when
+    both pointer columns must be cleared.
+
+    Extracted so the legacy and exact-row builders below can never drift
+    apart on which rows clear their pointer -- a per-builder copy would let
+    one column retain a stale pointer the other clears, which would make
+    the recovery CAS fence's conjunction over both columns never match (see
+    test_lease_checkpoint_pointer_case_predicates_match in
+    test_task_lease_service.py).
+    """
+    return or_(
+        task_status_predicate.ne(TaskStatus.RUNNING),
+        Task.run_id.is_(None),
+    )
+
+
 def lease_checkpoint_event_id_case() -> Any:
     """SET last_checkpoint_event_id: clear it when the row is not a live
     RUNNING row with a run id."""
     return case(
-        (
-            or_(
-                task_status_predicate.ne(TaskStatus.RUNNING),
-                Task.run_id.is_(None),
-            ),
-            None,
-        ),
+        (_checkpoint_pointer_clearing_predicate(), None),
         else_=Task.last_checkpoint_event_id,
+    )
+
+
+def lease_checkpoint_trace_event_id_case() -> Any:
+    """SET last_checkpoint_trace_event_id: mirrors
+    lease_checkpoint_event_id_case's clearing condition exactly, so the two
+    pointer columns are always set or cleared together."""
+    return case(
+        (_checkpoint_pointer_clearing_predicate(), None),
+        else_=Task.last_checkpoint_trace_event_id,
     )
 
 
@@ -307,6 +480,7 @@ def _expired_task_lease_candidates_query(
             Task.lease_expires_at,
             Task.state_version,
             Task.last_checkpoint_event_id,
+            Task.last_checkpoint_trace_event_id,
         )
         .filter(
             task_status_predicate.eq(TaskStatus.RUNNING),
@@ -344,6 +518,11 @@ def _task_lease_recovery_candidate_from_row(
         last_checkpoint_event_id=(
             str(row.last_checkpoint_event_id)
             if row.last_checkpoint_event_id is not None
+            else None
+        ),
+        last_checkpoint_trace_event_id=(
+            int(row.last_checkpoint_trace_event_id)
+            if row.last_checkpoint_trace_event_id is not None
             else None
         ),
     )
@@ -424,6 +603,11 @@ def recover_expired_task_lease_no_commit(
         "control_state": control_state_for_status(status).value,
         "state_version": func.coalesce(Task.state_version, 0) + 1,
         "error_message": error_message,
+        # Defence in depth: the column must never outlive the attempt that
+        # wrote it. This writer already NULLs runner_id, so no live fence
+        # depends on the value -- clearing it keeps the column honest for
+        # anyone who reads it directly.
+        "lease_attempt_id": None,
     }
     if status == TaskStatus.FAILED:
         values["output"] = None
@@ -441,6 +625,10 @@ def recover_expired_task_lease_no_commit(
             _nullable_match(
                 Task.last_checkpoint_event_id,
                 candidate.last_checkpoint_event_id,
+            ),
+            _nullable_match(
+                Task.last_checkpoint_trace_event_id,
+                candidate.last_checkpoint_trace_event_id,
             ),
         )
         .values(**values)
@@ -500,6 +688,7 @@ def acquire_task_lease_no_commit(
     now = utc_now()
     expires_at = task_lease_expires_at(now)
     candidate_run_id = expected_run_id or str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
     current_version = func.coalesce(Task.state_version, 0)
     running_control_state = control_state_for_status(TaskStatus.RUNNING).value
     values: dict[str, Any] = {
@@ -514,13 +703,25 @@ def acquire_task_lease_no_commit(
         "state_version": lease_state_version_case(
             TaskStatus.RUNNING, running_control_state, current_version
         ),
+        # A fresh identity for this exact claim. Every successful acquisition
+        # mints a new one; no other writer ever assigns a value here (the
+        # release/recovery writers only clear it). That is precisely what
+        # state_version cannot offer -- _apply_pause_requested_isolated bumps
+        # state_version mid-run without changing attempt ownership, so a
+        # state_version fence pinned at acquisition would reject a legitimate
+        # finalizer that had been paused.
+        "lease_attempt_id": attempt_id,
     }
     if new_run:
         values["last_checkpoint_event_id"] = None
+        values["last_checkpoint_trace_event_id"] = None
         values["output"] = None
         values["error_message"] = None
     elif expected_run_id is None:
         values["last_checkpoint_event_id"] = lease_checkpoint_event_id_case()
+        values["last_checkpoint_trace_event_id"] = (
+            lease_checkpoint_trace_event_id_case()
+        )
 
     stmt = (
         update(Task)
@@ -550,6 +751,7 @@ def acquire_task_lease_no_commit(
         task_id=task_id,
         runner_id=runner,
         run_id=str(stored_run_id) if stored_run_id is not None else None,
+        attempt_id=values["lease_attempt_id"],
     )
 
 
@@ -732,6 +934,7 @@ def release_task_lease_no_commit(
         "state_version": lease_state_version_case(
             status, control_state, current_version
         ),
+        "lease_attempt_id": None,
     }
     if status in _NON_TERMINAL_RELEASE_STATUSES:
         values["error_message"] = None
@@ -779,6 +982,7 @@ def fail_and_release_task_lease_no_commit(
             state_version=func.coalesce(Task.state_version, 0) + 1,
             error_message=error_message,
             output=None,
+            lease_attempt_id=None,
         )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
@@ -812,6 +1016,7 @@ def release_current_runner_task_lease(
             state_version=lease_state_version_case(
                 status, control_state, current_version
             ),
+            lease_attempt_id=None,
         )
     )
     if expected_run_id is not None:

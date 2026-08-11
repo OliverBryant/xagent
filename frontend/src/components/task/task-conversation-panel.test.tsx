@@ -3,9 +3,10 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const appState = vi.hoisted(() => ({
-  messages: [],
+  messages: [] as Array<Record<string, unknown>>,
   traceEvents: [],
-  currentTask: null,
+  currentTask: null as null | Record<string, unknown>,
+  taskRuntimeExtensions: {} as Record<string, Record<string, unknown>>,
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
@@ -108,6 +109,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     showEmptyStatus,
     showProcessView,
     onOpenExecutionPlan,
+    contextBadges,
+    taskRuntimeExtensionMetadata,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -117,6 +120,11 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     showEmptyStatus?: boolean
     showProcessView?: boolean
     onOpenExecutionPlan?: () => void
+    contextBadges?: Array<{ kind: string; label: string; detail: string }>
+    taskRuntimeExtensionMetadata?: {
+      bindings: string[]
+      publicMetadata: Record<string, Record<string, unknown>>
+    }
   }) => (
     <div
       data-testid="chat-message"
@@ -126,6 +134,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-process-status={processStatus || ""}
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
       data-show-process-view={showProcessView ? "true" : "false"}
+      data-context-badges={JSON.stringify(contextBadges || [])}
+      data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -244,9 +254,121 @@ describe("TaskConversationPanel", () => {
     appState.messages = []
     appState.traceEvents = []
     appState.currentTask = null
+    appState.taskRuntimeExtensions = {}
+    appState.taskId = 42
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
+  })
+
+  it("marks user turns with the task's Local browser context", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.taskRuntimeExtensions = {
+      local_browser: { kind: "local_browser" },
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([{
+        kind: "computer_use",
+        label: "chatPage.input.localBrowser.chipLabel",
+        detail: "chatPage.input.localBrowser.label",
+      }]),
+    )
+  })
+
+  it("passes bindings and public metadata through the message extension slot", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect my browser",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.currentTask = {
+      id: "42",
+      runtimeExtensionBindings: ["browser_relay"],
+    }
+    appState.taskRuntimeExtensions = {
+      browser_relay: { kind: "browser_relay", connected: true },
+    }
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({
+        bindings: ["browser_relay"],
+        publicMetadata: {
+          browser_relay: { kind: "browser_relay", connected: true },
+        },
+      }),
+    )
+  })
+
+  it("restores the Computer use badge from the task's persisted binding", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.currentTask = {
+      id: "823",
+      title: "Local browser task",
+      description: "Inspect this window",
+      status: "completed",
+      createdAt: "2026-08-07T07:00:00Z",
+      updatedAt: "2026-08-07T07:01:00Z",
+      runtimeExtensionBindings: ["local_browser"],
+    }
+    appState.taskId = 823
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([{
+        kind: "computer_use",
+        label: "chatPage.input.localBrowser.chipLabel",
+        detail: "chatPage.input.localBrowser.label",
+      }]),
+    )
+  })
+
+  it("does not reuse the previous task's Computer use badge", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Inspect this window",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+    appState.taskId = 824
+    appState.currentTask = {
+      id: "823",
+      title: "Previous local browser task",
+      description: "Inspect another window",
+      status: "completed",
+      createdAt: "2026-08-07T07:00:00Z",
+      updatedAt: "2026-08-07T07:01:00Z",
+      runtimeExtensionBindings: ["local_browser"],
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-context-badges",
+      JSON.stringify([]),
+    )
+    expect(screen.getByTestId("chat-message")).toHaveAttribute(
+      "data-runtime-extension-metadata",
+      JSON.stringify({ bindings: [], publicMetadata: {} }),
+    )
   })
 
   it("disables every file surface and drops staged files when the capability is disabled", async () => {

@@ -34,6 +34,7 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 
 logger = logging.getLogger(__name__)
@@ -46,15 +47,86 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
-    from ..services.gmail_provisioning import (
-        best_effort_provision_gmail_watches_for_user,
-    )
+    """Provision Gmail watches without letting the outcome reach the caller.
 
-    best_effort_provision_gmail_watches_for_user(
-        db,
-        user_id=user_id,
-        context="after OAuth callback",
-    )
+    This runs after the OAuth token is committed, so the connect has already
+    succeeded. Anything raised here would be rendered by the callback's outer
+    handler as an ``Authentication Failed`` 500, telling the user a connector
+    failed while it is in fact connected. A best-effort side effect must not
+    be able to change what the callback returns.
+    """
+    # The module is imported at module level so that a genuine module
+    # resolution failure surfaces at startup instead of being logged here as a
+    # routine provisioning warning. The call stays inside the guard, and going
+    # through the module keeps the attribute lookup late so tests can patch it.
+    try:
+        gmail_provisioning.best_effort_provision_gmail_watches_for_user(
+            db,
+            user_id=user_id,
+            context="after OAuth callback",
+        )
+    except Exception:
+        logger.warning(
+            "Best-effort Gmail watch provisioning failed for user %s "
+            "after OAuth callback",
+            user_id,
+            exc_info=True,
+        )
+
+
+def _run_post_commit_oauth_side_effects(
+    db: Session, *, user_id: Any, connector_key: str
+) -> None:
+    """Run the OAuth callback's post-commit work; never raise.
+
+    ``connector_key`` is the value persisted as ``UserOAuth.provider``: the app
+    id when the connect is app-scoped (``"gmail"``), otherwise the provider
+    name (``"google"``).
+
+    ``user_id`` is the raw ``oauth_state`` claim rather than an ``int`` so that
+    its coercion happens inside the guard below. Coercing it into the argument
+    would put that conversion post-commit but outside the guard, which is the
+    one thing this helper exists to prevent, and would lose the offending value
+    to a 500 instead of logging it.
+
+    Everything here runs once ``db.commit()`` has persisted the OAuth token, so
+    the connect has already succeeded as far as the user is concerned. The
+    callback's outer ``except Exception`` would render anything raised here as
+    an ``Authentication Failed`` 500, reporting a failure for a connector that
+    is in fact connected. That is the bug #1150 reproduced on staging.
+
+    Guarding the region rather than each individual call is what makes that
+    property structural: a side effect added here inherits it, instead of
+    reintroducing #1150 whenever someone forgets to wrap their own call. The
+    inner guards each side effect carries are kept as well, deliberately, so
+    that neither layer is load-bearing on its own.
+
+    One guard over the whole region does couple the side effects to each other:
+    a raiser aborts the ones after it. That is why the inner guards matter and
+    are worth keeping per side effect. Anything added here that must run even
+    when an earlier entry fails needs its own guard, exactly as Gmail
+    provisioning has.
+
+    Response construction stays outside this region on purpose. It also runs
+    after the commit, but a failure there leaves no response to return, so it
+    must keep reaching the outer handler rather than being swallowed here.
+
+    Failures are logged only. That is acceptable while every side effect in
+    this region has its own recovery path: Gmail watches are re-provisioned by
+    ``scan_due_gmail_watch_renewals``. A side effect that a swallowed failure
+    would strand needs a user-visible signal instead.
+    """
+    try:
+        if connector_key == "gmail":
+            _best_effort_ensure_gmail_watches_for_user(db, user_id=int(user_id))
+    except Exception:
+        logger.warning(
+            "Post-commit OAuth side effects failed for user %s on connector %s; "
+            "the connect itself succeeded",
+            user_id,
+            connector_key,
+            exc_info=True,
+        )
 
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
@@ -1468,8 +1540,12 @@ def generic_oauth_callback(
                         )
 
             db.commit()
-            if (app_id or provider) == "gmail":
-                _best_effort_ensure_gmail_watches_for_user(db, user_id=int(user_id))
+            # Everything past the commit belongs in the helper, which cannot
+            # change what this callback returns. Add new post-commit work
+            # there, not here.
+            _run_post_commit_oauth_side_effects(
+                db, user_id=user_id, connector_key=(app_id or provider)
+            )
 
         import json
         from urllib.parse import urlparse

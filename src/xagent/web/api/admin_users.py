@@ -20,10 +20,12 @@ from ..models.task import (
     TraceEvent,
     TraceMessageBlob,
 )
+from ..models.task_interaction import TaskInteractionRequest
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..schemas.user import UserListResponse, UserResponse
 from ..services.model_store import ModelStore
+from ..services.task_interaction_schema import interaction_requests_table_exists
 from ..services.task_runtime import (
     TaskRuntimeExtensionError,
     delete_task_extensions,
@@ -63,10 +65,54 @@ def _purge_user_task_rows(db: Session, *, user_id: int) -> None:
     Ordering matches ``purge_task_rows``: every child row referencing
     ``tasks.id`` goes before the ``tasks`` delete, so the purge stays valid
     under enforced foreign keys regardless of whether the deployment's schema
-    carries ``ON DELETE`` clauses.
+    carries ``ON DELETE`` clauses. ``tasks`` itself is also referenced --
+    ``last_checkpoint_trace_event_id`` FKs to ``trace_events.id`` -- so the
+    pointer columns are NULLed first, before the ``trace_events`` delete
+    below. ``task_interaction_requests`` rows sit on both ordering
+    obligations at once: they reference ``tasks.id`` directly, and their
+    ``resume_trace_event_id`` references ``trace_events.id`` through an
+    ``ON DELETE SET NULL`` that a still-active row's CHECK forbids -- so
+    they must go after the pointer NULL-first and before the
+    ``trace_events`` delete.
+
+    This path holds no lease and takes no row fence, matching how it
+    already treats every other child table; the interaction rows inherit
+    that shape. If a concurrent writer turns a row active between the
+    interaction delete and the ``trace_events`` delete, the failure mode
+    is one loud ``IntegrityError`` (the active-anchor CHECK) rolling back
+    the whole purge transaction with no partial state -- retrying the
+    deletion is the complete remedy.
     """
 
     task_ids = select(Task.id).where(Task.user_id == user_id).scalar_subquery()
+
+    # NULL the checkpoint pointer columns before the trace_events delete
+    # below: a task still pointing at a row would block (or, without
+    # DB-level enforcement, orphan) that delete. A bulk statement, not an
+    # ORM attribute assignment, because this session has autoflush
+    # disabled -- an attribute assignment would not reach the database
+    # until a later flush, by which point the trace_events delete has
+    # already run.
+    db.query(Task).filter(Task.user_id == user_id).update(
+        {
+            Task.last_checkpoint_event_id: None,
+            Task.last_checkpoint_trace_event_id: None,
+        },
+        synchronize_session=False,
+    )
+
+    # Interaction rows go before the trace_events delete below, for the same
+    # reason and with the same consequence as in purge_task_rows: the
+    # resume anchor's ON DELETE SET NULL would otherwise violate
+    # ck_task_interaction_requests_active_anchor on every active row and
+    # fail the whole user deletion.
+    #
+    # A separate statement rather than an entry in the loop below: the loop
+    # is unconditional, and this delete is gated on the table existing.
+    if interaction_requests_table_exists(db):
+        db.query(TaskInteractionRequest).filter(
+            TaskInteractionRequest.task_id.in_(task_ids)
+        ).delete(synchronize_session=False)
 
     # Children without a DB-level ``ON DELETE`` clause -- these are the rows a
     # bare ``DELETE FROM tasks`` would strand or fail on under strict FKs.

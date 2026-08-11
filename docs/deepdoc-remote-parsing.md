@@ -179,46 +179,37 @@ was compared against local CPU `deepdoc-lib` on the same PDF
 | Element count | 52 vs 52 |
 | Split across kinds | 48 text segments, 2 tables, 2 figures on both sides |
 | Type breakdown | `{title: 8, text: 40, table: 2, figure: 2}` on both sides |
+| Element text | 0 differences, verbatim — including both tables' HTML |
 | `layout_type` | 0 differences |
 | `positions` structure | 0 differences; every page number matches |
 | Figure captions | identical |
-| Element text | 6 whitespace/bullet variants, 2 elements ordered differently |
-| Table HTML | differs by one space in each of the two tables |
-| Coordinates | 119 of 192 exact; median delta 0; max 3.3 px |
-| `col_id` | 6-8 elements differ — non-deterministic, see below |
+| Coordinates | max delta 0.0046 px across 208 compared values; none above 0.1 px |
+| `col_id` | 6 elements differ — non-deterministic, see below |
 
-The structure is identical: the same elements, classified the same way, on the
-same pages. What varies is small and worth stating precisely rather than rounding
-to "identical".
+Text, classification, ordering and table HTML come back identical. The only two
+variations are sub-pixel coordinate noise and `col_id`.
+
+**Coordinates agree to within 0.005 px.** Of 208 compared values (`x0`, `x1`,
+`top`, `bottom` across all 52 elements) 14 differ at all, the largest by
+0.004557 px and the average by 0.001 px. Nothing exceeds 0.1 px. This is
+last-digit floating-point divergence between the GPU and CPU ONNX runtimes;
+`positions` drive PDF highlight boxes, where it is far below one screen pixel.
 
 **`col_id` is non-deterministic, and locally so.** `_assign_column` clusters
 x-coordinates with KMeans whose initialization is unseeded (it also emits
 `ConvergenceWarning: Number of distinct clusters (1) found smaller than
 n_clusters` on this document). Running local CPU parsing twice back to back in
-one process flips six elements between column 2 and column 3 with **zero** text
-or coordinate differences — so this is upstream `deepdoc-lib` behavior, not a
-remote artifact, and this integration does not try to correct it.
+one process flips *the same six elements* between column 2 and column 3, with
+zero text and zero coordinate differences between those two local runs. So the
+remote path is exactly as faithful to local output as local output is to itself,
+and this integration does not try to correct the instability.
 
-**Two elements come back in a different order.** On the two-column page, the
-pair at indices 38/39 is swapped relative to local, and likewise 46/47:
-remote element 38 carries exactly local element 39's text and vice versa.
-Because reading order is reconstructed from the column assignment, an unstable
-`col_id` reorders the elements that share a line — the same root cause as above.
-Content is preserved; only sequence moves.
-
-**Six texts differ by whitespace or bullet glyph.** `'4. Images '` vs
-`'4. Images'`, `'· Simple Tables'` vs `'·Simple Tables'`, `'●Complex Tables'`
-vs `'·Complex Tables'`, and three similar. Normalizing whitespace and bullet
-characters makes the two element multisets **exactly equal in both directions**.
-The two tables' HTML differs the same way — a single space. Unlike `col_id`,
-this does *not* reproduce local-vs-local, so it is a real remote/local
-difference attributable to GPU vs CPU ONNX numerics nudging text-line grouping
-in the OCR stage. It changes no token that matters after chunking.
-
-**Coordinates agree to within 3.3 px.** Pairing elements by content, 119 of 192
-compared coordinates are exact and the median delta is 0; the largest is 3.3 px
-on one line. `positions` drive PDF highlight boxes, where a 3 px shift is
-invisible, but "identical" would be the wrong word.
+One consequence worth knowing when comparing runs: because reading order is
+reconstructed from the column assignment, a `col_id` flip can also swap the
+order of elements sharing a line on a multi-column page. Comparing two runs
+element-by-element positionally will then report text differences that are
+really just a reordering. Compare by content, or normalize the order, before
+concluding that text diverged.
 
 The earlier design of this document listed a capability gap — no table HTML, no
 images, no paragraph merging, no cross-page coordinates — that applied to an

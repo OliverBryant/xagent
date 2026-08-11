@@ -329,6 +329,18 @@ def _normalize_elements(
                 f"Remote DeepDoc element {index} is missing "
                 f"{', '.join(repr(key) for key in missing)}"
             )
+        # Reject a present-but-null or wrongly-typed value here rather than
+        # letting it reach the translator, where it would surface as a pydantic
+        # ValidationError -- an exception the caller does not catch, so the
+        # local fallback would be skipped and the whole parse would fail.
+        wrong_type = [
+            key for key in ("type", "text") if not isinstance(element[key], str)
+        ]
+        if wrong_type:
+            raise ValueError(
+                f"Remote DeepDoc element {index} has non-string "
+                f"{', '.join(repr(key) for key in wrong_type)}"
+            )
 
         normalized_element = dict(element)
         image_base64 = normalized_element.pop("image_base64", None)

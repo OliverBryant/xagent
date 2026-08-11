@@ -1084,6 +1084,16 @@ class TestNormalizeElements:
             pytest.param({"elements": [42]}, id="element-int"),
             pytest.param({"elements": [{"type": "text"}]}, id="missing-text"),
             pytest.param({"elements": [{"text": "x"}]}, id="missing-type"),
+            # Present-but-null and wrongly-typed values must be rejected here.
+            # Left through, they reach the translator and raise a pydantic
+            # ValidationError, which the caller does not catch -- so the local
+            # fallback would be skipped and the whole parse would fail.
+            pytest.param({"elements": [{"type": None, "text": "x"}]}, id="null-type"),
+            pytest.param(
+                {"elements": [{"type": "text", "text": None}]}, id="null-text"
+            ),
+            pytest.param({"elements": [{"type": 1, "text": "x"}]}, id="int-type"),
+            pytest.param({"elements": [{"type": "text", "text": 1}]}, id="int-text"),
         ],
     )
     def test_malformed_payloads_raise_value_error(self, payload: Any) -> None:

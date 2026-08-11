@@ -260,14 +260,17 @@ def _translate_remote_elements(
         if not isinstance(element_metadata, dict):
             element_metadata = {}
 
-        layout_type = element.get("type", "text")
+        # `or` rather than a .get() default: the server may send an explicit
+        # null, which .get() would hand straight through as None and blow up
+        # ParsedTextSegment validation downstream.
+        layout_type = element.get("type") or "text"
         # Reshape into the bbox dict the local helpers expect. The metadata keys
         # are flattened in so _build_element_metadata can pick up
         # positions/col_id/page_number where the server reported them.
         bbox: Dict[str, Any] = {
             **element_metadata,
             "layout_type": layout_type,
-            "text": element.get("text", ""),
+            "text": element.get("text") or "",
             "image": element.get("image"),
         }
         base_metadata = _build_element_metadata(bbox, doc_id, **kwargs)

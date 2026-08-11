@@ -963,3 +963,33 @@ class TestTranslateRemoteElements:
         assert image_path.is_file()
         assert image_path.read_bytes() == b"fake png bytes"
         assert isolate_artifacts_dir in image_path.parents
+
+
+class TestTranslatorToleratesNullFields:
+    """The translator must not crash on an explicit null `type` or `text`.
+
+    The client rejects those before they get here, so this is the second layer:
+    a `.get(key, default)` would hand a present-but-null value straight through,
+    and `ParsedTextSegment` would then raise a pydantic ValidationError — which
+    the remote branch does not catch, so the local fallback would be skipped.
+    """
+
+    def test_null_type_and_text_degrade_to_empty_text_segment(self) -> None:
+        """A null `type` reads as text and a null `text` as the empty string."""
+        result = deepdoc_module._translate_remote_elements(
+            "null-doc",
+            [
+                {
+                    "type": None,
+                    "text": None,
+                    "image": None,
+                    "metadata": {"page_number": 1},
+                }
+            ],
+        )
+
+        assert len(result.text_segments) == 1
+        assert result.text_segments[0].text == ""
+        assert result.text_segments[0].metadata["layout_type"] == "text"
+        assert not result.tables
+        assert not result.figures

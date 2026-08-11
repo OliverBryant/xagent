@@ -175,30 +175,6 @@ def remote_pdf_elements() -> List[Dict[str, Any]]:
     ]
 
 
-def remote_docx_elements() -> List[Dict[str, Any]]:
-    """Canned remote response for a DOCX: styled paragraphs plus a table."""
-    return [
-        {
-            "type": "text",
-            "text": "Remote DOCX heading",
-            "image": None,
-            "metadata": {"style": "Heading 1"},
-        },
-        {
-            "type": "text",
-            "text": "Remote DOCX body",
-            "image": None,
-            "metadata": {"style": "Normal"},
-        },
-        {
-            "type": "table",
-            "text": "<table><tr><td>docx</td></tr></table>",
-            "image": None,
-            "metadata": {},
-        },
-    ]
-
-
 # ==========================================
 # ROUTING: REMOTE SUCCESS
 # ==========================================
@@ -254,52 +230,12 @@ class TestRemoteRoutingSuccess:
         assert result.metadata["parse_method"] == "deepdoc"
 
     @pytest.mark.asyncio
-    async def test_docx_goes_remote_without_local_parser(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
-    ) -> None:
-        """Remote routing is not PDF-only: .docx goes remote too."""
-        docx_file = tmp_path / "remote.docx"
-        # A ZIP magic header, so the cheap Open XML pre-check passes without
-        # needing a real DOCX on disk.
-        docx_file.write_bytes(b"PK\x03\x04 not really a docx")
-
-        arm_local_parser_tripwire(monkeypatch)
-
-        recorded: Dict[str, Any] = {}
-
-        def fake_parse_document_remote(
-            file_path: Any, **kwargs: Any
-        ) -> List[Dict[str, Any]]:
-            recorded["file_path"] = file_path
-            recorded.update(kwargs)
-            return remote_docx_elements()
-
-        monkeypatch.setattr(
-            deepdoc_remote, "parse_document_remote", fake_parse_document_remote
-        )
-
-        parser = DeepDocParser()
-        result = await parser.parse(str(docx_file), doc_id="remote_docx_doc")
-
-        assert recorded["ext"] == ".docx"
-        assert [segment.text for segment in result.text_segments] == [
-            "Remote DOCX heading",
-            "Remote DOCX body",
-        ]
-        # The DOCX-specific metadata key survives the remote translation.
-        assert result.text_segments[0].metadata["style"] == "Heading 1"
-        assert result.text_segments[1].metadata["style"] == "Normal"
-        assert len(result.tables) == 1
-        assert result.metadata["deepdoc_backend"] == "remote"
-        assert result.metadata["file_type"] == ".docx"
-
-    @pytest.mark.asyncio
     async def test_remote_success_reports_progress(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
     ) -> None:
-        """Remote mode wires the progress adapter for every format, not just PDF."""
-        txt_file = tmp_path / "remote.txt"
-        txt_file.write_text("local text that must never be read", encoding="utf-8")
+        """Remote mode wires the progress adapter through to the remote client."""
+        pdf_file = tmp_path / "remote_progress.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
 
         arm_local_parser_tripwire(monkeypatch)
 
@@ -311,7 +247,7 @@ class TestRemoteRoutingSuccess:
             )
             callback(0.05, "Uploading document to remote DeepDoc server")
             callback(1.0, "Remote DeepDoc parse finished (0.12s)")
-            return [{"type": "text", "text": "remote txt", "image": None}]
+            return [{"type": "text", "text": "remote page", "image": None}]
 
         monkeypatch.setattr(
             deepdoc_remote, "parse_document_remote", fake_parse_document_remote
@@ -320,11 +256,11 @@ class TestRemoteRoutingSuccess:
         progress = RecordingProgressCallback()
         parser = DeepDocParser()
         result = await parser.parse(
-            str(txt_file), progress_callback=progress, doc_id="remote_txt_doc"
+            str(pdf_file), progress_callback=progress, doc_id="remote_progress_doc"
         )
 
         assert result.metadata["deepdoc_backend"] == "remote"
-        assert [segment.text for segment in result.text_segments] == ["remote txt"]
+        assert [segment.text for segment in result.text_segments] == ["remote page"]
         # The adapter strips the timing suffix, matching local DeepDoc's shape.
         assert progress.statuses == [
             "Uploading document to remote DeepDoc server",
@@ -332,27 +268,23 @@ class TestRemoteRoutingSuccess:
         ]
 
     @pytest.mark.asyncio
-    async def test_remote_bytesio_goes_remote_without_local_parser(
+    async def test_pdf_bytesio_goes_remote_without_local_parser(
         self, monkeypatch: pytest.MonkeyPatch, remote_configured: str
     ) -> None:
-        """An in-memory spreadsheet also routes remote, with no local parse."""
+        """An in-memory PDF also routes remote, with no local parse."""
         arm_local_parser_tripwire(monkeypatch)
 
         def fake_parse_document_remote(
             file_path: Any, **kwargs: Any
         ) -> List[Dict[str, Any]]:
             assert isinstance(file_path, BytesIO)
-            assert kwargs["ext"] == ".xlsx"
+            assert kwargs["ext"] == ".pdf"
             return [
                 {
                     "type": "text",
-                    "text": "Name: Ada | Role: Engineer",
+                    "text": "In-memory remote paragraph",
                     "image": None,
-                    "metadata": {
-                        "sheet_name": "Sheet1",
-                        "row_number": 2,
-                        "row_type": "data",
-                    },
+                    "metadata": {"layout_type": "text", "page_number": 1},
                 }
             ]
 
@@ -362,17 +294,119 @@ class TestRemoteRoutingSuccess:
 
         parser = DeepDocParser()
         result = await parser._parse_impl(
-            BytesIO(b"not really an xlsx"),
-            file_ext=".xlsx",
-            doc_id="remote_xlsx_doc",
+            BytesIO(b"%PDF-1.4 not really a pdf"),
+            file_ext=".pdf",
+            doc_id="remote_bytesio_pdf_doc",
         )
 
         assert result.metadata["deepdoc_backend"] == "remote"
         assert result.metadata["source"] == "memory_buffer"
-        assert len(result.text_segments) == 1
-        assert result.text_segments[0].metadata["sheet_name"] == "Sheet1"
-        assert result.text_segments[0].metadata["row_number"] == 2
-        assert result.text_segments[0].metadata["row_type"] == "data"
+        assert [segment.text for segment in result.text_segments] == [
+            "In-memory remote paragraph"
+        ]
+
+
+# ==========================================
+# ROUTING: NON-PDF NEVER GOES REMOTE
+# ==========================================
+
+
+class TestNonPdfStaysLocal:
+    """``task=parse`` consumes PDFs only, so nothing else may attempt a round trip.
+
+    Before the gate existed, a configured remote server made every format upload
+    itself just to be rejected -- a ``.docx`` bought a 500 before falling back to
+    the same local parse that would have run anyway. These tests pin the gate by
+    arming the remote client as a tripwire: any HTTP attempt is a test failure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_docx_never_calls_remote(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
+    ) -> None:
+        """The known-gap case: a .docx must reach the local parser directly."""
+        docx_file = tmp_path / "local.docx"
+        # A ZIP magic header, so the cheap Open XML pre-check passes without
+        # needing a real DOCX on disk.
+        docx_file.write_bytes(b"PK\x03\x04 not really a docx")
+
+        arm_remote_tripwire(monkeypatch)
+
+        # The .docx branch dispatches on isinstance(parser, DoclingParser), so
+        # the stand-in has to be one; only parse_docx is exercised.
+        class FakeDocxParser(deepdoc_module.DeepDocDoclingParser):  # type: ignore[misc]
+            def __init__(self) -> None:
+                pass
+
+            def check_installation(self) -> bool:
+                return True
+
+            def parse_docx(self, file_path: Any, **kwargs: Any) -> Any:
+                return ([("Local DOCX body", "Normal")], [])
+
+        monkeypatch.setattr(
+            DeepDocParser, "_get_parser_for_ext", lambda self, ext: FakeDocxParser()
+        )
+
+        parser = DeepDocParser()
+        result = await parser.parse(str(docx_file), doc_id="local_docx_doc")
+
+        assert [segment.text for segment in result.text_segments] == ["Local DOCX body"]
+        # _translate_docx_output carries the metadata on the segments rather than
+        # on the ParseResult, so that is where the backend marker lands.
+        assert result.text_segments[0].metadata["deepdoc_backend"] == "local"
+        assert result.text_segments[0].metadata["file_type"] == ".docx"
+
+    @pytest.mark.asyncio
+    async def test_txt_never_calls_remote(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
+    ) -> None:
+        """A plain-text file is read locally; the remote server never hears about it."""
+        txt_file = tmp_path / "local.txt"
+        txt_file.write_text("Local text content", encoding="utf-8")
+
+        arm_remote_tripwire(monkeypatch)
+
+        parser = DeepDocParser()
+        result = await parser.parse(str(txt_file), doc_id="local_txt_doc")
+
+        assert [segment.text for segment in result.text_segments] == [
+            "Local text content"
+        ]
+        # _translate_text_output carries the metadata on the segments rather than
+        # on the ParseResult, so that is where the backend marker lands.
+        assert result.text_segments[0].metadata["deepdoc_backend"] == "local"
+        assert result.text_segments[0].metadata["file_type"] == ".txt"
+
+    @pytest.mark.asyncio
+    async def test_xlsx_bytesio_never_calls_remote(
+        self, monkeypatch: pytest.MonkeyPatch, remote_configured: str
+    ) -> None:
+        """An in-memory spreadsheet goes straight to the openpyxl row reader."""
+        arm_remote_tripwire(monkeypatch)
+        arm_local_parser_tripwire(monkeypatch)
+
+        def fake_parse_xlsx_rows(file_path: Any, **kwargs: Any) -> Any:
+            from xagent.providers.pdf_parser.base import ParsedTextSegment, ParseResult
+
+            return ParseResult(
+                text_segments=[
+                    ParsedTextSegment(text="local xlsx row", metadata=dict(kwargs))
+                ],
+                metadata=dict(kwargs),
+            )
+
+        monkeypatch.setattr(deepdoc_module, "_parse_xlsx_rows", fake_parse_xlsx_rows)
+
+        parser = DeepDocParser()
+        result = await parser._parse_impl(
+            BytesIO(b"not really an xlsx"),
+            file_ext=".xlsx",
+            doc_id="local_xlsx_doc",
+        )
+
+        assert [segment.text for segment in result.text_segments] == ["local xlsx row"]
+        assert result.metadata["deepdoc_backend"] == "local"
 
 
 # ==========================================
@@ -492,14 +526,12 @@ class TestRemoteFailureFallsBackToLocal:
         )
 
     @pytest.mark.asyncio
-    async def test_remote_error_falls_back_to_local_xlsx(
+    async def test_remote_error_falls_back_for_an_in_memory_pdf(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
         remote_configured: str,
     ) -> None:
-        """The .xlsx fallback reaches the openpyxl row reader, not a DeepDoc parser."""
-        arm_local_parser_tripwire(monkeypatch)
+        """A BytesIO PDF falls back too, and the buffer is still readable locally."""
 
         def failing_parse_document_remote(*args: Any, **kwargs: Any) -> Any:
             raise DeepDocRemoteError("Remote DeepDoc returned an unusable response")
@@ -508,30 +540,26 @@ class TestRemoteFailureFallsBackToLocal:
             deepdoc_remote, "parse_document_remote", failing_parse_document_remote
         )
 
-        recorded: Dict[str, Any] = {}
-
-        def fake_parse_xlsx_rows(file_path: Any, **kwargs: Any) -> Any:
-            recorded.update(kwargs)
-            from xagent.providers.pdf_parser.base import ParsedTextSegment, ParseResult
-
-            return ParseResult(
-                text_segments=[
-                    ParsedTextSegment(text="local xlsx row", metadata=dict(kwargs))
-                ],
-                metadata=dict(kwargs),
-            )
-
-        monkeypatch.setattr(deepdoc_module, "_parse_xlsx_rows", fake_parse_xlsx_rows)
-
-        parser = DeepDocParser()
-        result = await parser._parse_impl(
-            BytesIO(b"not really an xlsx"),
-            file_ext=".xlsx",
-            doc_id="fallback_xlsx_doc",
+        fake_parser = FakeLocalParser(
+            [{"layout_type": "text", "text": "Local in-memory paragraph"}]
+        )
+        monkeypatch.setattr(
+            DeepDocParser, "_get_parser_for_ext", lambda self, ext: fake_parser
         )
 
-        assert recorded["deepdoc_backend"] == "local"
-        assert [segment.text for segment in result.text_segments] == ["local xlsx row"]
+        stream = BytesIO(b"%PDF-1.4 not really a pdf")
+        parser = DeepDocParser()
+        result = await parser._parse_impl(
+            stream,
+            file_ext=".pdf",
+            doc_id="fallback_bytesio_pdf_doc",
+        )
+
+        assert [segment.text for segment in result.text_segments] == [
+            "Local in-memory paragraph"
+        ]
+        assert result.metadata["deepdoc_backend"] == "local"
+        assert fake_parser.calls[0]["file_path"] is stream
 
 
 # ==========================================
@@ -734,70 +762,88 @@ class TestTranslateRemoteElements:
             [3, 1, 300.0, 590.0, 0.0, 60.0],
         ]
 
-    def test_xlsx_shaped_elements_carry_row_metadata(self) -> None:
-        """Spreadsheet metadata keys survive translation, matching local xlsx rows."""
-        kwargs = {
-            "source": "remote.xlsx",
-            "file_type": ".xlsx",
-            "parse_method": "deepdoc",
-            "deepdoc_backend": "remote",
-        }
-        elements = [
-            {
-                "type": "text",
-                "text": "[Sheet1] Quarterly report",
-                "image": None,
-                "metadata": {
-                    "sheet_name": "Sheet1",
-                    "row_number": 1,
-                    "row_type": "title",
-                },
-            },
-            {
-                "type": "text",
-                "text": "Name | Role",
-                "image": None,
-                "metadata": {
-                    "sheet_name": "Sheet1",
-                    "row_number": 2,
-                    "row_type": "header",
-                },
-            },
-            {
-                "type": "text",
-                "text": "Name: Ada | Role: Engineer",
-                "image": None,
-                "metadata": {
-                    "sheet_name": "Sheet1",
-                    "row_number": 3,
-                    "row_type": "data",
-                },
-            },
-        ]
+    def test_title_elements_become_text_segments(self) -> None:
+        """``title`` is a real server layout type, and must not be dropped."""
+        result = _translate_remote_elements(
+            "title_doc",
+            [
+                {
+                    "type": "title",
+                    "text": "Sample Document",
+                    "image": None,
+                    "metadata": {
+                        "layout_type": "title",
+                        "page_number": 1,
+                        "col_id": 0,
+                        "positions": [[1, 70.7, 256.3, 77.3, 96.3]],
+                    },
+                }
+            ],
+            **self.base_kwargs(),
+        )
 
-        result = _translate_remote_elements("xlsx_doc", elements, **kwargs)
-
+        assert [segment.text for segment in result.text_segments] == ["Sample Document"]
+        assert result.text_segments[0].metadata["layout_type"] == "title"
         assert result.tables == []
         assert result.figures == []
-        assert len(result.text_segments) == 3
-        assert [segment.metadata["row_type"] for segment in result.text_segments] == [
-            "title",
-            "header",
-            "data",
+
+    def test_raw_bbox_coordinates_survive_translation(self) -> None:
+        """x0/x1/top/bottom and layoutno reach the segment metadata untouched."""
+        result = _translate_remote_elements(
+            "coords_doc",
+            [
+                {
+                    "type": "text",
+                    "text": "Positioned paragraph",
+                    "image": None,
+                    "metadata": {
+                        "x0": 70.666,
+                        "x1": 256.333,
+                        "top": 77.333,
+                        "bottom": 96.333,
+                        "layoutno": "text-3",
+                        "layout_type": "text",
+                        "page_number": 1,
+                    },
+                }
+            ],
+            **self.base_kwargs(),
+        )
+
+        metadata = result.text_segments[0].metadata
+        assert metadata["x0"] == 70.666
+        assert metadata["bottom"] == 96.333
+        assert metadata["layoutno"] == "text-3"
+
+    def test_absent_col_id_defaults_to_zero(self) -> None:
+        """The server omits ``col_id`` on some elements; translation must not fail.
+
+        ``_assign_column`` only labels elements it assigned to a column, so the
+        key is legitimately missing on tables and figures reinserted into the
+        text flow. The local translator defaults those to column 0 and so must
+        this one.
+        """
+        result = _translate_remote_elements(
+            "no_col_id_doc",
+            [
+                {
+                    "type": "table",
+                    "text": "<table><tr><td>T</td></tr></table>",
+                    "image": None,
+                    "metadata": {
+                        "layout_type": "table",
+                        "page_number": 2,
+                        "positions": [[2, 20.0, 400.0, 50.0, 200.0]],
+                    },
+                }
+            ],
+            **self.base_kwargs(),
+        )
+
+        assert result.tables[0].metadata["col_id"] == 0
+        assert result.tables[0].metadata["positions"] == [
+            [2, 0, 20.0, 400.0, 50.0, 200.0]
         ]
-        assert [segment.metadata["row_number"] for segment in result.text_segments] == [
-            1,
-            2,
-            3,
-        ]
-        for segment in result.text_segments:
-            assert segment.metadata["sheet_name"] == "Sheet1"
-            # The local xlsx translator emits no positions, and neither does this.
-            assert "positions" not in segment.metadata
-            # Shared metadata from kwargs is merged into every segment.
-            assert segment.metadata["source"] == "remote.xlsx"
-            assert segment.metadata["deepdoc_backend"] == "remote"
-            assert segment.metadata["doc_id"] == "xlsx_doc"
 
     def test_unknown_element_type_degrades_to_text(self) -> None:
         """A future element type must become a text segment, never be dropped."""

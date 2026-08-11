@@ -1,64 +1,64 @@
-"""HTTP client for offloading DeepDoc document parsing to a remote Xinference server.
+"""HTTP client for offloading DeepDoc PDF parsing to a remote Xinference server.
 
-Set ``XAGENT_DEEPDOC_XINFERENCE_URL`` to route every format ``DeepDocParser``
-supports to a GPU host instead of running local ONNX inference. Any failure
-raises :class:`DeepDocRemoteError`, which the caller treats as "fall back to
-local parsing" -- fallback is always on, which is what makes the switch
-transparent.
+Set ``XAGENT_DEEPDOC_XINFERENCE_URL`` to route PDF parsing to a GPU host
+instead of running local ONNX inference. Any failure raises
+:class:`DeepDocRemoteError`, which the caller treats as "fall back to local
+parsing" -- fallback is always on, which is what makes the switch transparent.
 
 This module deliberately depends on nothing but ``httpx`` and
 ``xagent.config``. In particular it must not import ``deepdoc.py``: the
 image-saving function is injected by the caller instead, which keeps the import
 graph acyclic and lets the client be tested without loading any parser.
 
-Proposed server API contract (v1)
----------------------------------
+Server API contract
+-------------------
 
-Xinference has no DeepDoc serving capability today; the endpoint below is a
-proposal tracked alongside this client, mirrored from
-``docs/deepdoc-remote-parsing.md`` section 6.
+Xinference serves DeepDoc's whole-document pipeline as ``task="parse"`` on the
+OCR endpoint (xorbitsai/inference#5299). One request runs
+``parse_into_bboxes()`` over the entire PDF server-side, so there is nothing to
+stitch together on this side.
 
 .. code-block:: text
 
-    POST {base_url}/v1/document/parse
-    Authorization: Bearer <api_key>          # omitted when the client has no key
+    POST {base_url}/v1/images/ocr
+    Authorization: Bearer <token>            # omitted when unauthenticated
 
     Request (multipart/form-data):
-      file         binary  required            original file; filename preserved
-                                               (server dispatches on the extension)
-      zoomin       int     default 3           PDF only, forwarded to parse_into_bboxes
-      image_scope  str     default table_figure    table_figure | all | none
+      model   str     required            launched DeepDoc model UID
+      image   binary  required            the PDF itself, sent as application/pdf
+      kwargs  str     required            JSON object: {"task": "parse", ...}
 
     Response 200 application/json:
     {
-      "filename": "report.pdf",
-      "file_type": ".pdf",
-      "elapsed_ms": 45210,
+      "task": "parse",
       "elements": [
         {
-          "type": "text",              // "text" | "table" | "figure"
-          "text": "...",               // HTML for tables, matching local behavior
-          "image_base64": null,        // PNG base64 for table/figure, null otherwise
-          "metadata": { ... }          // format specific, see the doc
+          "type": "title",               // text | title | table | figure
+          "text": "...",                 // complete HTML for tables
+          "image_base64": "...",         // omitted when the element has no crop
+          "metadata": {"x0": 70.7, "x1": 256.3, "top": 77.3, "bottom": 96.3,
+                       "page_number": 1, "layout_type": "title",
+                       "layoutno": "title-0", "col_id": 0,
+                       "positions": [[1, 70.7, 256.3, 77.3, 96.3]]}
         }
       ]
     }
 
-    Errors: 400 invalid/unsupported file, 401 auth failure, 413 file too large,
-            500 inference failure. Body is always {"detail": "..."}.
+    Errors: 400 non-PDF upload, invalid kwargs, or a render exceeding the
+            200 MP per-page / 1 GP per-document budget; 401 auth failure;
+            500 inference failure.
 
-Per-format server behavior and the ``metadata`` keys each format must supply
-are tabulated in the requirements doc. The intent is semantic parity with
-xagent's local parsing so remote and local results stay interchangeable when
-fallback kicks in: ``.pdf`` comes from ``parse_into_bboxes(zoomin)`` and
-carries ``page_number``, ``x0``, ``x1``, ``top``, ``bottom``, ``layout_type``,
-``col_id`` and ``positions``; ``.xlsx`` emits one element per row with
-``sheet_name``, ``row_number`` and ``row_type``; the remaining formats follow
-their local counterparts.
+Three details of that contract drive the code below:
 
-Only ``table`` and ``figure`` elements carry an image, because that is all the
-downstream translation consumes -- stripping text-element crops cuts the
-payload substantially.
+* ``task="parse"`` consumes a PDF, not a page image, and rejects ``pages`` and
+  ``dpi``. Only PDFs may be sent, which is why the caller gates on the
+  extension before calling in.
+* ``image_base64`` is *omitted* for elements without a crop rather than sent as
+  ``null``, and ``col_id`` is absent on elements the pipeline never assigned to
+  a column. Both are read with that in mind.
+* Coordinates in ``metadata`` accumulate across pages, matching what local
+  ``parse_into_bboxes`` produces, so the translated result stays interchangeable
+  with local output when fallback kicks in.
 """
 
 from __future__ import annotations
@@ -76,32 +76,41 @@ import httpx
 
 from ...config import (
     get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_model_uid,
+    get_deepdoc_xinference_password,
     get_deepdoc_xinference_timeout_seconds,
     get_deepdoc_xinference_url,
+    get_deepdoc_xinference_username,
 )
 
 logger = logging.getLogger(__name__)
 
-PARSE_ENDPOINT = "/v1/document/parse"
+PARSE_ENDPOINT = "/v1/images/ocr"
+TOKEN_ENDPOINT = "/token"
+
+# The only format ``task="parse"`` accepts. The caller gates on this too, so a
+# non-PDF never reaches the network; the constant keeps both checks honest.
+SUPPORTED_EXTENSION = ".pdf"
+PDF_MIME_TYPE = "application/pdf"
+
+# Only table and figure elements carry an image downstream, so asking for the
+# other crops would inflate the response for nothing. This is the server
+# default as well, sent explicitly so the payload does not change under us.
+IMAGE_SCOPE = "table_figure"
+
+# The server's own cap on the render scale (``MAX_PARSE_ZOOMIN`` there). Above
+# it a request is refused outright, so the value is mirrored rather than
+# discovered by a 400.
+MAX_ZOOMIN = 6
 
 # Connecting to and writing headers against a reachable host is fast; only the
 # parse itself is slow, so the connect/pool budgets stay short regardless of
 # how long the configured read timeout is.
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _POOL_TIMEOUT_SECONDS = 10.0
-
-_MIME_TYPES = {
-    ".pdf": "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ".xls": "application/vnd.ms-excel",
-    ".csv": "text/csv",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-    ".json": "application/json",
-    ".html": "text/html",
-}
-_DEFAULT_MIME_TYPE = "application/octet-stream"
+# The token exchange is a database lookup, not inference, so it gets its own
+# short budget instead of the whole-document read timeout.
+_TOKEN_TIMEOUT_SECONDS = 30.0
 
 ProgressCallback = Callable[[float, str], None]
 SaveImage = Callable[[bytes], str]
@@ -132,44 +141,101 @@ def is_remote_configured() -> bool:
         return False
 
 
-def _build_headers() -> dict[str, str]:
-    """Return the auth headers, which are empty when no API key is configured."""
+def _fetch_jwt(
+    base_url: str,
+    username: str,
+    password: str,
+    transport: Optional[httpx.BaseTransport],
+) -> str:
+    """Exchange credentials for a bearer token at ``POST /token``.
+
+    Raises:
+        httpx.HTTPError: On any transport failure or non-2xx status.
+        ValueError: If the response carries no usable ``access_token``.
+    """
+    with httpx.Client(
+        timeout=httpx.Timeout(_TOKEN_TIMEOUT_SECONDS), transport=transport
+    ) as client:
+        response = client.post(
+            f"{base_url}{TOKEN_ENDPOINT}",
+            json={"username": username, "password": password},
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token:
+        raise ValueError("Remote DeepDoc token response carried no 'access_token'")
+    return token
+
+
+def _build_headers(
+    base_url: str, transport: Optional[httpx.BaseTransport]
+) -> dict[str, str]:
+    """Return the auth headers for a parse request.
+
+    A configured username/password pair is exchanged for a short-lived JWT;
+    otherwise a configured API key is sent as the bearer token directly.
+    Xinference accepts either, and an unauthenticated cluster needs neither, so
+    an empty mapping is a valid result.
+    """
+    username = get_deepdoc_xinference_username()
+    password = get_deepdoc_xinference_password()
+    if username and password:
+        return {
+            "Authorization": f"Bearer {_fetch_jwt(base_url, username, password, transport)}"
+        }
+
     api_key = get_deepdoc_xinference_api_key()
     if api_key:
         return {"Authorization": f"Bearer {api_key}"}
     return {}
 
 
-def _mime_type_for(ext: str) -> str:
-    """Return the MIME type to advertise for ``ext``."""
-    return _MIME_TYPES.get(ext.lower(), _DEFAULT_MIME_TYPE)
-
-
-def _post_document(
+def _post_pdf(
     file_path: str | BytesIO,
     *,
     ext: str,
     zoomin: int,
     transport: Optional[httpx.BaseTransport],
 ) -> dict[str, Any]:
-    """Upload the document and return the decoded JSON response body.
+    """Upload the PDF for ``task="parse"`` and return the decoded JSON body.
 
     Args:
-        file_path: Path to the original file, or its bytes in memory.
-        ext: Lower-cased file extension, used for the MIME type and for the
-            synthetic filename of an in-memory document.
+        file_path: Path to the PDF, or its bytes in memory.
+        ext: Lower-cased file extension. Only ``".pdf"`` is accepted, because
+            that is all ``task="parse"`` can consume.
         zoomin: PDF render scale forwarded to the server.
         transport: Optional transport override. This is the seam tests use to
             install an ``httpx.MockTransport`` instead of reaching the network.
 
     Raises:
         httpx.HTTPError: On any transport failure or non-2xx status.
-        ValueError: If the body is not JSON, or is JSON but not an object.
+        ValueError: If remote mode is unconfigured, the extension is not
+            ``.pdf``, ``zoomin`` is out of range, or the body is not a JSON
+            object.
         OSError: If a file path cannot be read.
     """
     base_url = get_deepdoc_xinference_url()
     if base_url is None:
         raise ValueError("Remote DeepDoc parsing is not configured")
+    if ext.lower() != SUPPORTED_EXTENSION:
+        raise ValueError(
+            f"Remote DeepDoc parsing supports {SUPPORTED_EXTENSION} only, got {ext!r}"
+        )
+    # The server rejects anything outside this range with a 400. Checking here
+    # costs nothing and saves uploading a whole PDF only to have it refused --
+    # and the local parser accepts the value regardless, so the fallback still
+    # honors what the caller asked for.
+    if (
+        not isinstance(zoomin, int)
+        or isinstance(zoomin, bool)
+        or not 1 <= zoomin <= MAX_ZOOMIN
+    ):
+        raise ValueError(
+            f"Remote DeepDoc zoomin must be an integer between 1 and {MAX_ZOOMIN}, "
+            f"got {zoomin!r}"
+        )
 
     timeout_seconds = float(get_deepdoc_xinference_timeout_seconds())
     timeout = httpx.Timeout(
@@ -178,16 +244,25 @@ def _post_document(
         write=timeout_seconds,
         pool=_POOL_TIMEOUT_SECONDS,
     )
-    data = {"zoomin": str(zoomin)}
-    mime_type = _mime_type_for(ext)
+    # The server parses this field as JSON, so the whole task configuration
+    # travels as one string rather than as sibling form fields.
+    data = {
+        "model": get_deepdoc_xinference_model_uid(),
+        "kwargs": json.dumps(
+            {"task": "parse", "zoomin": zoomin, "image_scope": IMAGE_SCOPE}
+        ),
+    }
+    # The token exchange happens before the upload so a rejected credential
+    # costs nothing; it shares the caller's transport for testability.
+    headers = _build_headers(base_url, transport)
 
     def _send(filename: str, fh: Any) -> dict[str, Any]:
         with httpx.Client(timeout=timeout, transport=transport) as client:
             response = client.post(
                 f"{base_url}{PARSE_ENDPOINT}",
-                headers=_build_headers(),
+                headers=headers,
                 data=data,
-                files={"file": (filename, fh, mime_type)},
+                files={"image": (filename, fh, PDF_MIME_TYPE)},
             )
             response.raise_for_status()
             payload = response.json()
@@ -220,7 +295,9 @@ def _normalize_elements(
     Each element's ``image_base64`` is replaced by an ``image`` key holding the
     path string of the saved file, or ``None`` when the element carries no
     image. A path string is exactly what the caller's existing image handling
-    already accepts, so no downstream change is needed.
+    already accepts, so no downstream change is needed. The field is omitted
+    rather than nulled for elements without a crop, so its absence is the
+    normal case and not an error.
 
     Args:
         payload: Decoded response body.
@@ -283,11 +360,11 @@ def parse_document_remote(
     zoomin: int = 3,
     _transport: Optional[httpx.BaseTransport] = None,
 ) -> list[dict[str, Any]]:
-    """Parse a document on the remote DeepDoc server.
+    """Parse a PDF on the remote DeepDoc server in a single ``task=parse`` call.
 
     Args:
-        file_path: Path to the original file, or its bytes in memory.
-        ext: File extension of the document, for example ``".pdf"``.
+        file_path: Path to the PDF, or its bytes in memory.
+        ext: File extension of the document. Only ``".pdf"`` is supported.
         save_image: Writes decoded image bytes and returns the resulting path.
             Injected by the caller so this module stays independent of the
             parser that owns the artifact directory layout.
@@ -309,9 +386,7 @@ def parse_document_remote(
         callback(0.05, "Uploading document to remote DeepDoc server")
 
     try:
-        payload = _post_document(
-            file_path, ext=ext, zoomin=zoomin, transport=_transport
-        )
+        payload = _post_pdf(file_path, ext=ext, zoomin=zoomin, transport=_transport)
         elements = _normalize_elements(payload, save_image)
     except httpx.HTTPError as exc:
         raise DeepDocRemoteError(f"Remote DeepDoc request failed: {exc}") from exc

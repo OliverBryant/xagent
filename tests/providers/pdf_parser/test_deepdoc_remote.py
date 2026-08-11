@@ -1,4 +1,4 @@
-"""Tests for the remote DeepDoc parse client.
+"""Tests for the remote DeepDoc ``task=parse`` client.
 
 Every test here is a pure unit test: an ``httpx.MockTransport`` is injected
 through the ``_transport`` seam of :func:`parse_document_remote`, so nothing
@@ -12,10 +12,16 @@ makes the fallback to local parsing unconditional. A leaked
 ``httpx.ConnectError`` or ``binascii.Error`` would escape that clause and break
 parsing outright, so each failure test asserts the type is not merely "an
 exception" but exactly that one.
+
+Two shapes are asserted against the live server contract rather than a guess:
+the whole task configuration travels as one JSON ``kwargs`` form field, and
+``image_base64`` is *omitted* for elements without a crop rather than nulled.
 """
 
 import base64
 import binascii
+import json
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -24,10 +30,12 @@ import httpx
 import pytest
 
 from xagent.providers.pdf_parser.deepdoc_remote import (
+    IMAGE_SCOPE,
+    MAX_ZOOMIN,
     PARSE_ENDPOINT,
+    TOKEN_ENDPOINT,
     DeepDocRemoteError,
     _build_headers,
-    _mime_type_for,
     _normalize_elements,
     is_remote_configured,
     parse_document_remote,
@@ -38,6 +46,9 @@ API_KEY_ENV = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
 SHARED_API_KEY_ENV = "XINFERENCE_API_KEY"
 URL_ENV = "XAGENT_DEEPDOC_XINFERENCE_URL"
 TIMEOUT_ENV = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+MODEL_UID_ENV = "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+USERNAME_ENV = "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+PASSWORD_ENV = "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
 
 # Smallest possible real PNG, so the decoded bytes are a plausible image rather
 # than arbitrary base64 padding.
@@ -54,13 +65,16 @@ def remote_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     ``tests/conftest.py`` loads ``.env``/``example.env``, so a developer key in
     the environment would otherwise decide whether an ``Authorization`` header
-    is sent. Both key variables are cleared here and set explicitly by the
-    tests that care.
+    is sent. Every credential variable is cleared here and set explicitly by
+    the tests that care.
     """
     monkeypatch.setenv(URL_ENV, BASE_URL)
     monkeypatch.delenv(API_KEY_ENV, raising=False)
     monkeypatch.delenv(SHARED_API_KEY_ENV, raising=False)
     monkeypatch.delenv(TIMEOUT_ENV, raising=False)
+    monkeypatch.delenv(MODEL_UID_ENV, raising=False)
+    monkeypatch.delenv(USERNAME_ENV, raising=False)
+    monkeypatch.delenv(PASSWORD_ENV, raising=False)
 
 
 class RecordingSaveImage:
@@ -91,27 +105,99 @@ def json_transport(
     return httpx.MockTransport(handler)
 
 
+def routed_transport(
+    parse_payload: Any,
+    *,
+    token: str = "jwt-token",
+    token_status: int = 200,
+    token_payload: Any = None,
+    sink: Optional[list[httpx.Request]] = None,
+) -> httpx.MockTransport:
+    """Return a transport that answers ``/token`` and the parse endpoint apart.
+
+    The JWT exchange and the parse call share one transport, so a single handler
+    has to serve both; routing on the path is what lets a test assert the
+    ordering and the token actually reaching the parse request.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if sink is not None:
+            sink.append(request)
+        if request.url.path == TOKEN_ENDPOINT:
+            body = (
+                token_payload
+                if token_payload is not None
+                else {"access_token": token, "token_type": "bearer"}
+            )
+            return httpx.Response(token_status, json=body, request=request)
+        return httpx.Response(200, json=parse_payload, request=request)
+
+    return httpx.MockTransport(handler)
+
+
 def sample_payload() -> dict[str, Any]:
-    """A two-element response: one image-less text block, one table with a PNG."""
+    """A live-shaped response: an image-less title, and a table carrying a PNG.
+
+    The title element omits ``image_base64`` entirely rather than sending
+    ``null``, which is what the server actually does for elements without a
+    crop.
+    """
     return {
-        "filename": "report.pdf",
-        "file_type": ".pdf",
-        "elapsed_ms": 4521,
+        "task": "parse",
         "elements": [
             {
-                "type": "text",
-                "text": "Quarterly summary",
-                "image_base64": None,
-                "metadata": {"page_number": 1, "layout_type": "text"},
+                "type": "title",
+                "text": "Sample Document",
+                "metadata": {
+                    "x0": 70.666,
+                    "x1": 256.333,
+                    "top": 77.333,
+                    "bottom": 96.333,
+                    "page_number": 1,
+                    "layout_type": "title",
+                    "layoutno": "title-0",
+                    "col_id": 0,
+                    "positions": [[1, 70.7, 256.3, 77.3, 96.3]],
+                },
             },
             {
                 "type": "table",
-                "text": "<table><tr><td>Cell</td></tr></table>",
+                "text": "<table><caption>T1</caption><tr><th>Cell</th></tr></table>",
                 "image_base64": PNG_1X1_BASE64,
-                "metadata": {"page_number": 2, "layout_type": "table"},
+                "metadata": {
+                    "page_number": 2,
+                    "layout_type": "table",
+                    "positions": [[2, 20.0, 400.0, 50.0, 200.0]],
+                },
             },
         ],
     }
+
+
+def form_fields(request: httpx.Request) -> dict[str, str]:
+    """Extract the simple (non-file) multipart form fields from a request.
+
+    The client sends its task configuration as form fields next to the upload,
+    so several tests need to read them back. httpx offers no multipart decoder,
+    hence the deliberate minimal parse: split on the boundary and keep the parts
+    that carry a ``name`` but no ``filename``.
+    """
+    body = request.content.decode("utf-8", errors="replace")
+    fields: dict[str, str] = {}
+    for part in body.split("--"):
+        match = re.search(r'name="([^"]+)"', part)
+        if match is None or "filename=" in part:
+            continue
+        _, _, value = part.partition("\r\n\r\n")
+        fields[match.group(1)] = value.strip("\r\n")
+    return fields
+
+
+def parse_kwargs(request: httpx.Request) -> dict[str, Any]:
+    """Return the decoded ``kwargs`` JSON object the client sent."""
+    decoded = json.loads(form_fields(request)["kwargs"])
+    assert isinstance(decoded, dict)
+    return decoded
 
 
 class TestParseDocumentRemoteSuccess:
@@ -131,24 +217,44 @@ class TestParseDocumentRemoteSuccess:
         )
 
         assert len(elements) == 2
-        text, table = elements
+        title, table = elements
 
         # image_base64 is consumed, never forwarded.
-        assert "image_base64" not in text
+        assert "image_base64" not in title
         assert "image_base64" not in table
 
-        assert text["type"] == "text"
-        assert text["text"] == "Quarterly summary"
-        assert text["image"] is None
-        assert text["metadata"] == {"page_number": 1, "layout_type": "text"}
+        assert title["type"] == "title"
+        assert title["text"] == "Sample Document"
+        assert title["image"] is None
+        # Document-wide coordinates and positions reach the translator intact.
+        assert title["metadata"]["positions"] == [[1, 70.7, 256.3, 77.3, 96.3]]
+        assert title["metadata"]["col_id"] == 0
+        assert title["metadata"]["layout_type"] == "title"
 
         assert table["type"] == "table"
-        assert table["text"] == "<table><tr><td>Cell</td></tr></table>"
+        assert table["text"].startswith("<table><caption>")
         assert table["image"] == save_image.path
-        assert table["metadata"] == {"page_number": 2, "layout_type": "table"}
+        # col_id is absent on this element; nothing invents one.
+        assert "col_id" not in table["metadata"]
 
         # Only the table carried an image, so exactly one write happened.
         assert save_image.calls == [PNG_1X1]
+
+    def test_a_single_http_call_is_made(self, tmp_path: Path) -> None:
+        """task=parse runs the whole pipeline server-side; there is nothing to stitch."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport(sample_payload(), sink=requests),
+        )
+
+        assert len(requests) == 1
+        assert str(requests[0].url) == f"{BASE_URL}{PARSE_ENDPOINT}"
 
     def test_callback_reports_start_and_completion(self, tmp_path: Path) -> None:
         """The completion notice keeps the ``message (1.23s)`` shape local DeepDoc emits."""
@@ -168,10 +274,10 @@ class TestParseDocumentRemoteSuccess:
         assert progress[-1][1].startswith("Remote DeepDoc parse finished (")
         assert progress[-1][1].endswith("s)")
 
-    def test_request_carries_the_file_zoomin_and_auth_header(
+    def test_request_carries_the_pdf_model_and_task_kwargs(
         self, tmp_path: Path
     ) -> None:
-        """Multipart body holds the real filename; zoomin and the bearer token ride along."""
+        """The upload is the ``image`` part, typed as a PDF, beside model and kwargs."""
         source = tmp_path / "quarterly report.pdf"
         source.write_bytes(b"%PDF-1.7 fake")
         requests: list[httpx.Request] = []
@@ -190,12 +296,67 @@ class TestParseDocumentRemoteSuccess:
         assert str(request.url) == f"{BASE_URL}{PARSE_ENDPOINT}"
 
         body = request.content.decode("utf-8", errors="replace")
-        assert 'name="file"' in body
+        # The server reads the upload from the "image" field, not "file".
+        assert 'name="image"' in body
+        assert 'name="file"' not in body
         assert 'filename="quarterly report.pdf"' in body
         assert "application/pdf" in body
         assert "%PDF-1.7 fake" in body
-        assert 'name="zoomin"' in body
-        assert "\r\n\r\n5\r\n" in body
+
+        assert form_fields(request)["model"] == "DeepDoc"
+        assert parse_kwargs(request) == {
+            "task": "parse",
+            "zoomin": 5,
+            "image_scope": IMAGE_SCOPE,
+        }
+
+    def test_task_is_always_parse(self, tmp_path: Path) -> None:
+        """A per-page ``ocr`` task would return text with no structure at all."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        assert parse_kwargs(requests[0])["task"] == "parse"
+
+    def test_image_scope_is_sent_as_table_figure(self, tmp_path: Path) -> None:
+        """Only table/figure crops are consumed downstream, so only those are requested."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        assert IMAGE_SCOPE == "table_figure"
+        assert parse_kwargs(requests[0])["image_scope"] == "table_figure"
+
+    def test_pages_and_dpi_are_never_sent(self, tmp_path: Path) -> None:
+        """``task=parse`` rejects both outright, so the client must not offer them."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        sent = parse_kwargs(requests[0])
+        assert "pages" not in sent
+        assert "dpi" not in sent
 
     def test_zoomin_defaults_to_three(self, tmp_path: Path) -> None:
         """The default matches the local parser's parse_into_bboxes(zoomin=3)."""
@@ -210,9 +371,26 @@ class TestParseDocumentRemoteSuccess:
             _transport=json_transport({"elements": []}, sink=requests),
         )
 
-        assert "\r\n\r\n3\r\n" in requests[0].content.decode("utf-8", errors="replace")
+        assert parse_kwargs(requests[0])["zoomin"] == 3
 
-    def test_authorization_header_present_when_a_key_is_configured(
+    def test_model_uid_is_configurable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        monkeypatch.setenv(MODEL_UID_ENV, "deepdoc-gpu-1")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        assert form_fields(requests[0])["model"] == "deepdoc-gpu-1"
+
+    def test_api_key_is_sent_as_the_bearer_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         source = tmp_path / "report.pdf"
@@ -227,9 +405,97 @@ class TestParseDocumentRemoteSuccess:
             _transport=json_transport({"elements": []}, sink=requests),
         )
 
+        # No token exchange when a key is configured: one request, one header.
+        assert len(requests) == 1
         assert requests[0].headers["authorization"] == "Bearer secret-key"
 
-    def test_authorization_header_absent_when_no_key_is_configured(
+    def test_credentials_are_exchanged_for_a_jwt(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """POST /token first, then the parse call carrying the minted token."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "admin123")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=routed_transport(
+                sample_payload(), token="minted-jwt", sink=requests
+            ),
+        )
+
+        assert [request.url.path for request in requests] == [
+            TOKEN_ENDPOINT,
+            PARSE_ENDPOINT,
+        ]
+        token_request, parse_request = requests
+        assert json.loads(token_request.content) == {
+            "username": "admin",
+            "password": "admin123",
+        }
+        assert parse_request.headers["authorization"] == "Bearer minted-jwt"
+
+    def test_credentials_win_over_a_configured_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A JWT is short-lived and scoped; prefer it when both are available."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "admin123")
+        monkeypatch.setenv(API_KEY_ENV, "static-key")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=routed_transport(
+                sample_payload(), token="minted-jwt", sink=requests
+            ),
+        )
+
+        assert requests[-1].headers["authorization"] == "Bearer minted-jwt"
+
+    @pytest.mark.parametrize(
+        ("username", "password"),
+        [
+            pytest.param("admin", None, id="password-missing"),
+            pytest.param(None, "admin123", id="username-missing"),
+        ],
+    )
+    def test_half_configured_credentials_fall_back_to_the_api_key(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        username: Optional[str],
+        password: Optional[str],
+    ) -> None:
+        """An incomplete pair must not send a doomed token request."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        if username is not None:
+            monkeypatch.setenv(USERNAME_ENV, username)
+        if password is not None:
+            monkeypatch.setenv(PASSWORD_ENV, password)
+        monkeypatch.setenv(API_KEY_ENV, "static-key")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        assert [request.url.path for request in requests] == [PARSE_ENDPOINT]
+        assert requests[0].headers["authorization"] == "Bearer static-key"
+
+    def test_authorization_header_absent_when_nothing_is_configured(
         self, tmp_path: Path
     ) -> None:
         """An unauthenticated self-hosted Xinference must not receive a bogus header."""
@@ -245,23 +511,6 @@ class TestParseDocumentRemoteSuccess:
         )
 
         assert "authorization" not in requests[0].headers
-
-    def test_image_scope_is_not_sent(self, tmp_path: Path) -> None:
-        """The client relies on the server's ``table_figure`` default."""
-        source = tmp_path / "report.pdf"
-        source.write_bytes(b"%PDF-1.7 fake")
-        requests: list[httpx.Request] = []
-
-        parse_document_remote(
-            str(source),
-            ext=".pdf",
-            save_image=RecordingSaveImage(),
-            _transport=json_transport({"elements": []}, sink=requests),
-        )
-
-        assert "image_scope" not in requests[0].content.decode(
-            "utf-8", errors="replace"
-        )
 
     @pytest.mark.parametrize(
         "configured_url",
@@ -293,38 +542,26 @@ class TestParseDocumentRemoteSuccess:
         assert url == f"{BASE_URL}{PARSE_ENDPOINT}"
         assert "//v1" not in url
 
-    def test_bytesio_filename_falls_back_and_position_is_restored(self) -> None:
-        """An in-memory document uploads as ``document{ext}`` and is left rewound as found."""
-        stream = BytesIO(b"col1,col2\nval1,val2\n")
+    def test_bytesio_uploads_whole_buffer_and_restores_position(self) -> None:
+        """An in-memory PDF uploads as ``document.pdf`` and is left as it was found."""
+        stream = BytesIO(b"%PDF-1.7 in-memory document body")
         stream.seek(4)
         requests: list[httpx.Request] = []
 
         parse_document_remote(
             stream,
-            ext=".csv",
+            ext=".pdf",
             save_image=RecordingSaveImage(),
             _transport=json_transport({"elements": []}, sink=requests),
         )
 
         body = requests[0].content.decode("utf-8", errors="replace")
-        assert 'filename="document.csv"' in body
-        assert "text/csv" in body
+        assert 'filename="document.pdf"' in body
+        assert "application/pdf" in body
         # The whole buffer went up, not just the tail after the cursor.
-        assert "col1,col2" in body
+        assert "%PDF-1.7 in-memory document body" in body
         # The caller may still read from its own buffer after a fallback.
         assert stream.tell() == 4
-
-    @pytest.mark.parametrize(
-        ("ext", "expected"),
-        [
-            (".pdf", "application/pdf"),
-            (".csv", "text/csv"),
-            (".PDF", "application/pdf"),
-            (".unknown", "application/octet-stream"),
-        ],
-    )
-    def test_mime_type_lookup(self, ext: str, expected: str) -> None:
-        assert _mime_type_for(ext) == expected
 
     def test_empty_element_list_is_a_valid_response(self, tmp_path: Path) -> None:
         """A document with no extractable content is a success, not a failure."""
@@ -336,7 +573,7 @@ class TestParseDocumentRemoteSuccess:
             str(source),
             ext=".pdf",
             save_image=save_image,
-            _transport=json_transport({"elements": []}),
+            _transport=json_transport({"task": "parse", "elements": []}),
         )
 
         assert elements == []
@@ -392,6 +629,12 @@ class TestParseDocumentRemoteFailures:
                 id="http-401",
             ),
             pytest.param(
+                lambda: json_transport(
+                    {"detail": "task 'parse' requires a PDF"}, status_code=400
+                ),
+                id="http-400",
+            ),
+            pytest.param(
                 lambda: error_transport(
                     httpx.ConnectError("connection refused"),
                 ),
@@ -411,7 +654,7 @@ class TestParseDocumentRemoteFailures:
                 id="top-level-list",
             ),
             pytest.param(
-                lambda: json_transport({"filename": "report.pdf"}),
+                lambda: json_transport({"task": "parse"}),
                 id="elements-missing",
             ),
             pytest.param(
@@ -467,6 +710,164 @@ class TestParseDocumentRemoteFailures:
                 save_image=RecordingSaveImage(),
                 _transport=transport_factory(),
             )
+
+    @pytest.mark.parametrize(
+        "transport_factory",
+        [
+            pytest.param(
+                lambda: routed_transport(sample_payload(), token_status=401),
+                id="token-rejected",
+            ),
+            pytest.param(
+                lambda: routed_transport(sample_payload(), token_status=500),
+                id="token-server-error",
+            ),
+            pytest.param(
+                lambda: routed_transport(sample_payload(), token_payload={}),
+                id="token-field-missing",
+            ),
+            pytest.param(
+                lambda: routed_transport(
+                    sample_payload(), token_payload={"access_token": ""}
+                ),
+                id="token-empty",
+            ),
+            pytest.param(
+                lambda: routed_transport(
+                    sample_payload(), token_payload={"access_token": 42}
+                ),
+                id="token-not-a-string",
+            ),
+            pytest.param(
+                lambda: routed_transport(sample_payload(), token_payload=["a"]),
+                id="token-body-not-an-object",
+            ),
+        ],
+    )
+    def test_token_exchange_failure_raises_deepdoc_remote_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        transport_factory: Callable[[], httpx.MockTransport],
+    ) -> None:
+        """A broken JWT exchange falls back locally like any other remote failure."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "admin123")
+
+        with pytest.raises(DeepDocRemoteError):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=transport_factory(),
+            )
+
+    def test_a_failed_token_exchange_makes_no_parse_request(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Uploading a whole PDF with a credential the server rejected is pure waste."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "wrong")
+        requests: list[httpx.Request] = []
+
+        with pytest.raises(DeepDocRemoteError):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=routed_transport(
+                    sample_payload(), token_status=401, sink=requests
+                ),
+            )
+
+        assert [request.url.path for request in requests] == [TOKEN_ENDPOINT]
+
+    @pytest.mark.parametrize(
+        "ext",
+        [".docx", ".xlsx", ".csv", ".md", ".txt", ".json", ".html", ""],
+    )
+    def test_non_pdf_is_rejected_without_an_http_call(
+        self, tmp_path: Path, ext: str
+    ) -> None:
+        """task=parse consumes PDFs only, so anything else must not reach the wire."""
+        source = tmp_path / f"document{ext or '.bin'}"
+        source.write_bytes(b"not a pdf")
+        requests: list[httpx.Request] = []
+
+        with pytest.raises(DeepDocRemoteError):
+            parse_document_remote(
+                str(source),
+                ext=ext,
+                save_image=RecordingSaveImage(),
+                _transport=json_transport(sample_payload(), sink=requests),
+            )
+
+        assert requests == []
+
+    @pytest.mark.parametrize(
+        "zoomin",
+        [
+            pytest.param(0, id="zero"),
+            pytest.param(-1, id="negative"),
+            pytest.param(7, id="above-cap"),
+            pytest.param(9, id="well-above-cap"),
+            pytest.param(3.0, id="float"),
+            pytest.param(True, id="bool"),
+            pytest.param("3", id="string"),
+        ],
+    )
+    def test_out_of_range_zoomin_is_rejected_without_an_http_call(
+        self, tmp_path: Path, zoomin: Any
+    ) -> None:
+        """The server caps zoomin at 6; uploading a doomed PDF is pure waste."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        with pytest.raises(DeepDocRemoteError):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                zoomin=zoomin,
+                _transport=json_transport(sample_payload(), sink=requests),
+            )
+
+        assert requests == []
+
+    @pytest.mark.parametrize("zoomin", [1, 3, MAX_ZOOMIN])
+    def test_in_range_zoomin_is_accepted(self, tmp_path: Path, zoomin: int) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        requests: list[httpx.Request] = []
+
+        parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            zoomin=zoomin,
+            _transport=json_transport({"elements": []}, sink=requests),
+        )
+
+        assert parse_kwargs(requests[0])["zoomin"] == zoomin
+
+    def test_uppercase_pdf_extension_is_accepted(self, tmp_path: Path) -> None:
+        """The caller lower-cases the suffix, but the guard must not depend on that."""
+        source = tmp_path / "REPORT.PDF"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        elements = parse_document_remote(
+            str(source),
+            ext=".PDF",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport({"elements": []}),
+        )
+
+        assert elements == []
 
     @pytest.mark.parametrize(
         "exc",
@@ -599,13 +1000,13 @@ class TestParseDocumentRemoteFailures:
 
     def test_bytesio_position_is_restored_after_a_failure(self) -> None:
         """The buffer must be reusable by the local fallback path."""
-        stream = BytesIO(b"col1,col2\nval1,val2\n")
+        stream = BytesIO(b"%PDF-1.7 in-memory body")
         stream.seek(7)
 
         with pytest.raises(DeepDocRemoteError):
             parse_document_remote(
                 stream,
-                ext=".csv",
+                ext=".pdf",
                 save_image=RecordingSaveImage(),
                 _transport=json_transport({"detail": "boom"}, status_code=500),
             )
@@ -617,7 +1018,7 @@ class TestNormalizeElements:
     """Direct coverage of the translator, where wrapping is not in the way."""
 
     def test_absent_image_base64_still_yields_an_image_key(self) -> None:
-        """The caller always reads ``image``, so the key must exist even unset."""
+        """The server omits the field entirely, and the caller always reads ``image``."""
         save_image = RecordingSaveImage()
 
         elements = _normalize_elements(
@@ -638,6 +1039,24 @@ class TestNormalizeElements:
 
         assert elements[0]["image"] is None
         assert save_image.calls == []
+
+    def test_metadata_is_passed_through_untouched(self) -> None:
+        """Coordinates, layoutno and positions all reach the downstream translator."""
+        metadata = {
+            "x0": 70.666,
+            "top": 77.333,
+            "page_number": 1,
+            "layout_type": "title",
+            "layoutno": "title-0",
+            "positions": [[1, 70.7, 256.3, 77.3, 96.3]],
+        }
+
+        elements = _normalize_elements(
+            {"elements": [{"type": "title", "text": "T", "metadata": metadata}]},
+            RecordingSaveImage(),
+        )
+
+        assert elements[0]["metadata"] == metadata
 
     def test_source_payload_is_not_mutated(self) -> None:
         """Elements are copied, so a caller retrying locally sees its own data intact."""
@@ -681,25 +1100,34 @@ class TestNormalizeElements:
 
 
 class TestBuildHeaders:
-    """Auth header construction, including the shared-key fallback."""
+    """Auth header construction: JWT exchange, API key, and the shared-key fallback."""
 
-    def test_no_key_configured_yields_no_headers(self) -> None:
-        assert _build_headers() == {}
+    def test_nothing_configured_yields_no_headers(self) -> None:
+        assert _build_headers(BASE_URL, None) == {}
 
     def test_dedicated_key_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(API_KEY_ENV, "dedicated")
-        assert _build_headers() == {"Authorization": "Bearer dedicated"}
+        assert _build_headers(BASE_URL, None) == {"Authorization": "Bearer dedicated"}
 
     def test_shared_key_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(SHARED_API_KEY_ENV, "shared")
-        assert _build_headers() == {"Authorization": "Bearer shared"}
+        assert _build_headers(BASE_URL, None) == {"Authorization": "Bearer shared"}
 
     def test_dedicated_key_wins_over_the_shared_one(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(API_KEY_ENV, "dedicated")
         monkeypatch.setenv(SHARED_API_KEY_ENV, "shared")
-        assert _build_headers() == {"Authorization": "Bearer dedicated"}
+        assert _build_headers(BASE_URL, None) == {"Authorization": "Bearer dedicated"}
+
+    def test_credentials_produce_a_minted_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "admin123")
+        transport = routed_transport({"elements": []}, token="minted")
+
+        assert _build_headers(BASE_URL, transport) == {"Authorization": "Bearer minted"}
 
 
 class TestIsRemoteConfigured:

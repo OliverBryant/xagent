@@ -23,8 +23,11 @@ from xagent.config import (
     DB_POOL_SIZE,
     DB_POOL_TIMEOUT_SECONDS,
     DEEPDOC_XINFERENCE_API_KEY,
+    DEEPDOC_XINFERENCE_MODEL_UID,
+    DEEPDOC_XINFERENCE_PASSWORD,
     DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
     DEEPDOC_XINFERENCE_URL,
+    DEEPDOC_XINFERENCE_USERNAME,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -114,8 +117,11 @@ from xagent.config import (
     get_db_pool_size,
     get_db_pool_timeout_seconds,
     get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_model_uid,
+    get_deepdoc_xinference_password,
     get_deepdoc_xinference_timeout_seconds,
     get_deepdoc_xinference_url,
+    get_deepdoc_xinference_username,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
     get_external_skills_dirs,
@@ -1228,6 +1234,9 @@ class TestDeepDocRemoteParsingConfig:
             DEEPDOC_XINFERENCE_TIMEOUT_SECONDS
             == "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
         )
+        assert DEEPDOC_XINFERENCE_MODEL_UID == "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+        assert DEEPDOC_XINFERENCE_USERNAME == "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+        assert DEEPDOC_XINFERENCE_PASSWORD == "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
 
     def test_url_unset_defaults_to_local_mode(self, monkeypatch):
         monkeypatch.delenv(DEEPDOC_XINFERENCE_URL, raising=False)
@@ -1290,6 +1299,45 @@ class TestDeepDocRemoteParsingConfig:
     def test_timeout_invalid_or_non_positive_falls_back(self, monkeypatch, value):
         monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, value)
         assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_model_uid_defaults_to_the_family_name(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_MODEL_UID, raising=False)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_model_uid_env_override_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, "  deepdoc-gpu-1  ")
+        assert get_deepdoc_xinference_model_uid() == "deepdoc-gpu-1"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_model_uid_blank_falls_back_to_the_default(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, value)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_username_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_USERNAME, raising=False)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_username_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, "  admin  ")
+        assert get_deepdoc_xinference_username() == "admin"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_username_blank_means_no_token_exchange(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, value)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_password_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_PASSWORD, raising=False)
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_blank_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "")
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_preserves_surrounding_whitespace(self, monkeypatch):
+        """Whitespace can be significant in a secret, so it is not stripped."""
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "  pa ss  ")
+        assert get_deepdoc_xinference_password() == "  pa ss  "
 
 
 class TestGetDefaultSqliteDbPath:

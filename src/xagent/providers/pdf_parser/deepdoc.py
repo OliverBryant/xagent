@@ -233,14 +233,15 @@ def _translate_remote_elements(
 ) -> ParseResult:
     """Translate remote DeepDoc elements into our ParseResult format.
 
-    The remote server returns one flat element list for every format, so this
-    is the single translator for remote mode. Each element is reshaped into the
-    bbox dict the local PDF helpers already consume, which keeps table and
-    figure handling (including image paths) identical to local parsing.
+    The remote server runs the same ``parse_into_bboxes`` pipeline this file
+    calls locally and returns its elements as a flat list, so each one is
+    reshaped back into the bbox dict the local PDF helpers already consume.
+    That keeps table and figure handling (including image paths), ``positions``
+    and cross-page coordinates identical to local parsing.
 
-    Format-specific metadata such as ``style``, ``sheet_name``, ``row_number``
-    and ``row_type`` lives in ``element["metadata"]`` and is merged into the
-    resulting segment metadata, matching what the local translators produce.
+    Metadata keys ``_build_element_metadata`` does not know about -- ``x0``,
+    ``bottom``, ``layoutno`` and friends -- are merged in afterwards so nothing
+    the server reported is dropped.
 
     Args:
         doc_id: Document ID.
@@ -260,9 +261,9 @@ def _translate_remote_elements(
             element_metadata = {}
 
         layout_type = element.get("type", "text")
-        # Reshape into the bbox dict the local helpers expect. Format-specific
-        # metadata keys are flattened in so _build_element_metadata can pick up
-        # positions/col_id/page_number when the format supplies them.
+        # Reshape into the bbox dict the local helpers expect. The metadata keys
+        # are flattened in so _build_element_metadata can pick up
+        # positions/col_id/page_number where the server reported them.
         bbox: Dict[str, Any] = {
             **element_metadata,
             "layout_type": layout_type,
@@ -270,8 +271,8 @@ def _translate_remote_elements(
             "image": element.get("image"),
         }
         base_metadata = _build_element_metadata(bbox, doc_id, **kwargs)
-        # Carry the format-specific keys (style, sheet_name, row_number,
-        # row_type, ...) that _build_element_metadata does not know about.
+        # Carry the raw bbox keys (x0, x1, top, bottom, layoutno, ...) that
+        # _build_element_metadata does not know about.
         for key, value in element_metadata.items():
             base_metadata.setdefault(key, value)
 
@@ -650,8 +651,8 @@ class DeepDocParser(
                 parser_call_kwargs.setdefault("need_image", True)
                 # Note: __call__ doesn't accept need_position, we'll extract positions separately
 
-            # Set up the progress callback once, so remote mode reports progress
-            # for every format rather than only for PDF.
+            # Set up the progress callback once, so the remote path and the
+            # local PDF path below share a single adapter.
             callback = None
             if progress_callback is not None:
                 from ...core.tools.core.RAG_tools.progress.adapters import (
@@ -661,10 +662,15 @@ class DeepDocParser(
                 adapter = DeepDocProgressAdapter(progress_callback)
                 callback = adapter.get_callback()
 
-            # Remote-first dispatch: when a remote server is configured every
-            # supported format goes there, and any failure falls back to local
-            # parsing. No local parser is instantiated on the remote path.
-            if deepdoc_remote.is_remote_configured():
+            # Remote-first dispatch for PDFs: when a remote server is
+            # configured the document goes there, and any failure falls back to
+            # local parsing. No local parser is instantiated on the remote path.
+            #
+            # The gate is deliberately narrow. Xinference serves DeepDoc's
+            # whole-document pipeline as task="parse", which consumes a PDF and
+            # nothing else, so sending a .docx would only buy a failed round
+            # trip before the same local parse ran anyway.
+            if ext == ".pdf" and deepdoc_remote.is_remote_configured():
                 try:
                     elements = deepdoc_remote.parse_document_remote(
                         file_path,

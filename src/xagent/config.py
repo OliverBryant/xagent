@@ -63,6 +63,9 @@ KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
 DEEPDOC_XINFERENCE_URL = "XAGENT_DEEPDOC_XINFERENCE_URL"
 DEEPDOC_XINFERENCE_API_KEY = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
 DEEPDOC_XINFERENCE_TIMEOUT_SECONDS = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_MODEL_UID = "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+DEEPDOC_XINFERENCE_USERNAME = "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+DEEPDOC_XINFERENCE_PASSWORD = "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -1889,6 +1892,31 @@ def get_deepdoc_xinference_timeout_seconds() -> int:
     ``timeout=1800`` precedent in deepdoc-lib's own remote API client.
     """
     return _get_positive_int_env(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, 1800)
+
+
+def get_deepdoc_xinference_model_uid() -> str:
+    """Return the Xinference model UID that remote DeepDoc requests target.
+
+    The OCR endpoint dispatches on this ``model`` form field, so it must name a
+    launched DeepDoc model. ``DeepDoc`` is the model name Xinference registers
+    the family under, which is also the UID a launch gets when none is chosen.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_MODEL_UID) or "").strip() or "DeepDoc"
+
+
+def get_deepdoc_xinference_username() -> str | None:
+    """Return the username for the remote DeepDoc JWT exchange, if configured.
+
+    Xinference clusters started with authentication mint a bearer token from
+    ``POST /token``; deployments that instead issue a long-lived API key leave
+    this unset and configure the key.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_USERNAME) or "").strip() or None
+
+
+def get_deepdoc_xinference_password() -> str | None:
+    """Return the password for the remote DeepDoc JWT exchange, if configured."""
+    return os.getenv(DEEPDOC_XINFERENCE_PASSWORD) or None
 
 
 def get_default_sqlite_db_path() -> str:

@@ -95,8 +95,8 @@ sequenceDiagram
 | `XAGENT_DEEPDOC_XINFERENCE_URL` | yes, to enable remote | unset (= local mode) | Xinference base URL, e.g. `http://gpu-host:9997`. Validated as `http`/`https`, trailing slash stripped. |
 | `XAGENT_DEEPDOC_XINFERENCE_MODEL_UID` | no | `DeepDoc` | The `model` form field; must name a launched DeepDoc model. |
 | `XAGENT_DEEPDOC_XINFERENCE_API_KEY` | no | falls back to bare `XINFERENCE_API_KEY`, then no auth header | Sent directly as the bearer token. |
-| `XAGENT_DEEPDOC_XINFERENCE_USERNAME` / `_PASSWORD` | no | unset | Exchanged for a JWT at `POST /token`. When both are set they take precedence over the API key. |
-| `XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS` | no | `1800` | Read timeout for one whole-document parse, matching the `timeout=1800` precedent in deepdoc-lib's own MinerU API client. |
+| `XAGENT_DEEPDOC_XINFERENCE_USERNAME` / `_PASSWORD` | no | unset | Exchanged for a JWT at `POST /token`. Takes precedence over the API key when the username is set and the password is not blank. The password itself is sent unstripped, since whitespace can be significant in a secret, but a whitespace-only value is treated as unset so it cannot shadow a working API key. |
+| `XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS` | no | `1800` | Read and write timeout for one whole-document parse, matching the `timeout=1800` precedent in deepdoc-lib's own MinerU API client. Connect and pool stay pinned at 10 s and the token exchange at 30 s, so an unreachable host fails fast instead of hanging for the parse budget. |
 
 Authentication is whichever of the two the cluster uses: a username/password
 pair mints a short-lived JWT, an API key is sent as-is, and a cluster started

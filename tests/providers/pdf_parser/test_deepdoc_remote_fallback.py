@@ -1095,3 +1095,62 @@ class TestUntrustedMetadataFallsBackRatherThanRaising:
 
         assert result.metadata["deepdoc_backend"] == "local"
         assert "falling back to local" in caplog.text
+
+
+class TestRawOutputPassthroughOnTheRemotePath:
+    """`enable_raw_output` must mean the same thing remotely as it does locally.
+
+    `ParseResult`'s own visualization helpers read `raw_parser_output["bboxes"]`
+    and expect the coordinate keys flat. Keying the remote payload any other way
+    leaves `has_visualization_data` true while `get_visualization_elements()`
+    silently returns nothing — a parity break that looks like working code.
+    """
+
+    @pytest.mark.asyncio
+    async def test_remote_raw_output_feeds_the_visualization_helpers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
+    ) -> None:
+        pdf_file = tmp_path / "viz.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        monkeypatch.setattr(
+            deepdoc_remote, "parse_document_remote", lambda *a, **k: remote_pdf_elements()
+        )
+        arm_local_parser_tripwire(monkeypatch)
+
+        parser = DeepDocParser(enable_raw_output=True)
+        result = await parser.parse(str(pdf_file), doc_id="viz_doc")
+
+        assert result.parser_engine == "deepdoc"
+        assert result.has_visualization_data
+        assert result.raw_parser_output is not None
+        assert result.raw_parser_output["total_elements"] == 3
+        assert result.raw_parser_output["has_positions"] is True
+
+        # The helpers must actually yield the elements, not an empty list.
+        elements = result.get_visualization_elements()
+        assert len(elements) == 3
+        assert [element["type"] for element in elements] == ["text", "table", "figure"]
+        assert [element["page"] for element in elements] == [1, 2, 3]
+
+        summary = result.get_visualization_summary()
+        assert summary["total_elements"] == 3
+        assert summary["elements_by_type"] == {"text": 1, "table": 1, "figure": 1}
+
+    @pytest.mark.asyncio
+    async def test_raw_output_stays_absent_when_the_flag_is_off(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
+    ) -> None:
+        pdf_file = tmp_path / "noviz.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        monkeypatch.setattr(
+            deepdoc_remote, "parse_document_remote", lambda *a, **k: remote_pdf_elements()
+        )
+        arm_local_parser_tripwire(monkeypatch)
+
+        result = await DeepDocParser().parse(str(pdf_file), doc_id="noviz_doc")
+
+        assert result.raw_parser_output is None
+        assert result.parser_engine is None
+        assert not result.has_visualization_data

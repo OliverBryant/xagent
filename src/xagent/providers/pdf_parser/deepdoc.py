@@ -696,18 +696,28 @@ class DeepDocParser(
                         doc_id, elements, **remote_metadata
                     )
                     # Mirror the local branch's passthrough so the flag means
-                    # the same thing on both paths. The server returns the
-                    # elements of parse_into_bboxes rather than raw bboxes, so
-                    # the payload is shaped like the response, not like the
-                    # local bbox list.
+                    # the same thing on both paths. ParseResult's own
+                    # visualization helpers read "bboxes" and expect the
+                    # coordinate keys flat, so the remote elements are
+                    # flattened back into that shape rather than passed through
+                    # nested under "metadata" -- keying this differently would
+                    # leave has_visualization_data true while
+                    # get_visualization_elements() returned nothing.
                     if self.enable_raw_output:
+                        bboxes = [
+                            {
+                                **element.get("metadata", {}),
+                                "layout_type": element.get("type") or "text",
+                                "text": element.get("text") or "",
+                            }
+                            for element in elements
+                        ]
                         parse_result.raw_parser_output = {
-                            "format": "deepdoc_parse_elements",
-                            "elements": elements,
-                            "total_elements": len(elements),
+                            "format": "deepdoc_pdf",
+                            "bboxes": bboxes,
+                            "total_elements": len(bboxes),
                             "has_positions": any(
-                                "positions" in element.get("metadata", {})
-                                for element in elements
+                                "positions" in bbox for bbox in bboxes
                             ),
                         }
                         parse_result.parser_engine = "deepdoc"

@@ -228,6 +228,18 @@ def _translate_pdf_bboxes(
     )
 
 
+def _element_metadata_dict(element: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a remote element's ``metadata`` as a dict, whatever the server sent.
+
+    ``metadata`` is untrusted: it can be absent, null, or not an object at all.
+    Every reader has to treat those the same way, because ``{**None}`` raises and
+    an unexpected shape must never be able to fail a parse the local path would
+    have completed.
+    """
+    metadata = element.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def _translate_remote_elements(
     doc_id: str, elements: List[Dict[str, Any]], **kwargs: Any
 ) -> ParseResult:
@@ -256,9 +268,7 @@ def _translate_remote_elements(
     tables: List[ParsedTable] = []
 
     for element in elements:
-        element_metadata = element.get("metadata")
-        if not isinstance(element_metadata, dict):
-            element_metadata = {}
+        element_metadata = _element_metadata_dict(element)
 
         # `or` rather than a .get() default: the server may send an explicit
         # null, which .get() would hand straight through as None and blow up
@@ -706,9 +716,14 @@ class DeepDocParser(
                     # leave has_visualization_data true while
                     # get_visualization_elements() returned nothing.
                     if self.enable_raw_output:
+                        # Guard the metadata the same way the translator does. A
+                        # debug flag must never decide whether a parse succeeds,
+                        # and `{**None}` raises, so a server sending a null or
+                        # non-object `metadata` would otherwise parse fine with
+                        # the flag off and fall back with it on.
                         bboxes = [
                             {
-                                **element.get("metadata", {}),
+                                **_element_metadata_dict(element),
                                 "layout_type": element.get("type") or "text",
                                 "text": element.get("text") or "",
                             }

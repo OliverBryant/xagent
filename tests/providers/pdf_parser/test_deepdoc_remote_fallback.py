@@ -1193,3 +1193,57 @@ class TestBackendMarkerOnEveryFormat:
         result = await parser.parse(str(source), doc_id="backend-marker")
 
         assert result.metadata.get("deepdoc_backend") == "local"
+
+
+class TestRawOutputFlagDoesNotChangeParsing:
+    """`enable_raw_output` is a debug switch and must not decide if a parse works.
+
+    Building the passthrough payload reads each element's `metadata`, which is
+    untrusted — it can be absent, null, or not an object. `{**None}` raises, so an
+    unguarded build made these inputs parse remotely with the flag off and fall
+    back to local with it on.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param(None, id="metadata-null"),
+            pytest.param("not-an-object", id="metadata-string"),
+            pytest.param(["not", "an", "object"], id="metadata-list"),
+        ],
+    )
+    async def test_odd_metadata_parses_the_same_either_way(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        remote_configured: str,
+        metadata: Any,
+    ) -> None:
+        pdf_file = tmp_path / "flag.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        monkeypatch.setattr(
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *args, **kwargs: [
+                {
+                    "type": "text",
+                    "text": "remote paragraph",
+                    "image": None,
+                    "metadata": metadata,
+                }
+            ],
+        )
+        arm_local_parser_tripwire(monkeypatch)
+
+        for enable_raw_output in (False, True):
+            parser = DeepDocParser(enable_raw_output=enable_raw_output)
+            result = await parser.parse(str(pdf_file), doc_id="flag_doc")
+
+            # Remote either way: the tripwire would have fired on a fallback.
+            assert result.metadata["deepdoc_backend"] == "remote"
+            assert result.text_segments[0].text == "remote paragraph"
+            if enable_raw_output:
+                assert result.raw_parser_output is not None
+                assert result.raw_parser_output["total_elements"] == 1

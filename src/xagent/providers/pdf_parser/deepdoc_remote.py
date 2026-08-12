@@ -56,6 +56,9 @@ Three details of that contract drive the code below:
 * ``image_base64`` is *omitted* for elements without a crop rather than sent as
   ``null``, and ``col_id`` is absent on elements the pipeline never assigned to
   a column. Both are read with that in mind.
+* Crops are always PNG. The server encodes with ``image.save(buffer,
+  format="PNG")`` and picks it deliberately, since crops are line art, so the
+  caller writes them with a ``.png`` suffix rather than sniffing the bytes.
 * Coordinates in ``metadata`` accumulate across pages, matching what local
   ``parse_into_bboxes`` produces, so the translated result stays interchangeable
   with local output when fallback kicks in.
@@ -141,6 +144,26 @@ def is_remote_configured() -> bool:
         return False
 
 
+def _report(
+    callback: Optional[ProgressCallback], progress: float, message: str
+) -> None:
+    """Emit a progress update, swallowing anything the sink raises.
+
+    Progress reporting is never worth a parse. The sink reaches websocket and
+    task-state broadcasting, and ``DeepDocProgressAdapter`` re-raises out of its
+    own ``except`` handler, so a failing sink is not hypothetical. Left
+    unguarded on the entry call it would bypass the caller's fallback; on the
+    completion call it would discard a successful parse along with every crop
+    already written to disk.
+    """
+    if callback is None:
+        return
+    try:
+        callback(progress, message)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Remote DeepDoc progress callback failed: %s", exc)
+
+
 def _fetch_jwt(
     base_url: str,
     username: str,
@@ -181,7 +204,12 @@ def _build_headers(
     """
     username = get_deepdoc_xinference_username()
     password = get_deepdoc_xinference_password()
-    if username and password:
+    # Gate on a non-blank password but send it unstripped: whitespace can be
+    # significant in a secret, yet a password of only spaces is a misconfigured
+    # variable rather than a credential. Treating it as one would take this
+    # branch, ignore a perfectly good API key, and 401 forever -- visible only
+    # as a silent permanent fallback to local parsing.
+    if username and password and password.strip():
         return {
             "Authorization": f"Bearer {_fetch_jwt(base_url, username, password, transport)}"
         }
@@ -305,9 +333,11 @@ def _normalize_elements(
 
     Raises:
         ValueError: If the payload does not carry a list of elements that each
-            look like a parsed element, or if an element's image decodes to no
-            bytes at all.
+            look like a parsed element.
         binascii.Error: If an element's image is not valid base64.
+
+    Any crop already written before a failure is removed before the exception
+    propagates, so a rejected response leaves nothing behind.
     """
     elements = payload.get("elements")
     if not isinstance(elements, list):
@@ -316,6 +346,26 @@ def _normalize_elements(
             f"(got {type(elements).__name__})"
         )
 
+    # Crops are written as the loop goes, so a failure partway through would
+    # otherwise leave the earlier ones orphaned under the artifacts directory --
+    # nothing GCs that tree, and the local fallback then writes its own full set
+    # alongside them under fresh names.
+    written: list[str] = []
+    try:
+        return _normalize_elements_inner(elements, save_image, written)
+    except Exception:
+        for path in written:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove orphaned crop %s: %s", path, exc)
+        raise
+
+
+def _normalize_elements_inner(
+    elements: list[Any], save_image: SaveImage, written: list[str]
+) -> list[dict[str, Any]]:
+    """Validate and normalize elements, recording every crop written to disk."""
     normalized: list[dict[str, Any]] = []
     for index, element in enumerate(elements):
         if not isinstance(element, dict):
@@ -345,17 +395,14 @@ def _normalize_elements(
         normalized_element = dict(element)
         image_base64 = normalized_element.pop("image_base64", None)
         if image_base64:
-            # validate=True rejects non-alphabet characters instead of dropping
-            # them. Without it a corrupt-but-right-length payload decodes to
-            # b"" and gets written out as a zero-byte PNG, so the caller
-            # receives a broken image path rather than falling back to local
-            # parsing.
+            # validate=True raises on non-alphabet characters instead of
+            # silently dropping them, so corruption surfaces as a
+            # DeepDocRemoteError and the caller falls back, rather than a
+            # truncated image being written to disk and treated as valid.
             image_bytes = base64.b64decode(image_base64, validate=True)
-            if not image_bytes:
-                raise ValueError(
-                    f"Remote DeepDoc element {index} carries an empty image"
-                )
-            normalized_element["image"] = save_image(image_bytes)
+            image_path = save_image(image_bytes)
+            written.append(image_path)
+            normalized_element["image"] = image_path
         else:
             normalized_element["image"] = None
         normalized.append(normalized_element)
@@ -394,8 +441,7 @@ def parse_document_remote(
         DeepDocRemoteError: On any failure. Callers fall back to local parsing.
     """
     started = time.monotonic()
-    if callback is not None:
-        callback(0.05, "Uploading document to remote DeepDoc server")
+    _report(callback, 0.05, "Uploading document to remote DeepDoc server")
 
     try:
         payload = _post_pdf(file_path, ext=ext, zoomin=zoomin, transport=_transport)
@@ -423,8 +469,7 @@ def parse_document_remote(
         raise DeepDocRemoteError(f"Remote DeepDoc parse failed: {exc}") from exc
 
     elapsed = time.monotonic() - started
-    if callback is not None:
-        callback(1.0, f"Remote DeepDoc parse finished ({elapsed:.2f}s)")
+    _report(callback, 1.0, f"Remote DeepDoc parse finished ({elapsed:.2f}s)")
     logger.info(
         "Remote DeepDoc parsed %s into %d elements in %.2fs",
         ext,

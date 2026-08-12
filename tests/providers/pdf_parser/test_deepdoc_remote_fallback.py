@@ -993,3 +993,105 @@ class TestTranslatorToleratesNullFields:
         assert result.text_segments[0].metadata["layout_type"] == "text"
         assert not result.tables
         assert not result.figures
+
+
+class TestUntrustedMetadataFallsBackRatherThanRaising:
+    """Server-supplied `metadata` is untrusted and must not be able to fail a parse.
+
+    `_normalize_elements` validates the top-level `type`/`text` but passes
+    `metadata` through untouched by design, so anything in it reaches
+    `_build_element_metadata`, where `int(pos[0])`/`float(pos[1:])` run bare.
+    Those raise `ValueError`, and `_translate_remote_elements` runs inside the
+    remote branch's `try`, so the fallback has to be broad enough to catch them
+    -- otherwise the document fails to ingest even though local parsing was
+    available.
+    """
+
+    @pytest.mark.asyncio
+    # Only a well-formed 5-tuple reaches the bare int()/float() calls;
+    # _build_element_metadata skips anything shorter or not a sequence, so those
+    # shapes pass through harmlessly and are covered by the translator tests.
+    @pytest.mark.parametrize(
+        "positions",
+        [
+            pytest.param([["bad", 1, 2, 3, 4]], id="non-numeric-page"),
+            pytest.param([[1, 2, 3, 4, "bad"]], id="non-numeric-coord"),
+            pytest.param([[1, None, 2, 3, 4]], id="none-coord"),
+        ],
+    )
+    async def test_malformed_positions_fall_back_to_local(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        remote_configured: str,
+        positions: Any,
+    ) -> None:
+        """A parse still succeeds locally when the server sends unusable positions."""
+        pdf_file = tmp_path / "untrusted.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        monkeypatch.setattr(
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *args, **kwargs: [
+                {
+                    "type": "text",
+                    "text": "remote paragraph",
+                    "image": None,
+                    "metadata": {"page_number": 1, "positions": positions},
+                }
+            ],
+        )
+        fake_parser = FakeLocalParser(
+            [{"layout_type": "text", "text": "local paragraph"}]
+        )
+        monkeypatch.setattr(
+            DeepDocParser, "_get_parser_for_ext", lambda self, ext: fake_parser
+        )
+
+        parser = DeepDocParser()
+        with caplog.at_level("WARNING", logger="xagent.providers.pdf_parser.deepdoc"):
+            result = await parser.parse(str(pdf_file), doc_id="untrusted")
+
+        assert result.metadata["deepdoc_backend"] == "local"
+        assert result.text_segments[0].text == "local paragraph"
+        assert "falling back to local" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_missing_image_path_falls_back_to_local(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        remote_configured: str,
+    ) -> None:
+        """`_handle_image` raises for a path that no longer exists; that must fall back."""
+        pdf_file = tmp_path / "missing_crop.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        monkeypatch.setattr(
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *args, **kwargs: [
+                {
+                    "type": "table",
+                    "text": "<table></table>",
+                    "image": str(tmp_path / "gone.png"),
+                    "metadata": {"page_number": 1},
+                }
+            ],
+        )
+        fake_parser = FakeLocalParser(
+            [{"layout_type": "text", "text": "local paragraph"}]
+        )
+        monkeypatch.setattr(
+            DeepDocParser, "_get_parser_for_ext", lambda self, ext: fake_parser
+        )
+
+        parser = DeepDocParser()
+        with caplog.at_level("WARNING", logger="xagent.providers.pdf_parser.deepdoc"):
+            result = await parser.parse(str(pdf_file), doc_id="missing-crop")
+
+        assert result.metadata["deepdoc_backend"] == "local"
+        assert "falling back to local" in caplog.text

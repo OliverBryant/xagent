@@ -463,6 +463,17 @@ def _normalized_http_env_url(env_var: str) -> str | None:
             f"Invalid {env_var} value: {value!r}. "
             "Expected an absolute http:// or https:// URL without a query or fragment."
         )
+    # Reject embedded credentials. httpx does not send URL userinfo as Basic
+    # auth, so they authenticate nothing, but httpx.HTTPStatusError renders the
+    # full URL unredacted -- and callers put that string into log messages, so a
+    # password placed here ends up in plaintext in application logs.
+    if "@" in parts.netloc:
+        raise ValueError(
+            f"Invalid {env_var} value: credentials embedded in the URL are not "
+            "supported, because error messages built from it are logged. "
+            "Remove the 'user:password@' part and configure the credential "
+            "separately."
+        )
     return value
 
 
@@ -2156,7 +2167,8 @@ def get_deepdoc_xinference_timeout_seconds() -> int:
     """Return the read timeout for one remote DeepDoc document parse.
 
     Parsing a large PDF can take minutes, so the default matches the
-    ``timeout=1800`` precedent in deepdoc-lib's own remote API client.
+    ``timeout=1800`` precedent in deepdoc-lib's own MinerU API client
+    (``deepdoc/parser/mineru_parser.py``).
     """
     return _get_positive_int_env(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, 1800)
 

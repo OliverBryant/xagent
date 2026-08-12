@@ -633,9 +633,13 @@ class DeepDocParser(
             }
 
             # Validate Office document format (.docx, .xlsx, .pptx)
-            # Skip validation for BytesIO objects as they're already validated during conversion
-            # This magic-byte check is cheap and runs before any upload, so a
-            # malformed file fails fast instead of wasting remote bandwidth.
+            # Skip validation for BytesIO objects as they're already validated
+            # during conversion. This says nothing about the remote path -- that
+            # only runs for .pdf, so these extensions never reach it. Hoisting
+            # the check above the local dispatch does mean an .xlsx whose
+            # BytesIO conversion failed now gets validated where it previously
+            # went straight to _parse_xlsx_rows; failing fast on a mislabelled
+            # file is the better outcome there.
             if ext in [".docx", ".xlsx", ".pptx"] and not isinstance(
                 file_path, BytesIO
             ):
@@ -656,8 +660,11 @@ class DeepDocParser(
 
             # Set up the progress callback once, so the remote path and the
             # local PDF path below share a single adapter.
+            # Built once here so the remote and local PDF paths below share a
+            # single adapter. Only those two consume it, so it is scoped to
+            # .pdf rather than paid for on every format.
             callback = None
-            if progress_callback is not None:
+            if ext == ".pdf" and progress_callback is not None:
                 from ...core.tools.core.RAG_tools.progress.adapters import (
                     DeepDocProgressAdapter,
                 )
@@ -685,10 +692,36 @@ class DeepDocParser(
                         zoomin=parser_call_kwargs.get("zoomin", 3),
                     )
                     remote_metadata = {**metadata, "deepdoc_backend": "remote"}
-                    return _translate_remote_elements(
+                    parse_result = _translate_remote_elements(
                         doc_id, elements, **remote_metadata
                     )
-                except deepdoc_remote.DeepDocRemoteError as exc:
+                    # Mirror the local branch's passthrough so the flag means
+                    # the same thing on both paths. The server returns the
+                    # elements of parse_into_bboxes rather than raw bboxes, so
+                    # the payload is shaped like the response, not like the
+                    # local bbox list.
+                    if self.enable_raw_output:
+                        parse_result.raw_parser_output = {
+                            "format": "deepdoc_parse_elements",
+                            "elements": elements,
+                            "total_elements": len(elements),
+                            "has_positions": any(
+                                "positions" in element.get("metadata", {})
+                                for element in elements
+                            ),
+                        }
+                        parse_result.parser_engine = "deepdoc"
+                    return parse_result
+                # Deliberately broad. The point of the remote path is that it is
+                # an optimization, so *nothing* it does may cost us a parse we
+                # could have done locally. Narrowing this to DeepDocRemoteError
+                # only covers the client's own failures, while the try also
+                # wraps the translation of server-supplied data: an unexpected
+                # `metadata` shape reaches _build_element_metadata and raises
+                # from a bare int()/float(), which would escape and fail the
+                # ingest. Validating each field as it bites is a losing game --
+                # this closes the class.
+                except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Remote DeepDoc parse failed (%s); falling back to local", exc
                     )

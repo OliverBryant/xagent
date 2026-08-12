@@ -219,7 +219,12 @@ request with nothing to stitch.
 
 ## 8. Acceptance criteria
 
-1. **Env unset** — behavior is byte-for-byte the current behavior (fully local).
+1. **Env unset** — fully local, with two deliberate differences from the
+   pre-integration behavior: `ParseResult.metadata` now carries
+   `deepdoc_backend="local"` on every format, and the Office magic-byte check
+   was hoisted above the local dispatch, so an `.xlsx` whose BytesIO conversion
+   failed is now validated where it previously went straight to
+   `_parse_xlsx_rows`. Parsed content itself is unchanged.
 2. **Non-PDF, env set** — parsed locally with **zero HTTP requests**.
 3. **PDF, env set, service healthy** — parsed remotely in one request; local
    ONNX models are **not loaded** and no ModelScope download is triggered;

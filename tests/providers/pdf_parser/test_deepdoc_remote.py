@@ -310,53 +310,44 @@ class TestParseDocumentRemoteSuccess:
             "image_scope": IMAGE_SCOPE,
         }
 
-    def test_task_is_always_parse(self, tmp_path: Path) -> None:
-        """A per-page ``ocr`` task would return text with no structure at all."""
+    def test_configured_timeout_reaches_read_and_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The configured timeout bounds the upload and the parse, not the connect.
+
+        A whole-document parse can legitimately take many minutes, so ``read``
+        and ``write`` follow the configured value while ``connect`` and ``pool``
+        stay short -- an unreachable host should fail fast rather than hang for
+        the parse budget.
+        """
+        monkeypatch.setenv(TIMEOUT_ENV, "1234")
         source = tmp_path / "report.pdf"
         source.write_bytes(b"%PDF-1.7 fake")
-        requests: list[httpx.Request] = []
+        seen: list[httpx.Timeout] = []
+
+        real_client = httpx.Client
+
+        def capturing_client(*args: Any, **kwargs: Any) -> httpx.Client:
+            timeout = kwargs.get("timeout")
+            if isinstance(timeout, httpx.Timeout):
+                seen.append(timeout)
+            return real_client(*args, **kwargs)
+
+        monkeypatch.setattr(httpx, "Client", capturing_client)
 
         parse_document_remote(
             str(source),
             ext=".pdf",
             save_image=RecordingSaveImage(),
-            _transport=json_transport({"elements": []}, sink=requests),
+            _transport=json_transport({"elements": []}),
         )
 
-        assert parse_kwargs(requests[0])["task"] == "parse"
-
-    def test_image_scope_is_sent_as_table_figure(self, tmp_path: Path) -> None:
-        """Only table/figure crops are consumed downstream, so only those are requested."""
-        source = tmp_path / "report.pdf"
-        source.write_bytes(b"%PDF-1.7 fake")
-        requests: list[httpx.Request] = []
-
-        parse_document_remote(
-            str(source),
-            ext=".pdf",
-            save_image=RecordingSaveImage(),
-            _transport=json_transport({"elements": []}, sink=requests),
-        )
-
-        assert IMAGE_SCOPE == "table_figure"
-        assert parse_kwargs(requests[0])["image_scope"] == "table_figure"
-
-    def test_pages_and_dpi_are_never_sent(self, tmp_path: Path) -> None:
-        """``task=parse`` rejects both outright, so the client must not offer them."""
-        source = tmp_path / "report.pdf"
-        source.write_bytes(b"%PDF-1.7 fake")
-        requests: list[httpx.Request] = []
-
-        parse_document_remote(
-            str(source),
-            ext=".pdf",
-            save_image=RecordingSaveImage(),
-            _transport=json_transport({"elements": []}, sink=requests),
-        )
-
-        sent = parse_kwargs(requests[0])
-        assert "pages" not in sent
-        assert "dpi" not in sent
+        assert seen, "no httpx.Client was constructed with an explicit timeout"
+        timeout = seen[0]
+        assert timeout.read == 1234
+        assert timeout.write == 1234
+        assert timeout.connect == 10
+        assert timeout.pool == 10
 
     def test_zoomin_defaults_to_three(self, tmp_path: Path) -> None:
         """The default matches the local parser's parse_into_bboxes(zoomin=3)."""
@@ -1199,3 +1190,99 @@ class TestIsRemoteConfigured:
     ) -> None:
         monkeypatch.setenv(URL_ENV, value)
         assert is_remote_configured() is True
+
+
+class TestBlankPasswordDoesNotHijackTheApiKey:
+    """A whitespace-only password must not be mistaken for a credential.
+
+    The password is deliberately not stripped, because whitespace can be
+    significant in a secret. But a password of only spaces is a misconfigured
+    variable, and treating it as real would take the JWT branch, ignore a
+    working API key, and 401 forever — surfacing only as a permanent silent
+    fallback to local parsing.
+    """
+
+    @pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+    def test_blank_password_falls_through_to_the_api_key(
+        self, monkeypatch: pytest.MonkeyPatch, password: str
+    ) -> None:
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, password)
+        monkeypatch.setenv(API_KEY_ENV, "configured-key")
+
+        assert _build_headers(BASE_URL, None) == {
+            "Authorization": "Bearer configured-key"
+        }
+
+    def test_a_password_of_significant_whitespace_is_still_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Padding around a real secret is preserved, not stripped away."""
+        monkeypatch.setenv(USERNAME_ENV, "admin")
+        monkeypatch.setenv(PASSWORD_ENV, "  secret  ")
+        sent: list[httpx.Request] = []
+
+        headers = _build_headers(
+            BASE_URL,
+            routed_transport({"elements": []}, token="jwt-abc", sink=sent),
+        )
+
+        assert headers == {"Authorization": "Bearer jwt-abc"}
+        body = json.loads(sent[0].content)
+        assert body["password"] == "  secret  "
+
+
+class TestProgressSinkCannotBreakTheParse:
+    """A raising progress sink must never cost a parse.
+
+    Both callbacks sit outside the function's own ``try``, so without their own
+    guard the exception escapes as its own type and bypasses the caller's
+    ``except DeepDocRemoteError``. On the entry call that skips the fallback; on
+    the completion call it is worse, discarding a *successful* parse along with
+    every crop already written to disk.
+    """
+
+    def test_raising_sink_on_entry_does_not_prevent_the_parse(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        def exploding_callback(progress: float, message: str) -> None:
+            raise RuntimeError("sink is broken")
+
+        elements = parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            callback=exploding_callback,
+            _transport=json_transport(sample_payload()),
+        )
+
+        assert len(elements) == 2
+
+    def test_raising_sink_on_completion_does_not_discard_the_result(
+        self, tmp_path: Path
+    ) -> None:
+        """The completion notice fires after the crops are written; it must not undo them."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        save_image = RecordingSaveImage()
+        calls: list[float] = []
+
+        def late_exploding_callback(progress: float, message: str) -> None:
+            calls.append(progress)
+            if progress >= 1.0:
+                raise RuntimeError("sink broke at the finish line")
+
+        elements = parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=save_image,
+            callback=late_exploding_callback,
+            _transport=json_transport(sample_payload()),
+        )
+
+        assert calls == [0.05, 1.0]
+        assert len(elements) == 2
+        assert len(save_image.calls) == 1

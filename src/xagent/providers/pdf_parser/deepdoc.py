@@ -565,11 +565,6 @@ class DeepDocParser(
         self._parsers: dict[str, Any] = {}
         self.enable_raw_output = enable_raw_output
 
-    def _get_parser(self, file_path: str) -> Tuple[Any, str]:
-        """Get parser and extension for a file path."""
-        ext = Path(file_path).suffix.lower()
-        return self._get_parser_for_ext(ext), ext
-
     def _get_parser_for_ext(self, ext: str) -> Any:
         """Get parser for a specific file extension (used for file paths and BytesIO objects)."""
         if ext not in self._parsers:

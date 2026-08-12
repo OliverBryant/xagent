@@ -1114,7 +1114,9 @@ class TestRawOutputPassthroughOnTheRemotePath:
         pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
 
         monkeypatch.setattr(
-            deepdoc_remote, "parse_document_remote", lambda *a, **k: remote_pdf_elements()
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *a, **k: remote_pdf_elements(),
         )
         arm_local_parser_tripwire(monkeypatch)
 
@@ -1145,7 +1147,9 @@ class TestRawOutputPassthroughOnTheRemotePath:
         pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
 
         monkeypatch.setattr(
-            deepdoc_remote, "parse_document_remote", lambda *a, **k: remote_pdf_elements()
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *a, **k: remote_pdf_elements(),
         )
         arm_local_parser_tripwire(monkeypatch)
 
@@ -1154,3 +1158,38 @@ class TestRawOutputPassthroughOnTheRemotePath:
         assert result.raw_parser_output is None
         assert result.parser_engine is None
         assert not result.has_visualization_data
+
+
+class TestBackendMarkerOnEveryFormat:
+    """`deepdoc_backend` must survive every format's translator.
+
+    Only the PDF translator used to forward the parse metadata onto the
+    ParseResult, so a DOCX/XLSX/MD/TXT/CSV parse returned `deepdoc_backend=None`
+    and the remote-versus-local outcome was unobservable for those formats.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("suffix", "payload"),
+        [
+            (".txt", b"plain text body"),
+            (".md", b"# heading\n\nbody text\n"),
+        ],
+    )
+    async def test_local_parse_marks_backend(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        suffix: str,
+        payload: bytes,
+    ) -> None:
+        """Formats that bypass the PDF branch still report the local backend."""
+        source = tmp_path / f"sample{suffix}"
+        source.write_bytes(payload)
+
+        arm_remote_tripwire(monkeypatch)
+
+        parser = DeepDocParser()
+        result = await parser.parse(str(source), doc_id="backend-marker")
+
+        assert result.metadata.get("deepdoc_backend") == "local"

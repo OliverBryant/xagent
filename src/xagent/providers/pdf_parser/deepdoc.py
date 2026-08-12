@@ -448,12 +448,14 @@ def _translate_docx_output(
                     ParsedTable(html=table_html, image=None, metadata=table_metadata)
                 )
 
-    return ParseResult(text_segments=text_segments, figures=figures, tables=tables)
+    return ParseResult(
+        text_segments=text_segments, figures=figures, tables=tables, metadata=kwargs
+    )
 
 
 def _translate_excel_output(raw_output: Any, **kwargs: Any) -> ParseResult:
     text_segments = [ParsedTextSegment(text=row, metadata=kwargs) for row in raw_output]
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _translate_text_output(raw_output: Any, **kwargs: Any) -> ParseResult:
@@ -467,7 +469,7 @@ def _translate_text_output(raw_output: Any, **kwargs: Any) -> ParseResult:
                 text_segments.append(ParsedTextSegment(text=item[0], metadata=kwargs))
     elif isinstance(raw_output, str):
         text_segments.append(ParsedTextSegment(text=raw_output, metadata=kwargs))
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _translate_markdown_output(raw_output: Any, **kwargs: Any) -> ParseResult:
@@ -483,7 +485,7 @@ def _translate_markdown_output(raw_output: Any, **kwargs: Any) -> ParseResult:
             table_meta = kwargs.copy()
             table_meta["type"] = "table"
             text_segments.append(ParsedTextSegment(text=tbl, metadata=table_meta))
-    return ParseResult(text_segments=text_segments)
+    return ParseResult(text_segments=text_segments, metadata=kwargs)
 
 
 def _parse_docx_with_python_docx(
@@ -960,6 +962,6 @@ def _parse_xlsx_rows(file_path: str | BytesIO, **kwargs: Any) -> ParseResult:
                     ParsedTextSegment(text=row_text, metadata=metadata)
                 )
 
-        return ParseResult(text_segments=text_segments)
+        return ParseResult(text_segments=text_segments, metadata=kwargs)
     finally:
         workbook.close()

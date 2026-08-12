@@ -48,6 +48,15 @@ stitch together on this side.
             200 MP per-page / 1 GP per-document budget; 401 auth failure;
             500 inference failure.
 
+A managed deployment answers with that object wrapped in a gateway envelope,
+verified against Xinference Cloud::
+
+    {"code": 0, "message": "Request successful.", "data": {"task": ..., "elements": [...]}}
+
+Both shapes are accepted. The envelope also carries failures the gateway
+returns with HTTP 200 and a non-zero ``code``, which ``raise_for_status`` cannot
+see, so that case is turned into an error rather than read as an empty result.
+
 Three details of that contract drive the code below:
 
 * ``task="parse"`` consumes a PDF, not a page image, and rejects ``pages`` and
@@ -315,6 +324,36 @@ def _post_pdf(
         return _send(Path(file_path).name, fh)
 
 
+def _extract_elements(payload: dict[str, Any]) -> list[Any]:
+    """Return the element list, whether or not the response is enveloped.
+
+    A self-hosted Xinference answers with the parse result directly, while the
+    managed gateway wraps it as ``{"code": 0, "message": ..., "data": {...}}``.
+    Both are legitimate, so unwrap a ``data`` object when the elements are not
+    where a direct response would put them.
+
+    A non-zero ``code`` is surfaced rather than swallowed: the gateway uses it to
+    report a failure it still returned with HTTP 200, which ``raise_for_status``
+    cannot catch.
+    """
+    for candidate in (payload, payload.get("data")):
+        if not isinstance(candidate, dict):
+            continue
+        elements = candidate.get("elements")
+        if isinstance(elements, list):
+            return elements
+
+    code = payload.get("code")
+    if isinstance(code, int) and code != 0:
+        raise ValueError(
+            f"Remote DeepDoc reported code {code}: {payload.get('message')!r}"
+        )
+    raise ValueError(
+        "Remote DeepDoc response is missing an 'elements' list "
+        f"(top-level keys: {sorted(payload)})"
+    )
+
+
 def _normalize_elements(
     payload: dict[str, Any], save_image: SaveImage
 ) -> list[dict[str, Any]]:
@@ -339,12 +378,7 @@ def _normalize_elements(
     Any crop already written before a failure is removed before the exception
     propagates, so a rejected response leaves nothing behind.
     """
-    elements = payload.get("elements")
-    if not isinstance(elements, list):
-        raise ValueError(
-            "Remote DeepDoc response is missing an 'elements' list "
-            f"(got {type(elements).__name__})"
-        )
+    elements = _extract_elements(payload)
 
     # Crops are written as the loop goes, so a failure partway through would
     # otherwise leave the earlier ones orphaned under the artifacts directory --

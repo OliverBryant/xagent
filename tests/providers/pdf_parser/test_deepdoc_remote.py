@@ -1286,3 +1286,76 @@ class TestProgressSinkCannotBreakTheParse:
         assert calls == [0.05, 1.0]
         assert len(elements) == 2
         assert len(save_image.calls) == 1
+
+
+class TestEnvelopedResponses:
+    """The managed gateway wraps the parse result; a self-hosted server does not.
+
+    Verified against the live SaaS endpoint, which answers
+    ``{"code": 0, "message": "Request successful.", "data": {"task": ..., "elements": [...]}}``
+    while a self-hosted Xinference returns that inner object directly. Both are
+    legitimate deployments of the same contract, so the client accepts either.
+    """
+
+    def test_enveloped_payload_is_unwrapped(self, tmp_path: Path) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+        save_image = RecordingSaveImage()
+
+        elements = parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=save_image,
+            _transport=json_transport(
+                {
+                    "code": 0,
+                    "message": "Request successful.",
+                    "data": sample_payload(),
+                }
+            ),
+        )
+
+        assert len(elements) == 2
+        assert elements[0]["text"] == "Sample Document"
+        assert elements[1]["image"] == save_image.path
+
+    def test_direct_payload_still_works(self, tmp_path: Path) -> None:
+        """The unwrapping must not regress the self-hosted shape."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        elements = parse_document_remote(
+            str(source),
+            ext=".pdf",
+            save_image=RecordingSaveImage(),
+            _transport=json_transport(sample_payload()),
+        )
+
+        assert len(elements) == 2
+
+    def test_nonzero_code_is_surfaced_not_swallowed(self, tmp_path: Path) -> None:
+        """The gateway reports some failures with HTTP 200 and a non-zero code."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        with pytest.raises(DeepDocRemoteError, match="code 40301"):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=json_transport(
+                    {"code": 40301, "message": "quota exceeded", "data": None}
+                ),
+            )
+
+    def test_envelope_without_elements_is_rejected(self, tmp_path: Path) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        with pytest.raises(DeepDocRemoteError):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=json_transport({"code": 0, "data": {"task": "parse"}}),
+            )

@@ -117,23 +117,29 @@ def remote_configured(monkeypatch: pytest.MonkeyPatch) -> str:
 class CapturedWarnings:
     """Records warnings straight off a named logger.
 
-    ``caplog`` installs its handler on the root logger and depends on
-    propagation surviving whatever else configured logging in the same process.
-    In CI these assertions read an empty ``caplog.text`` intermittently -- the
-    same two tests failed on two runs and passed on others, including a second
-    run of the identical commit. The trigger did not reproduce locally, even
-    under the CI invocation (``-n 4 --dist=loadscope`` over the same paths), so
-    the cause is recorded as unidentified rather than guessed at; a module-scope
-    ``setup_logging()`` somewhere in the run is the likeliest candidate.
+    These assertions were originally written against ``caplog``, which installs
+    its handler on the *root* logger and therefore depends on propagation and on
+    the root level surviving whatever else configured logging in the same
+    process. In CI they intermittently read an empty capture -- the same two
+    tests, failing on some runs and passing on others including a rerun of the
+    identical commit. The trigger never reproduced locally, not even under the
+    CI invocation (``-n 4 --dist=loadscope`` over the same paths).
 
-    Attaching a handler to the emitting logger removes the dependency on root
-    propagation altogether, which makes the assertion independent of whatever
-    else in the process touched logging.
+    So rather than keep guessing at the cause, this removes every dependency it
+    could plausibly have had: the handler goes on the emitting logger (no
+    propagation needed), the level is forced (no inherited threshold), and
+    ``disabled`` is cleared (``logging.disable()`` elsewhere in the run cannot
+    suppress it). Everything is restored on exit.
+
+    Even so, callers should treat a log assertion as a secondary check. The
+    behavioural facts -- that the fallback ran, that the local parser was
+    called, that ``deepdoc_backend`` says ``local`` -- are asserted separately
+    and are what actually matter.
     """
 
     class _Collector(logging.Handler):
         def __init__(self, records: List[logging.LogRecord]) -> None:
-            super().__init__()
+            super().__init__(level=logging.NOTSET)
             self._records = records
 
         def emit(self, record: logging.LogRecord) -> None:
@@ -144,8 +150,14 @@ class CapturedWarnings:
         self._records: List[logging.LogRecord] = []
         self._handler: logging.Handler = self._Collector(self._records)
         self._previous_level = self._logger.level
+        self._previous_disabled = self._logger.disabled
+        self._previous_manager_disable = logging.root.manager.disable
 
     def __enter__(self) -> "CapturedWarnings":
+        # A module-level logging.disable() suppresses records before any handler
+        # sees them, and it is process-global, so clear it for the duration.
+        logging.root.manager.disable = 0
+        self._logger.disabled = False
         self._logger.setLevel(logging.WARNING)
         self._logger.addHandler(self._handler)
         return self
@@ -153,6 +165,8 @@ class CapturedWarnings:
     def __exit__(self, *exc_info: Any) -> None:
         self._logger.removeHandler(self._handler)
         self._logger.setLevel(self._previous_level)
+        self._logger.disabled = self._previous_disabled
+        logging.root.manager.disable = self._previous_manager_disable
 
     @property
     def text(self) -> str:

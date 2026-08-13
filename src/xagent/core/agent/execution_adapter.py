@@ -397,7 +397,34 @@ class AgentExecutionAdapter:
                         if isinstance(interactions, list)
                         else [],
                     },
+                    # This top-level key is the supported contract for
+                    # readers of the clarification draft. ``agent_result``
+                    # above is a diagnostic snapshot of the raw pattern
+                    # result, already read by ``agent_tool.py`` and
+                    # ``websocket.py`` for other purposes -- it happens to
+                    # carry the same draft too, but callers should not dig
+                    # it out from there.
+                    "clarification_draft": result.get("clarification_draft"),
+                    # Empty list rather than ``None`` so a reader only ever
+                    # needs one check (``if superseded:``) instead of also
+                    # distinguishing "key absent" from "key present but
+                    # empty".
+                    "clarification_superseded_step_ids": (
+                        result.get("clarification_superseded_step_ids") or []
+                    ),
                 }
+            )
+        if status == "interrupted":
+            # A losing waiting step can still be superseded in a batch whose
+            # winner is an interrupt rather than a question (the DAG ranks
+            # an interrupt ahead of a waiting result within the same
+            # wakeup), so this key must reach the top level here too --
+            # otherwise a reader has no way to tell "no sibling was
+            # superseded" apart from "this status never carries the key".
+            # Same empty-list default as the waiting branch above, for the
+            # same reason: one ``if superseded:`` check covers both.
+            normalized["clarification_superseded_step_ids"] = (
+                result.get("clarification_superseded_step_ids") or []
             )
         return normalized
 

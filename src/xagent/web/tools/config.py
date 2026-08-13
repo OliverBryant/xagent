@@ -9,6 +9,7 @@ import copy
 import inspect
 import logging
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -728,6 +729,28 @@ def _load_custom_api_runtime_view_sync(
         ) from exc
 
 
+def _visible_custom_api_query(
+    db: Any, *, owner_user_id: int | None, team_api_ids: frozenset[int]
+) -> Any:
+    """Production custom-API visibility query, shared by both read points.
+
+    Module-level, not a ``WebToolConfig`` method: ``_load_custom_api_factory_inputs``
+    below is a module-level function that never sees a ``WebToolConfig``
+    instance (the detached-plan contract documented on
+    ``_load_tool_factory_runtime_snapshot``'s docstring, this module: "never
+    receives the caller's ``WebToolConfig``, request Session, or ORM user"),
+    so a method could serve only one of the two read points.
+    """
+    from ..models.custom_api import CustomApi
+    from ..services.connector_team_scope import visible_custom_api_clause
+
+    return (
+        db.query(CustomApi)
+        .filter(visible_custom_api_clause(owner_user_id, team_api_ids))
+        .order_by(CustomApi.id)
+    )
+
+
 def _load_custom_api_factory_inputs(
     db: Any,
     *,
@@ -739,17 +762,23 @@ def _load_custom_api_factory_inputs(
     if user_id is None:
         return []
 
-    from ..models.custom_api import UserCustomApi
+    # Resolved before the caller's guarded region (this helper carries no
+    # try/except of its own): that region reports "every selected API is
+    # unavailable", which is the wrong answer for "the scope could not be
+    # resolved". The typed error is what survives the tool-creator frame --
+    # an untyped one is dropped there with an ERROR and no tool set at all.
+    from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
 
-    user_apis = (
-        db.query(UserCustomApi)
-        .filter(
-            UserCustomApi.user_id == user_id,
-            UserCustomApi.is_active,
-        )
-        .all()
+    team_api_ids = frozenset(
+        resolve_team_connector_ids_or_raise(
+            db, team_id=connector_team_id, log_subject=user_id
+        )["custom_api"]
     )
-    if not user_apis:
+
+    rows = _visible_custom_api_query(
+        db, owner_user_id=user_id, team_api_ids=team_api_ids
+    ).all()
+    if not rows:
         return []
 
     runtime_view = _load_custom_api_runtime_view_sync(
@@ -760,10 +789,7 @@ def _load_custom_api_factory_inputs(
         agent_team_id=connector_team_id,
     )
     configs: list[dict[str, Any]] = []
-    for user_api in user_apis:
-        api = user_api.custom_api
-        if api is None:
-            continue
+    for api in rows:
         runtime_values = runtime_view.get(f"custom_api:{int(api.id)}")
         configs.append(
             _custom_api_config_from_model(
@@ -1122,6 +1148,11 @@ def _load_tool_runtime_policy_snapshot(
     )
 
 
+# Maps the frontend's `app_locale` cookie (see i18n-context.tsx, which only
+# ever sets "en" or "zh") to a Playwright-compatible locale tag.
+_APP_LOCALE_TO_BROWSER_LOCALE = {"en": "en-US", "zh": "zh-CN"}
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -1284,6 +1315,13 @@ class WebToolConfig(BaseToolConfig):
         self._retained_factory_model_state: _RetainedFactoryModelState | None = None
         self._factory_runtime_handed_off = False
         self._pending_runtime_policy: _ToolRuntimePolicySnapshot | None = None
+        # get_browser_locale() memoizes on first call: _detach_factory_runtime_resources()
+        # nulls self.request once tools are built, but AgentService can rebuild tools on
+        # this same config instance later (_ensure_tools_initialized), at which point
+        # re-deriving from self.request would silently lose the already-resolved locale
+        # to the deployment default rather than reusing what was actually resolved.
+        self._browser_locale_resolved = False
+        self._cached_browser_locale: Optional[str] = None
 
     def _build_mcp_file_allowed_dirs(self) -> str:
         """Build comma-separated file roots that local MCP tools may read."""
@@ -1309,6 +1347,16 @@ class WebToolConfig(BaseToolConfig):
 
         Uses ``getattr`` so a minimal request object (e.g. one carrying only a
         user id) doesn't trip the broad ``except`` and log a spurious warning.
+
+        Only safe as long as ``request`` never reaches here as a real
+        Starlette ``Request``/``HTTPConnection`` without ``AuthenticationMiddleware``
+        installed (which this app never installs): accessing ``.user`` on one
+        raises ``AssertionError``, not ``AttributeError``, so ``getattr``'s
+        default would not save it. Currently unreachable because
+        ``create_default_tools`` always passes an explicit ``user=``/``is_admin=``
+        (this path only runs when ``is_admin`` is left unset), but a future
+        caller that omits both and passes a real ``Request`` here would crash
+        instead of defaulting to ``False``.
         """
         user = getattr(request, "user", None)
         return bool(getattr(user, "is_admin", False)) if user is not None else False
@@ -1761,6 +1809,60 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def get_browser_locale(self) -> Optional[str]:
+        """Derive a browser-automation locale from the ``app_locale``
+        cookie the web UI's language switcher sets (see
+        frontend/src/contexts/i18n-context.tsx), so a task's Playwright
+        sessions request pages in the language the browser is currently
+        set to, rather than a single locale hardcoded for every
+        deployment or the browser's own Accept-Language header (which
+        reflects OS/browser settings, not a deliberate in-app choice, and
+        does not necessarily match the language the UI is displaying).
+
+        This is a browser cookie, not a persisted account attribute: there
+        is no ``locale`` column on ``User`` and no ``locale`` field on
+        ``TaskCreateRequest``. It's device- and browser-scoped, lost when
+        cookies are cleared, and not synced across a user's sessions.
+
+        ``None`` (no request, no cookie, or an unrecognized value) lets the
+        browser tool fall back to its own deployment default.
+
+        Memoized on first call: ``_detach_factory_runtime_resources`` nulls
+        ``self.request`` once tools are built, but ``AgentService`` can
+        rebuild tools on this same config instance later
+        (``_ensure_tools_initialized``) -- re-deriving at that point would
+        silently lose the already-resolved locale to the deployment default
+        instead of reusing what this task actually resolved.
+        """
+        if not self._browser_locale_resolved:
+            cookies = getattr(self.request, "cookies", None)
+            app_locale = getattr(cookies, "get", lambda _key: None)("app_locale")
+            self._cached_browser_locale = self._normalize_app_locale_cookie(app_locale)
+            self._browser_locale_resolved = True
+        return self._cached_browser_locale
+
+    @staticmethod
+    def _normalize_app_locale_cookie(app_locale: Any) -> Optional[str]:
+        """Map an ``app_locale`` cookie value to a Playwright locale tag.
+
+        Matches on the primary language subtag so an already-valid BCP-47-ish
+        variant (``zh-CN``, ``zh_CN``, ``EN``, ...) resolves the same as the
+        exact ``"en"``/``"zh"`` the frontend writes today (see
+        ``frontend/src/contexts/i18n-context.tsx``), instead of only matching
+        those two literal strings.
+
+        Primary-subtag-only means ``zh-TW``/``zh-HK`` would also map to the
+        Simplified ``zh-CN`` in ``_APP_LOCALE_TO_BROWSER_LOCALE`` rather than
+        a Traditional-Chinese locale -- harmless today since the frontend's
+        ``Locale`` type is a hard ``"en" | "zh"`` union with no way to write
+        those values, but revisit this if a Traditional-Chinese UI locale is
+        ever added.
+        """
+        if not isinstance(app_locale, str) or not app_locale:
+            return None
+        primary = re.split(r"[-_]", app_locale, maxsplit=1)[0].lower()
+        return _APP_LOCALE_TO_BROWSER_LOCALE.get(primary)
 
     def set_task_runtime_contribution(self, contribution: Any) -> None:
         """Attach the detached contribution built for this task."""
@@ -3391,26 +3493,13 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
-        try:
-            from ..services.connector_team_scope import team_connector_ids
+        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
 
-            team_mcp_ids = frozenset(
-                team_connector_ids(self.db, team_id=self._connector_team_id)["mcp"]
-            )
-        except ConnectorRuntimeError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "Failed to resolve team connector scope for user %s",
-                self._user_id,
-                exc_info=True,
-            )
-            raise ConnectorRuntimeError(
-                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-                "Connector team scope is unavailable.",
-                details={"reason": "team_scope_resolution_failed"},
-                status_code=503,
-            ) from exc
+        team_mcp_ids = frozenset(
+            resolve_team_connector_ids_or_raise(
+                self.db, team_id=self._connector_team_id, log_subject=self._user_id
+            )["mcp"]
+        )
 
         try:
             from ..services.mcp_runtime import (
@@ -3461,26 +3550,60 @@ class WebToolConfig(BaseToolConfig):
         if not self._user_id:
             return []
 
+        # Resolved before the guarded region below: that region reports
+        # "every selected API is unavailable", which is the wrong answer
+        # for "the scope could not be resolved". The typed error is what
+        # survives the tool-creator frame -- an untyped one is dropped there
+        # with an ERROR and no tool set at all.
+        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
+
+        team_api_ids = frozenset(
+            resolve_team_connector_ids_or_raise(
+                self.db, team_id=self._connector_team_id, log_subject=self._user_id
+            )["custom_api"]
+        )
+
+        # Fails closed on the query itself, matching the MCP twin
+        # (_load_mcp_server_configs): a genuine DB/query failure here is not
+        # "the caller selected zero custom APIs", so it must not degrade to
+        # an empty list. The MCP twin raises its own MCPConfigLoadError,
+        # whose summaries/failure-policy machinery (enforce_mcp_failure_policy)
+        # has no custom-API equivalent and would be new surface to build for
+        # this fix; ConnectorRuntimeError is the typed error this same
+        # function already raises for the team-scope-resolution failure
+        # above, is already propagated by every frame between here and the
+        # tool creator (create_db_custom_api_tools's own
+        # ``except ConnectorRuntimeError: raise``, then the registry loop's),
+        # and needs no new plumbing. Per-row config-building below keeps its
+        # existing swallow behavior unchanged -- neither side treats an
+        # individual row's build failure as fatal -- but the granularity
+        # still differs and is a remaining difference, out of scope here:
+        # the MCP twin isolates a failed row into an "unavailable" config
+        # and keeps loading the others, while this loop's guard spans the
+        # whole loop, so one bad row still discards every row.
         try:
-            from ..models.custom_api import UserCustomApi
-
-            user_apis = (
-                self.db.query(UserCustomApi)
-                .filter(
-                    UserCustomApi.user_id == int(self._user_id),
-                    UserCustomApi.is_active,
-                )
-                .all()
+            apis = _visible_custom_api_query(
+                self.db,
+                owner_user_id=int(self._user_id),
+                team_api_ids=team_api_ids,
+            ).all()
+        except ConnectorRuntimeError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Failed to scan Custom API configs with %s",
+                type(error).__name__,
             )
+            raise ConnectorRuntimeError(
+                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+                "Custom API configurations could not be loaded.",
+                details={"reason": "custom_api_config_load_failed"},
+                status_code=503,
+            ) from error
 
-            if not user_apis:
-                return []
-
+        try:
             custom_api_configs = []
-            for user_api in user_apis:
-                api = user_api.custom_api
-                if api is None:
-                    continue
+            for api in apis:
                 custom_api_configs.append(
                     _custom_api_config_from_model(
                         api,

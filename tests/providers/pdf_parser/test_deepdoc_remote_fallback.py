@@ -14,6 +14,7 @@ production code ever moves local-parser construction back above the remote
 dispatch, these tests fail immediately.
 """
 
+import logging
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -111,6 +112,61 @@ def remote_configured(monkeypatch: pytest.MonkeyPatch) -> str:
     url = "http://deepdoc.invalid:9997"
     monkeypatch.setenv(REMOTE_URL_ENV, url)
     return url
+
+
+class CapturedWarnings:
+    """Records warnings straight off a named logger.
+
+    ``caplog`` installs its handler on the root logger and depends on
+    propagation surviving whatever else configured logging in the same process.
+    In CI these assertions read an empty ``caplog.text`` intermittently -- the
+    same two tests failed on two runs and passed on others, including a second
+    run of the identical commit. The trigger did not reproduce locally, even
+    under the CI invocation (``-n 4 --dist=loadscope`` over the same paths), so
+    the cause is recorded as unidentified rather than guessed at; a module-scope
+    ``setup_logging()`` somewhere in the run is the likeliest candidate.
+
+    Attaching a handler to the emitting logger removes the dependency on root
+    propagation altogether, which makes the assertion independent of whatever
+    else in the process touched logging.
+    """
+
+    class _Collector(logging.Handler):
+        def __init__(self, records: List[logging.LogRecord]) -> None:
+            super().__init__()
+            self._records = records
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self._records.append(record)
+
+    def __init__(self, logger_name: str) -> None:
+        self._logger = logging.getLogger(logger_name)
+        self._records: List[logging.LogRecord] = []
+        self._handler: logging.Handler = self._Collector(self._records)
+        self._previous_level = self._logger.level
+
+    def __enter__(self) -> "CapturedWarnings":
+        self._logger.setLevel(logging.WARNING)
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._previous_level)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(record.getMessage() for record in self._records)
+
+
+def capture_deepdoc_warnings() -> CapturedWarnings:
+    """Capture warnings emitted by the DeepDoc parser module."""
+    return CapturedWarnings("xagent.providers.pdf_parser.deepdoc")
+
+
+def capture_remote_warnings() -> CapturedWarnings:
+    """Capture warnings emitted by the remote client module."""
+    return CapturedWarnings("xagent.providers.pdf_parser.deepdoc_remote")
 
 
 def arm_local_parser_tripwire(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,7 +478,6 @@ class TestRemoteFailureFallsBackToLocal:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
         remote_configured: str,
     ) -> None:
         """DeepDocRemoteError yields the local result, a warning, and backend=local."""
@@ -454,7 +509,7 @@ class TestRemoteFailureFallsBackToLocal:
         )
 
         parser = DeepDocParser()
-        with caplog.at_level("WARNING", logger="xagent.providers.pdf_parser.deepdoc"):
+        with capture_deepdoc_warnings() as captured:
             result = await parser.parse(str(pdf_file), doc_id="fallback_pdf_doc")
 
         # The local result is what comes back.
@@ -471,15 +526,14 @@ class TestRemoteFailureFallsBackToLocal:
         assert fake_parser.calls[0]["zoomin"] == 3
 
         # And the failure was logged rather than swallowed.
-        assert "Remote DeepDoc parse failed" in caplog.text
-        assert "falling back to local" in caplog.text
+        assert "Remote DeepDoc parse failed" in captured.text
+        assert "falling back to local" in captured.text
 
     @pytest.mark.asyncio
     async def test_broken_progress_sink_does_not_abort_the_fallback(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
         remote_configured: str,
     ) -> None:
         """Reporting the fallback must never be able to prevent the fallback.
@@ -508,7 +562,7 @@ class TestRemoteFailureFallsBackToLocal:
 
         progress = BrokenProgressCallback()
         parser = DeepDocParser()
-        with caplog.at_level("WARNING"):
+        with capture_deepdoc_warnings() as captured:
             result = await parser.parse(
                 str(pdf_file),
                 progress_callback=progress,
@@ -522,7 +576,7 @@ class TestRemoteFailureFallsBackToLocal:
         # The sink was genuinely exercised and genuinely raised.
         assert progress.call_count > 0
         assert "Progress callback failed while reporting the DeepDoc fallback" in (
-            caplog.text
+            captured.text
         )
 
     @pytest.mark.asyncio
@@ -601,7 +655,6 @@ class TestEnvUnsetStaysLocal:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A typo in the URL must not break every parse; it degrades to local."""
         pdf_file = tmp_path / "malformed_url.pdf"
@@ -618,14 +671,14 @@ class TestEnvUnsetStaysLocal:
         )
 
         parser = DeepDocParser()
-        with caplog.at_level("WARNING"):
+        with capture_remote_warnings() as captured:
             result = await parser.parse(str(pdf_file), doc_id="malformed_url_doc")
 
         assert [segment.text for segment in result.text_segments] == [
             "Local despite a bad URL"
         ]
         assert result.metadata["deepdoc_backend"] == "local"
-        assert "parsing locally" in caplog.text
+        assert "parsing locally" in captured.text
 
 
 # ==========================================
@@ -1023,7 +1076,6 @@ class TestUntrustedMetadataFallsBackRatherThanRaising:
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
         remote_configured: str,
         positions: Any,
     ) -> None:
@@ -1051,19 +1103,18 @@ class TestUntrustedMetadataFallsBackRatherThanRaising:
         )
 
         parser = DeepDocParser()
-        with caplog.at_level("WARNING", logger="xagent.providers.pdf_parser.deepdoc"):
+        with capture_deepdoc_warnings() as captured:
             result = await parser.parse(str(pdf_file), doc_id="untrusted")
 
         assert result.metadata["deepdoc_backend"] == "local"
         assert result.text_segments[0].text == "local paragraph"
-        assert "falling back to local" in caplog.text
+        assert "falling back to local" in captured.text
 
     @pytest.mark.asyncio
     async def test_missing_image_path_falls_back_to_local(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
         remote_configured: str,
     ) -> None:
         """`_handle_image` raises for a path that no longer exists; that must fall back."""
@@ -1090,11 +1141,11 @@ class TestUntrustedMetadataFallsBackRatherThanRaising:
         )
 
         parser = DeepDocParser()
-        with caplog.at_level("WARNING", logger="xagent.providers.pdf_parser.deepdoc"):
+        with capture_deepdoc_warnings() as captured:
             result = await parser.parse(str(pdf_file), doc_id="missing-crop")
 
         assert result.metadata["deepdoc_backend"] == "local"
-        assert "falling back to local" in caplog.text
+        assert "falling back to local" in captured.text
 
 
 class TestRawOutputPassthroughOnTheRemotePath:

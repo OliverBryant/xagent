@@ -463,11 +463,23 @@ def _normalized_http_env_url(env_var: str) -> str | None:
             f"Invalid {env_var} value: {value!r}. "
             "Expected an absolute http:// or https:// URL without a query or fragment."
         )
-    # Reject embedded credentials. httpx does not send URL userinfo as Basic
-    # auth, so they authenticate nothing, but httpx.HTTPStatusError renders the
-    # full URL unredacted -- and callers put that string into log messages, so a
-    # password placed here ends up in plaintext in application logs.
-    if "@" in parts.netloc:
+    return value
+
+
+def _reject_url_userinfo(env_var: str, value: str | None) -> str | None:
+    """Reject a URL carrying ``user:password@``, returning it otherwise.
+
+    httpx does not send URL userinfo as Basic auth, so credentials placed there
+    authenticate nothing -- but ``httpx.HTTPStatusError`` renders the full URL
+    unredacted, and callers put that string into log messages, so a password
+    there ends up in plaintext in the application log.
+
+    Kept separate from :func:`_normalized_http_env_url` on purpose. That helper
+    has pre-existing callers whose own call sites do not catch ``ValueError``
+    and rely on ``or``-chained fallbacks, so rejecting inside it would turn a
+    working (if ill-advised) configuration into a runtime failure for them.
+    """
+    if value is not None and "@" in urlsplit(value).netloc:
         raise ValueError(
             f"Invalid {env_var} value: credentials embedded in the URL are not "
             "supported, because error messages built from it are logged. "
@@ -2147,7 +2159,9 @@ def get_deepdoc_xinference_url() -> str | None:
     misconfiguration surfaces instead of showing up only as unexplained
     slowness.
     """
-    return _normalized_http_env_url(DEEPDOC_XINFERENCE_URL)
+    return _reject_url_userinfo(
+        DEEPDOC_XINFERENCE_URL, _normalized_http_env_url(DEEPDOC_XINFERENCE_URL)
+    )
 
 
 def get_deepdoc_xinference_api_key() -> str | None:

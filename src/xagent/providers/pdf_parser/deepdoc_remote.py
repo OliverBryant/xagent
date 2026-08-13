@@ -336,6 +336,15 @@ def _extract_elements(payload: dict[str, Any]) -> list[Any]:
     report a failure it still returned with HTTP 200, which ``raise_for_status``
     cannot catch.
     """
+    # Checked before unwrapping: a gateway reporting a failure this way is
+    # authoritative, whatever it left in `data`. Deciding afterwards would let a
+    # non-zero code accompanied by an element list read as success.
+    code = payload.get("code")
+    if code is not None and code != 0:
+        raise ValueError(
+            f"Remote DeepDoc reported code {code!r}: {payload.get('message')!r}"
+        )
+
     for candidate in (payload, payload.get("data")):
         if not isinstance(candidate, dict):
             continue
@@ -343,11 +352,6 @@ def _extract_elements(payload: dict[str, Any]) -> list[Any]:
         if isinstance(elements, list):
             return elements
 
-    code = payload.get("code")
-    if isinstance(code, int) and code != 0:
-        raise ValueError(
-            f"Remote DeepDoc reported code {code}: {payload.get('message')!r}"
-        )
     raise ValueError(
         "Remote DeepDoc response is missing an 'elements' list "
         f"(top-level keys: {sorted(payload)})"
@@ -429,6 +433,15 @@ def _normalize_elements_inner(
         normalized_element = dict(element)
         image_base64 = normalized_element.pop("image_base64", None)
         if image_base64:
+            # Checked explicitly so a JSON number or array names the element and
+            # the field. Left to b64decode it raises TypeError, which the caller
+            # reports as "argument should be a bytes-like object" -- true but
+            # useless for working out which response was wrong.
+            if not isinstance(image_base64, str):
+                raise ValueError(
+                    f"Remote DeepDoc element {index} has non-string "
+                    f"'image_base64' ({type(image_base64).__name__})"
+                )
             # validate=True raises on non-alphabet characters instead of
             # silently dropping them, so corruption surfaces as a
             # DeepDocRemoteError and the caller falls back, rather than a

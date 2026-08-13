@@ -92,7 +92,7 @@ sequenceDiagram
 
 | Environment variable | Required | Default | Notes |
 |---|---|---|---|
-| `XAGENT_DEEPDOC_XINFERENCE_URL` | yes, to enable remote | unset (= local mode) | Xinference base URL, e.g. `http://gpu-host:9997`. Validated as `http`/`https`, trailing slash stripped. |
+| `XAGENT_DEEPDOC_XINFERENCE_URL` | yes, to enable remote | unset (= local mode) | Xinference base URL, e.g. `http://gpu-host:9997`. Must be a bare origin (a path is fine): a query string, a fragment, or embedded `user:password@` credentials are all rejected, and a rejected value logs a warning and **parses locally** rather than failing. Pasting a console URL therefore silently gets you local parsing — check the log if remote appears not to engage. Trailing slashes are stripped. |
 | `XAGENT_DEEPDOC_XINFERENCE_MODEL_UID` | no | `DeepDoc` | The `model` form field; must name a launched DeepDoc model. |
 | `XAGENT_DEEPDOC_XINFERENCE_API_KEY` | no | falls back to bare `XINFERENCE_API_KEY`, then no auth header | Sent directly as the bearer token. |
 | `XAGENT_DEEPDOC_XINFERENCE_USERNAME` / `_PASSWORD` | no | unset | Exchanged for a JWT at `POST /token`. Takes precedence over the API key when the username is set and the password is not blank. The password itself is sent unstripped, since whitespace can be significant in a secret, but a whitespace-only value is treated as unset so it cannot shadow a working API key. |
@@ -210,6 +210,15 @@ order of elements sharing a line on a multi-column page. Comparing two runs
 element-by-element positionally will then report text differences that are
 really just a reordering. Compare by content, or normalize the order, before
 concluding that text diverged.
+
+**Remote segment metadata carries five extra keys.** The server reports each
+element's coordinates in `metadata`, and those are merged through, so a remote
+text segment additionally carries `x0`, `x1`, `top`, `bottom` and `layoutno`
+where a local one carries none of them. Local parsing keeps those coordinates
+only inside `positions`. This is deliberate — discarding them would lose
+information the server took the trouble to send — but it does mean "equivalent
+to local output" in section 8 means the same elements with the same text,
+classification and `positions`, not byte-identical metadata dicts.
 
 The earlier design of this document listed a capability gap — no table HTML, no
 images, no paragraph merging, no cross-page coordinates — that applied to an

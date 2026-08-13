@@ -94,15 +94,20 @@ def _build_element_metadata(
 ) -> Dict[str, Any]:
     """Build metadata dict for an element."""
     layout_type = bbox.get("layout_type", "text")
+    # page_number and col_id are coerced for the same reason positions are: on
+    # the remote path they come from an untrusted server, and a string sneaking
+    # into either one is persisted straight into chunk metadata. Locally deepdoc
+    # already supplies ints, so this is a no-op there. A value that will not
+    # coerce raises, which the caller turns into a fallback to local parsing.
     metadata = {
         "layout_type": layout_type,
         "doc_id": doc_id,
-        "page_number": bbox.get("page_number", 1),
+        "page_number": int(bbox.get("page_number", 1)),
         **kwargs,
     }
 
     # Extract col_id for two-column layout support
-    col_id = bbox.get("col_id", 0)
+    col_id = int(bbox.get("col_id", 0))
     metadata["col_id"] = col_id
 
     # Extract positions for PDF visualization (format: [[page_num, left, right, top, bottom], ...])
@@ -226,6 +231,22 @@ def _translate_pdf_bboxes(
     return ParseResult(
         text_segments=text_segments, figures=figures, tables=tables, metadata=kwargs
     )
+
+
+def _discard_remote_crops(elements: List[Dict[str, Any]]) -> None:
+    """Delete crop files named by remote elements, ignoring anything unusable.
+
+    Called when translation failed after the client had already written crops,
+    so those files describe a result nobody will use.
+    """
+    for element in elements:
+        path = element.get("image") if isinstance(element, dict) else None
+        if not isinstance(path, str):
+            continue
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove orphaned crop %s: %s", path, exc)
 
 
 def _element_metadata_dict(element: Dict[str, Any]) -> Dict[str, Any]:
@@ -665,8 +686,6 @@ class DeepDocParser(
                 parser_call_kwargs.setdefault("need_image", True)
                 # Note: __call__ doesn't accept need_position, we'll extract positions separately
 
-            # Set up the progress callback once, so the remote path and the
-            # local PDF path below share a single adapter.
             # Built once here so the remote and local PDF paths below share a
             # single adapter. Only those two consume it, so it is scoped to
             # .pdf rather than paid for on every format.
@@ -688,6 +707,9 @@ class DeepDocParser(
             # nothing else, so sending a .docx would only buy a failed round
             # trip before the same local parse ran anyway.
             if ext == ".pdf" and deepdoc_remote.is_remote_configured():
+                # Held outside the try so the handler can clean up crops the
+                # client already wrote before translation failed.
+                elements: List[Dict[str, Any]] = []
                 try:
                     elements = deepdoc_remote.parse_document_remote(
                         file_path,
@@ -721,6 +743,10 @@ class DeepDocParser(
                                 **_element_metadata_dict(element),
                                 "layout_type": element.get("type") or "text",
                                 "text": element.get("text") or "",
+                                # `has_image` in the visualization helpers tests
+                                # for key *presence*, so dropping this makes
+                                # every remote element report no image.
+                                "image": element.get("image"),
                             }
                             for element in elements
                         ]
@@ -747,6 +773,11 @@ class DeepDocParser(
                     logger.warning(
                         "Remote DeepDoc parse failed (%s); falling back to local", exc
                     )
+                    # The client cleans up after its own failures, but a crop
+                    # written before translation raised is stranded: the local
+                    # fallback writes a fresh set under new names beside it and
+                    # nothing prunes that tree.
+                    _discard_remote_crops(elements)
                     if callback:
                         # Reporting the fallback must never be able to prevent
                         # it: a progress sink that raises would otherwise turn a

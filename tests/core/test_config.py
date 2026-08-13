@@ -2482,3 +2482,39 @@ class TestCompactThresholdConfig:
 
         monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, value)
         assert get_compact_threshold_default() == 32000
+
+
+class TestUrlUserinfoRejectionIsScopedToDeepDoc:
+    """Only the DeepDoc URL rejects embedded credentials.
+
+    The rejection guards a specific hazard: the remote client interpolates
+    ``httpx.HTTPStatusError`` — which renders the URL unredacted — into an
+    exception the caller logs. Putting the check inside the shared
+    ``_normalized_http_env_url`` would also apply it to
+    ``PUBLIC_API_BASE_URL``/``S2S_API_BASE_URL``, whose call sites do not catch
+    ``ValueError`` and depend on ``or``-chained fallbacks, so a pre-existing
+    (if ill-advised) config would start failing at runtime.
+    """
+
+    def test_deepdoc_url_rejects_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://user:pw@gpu-host:9997")
+        with pytest.raises(ValueError, match="credentials embedded"):
+            get_deepdoc_xinference_url()
+
+    def test_deepdoc_url_without_credentials_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://gpu-host:9997/base")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997/base"
+
+    def test_shared_helper_consumers_keep_working(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other consumers of the shared helper must be unaffected."""
+        monkeypatch.setenv(PUBLIC_API_BASE_URL, "http://user:pw@api.example.com")
+        monkeypatch.delenv(S2S_API_BASE_URL, raising=False)
+
+        assert get_public_api_base_url() == "http://user:pw@api.example.com"
+        assert get_s2s_api_base_url() == "http://user:pw@api.example.com"

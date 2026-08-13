@@ -1359,3 +1359,78 @@ class TestEnvelopedResponses:
                 save_image=RecordingSaveImage(),
                 _transport=json_transport({"code": 0, "data": {"task": "parse"}}),
             )
+
+
+class TestNonStringImageBase64:
+    """A JSON number or array in ``image_base64`` must name the offending field.
+
+    Left to ``b64decode`` it raises ``TypeError``, which the caller reports as
+    "argument should be a bytes-like object" — true, but useless for working out
+    which element of which response was malformed.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(12345, id="int"),
+            pytest.param(["a"], id="list"),
+            pytest.param({"a": 1}, id="dict"),
+            pytest.param(True, id="bool"),
+        ],
+    )
+    def test_non_string_base64_names_the_field(
+        self, tmp_path: Path, value: Any
+    ) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        with pytest.raises(DeepDocRemoteError, match="image_base64"):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=json_transport(
+                    {
+                        "elements": [
+                            {"type": "table", "text": "t", "image_base64": value}
+                        ]
+                    }
+                ),
+            )
+
+
+class TestEnvelopeCodeCheckedFirst:
+    """A gateway reporting a failure is authoritative, whatever it left in ``data``."""
+
+    def test_nonzero_code_wins_over_a_present_element_list(
+        self, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        with pytest.raises(DeepDocRemoteError, match="40301"):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=json_transport(
+                    {
+                        "code": 40301,
+                        "message": "quota exceeded",
+                        "data": {"elements": [{"type": "text", "text": "x"}]},
+                    }
+                ),
+            )
+
+    def test_non_int_code_is_still_reported(self, tmp_path: Path) -> None:
+        """A string code would previously fall through to the generic message."""
+        source = tmp_path / "report.pdf"
+        source.write_bytes(b"%PDF-1.7 fake")
+
+        with pytest.raises(DeepDocRemoteError, match="ERR_QUOTA"):
+            parse_document_remote(
+                str(source),
+                ext=".pdf",
+                save_image=RecordingSaveImage(),
+                _transport=json_transport({"code": "ERR_QUOTA", "data": None}),
+            )

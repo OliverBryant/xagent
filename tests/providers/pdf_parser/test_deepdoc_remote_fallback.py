@@ -1298,3 +1298,132 @@ class TestRawOutputFlagDoesNotChangeParsing:
             if enable_raw_output:
                 assert result.raw_parser_output is not None
                 assert result.raw_parser_output["total_elements"] == 1
+
+
+class TestCropsAreNotOrphanedByTranslationFailure:
+    """A crop written before translation failed describes a discarded result.
+
+    The client cleans up after its own failures, but once it has returned, a
+    crop stranded by a translation error would sit in the artifacts tree
+    alongside the fresh set the local fallback writes, and nothing prunes it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_written_crop_is_removed_when_translation_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        remote_configured: str,
+        isolate_artifacts_dir: Path,
+    ) -> None:
+        pdf_file = tmp_path / "orphan.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+
+        # The first element's crop lands on disk; the second trips the
+        # translator on an uncoercible page number.
+        crop = isolate_artifacts_dir / "already_written.png"
+        crop.parent.mkdir(parents=True, exist_ok=True)
+        crop.write_bytes(b"fake png")
+
+        monkeypatch.setattr(
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *args, **kwargs: [
+                {
+                    "type": "table",
+                    "text": "<table></table>",
+                    "image": str(crop),
+                    "metadata": {"page_number": 1},
+                },
+                {
+                    "type": "text",
+                    "text": "trips the translator",
+                    "image": None,
+                    "metadata": {"page_number": "not-a-number"},
+                },
+            ],
+        )
+        fake_parser = FakeLocalParser(
+            [{"layout_type": "text", "text": "local paragraph"}]
+        )
+        monkeypatch.setattr(
+            DeepDocParser, "_get_parser_for_ext", lambda self, ext: fake_parser
+        )
+
+        result = await DeepDocParser().parse(str(pdf_file), doc_id="orphan_doc")
+
+        assert result.metadata["deepdoc_backend"] == "local"
+        assert not crop.exists(), "crop from the discarded remote result was kept"
+
+
+class TestRawOutputCarriesTheImageKey:
+    """`has_image` in the visualization helpers tests for key *presence*."""
+
+    @pytest.mark.asyncio
+    async def test_image_key_survives_into_raw_bboxes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_configured: str
+    ) -> None:
+        pdf_file = tmp_path / "viz.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 not really a pdf")
+        crop = tmp_path / "table.png"
+        crop.write_bytes(b"fake png")
+
+        monkeypatch.setattr(
+            deepdoc_remote,
+            "parse_document_remote",
+            lambda *args, **kwargs: [
+                {
+                    "type": "table",
+                    "text": "<table></table>",
+                    "image": str(crop),
+                    "metadata": {"page_number": 1},
+                }
+            ],
+        )
+        arm_local_parser_tripwire(monkeypatch)
+
+        result = await DeepDocParser(enable_raw_output=True).parse(
+            str(pdf_file), doc_id="viz_image_doc"
+        )
+
+        assert result.raw_parser_output is not None
+        assert "image" in result.raw_parser_output["bboxes"][0]
+        element = result.get_visualization_elements()[0]
+        assert element["metadata"]["has_image"] is True
+
+
+class TestUntrustedNumericMetadataIsCoerced:
+    """`page_number` and `col_id` are coerced like `positions` already were."""
+
+    def test_numeric_strings_become_ints(self) -> None:
+        result = _translate_remote_elements(
+            "coerce-doc",
+            [
+                {
+                    "type": "text",
+                    "text": "paragraph",
+                    "image": None,
+                    "metadata": {"page_number": "3", "col_id": "2"},
+                }
+            ],
+        )
+
+        metadata = result.text_segments[0].metadata
+        assert metadata["page_number"] == 3
+        assert metadata["col_id"] == 2
+        assert isinstance(metadata["page_number"], int)
+        assert isinstance(metadata["col_id"], int)
+
+    def test_uncoercible_value_raises_so_the_caller_falls_back(self) -> None:
+        with pytest.raises(ValueError):
+            _translate_remote_elements(
+                "coerce-doc",
+                [
+                    {
+                        "type": "text",
+                        "text": "paragraph",
+                        "image": None,
+                        "metadata": {"page_number": "page one"},
+                    }
+                ],
+            )

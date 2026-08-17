@@ -96,12 +96,12 @@ def coerce_duration(value: object) -> Optional[float]:
 
 
 def record_media_usage(
-    unit: MediaUnit | str,
+    unit: MediaUnit | str | None,
     quantity: float,
     *,
     model: str = "",
     model_id: str = "",
-    call_type: MediaCallType | str = "",
+    call_type: MediaCallType | str | None = "",
 ) -> None:
     """Record one media model call; swallow any error.
 
@@ -129,7 +129,7 @@ def record_media_seconds(
     *,
     model: str = "",
     model_id: str = "",
-    call_type: MediaCallType | str = "",
+    call_type: MediaCallType | str | None = "",
 ) -> None:
     """Record a duration-billed media call, keeping the unit stable.
 

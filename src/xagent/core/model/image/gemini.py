@@ -18,7 +18,9 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
-from .base import BaseImageModel, default_image_abilities
+from ..chat.token_context import MediaCallType
+from .base import BaseImageModel
+from .usage import record_image_usage
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +170,18 @@ class GeminiImageModel(BaseImageModel):
         ).rstrip("/")
         self.timeout = timeout
 
+        # Determine supported abilities based on model name
         # Newer models like gemini-3-pro-image-preview-2k support editing
-        self._abilities = abilities or default_image_abilities("gemini", model_name)
+        if abilities is not None and len(abilities) > 0:
+            # Use explicitly provided abilities
+            self._abilities = abilities
+        else:
+            # Auto-detect abilities based on model name
+            model_lower = model_name.lower()
+            if "3-pro" in model_lower or "edit" in model_lower:
+                self._abilities = ["generate", "edit"]
+            else:
+                self._abilities = ["generate"]
 
     @property
     def abilities(self) -> List[str]:
@@ -369,6 +381,25 @@ class GeminiImageModel(BaseImageModel):
             #   "usageMetadata": {...}
             # }
 
+            # Meter before validating the response body. Google has already
+            # billed this 200, and usageMetadata is present even when the
+            # candidate carries no usable image (safety-blocked finish reason,
+            # empty parts). Recording after the structural checks below would
+            # drop usage for exactly those billed-but-unusable responses, and
+            # retry_on only matches 429/5xx so they are never retried either.
+            usage_metadata = response_data.get("usageMetadata", {})
+            token_usage = {
+                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
+                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
+                "total_tokens": usage_metadata.get("totalTokenCount", 0),
+            }
+            record_image_usage(
+                {"usage": token_usage},
+                model_name=self.model_name,
+                call_type=MediaCallType.GENERATE_IMAGE,
+                resolution=(image_config or {}).get("imageSize", ""),
+            )
+
             candidates = response_data.get("candidates", [])
             if not candidates:
                 raise RuntimeError("No candidates in response")
@@ -412,16 +443,7 @@ class GeminiImageModel(BaseImageModel):
                     )
                 raise RuntimeError("No image data in response")
 
-            # Extract usage metadata
-            usage_metadata = response_data.get("usageMetadata", {})
-
-            # Build token usage info
-            token_usage = {
-                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
-                "total_tokens": usage_metadata.get("totalTokenCount", 0),
-            }
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": token_usage,
@@ -626,6 +648,22 @@ class GeminiImageModel(BaseImageModel):
 
                 response_data = response.json()
 
+            # Meter before validating the response body — see generate_image
+            # for why a billed 200 must be recorded ahead of the structural
+            # checks below.
+            usage_metadata = response_data.get("usageMetadata", {})
+            token_usage = {
+                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
+                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
+                "total_tokens": usage_metadata.get("totalTokenCount", 0),
+            }
+            record_image_usage(
+                {"usage": token_usage},
+                model_name=self.model_name,
+                call_type=MediaCallType.EDIT_IMAGE,
+                resolution=(image_config or {}).get("imageSize", ""),
+            )
+
             # Parse response - similar to generate but for edited image
             candidates = response_data.get("candidates", [])
             if not candidates:
@@ -668,15 +706,7 @@ class GeminiImageModel(BaseImageModel):
                     )
                 raise RuntimeError("No image data in edit response")
 
-            # Extract usage metadata
-            usage_metadata = response_data.get("usageMetadata", {})
-
-            token_usage = {
-                "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
-                "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
-                "total_tokens": usage_metadata.get("totalTokenCount", 0),
-            }
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": edited_image_url,
                 "usage": token_usage,

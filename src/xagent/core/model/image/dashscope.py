@@ -7,7 +7,9 @@ from typing import Any, List, Optional
 
 import aiohttp
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 
 class DashScopeImageModel(BaseImageModel):
@@ -200,6 +202,18 @@ class DashScopeImageModel(BaseImageModel):
 
                     response_data = await response.json()
 
+            # Meter before validating the response body. DashScope has already
+            # billed this 200, and the `usage` payload sits at the top level —
+            # independent of the `output` structure the checks below walk. A
+            # billed-but-unparseable response would otherwise go unmetered.
+            usage = response_data.get("usage", {})
+            record_image_usage(
+                {"usage": usage},
+                model_name=self.model_name,
+                call_type=MediaCallType.GENERATE_IMAGE,
+                resolution=str(size or ""),
+            )
+
             # Extract the image URL from the response
             if "output" not in response_data:
                 raise RuntimeError("Invalid response format: missing 'output' field")
@@ -228,14 +242,11 @@ class DashScopeImageModel(BaseImageModel):
 
             image_url = image_item["image"]
 
-            # Extract usage information
-            usage = response_data.get("usage", {})
-            task_metric = output.get("task_metric", {})
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": usage,
-                "task_metric": task_metric,
+                "task_metric": output.get("task_metric", {}),
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }
@@ -332,6 +343,15 @@ class DashScopeImageModel(BaseImageModel):
 
                     response_data = await response.json()
 
+            # Meter before validating the response body — see generate_image.
+            usage = response_data.get("usage", {})
+            record_image_usage(
+                {"usage": usage},
+                model_name=self.model_name,
+                call_type=MediaCallType.EDIT_IMAGE,
+                resolution=str(kwargs.get("size") or ""),
+            )
+
             # Extract the image URL from the response (same structure as generation)
             if "output" not in response_data:
                 raise RuntimeError("Invalid response format: missing 'output' field")
@@ -360,14 +380,11 @@ class DashScopeImageModel(BaseImageModel):
 
             image_url = image_item["image"]
 
-            # Extract usage information
-            usage = response_data.get("usage", {})
-            task_metric = output.get("task_metric", {})
-
+            # Usage was already recorded above, before validation.
             return {
                 "image_url": image_url,
                 "usage": usage,
-                "task_metric": task_metric,
+                "task_metric": output.get("task_metric", {}),
                 "request_id": response_data.get("request_id"),
                 "raw_response": response_data,
             }

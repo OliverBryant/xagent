@@ -198,7 +198,8 @@ class OpenAIImageModel(BaseImageModel):
         image_count = kwargs.get("n", 1)
         image_files = []
         try:
-            image_files = [open(path, "rb") for path in image_paths]
+            for path in image_paths:
+                image_files.append(open(path, "rb"))
             images_client: Any = self._client.images
             response = await images_client.edit(
                 image=image_files if len(image_files) > 1 else image_files[0],

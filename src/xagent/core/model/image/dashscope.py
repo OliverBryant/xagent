@@ -211,6 +211,7 @@ class DashScopeImageModel(BaseImageModel):
                 {"usage": usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.GENERATE_IMAGE,
+                image_count=kwargs.get("n", 1),
                 resolution=str(size or ""),
             )
 
@@ -349,6 +350,7 @@ class DashScopeImageModel(BaseImageModel):
                 {"usage": usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.EDIT_IMAGE,
+                image_count=kwargs.get("n", 1),
                 resolution=str(kwargs.get("size") or ""),
             )
 

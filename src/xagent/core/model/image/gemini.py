@@ -18,8 +18,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
-from .base import BaseImageModel, default_image_abilities
 from ..chat.token_context import MediaCallType
+from .base import BaseImageModel, default_image_abilities
 from .usage import record_image_usage
 
 logger = logging.getLogger(__name__)
@@ -387,6 +387,7 @@ class GeminiImageModel(BaseImageModel):
                 {"usage": token_usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.GENERATE_IMAGE,
+                image_count=kwargs.get("n", 1),
                 resolution=(image_config or {}).get("imageSize", ""),
             )
 
@@ -651,6 +652,7 @@ class GeminiImageModel(BaseImageModel):
                 {"usage": token_usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.EDIT_IMAGE,
+                image_count=kwargs.get("n", 1),
                 resolution=(image_config or {}).get("imageSize", ""),
             )
 

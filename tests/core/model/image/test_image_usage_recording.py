@@ -121,7 +121,7 @@ class _FakeResponse:
 # Google has billed this, and retry_on only matches 429/5xx so it is final.
 _GEMINI_SAFETY_BLOCKED = {
     "candidates": [{"finishReason": "SAFETY", "content": {"parts": [{"text": "no"}]}}],
-    "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 0},
+    "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 5},
 }
 
 
@@ -144,7 +144,7 @@ async def test_gemini_meters_billed_response_with_no_image(monkeypatch) -> None:
 
     with TokenContextManager() as manager:
         with pytest.raises(RuntimeError):
-            await model.generate_image(prompt="p")
+            await model.generate_image(prompt="p", n=3)
         usage = manager.get_usage()
 
     # The call was billed by the provider, so it must be metered even though
@@ -152,7 +152,8 @@ async def test_gemini_meters_billed_response_with_no_image(monkeypatch) -> None:
     assert usage.media_calls == 1
     entry = usage.details[0]
     assert entry["unit"] == "images"
-    assert entry["provider_tokens"] == 11
+    assert entry["quantity"] == 3
+    assert entry["provider_tokens"] == 16
 
 
 @pytest.mark.asyncio
@@ -192,8 +193,150 @@ async def test_dashscope_meters_billed_unparseable_response(monkeypatch) -> None
 
     with TokenContextManager() as manager:
         with pytest.raises(RuntimeError):
-            await model.generate_image(prompt="p")
+            await model.generate_image(prompt="p", n=4)
         usage = manager.get_usage()
 
     assert usage.media_calls == 1
     assert usage.details[0]["unit"] == "images"
+    assert usage.details[0]["quantity"] == 4
+
+
+@pytest.mark.asyncio
+async def test_gemini_edit_forwards_image_count(monkeypatch) -> None:
+    from xagent.core.model.image import gemini as gemini_mod
+
+    calls = []
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, *a, **kw):
+            return _FakeResponse(
+                {
+                    "candidates": [
+                        {
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                    {"text": "![Image](https://example.com/edit.png)"}
+                                ]
+                            },
+                        }
+                    ],
+                    "usageMetadata": {},
+                }
+            )
+
+    monkeypatch.setattr(gemini_mod.httpx, "AsyncClient", lambda **kw: _Client())
+    monkeypatch.setattr(
+        gemini_mod,
+        "record_image_usage",
+        lambda *args, **kwargs: calls.append(kwargs),
+    )
+    model = gemini_mod.GeminiImageModel(
+        model_name="gemini-3-pro-image-preview-2k",
+        api_key="k",
+        abilities=["generate", "edit"],
+    )
+
+    await model.edit_image(
+        image_url="data:image/png;base64,iVBORw0KGgo=",
+        prompt="edit",
+        n=3,
+    )
+
+    assert calls[0]["image_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_dashscope_edit_forwards_image_count(monkeypatch) -> None:
+    from xagent.core.model.image import dashscope as ds_mod
+
+    calls = []
+    payload = {
+        "usage": {},
+        "output": {
+            "choices": [
+                {"message": {"content": [{"image": "https://example.com/edit.png"}]}}
+            ]
+        },
+    }
+
+    class _Post:
+        async def __aenter__(self):
+            return _AsyncResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _AsyncResp:
+        status = 200
+
+        async def json(self):
+            return payload
+
+        async def text(self):
+            return ""
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, *a, **kw):
+            return _Post()
+
+    monkeypatch.setattr(ds_mod.aiohttp, "ClientSession", lambda **kw: _Session())
+    monkeypatch.setattr(
+        ds_mod,
+        "record_image_usage",
+        lambda *args, **kwargs: calls.append(kwargs),
+    )
+    model = ds_mod.DashScopeImageModel(
+        model_name="wanx", api_key="k", abilities=["generate", "edit"]
+    )
+
+    await model.edit_image(
+        image_url="https://example.com/source.png",
+        prompt="edit",
+        n=4,
+    )
+
+    assert calls[0]["image_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_openai_edit_closes_files_when_later_open_fails(monkeypatch) -> None:
+    from xagent.core.model.image.openai import OpenAIImageModel
+
+    class _OpenedFile:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    opened_file = _OpenedFile()
+
+    def fake_open(path, mode):
+        if path == "missing.png":
+            raise FileNotFoundError(path)
+        return opened_file
+
+    model = OpenAIImageModel(api_key="k")
+    monkeypatch.setattr(model, "_ensure_client", lambda: None)
+    monkeypatch.setattr(model, "_client", object())
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    with pytest.raises(FileNotFoundError):
+        await model.edit_image(
+            image_url=["first.png", "missing.png"],
+            prompt="edit",
+        )
+
+    assert opened_file.closed is True

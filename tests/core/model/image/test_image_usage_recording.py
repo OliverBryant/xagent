@@ -107,10 +107,10 @@ class _FakeResponse:
     status_code = 200
     status = 200
 
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: object) -> None:
         self._payload = payload
 
-    def json(self) -> dict:
+    def json(self) -> object:
         return self._payload
 
     def raise_for_status(self) -> None:
@@ -156,6 +156,32 @@ async def test_gemini_meters_billed_response_with_no_image(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gemini_rejects_non_object_response_after_metering(monkeypatch) -> None:
+    from xagent.core.model.image import gemini as gemini_mod
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, *a, **kw):
+            return _FakeResponse([])
+
+    monkeypatch.setattr(gemini_mod.httpx, "AsyncClient", lambda **kw: _Client())
+    model = gemini_mod.GeminiImageModel(model_name="gemini-image", api_key="k")
+
+    with TokenContextManager() as manager:
+        with pytest.raises(RuntimeError, match="expected an object"):
+            await model.generate_image(prompt="p")
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["provider_tokens"] == 0
+
+
+@pytest.mark.asyncio
 async def test_dashscope_meters_billed_unparseable_response(monkeypatch) -> None:
     from xagent.core.model.image import dashscope as ds_mod
 
@@ -197,3 +223,47 @@ async def test_dashscope_meters_billed_unparseable_response(monkeypatch) -> None
 
     assert usage.media_calls == 1
     assert usage.details[0]["unit"] == "images"
+
+
+@pytest.mark.asyncio
+async def test_dashscope_rejects_non_object_response_after_metering(
+    monkeypatch,
+) -> None:
+    from xagent.core.model.image import dashscope as ds_mod
+
+    class _Post:
+        async def __aenter__(self):
+            return _AsyncResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _AsyncResp:
+        status = 200
+
+        async def json(self):
+            return []
+
+        async def text(self):
+            return ""
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, *a, **kw):
+            return _Post()
+
+    monkeypatch.setattr(ds_mod.aiohttp, "ClientSession", lambda **kw: _Session())
+    model = ds_mod.DashScopeImageModel(model_name="wanx", api_key="k")
+
+    with TokenContextManager() as manager:
+        with pytest.raises(RuntimeError, match="expected an object"):
+            await model.generate_image(prompt="p")
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["provider_tokens"] == 0

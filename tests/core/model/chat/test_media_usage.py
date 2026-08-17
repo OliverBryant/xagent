@@ -279,6 +279,25 @@ def test_empty_call_type_is_allowed() -> None:
     assert usage.details[0]["call_type"] == ""
 
 
+def test_none_call_type_is_normalised_to_empty() -> None:
+    with TokenContextManager() as manager:
+        add_media_usage(unit="requests", quantity=1, model="m", call_type=None)
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["call_type"] == ""
+
+
+def test_none_unit_is_rejected_with_clear_error() -> None:
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError, match="Media unit cannot be None"):
+            add_media_usage(unit=None, quantity=1, model="m")
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
 def test_enum_members_are_accepted() -> None:
     with TokenContextManager() as manager:
         add_media_usage(

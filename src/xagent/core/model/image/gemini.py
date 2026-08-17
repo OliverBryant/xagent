@@ -172,7 +172,7 @@ class GeminiImageModel(BaseImageModel):
 
         # Determine supported abilities based on model name
         # Newer models like gemini-3-pro-image-preview-2k support editing
-        if abilities is not None and len(abilities) > 0:
+        if abilities is not None:
             # Use explicitly provided abilities
             self._abilities = abilities
         else:
@@ -387,7 +387,13 @@ class GeminiImageModel(BaseImageModel):
             # empty parts). Recording after the structural checks below would
             # drop usage for exactly those billed-but-unusable responses, and
             # retry_on only matches 429/5xx so they are never retried either.
-            usage_metadata = response_data.get("usageMetadata", {})
+            if not isinstance(response_data, dict) or not response_data:
+                usage_metadata = {}
+            else:
+                raw_usage_metadata = response_data.get("usageMetadata", {})
+                usage_metadata = (
+                    raw_usage_metadata if isinstance(raw_usage_metadata, dict) else {}
+                )
             token_usage = {
                 "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
                 "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
@@ -399,6 +405,9 @@ class GeminiImageModel(BaseImageModel):
                 call_type=MediaCallType.GENERATE_IMAGE,
                 resolution=(image_config or {}).get("imageSize", ""),
             )
+
+            if not isinstance(response_data, dict):
+                raise RuntimeError("Invalid response format: expected an object")
 
             candidates = response_data.get("candidates", [])
             if not candidates:
@@ -651,7 +660,13 @@ class GeminiImageModel(BaseImageModel):
             # Meter before validating the response body — see generate_image
             # for why a billed 200 must be recorded ahead of the structural
             # checks below.
-            usage_metadata = response_data.get("usageMetadata", {})
+            if not isinstance(response_data, dict) or not response_data:
+                usage_metadata = {}
+            else:
+                raw_usage_metadata = response_data.get("usageMetadata", {})
+                usage_metadata = (
+                    raw_usage_metadata if isinstance(raw_usage_metadata, dict) else {}
+                )
             token_usage = {
                 "prompt_tokens": usage_metadata.get("promptTokenCount", 0),
                 "completion_tokens": usage_metadata.get("candidatesTokenCount", 0),
@@ -663,6 +678,9 @@ class GeminiImageModel(BaseImageModel):
                 call_type=MediaCallType.EDIT_IMAGE,
                 resolution=(image_config or {}).get("imageSize", ""),
             )
+
+            if not isinstance(response_data, dict):
+                raise RuntimeError("Invalid response format: expected an object")
 
             # Parse response - similar to generate but for edited image
             candidates = response_data.get("candidates", [])

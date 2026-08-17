@@ -60,9 +60,9 @@ class TestGeminiImageModel:
         model3 = GeminiImageModel(abilities=["generate", "edit"])
         assert model3.abilities == ["generate", "edit"]  # edit is preserved
 
-        # Test with empty abilities (should use default)
+        # An explicit empty list disables all abilities; only None auto-detects.
         model4 = GeminiImageModel(abilities=[])
-        assert model4.abilities == ["generate"]
+        assert model4.abilities == []
 
         # Test with None abilities (should use default)
         model5 = GeminiImageModel(abilities=None)

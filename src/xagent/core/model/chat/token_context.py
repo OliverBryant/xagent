@@ -51,7 +51,7 @@ _MEDIA_UNIT_VALUES = frozenset(member.value for member in MediaUnit)
 _MEDIA_CALL_TYPE_VALUES = frozenset(member.value for member in MediaCallType)
 
 
-def _validated_media_unit(unit: "MediaUnit | str") -> str:
+def _validated_media_unit(unit: "MediaUnit | str | None") -> str:
     """Normalise ``unit`` to a known :class:`MediaUnit` value.
 
     A typo'd unit silently mints a new billing dimension that
@@ -59,6 +59,8 @@ def _validated_media_unit(unit: "MediaUnit | str") -> str:
     record cannot be repaired retroactively once written. Rejecting at the
     write boundary is the only point where the error is still fixable.
     """
+    if unit is None:
+        raise ValueError("Media unit cannot be None")
     value = unit.value if isinstance(unit, MediaUnit) else str(unit)
     if value not in _MEDIA_UNIT_VALUES:
         raise ValueError(
@@ -68,12 +70,14 @@ def _validated_media_unit(unit: "MediaUnit | str") -> str:
     return value
 
 
-def _validated_media_call_type(call_type: "MediaCallType | str") -> str:
+def _validated_media_call_type(call_type: "MediaCallType | str | None") -> str:
     """Normalise ``call_type`` to a known :class:`MediaCallType` value.
 
     Empty is allowed: ``call_type`` is optional metadata rather than a billing
     dimension on its own, and omitting it is a legitimate caller choice.
     """
+    if call_type is None:
+        return ""
     value = call_type.value if isinstance(call_type, MediaCallType) else str(call_type)
     if value and value not in _MEDIA_CALL_TYPE_VALUES:
         raise ValueError(
@@ -167,10 +171,10 @@ class TokenUsage:
 
     def add_media_usage(
         self,
-        unit: str,
+        unit: "MediaUnit | str | None",
         quantity: float,
         model: str = "",
-        call_type: str = "",
+        call_type: "MediaCallType | str | None" = "",
         model_id: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
@@ -677,10 +681,10 @@ def add_token_usage(
 
 
 def add_media_usage(
-    unit: "MediaUnit | str",
+    unit: "MediaUnit | str | None",
     quantity: float,
     model: str = "",
-    call_type: "MediaCallType | str" = "",
+    call_type: "MediaCallType | str | None" = "",
     model_id: str = "",
     input_tokens: int = 0,
     output_tokens: int = 0,

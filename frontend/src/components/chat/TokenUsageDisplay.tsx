@@ -145,9 +145,14 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             llm_calls: data.llm_calls || 0,
             cached_input_tokens: data.cached_input_tokens || 0,
             model_usage: Array.isArray(data.model_usage) ? data.model_usage : [],
-            media_usage: (Array.isArray(data.media_usage) ? data.media_usage : [])
+            // `data` is `any` from response.json(), so annotate explicitly:
+            // without it the filter callback's parameter is implicitly `any`
+            // and the build fails under noImplicitAny.
+            media_usage: ((Array.isArray(data.media_usage)
+              ? data.media_usage
+              : []) as unknown[])
               .map(normalizeMediaUsage)
-              .filter((row): row is MediaUsage => row !== null),
+              .filter((row: MediaUsage | null): row is MediaUsage => row !== null),
           });
         }
       } catch (error) {

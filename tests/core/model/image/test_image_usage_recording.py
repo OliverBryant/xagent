@@ -340,3 +340,100 @@ async def test_openai_edit_closes_files_when_later_open_fails(monkeypatch) -> No
         )
 
     assert opened_file.closed is True
+
+
+@pytest.mark.asyncio
+async def test_gemini_does_not_bill_unsupported_n(monkeypatch) -> None:
+    # The Gemini API has no multi-image parameter, and this client forwards only
+    # `temperature` out of **kwargs, so a caller-supplied n never reaches the
+    # provider — one image is requested, generated, and parsed. Billing n would
+    # charge for images that do not exist.
+    from xagent.core.model.image import gemini as gemini_mod
+
+    payload = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{"inlineData": {"mimeType": "image/png", "data": "eA=="}}]
+                },
+            }
+        ],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1},
+    }
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, *a, **kw):
+            # n must not have been forwarded to the provider.
+            assert "n" not in kw.get("json", {}).get("generationConfig", {})
+            return _FakeResponse(payload)
+
+    monkeypatch.setattr(gemini_mod.httpx, "AsyncClient", lambda **kw: _Client())
+    model = gemini_mod.GeminiImageModel(model_name="gemini-image", api_key="k")
+
+    with TokenContextManager() as manager:
+        await model.generate_image(prompt="p", n=4)
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert len(entries) == 1
+    assert entries[0]["quantity"] == 1.0  # not 4.0
+
+
+@pytest.mark.asyncio
+async def test_dashscope_bills_n_it_actually_forwards(monkeypatch) -> None:
+    # DashScope spreads **kwargs into the request `parameters`, so n does reach
+    # the provider and is billed by it. The recorded count must match.
+    from xagent.core.model.image import dashscope as ds_mod
+
+    seen: dict = {}
+    payload = {
+        "usage": {},
+        "output": {
+            "choices": [{"message": {"content": [{"image": "https://x/1.png"}]}}]
+        },
+    }
+
+    class _AsyncResp:
+        status = 200
+
+        async def json(self):
+            return payload
+
+        async def text(self):
+            return ""
+
+    class _Post:
+        async def __aenter__(self):
+            return _AsyncResp()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def post(self, *a, **kw):
+            seen.update(kw.get("json", {}))
+            return _Post()
+
+    monkeypatch.setattr(ds_mod.aiohttp, "ClientSession", lambda **kw: _Session())
+    model = ds_mod.DashScopeImageModel(model_name="wanx", api_key="k")
+
+    with TokenContextManager() as manager:
+        await model.generate_image(prompt="p", n=3)
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    # n really was sent to the provider...
+    assert seen["parameters"]["n"] == 3
+    # ...so the billed quantity matches the provider's own invoice.
+    assert entries[0]["quantity"] == 3.0

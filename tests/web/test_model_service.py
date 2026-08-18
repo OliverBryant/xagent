@@ -700,6 +700,39 @@ class TestModelService:
 
     @pytest.mark.parametrize(
         "get_default",
+        [get_default_sound_effect_model, get_default_music_model],
+    )
+    def test_audio_generation_shared_default_requires_active_model(self, get_default):
+        """The shared-default branch must filter on is_active.
+
+        Without it an inactive shared default still resolves to a model
+        instance that is absent from the audio tool's own registry, so its
+        usage records fall back to a phantom model name instead of the real
+        one. This mirrors the user-default branch, which already filtered.
+        """
+        mock_db = MagicMock()
+        filter_query = (
+            mock_db.query.return_value.join.return_value.join.return_value.filter
+        )
+        filter_query.return_value.limit.return_value.all.return_value = []
+        session_factory = MagicMock(return_value=mock_db)
+
+        with patch(
+            "xagent.web.models.database.get_session_local",
+            return_value=session_factory,
+        ):
+            get_default(user_id=None)
+
+        # The is_active column itself is passed as a filter condition, so look
+        # for a condition naming that column rather than a comparison value.
+        assert any(
+            getattr(condition, "key", None) == "is_active"
+            or getattr(getattr(condition, "left", None), "key", None) == "is_active"
+            for condition in filter_query.call_args.args
+        ), "shared audio-generation default must filter on DBModel.is_active"
+
+    @pytest.mark.parametrize(
+        "get_default",
         [get_default_embedding_model, get_default_rerank_model],
     )
     def test_text_default_closes_owned_session_after_shared_fallback(

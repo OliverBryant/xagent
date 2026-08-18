@@ -124,9 +124,10 @@ class TokenUsage:
         self.__dict__["_lock"] = threading.Lock()
 
     @property
-    def _lock(self) -> threading.Lock:
+    def _lock(self) -> "threading.Lock":
         """The per-instance mutation lock (see :meth:`__post_init__`)."""
-        return self.__dict__["_lock"]
+        lock: threading.Lock = self.__dict__["_lock"]
+        return lock
 
     def __getstate__(self) -> Dict[str, Any]:
         """Drop the lock: it is not picklable and is per-instance state."""
@@ -243,10 +244,10 @@ class TokenUsage:
 
     def record_media_call(
         self,
-        unit: str,
+        unit: "MediaUnit | str | None",
         quantity: float,
         model: str = "",
-        call_type: str = "",
+        call_type: "MediaCallType | str | None" = "",
         model_id: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
@@ -265,8 +266,8 @@ class TokenUsage:
         Consumers derive per-model rows from ``details`` and the call count from
         the scalar, so a torn snapshot reports mutually inconsistent billing.
         """
-        unit = _validated_media_unit(unit)
-        call_type = _validated_media_call_type(call_type)
+        unit_value = _validated_media_unit(unit)
+        call_type_value = _validated_media_call_type(call_type)
         # Validate here, not only in the module-level ``add_media_usage``: this
         # is the actual write boundary, and a direct caller (tests, future
         # producers holding a TokenUsage) would otherwise persist a boolean,
@@ -280,7 +281,7 @@ class TokenUsage:
             self.details.append(
                 {
                     "type": "media",
-                    "unit": unit,
+                    "unit": unit_value,
                     "quantity": quantity,
                     "provider_tokens": input_tokens + output_tokens,
                     "provider_input_tokens": input_tokens,
@@ -288,7 +289,7 @@ class TokenUsage:
                     "tokens_estimated": tokens_estimated,
                     "model": model,
                     "model_id": model_id,
-                    "call_type": call_type,
+                    "call_type": call_type_value,
                     "resolution": resolution,
                 }
             )

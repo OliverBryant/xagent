@@ -1117,6 +1117,89 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_media_rows_report_only_the_current_turn_delta(self, db_session):
+        """Media rows must behave like token rows across the TaskTracker seam.
+
+        The seed derives ``media_calls`` from persisted media rows rather than a
+        column, so a multi-turn task must not re-report a prior turn's media
+        calls; and both the mid-run gate and the completion hook must see only
+        this turn's rows.
+        """
+        from xagent.core.model.chat.token_context import (
+            MediaCallType,
+            MediaUnit,
+            add_media_usage,
+        )
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 0
+        task.output_tokens = 0
+        task.llm_calls = 1
+        # A prior turn already recorded two media calls, persisted as rows.
+        task.token_usage_details = [
+            {
+                "type": "media",
+                "unit": "images",
+                "quantity": 2.0,
+                "model": "sd",
+                "call_type": "generate_image",
+            },
+            {
+                "type": "media",
+                "unit": "seconds",
+                "quantity": 9.0,
+                "model": "whisper",
+                "call_type": "asr",
+            },
+        ]
+
+        recorded = {}
+        gated = {}
+
+        def _usage_hook(db, user_id, delta_details, delta_actions):
+            recorded.update(details=delta_details, actions=delta_actions)
+
+        def _gate_hook(db, user_id, delta_details, delta_actions):
+            gated.update(details=delta_details)
+            return None
+
+        quota_hooks.set_usage_record_hook(_usage_hook)
+        quota_hooks.set_run_progress_gate_hook(_gate_hook)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+
+            # The seed counted the prior rows, so the baseline is not zero.
+            seeded = get_token_usage()
+            assert seeded.media_calls == 2
+
+            # This turn records one more media call.
+            add_media_usage(
+                unit=MediaUnit.SECONDS,
+                quantity=4.5,
+                model="whisper",
+                call_type=MediaCallType.ASR,
+            )
+
+            # A periodic snapshot must carry the running total, not drop it.
+            snapshot = get_token_usage().snapshot()
+            assert snapshot.media_calls == 3
+
+            # The mid-run gate sees only this turn's row.
+            await tracker.interrupt_reason_for_quota()
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        for label, payload in (("gate", gated), ("completion", recorded)):
+            media = [d for d in payload["details"] if d.get("type") == "media"]
+            assert len(media) == 1, f"{label} hook saw {len(media)} media rows"
+            assert media[0]["quantity"] == 4.5, f"{label} hook saw a prior-turn row"
+
+    @pytest.mark.asyncio
     async def test_interrupt_reason_for_quota_passes_turn_delta(self, db_session):
         """The per-step quota gate must see the same this-turn delta the metering
         path computes, and surface the gate's reason (or None when open)."""

@@ -104,9 +104,14 @@ class TokenUsage:
     input_tokens: int = 0
     output_tokens: int = 0
     llm_calls: int = 0
-    media_calls: int = 0
     tool_calls: int = 0
     details: List[Dict] = field(default_factory=list)
+    # Appended AFTER the legacy fields, and keyword-only, so the historical
+    # positional signature — TokenUsage(input, output, llm_calls, tool_calls,
+    # details) — keeps binding the way existing callers expect. Inserting it
+    # before tool_calls silently rebound their 4th and 5th arguments (tool
+    # count became media count, details became tool count) with no error.
+    media_calls: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         # Counter updates are read-modify-write, and one TokenUsage is routinely
@@ -119,8 +124,8 @@ class TokenUsage:
         # directly (ignoring ``__getstate__``), so it would raise
         # ``TypeError: cannot pickle '_thread.lock' object`` for any generic
         # consumer. Keeping it in ``__dict__`` also leaves the public
-        # positional signature — ``TokenUsage(input, output, llm, media, tool,
-        # details)`` — free of a private slot.
+        # positional signature — ``TokenUsage(input, output, llm_calls,
+        # tool_calls, details)`` — free of a private slot.
         self.__dict__["_lock"] = threading.Lock()
 
     @property
@@ -226,7 +231,7 @@ class TokenUsage:
         # appending unvalidated quantities (inf/negatives) that the other
         # rejected. The only difference is that this method does not bump
         # media_calls — callers of the older two-step API bump it themselves via
-        # increment_media_calls — so undo that here to keep the count honest.
+        # increment_media_calls — hence count_call=False below.
         self.record_media_call(
             unit=unit,
             quantity=quantity,
@@ -273,6 +278,26 @@ class TokenUsage:
         # producers holding a TokenUsage) would otherwise persist a boolean,
         # negative, or non-finite quantity that cannot be repaired later.
         quantity = _coerce_float(quantity)
+        # REQUESTS is defined as exactly one provider call, so its quantity is
+        # not a free variable. Letting 0/0.5/2 through would make the billable
+        # quantity disagree with the media_calls/aggregate `calls` count derived
+        # from the same row — quota and pricing would then read different
+        # numbers off one record. Raised rather than clamped: a caller passing
+        # something else has a real bug, and silently rewriting it hides that.
+        # Producers route through ``media_usage.record_media_usage``, which
+        # swallows this so an accounting bug still cannot break a media call.
+        #
+        # Note the legacy two-step path (``increment_media_calls`` then
+        # ``add_media_usage``) bumps the counter in the CALLER, so a rejection
+        # there leaves a counted call with no detail row. That path is only
+        # reachable by an explicit two-step caller — every in-tree producer uses
+        # the single atomic entry point — and is exactly why the two-step API is
+        # kept only for backwards compatibility rather than used internally.
+        if unit_value == MediaUnit.REQUESTS.value and quantity != 1.0:
+            raise ValueError(
+                f"MediaUnit.REQUESTS means exactly one call, so quantity must "
+                f"be 1; got {quantity!r}"
+            )
         input_tokens = _coerce_int(input_tokens)
         output_tokens = _coerce_int(output_tokens)
         with self._lock:
@@ -293,6 +318,28 @@ class TokenUsage:
                     "resolution": resolution,
                 }
             )
+
+    def snapshot(self) -> "TokenUsage":
+        """A detached copy taken under the lock.
+
+        Reading the fields individually — as an external copier must — can
+        interleave with a concurrent ``record_media_call``/``merge`` and produce
+        a torn snapshot: a counter without its matching detail row, or the
+        reverse. Consumers derive per-model rows from ``details`` and the call
+        count from the scalar, so a torn pair reports mutually inconsistent
+        billing. Taking the lock once here is the only way a copier can get a
+        self-consistent view.
+        """
+        with self._lock:
+            copy = TokenUsage(
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                llm_calls=self.llm_calls,
+                tool_calls=self.tool_calls,
+                details=[dict(item) for item in self.details if isinstance(item, dict)],
+                media_calls=self.media_calls,
+            )
+        return copy
 
     def increment_llm_calls(self) -> None:
         """Increment the LLM call counter."""
@@ -432,18 +479,35 @@ def get_token_usage() -> TokenUsage:
 
 
 def _coerce_int(value: Any) -> int:
-    """Best-effort int; 0 if the value isn't a usable number (e.g. None/mock)."""
+    """A finite, non-negative int; 0 if the value isn't a usable token count.
+
+    Token counts share the quantity guarantees documented on
+    :func:`_coerce_float`, for the same reason: this is the boundary before the
+    value is persisted into task and quota details, where it cannot be
+    repaired. Specifically:
+
+    * ``bool`` — ``True``/``False`` are a caller bug, not a count of 1 or 0.
+    * negatives — a negative token count would subtract from a bill.
+    * ``NaN``/``inf`` — ``int(float("inf"))`` raises ``OverflowError``, which
+      would propagate out of the accounting path and drop the whole (billable)
+      media row rather than just the bad field.
+    """
     if isinstance(value, bool):
-        return int(value)
+        logger.warning("Discarding boolean token count: %r", value)
+        return 0
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
         # None/absent is expected (provider omitted the field) — stay quiet.
         # A present-but-malformed value signals a provider-adapter bug worth
         # surfacing rather than silently billing it as zero.
         if value is not None:
             logger.warning("Discarding non-numeric token count: %r", value)
         return 0
+    if result < 0:
+        logger.warning("Discarding negative token count: %r", value)
+        return 0
+    return result
 
 
 def estimate_tokens(text: Any) -> int:
@@ -466,7 +530,12 @@ def estimate_tokens(text: Any) -> int:
         # an accounting path.
         try:
             items = [item for item in text if isinstance(item, str)]
-        except TypeError:
+        except Exception as e:  # noqa: BLE001
+            # Not just TypeError: a custom iterable's __iter__/__next__ can
+            # raise anything, and this runs in an accounting path whose
+            # documented contract is that malformed input never breaks the call
+            # being measured. Estimate 0 and say so.
+            logger.warning("Token estimation failed for %r: %s", type(text), e)
             return 0
 
     cjk = 0

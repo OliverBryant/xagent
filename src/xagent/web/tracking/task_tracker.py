@@ -57,15 +57,13 @@ def _copy_details(raw_details: Any) -> list[dict[str, Any]]:
 
 
 def _copy_usage(usage: TokenUsage) -> TokenUsage:
-    """Detach a stable snapshot before yielding to a database worker."""
-    return TokenUsage(
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        llm_calls=usage.llm_calls,
-        media_calls=usage.media_calls,
-        tool_calls=usage.tool_calls,
-        details=_copy_details(usage.details),
-    )
+    """Detach a stable snapshot before yielding to a database worker.
+
+    Delegates to ``TokenUsage.snapshot`` so the copy is taken under the usage
+    object's own lock. Reading the fields here field-by-field could interleave
+    with a concurrent media write and yield a counter without its detail row.
+    """
+    return usage.snapshot()
 
 
 def _task_for_run(

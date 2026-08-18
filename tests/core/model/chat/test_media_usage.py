@@ -446,41 +446,74 @@ def test_usage_survives_asdict_deepcopy_and_pickle() -> None:
     assert revived.media_calls == 2
 
 
-def test_media_calls_is_not_positionally_before_legacy_fields() -> None:
-    # Guards the public constructor shape: media_calls sits after llm_calls and
-    # before tool_calls, and the private lock must not occupy a positional slot.
-    usage = TokenUsage(1, 2, 3, 4, 5, [])
+def test_legacy_positional_construction_still_binds_the_same_fields() -> None:
+    # media_calls must NOT be inserted into the historical positional sequence.
+    # An existing TokenUsage(input, output, llm_calls, tool_calls, details) call
+    # would otherwise bind its 4th argument to media_calls and shift the rest —
+    # tool count read as media count, details read as tool count — silently,
+    # with no error. The field is appended and keyword-only instead.
+    details = [{"type": "input", "tokens": 7}]
+    usage = TokenUsage(10, 5, 2, 3, details)
 
-    assert usage.input_tokens == 1
-    assert usage.output_tokens == 2
-    assert usage.llm_calls == 3
-    assert usage.media_calls == 4
-    assert usage.tool_calls == 5
+    assert usage.input_tokens == 10
+    assert usage.output_tokens == 5
+    assert usage.llm_calls == 2
+    assert usage.tool_calls == 3
+    assert usage.details == details
+    assert usage.media_calls == 0
+
+    # And it is reachable by keyword, where it cannot be confused with anything.
+    assert TokenUsage(media_calls=4).media_calls == 4
+
+    # The private lock must not occupy a positional slot either: six positional
+    # arguments is the documented maximum (five fields plus self).
+    with pytest.raises(TypeError):
+        TokenUsage(1, 2, 3, 4, [], 5)  # type: ignore[misc]
 
 
 def test_concurrent_merges_in_both_directions_do_not_deadlock() -> None:
-    # merge() snapshots the source under its own lock before taking the
-    # target's; holding both would deadlock on opposing merges.
+    # merge() snapshots the source under its own lock and releases it before
+    # taking the target's; holding both at once would deadlock on opposing
+    # merges. A plain thread start/join can be scheduled so the two never
+    # actually overlap, which would pass even against a both-locks-held
+    # implementation — so a Barrier forces them into the window.
     a = TokenUsage()
     b = TokenUsage()
-    for _ in range(50):
+    per_side = 50
+    for _ in range(per_side):
         a.record_media_call(unit="images", quantity=1, call_type="generate_image")
         b.record_media_call(unit="seconds", quantity=1, call_type="asr")
 
-    threads = [
-        threading.Thread(target=a.merge, args=(b,)),
-        threading.Thread(target=b.merge, args=(a,)),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=10)
+    barrier = threading.Barrier(2)
 
-    for t in threads:
-        assert not t.is_alive(), "merge deadlocked in opposing directions"
-    # Neither side lost rows: each gained at least the other's original 50.
-    assert len(a.details) >= 100
-    assert len(b.details) >= 100
+    def merge_after_barrier(target: TokenUsage, source: TokenUsage) -> None:
+        barrier.wait(timeout=10)
+        target.merge(source)
+
+    threads = [
+        threading.Thread(target=merge_after_barrier, args=(a, b)),
+        threading.Thread(target=merge_after_barrier, args=(b, a)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    for thread in threads:
+        assert not thread.is_alive(), "merge deadlocked in opposing directions"
+
+    # Exact counts, not lower bounds: a lower bound would pass while rows were
+    # dropped or a counter drifted from its detail rows. Each side ends with its
+    # own 50 plus whatever snapshot it read of the other — between 50 and 100
+    # extra depending on interleaving — but the scalar and the rows must always
+    # agree with each other, and neither side may lose its own rows.
+    for usage, own_unit in ((a, "images"), (b, "seconds")):
+        media_rows = [d for d in usage.details if d.get("type") == "media"]
+        assert usage.media_calls == len(media_rows), "counter drifted from rows"
+        assert len(media_rows) >= 2 * per_side
+        assert len(media_rows) <= 3 * per_side
+        own_rows = [d for d in media_rows if d["unit"] == own_unit]
+        assert len(own_rows) >= per_side, "a side lost its own rows"
 
 
 def test_estimate_tokens_accepts_any_iterable_of_strings() -> None:
@@ -514,3 +547,158 @@ def test_estimate_tokens_counts_cjk_per_character() -> None:
     # undercount Chinese by close to 4x.
     assert estimate_tokens("中文") == 2
     assert estimate_tokens("中文abcd") == 3
+
+
+@pytest.mark.parametrize("bad_quantity", [0, 0.5, 2, 7, -1])
+def test_requests_unit_rejects_any_quantity_but_one(bad_quantity) -> None:
+    # MediaUnit.REQUESTS is defined as exactly one provider call, so its
+    # quantity is not a free variable. Letting another value through would make
+    # the billable quantity disagree with the media_calls / aggregate `calls`
+    # count derived from the same row, so quota and pricing would read
+    # different numbers off one record.
+    usage = TokenUsage()
+    with pytest.raises(ValueError, match="exactly one call"):
+        usage.record_media_call(
+            unit=MediaUnit.REQUESTS, quantity=bad_quantity, call_type="rerank"
+        )
+
+    # Rejected before any mutation: no counter bump, no orphan detail row.
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+def test_requests_unit_accepts_exactly_one() -> None:
+    usage = TokenUsage()
+    usage.record_media_call(unit=MediaUnit.REQUESTS, quantity=1, call_type="rerank")
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["quantity"] == 1.0
+
+
+def test_other_units_keep_free_quantities() -> None:
+    # The REQUESTS constraint must not leak into duration/count-billed units.
+    usage = TokenUsage()
+    usage.record_media_call(unit=MediaUnit.SECONDS, quantity=2.5, call_type="asr")
+    usage.record_media_call(unit=MediaUnit.IMAGES, quantity=4, call_type="edit_image")
+
+    assert [d["quantity"] for d in usage.details] == [2.5, 4.0]
+
+
+def test_requests_rejection_is_swallowed_by_the_wrapper() -> None:
+    # Producers route through record_media_usage, whose contract is that an
+    # accounting bug never breaks the media call the user asked for.
+    from xagent.core.tools.core.media_usage import record_media_usage
+
+    with TokenContextManager() as manager:
+        record_media_usage(
+            MediaUnit.REQUESTS, 3, model="m", call_type=MediaCallType.RERANK
+        )
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+@pytest.mark.parametrize(
+    "bad_tokens",
+    [True, False, -100, float("inf"), float("-inf"), float("nan"), "abc"],
+)
+def test_malformed_provider_tokens_sanitize_without_losing_the_row(bad_tokens) -> None:
+    # int(float("inf")) raises OverflowError, which was not caught — so a
+    # malformed provider payload propagated out of the accounting path and
+    # dropped the whole billable media row. Negatives and booleans were
+    # persisted as-is, letting a provider bug subtract from a bill.
+    usage = TokenUsage()
+    usage.record_media_call(
+        unit="images",
+        quantity=1,
+        call_type="generate_image",
+        input_tokens=bad_tokens,
+        output_tokens=bad_tokens,
+    )
+
+    # The row survives — the call happened and is billable by quantity ...
+    assert usage.media_calls == 1
+    entry = usage.details[0]
+    assert entry["quantity"] == 1.0
+    # ... with only the unusable token fields zeroed.
+    assert entry["provider_input_tokens"] == 0
+    assert entry["provider_output_tokens"] == 0
+    assert entry["provider_tokens"] == 0
+
+
+def test_valid_provider_tokens_survive() -> None:
+    usage = TokenUsage()
+    usage.record_media_call(
+        unit="images",
+        quantity=1,
+        call_type="generate_image",
+        input_tokens=11,
+        output_tokens=5,
+    )
+    entry = usage.details[0]
+
+    assert (entry["provider_input_tokens"], entry["provider_output_tokens"]) == (11, 5)
+    assert entry["provider_tokens"] == 16
+
+
+def test_snapshot_is_taken_under_the_lock() -> None:
+    # An external copier (TaskTracker._copy_usage) reading fields one by one can
+    # interleave with a concurrent write and see a counter without its matching
+    # detail row. snapshot() takes the lock once so the pair always agrees.
+    usage = TokenUsage()
+    torn: list[tuple[int, int]] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        for _ in range(400):
+            usage.record_media_call(unit="images", quantity=1, call_type="video")
+        stop.set()
+
+    def reader() -> None:
+        while not stop.is_set():
+            snap = usage.snapshot()
+            media = sum(1 for d in snap.details if d.get("type") == "media")
+            if snap.media_calls != media:
+                torn.append((snap.media_calls, media))
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not torn, f"snapshot() returned torn state: {torn[:5]}"
+    assert usage.media_calls == 400
+
+
+def test_snapshot_detaches_from_the_source() -> None:
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=1, call_type="video")
+    snap = usage.snapshot()
+
+    usage.record_media_call(unit="images", quantity=1, call_type="video")
+
+    # The snapshot must not see writes that landed after it was taken.
+    assert snap.media_calls == 1
+    assert len(snap.details) == 1
+    assert snap.details is not usage.details
+
+
+def test_estimate_tokens_never_raises_from_a_hostile_iterable() -> None:
+    # The docstring promises malformed input cannot raise, but only TypeError
+    # was caught: a custom iterable raising anything else escaped into the
+    # accounting path and would break the call being measured.
+    from xagent.core.model.chat.token_context import estimate_tokens
+
+    class _RaisesMidIteration:
+        def __iter__(self):
+            yield "abcd"
+            raise RuntimeError("iterator exploded")
+
+    class _RaisesImmediately:
+        def __iter__(self):
+            raise ValueError("cannot iterate")
+
+    assert estimate_tokens(_RaisesMidIteration()) == 0
+    assert estimate_tokens(_RaisesImmediately()) == 0

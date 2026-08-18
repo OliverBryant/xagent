@@ -15,33 +15,57 @@ vi.mock("@/lib/utils", () => ({
   getApiUrl: () => "http://api.local",
 }))
 
+const interpolate = (
+  message: string,
+  vars?: Record<string, string | number>,
+) =>
+  Object.entries(vars ?? {}).reduce(
+    (result, [name, value]) => result.replaceAll(`{${name}}`, String(value)),
+    message,
+  )
+
+const messages: Record<string, string> = {
+  "chatPage.tokenUsage.input": "Input tokens",
+  "chatPage.tokenUsage.output": "Output tokens",
+  "chatPage.tokenUsage.cached": "Cached input tokens",
+  "chatPage.tokenUsage.inputShort": "Input",
+  "chatPage.tokenUsage.outputShort": "Output",
+  "chatPage.tokenUsage.cachedShort": "Cached",
+  "chatPage.tokenUsage.cachedShare": "{pct}% cached",
+  "chatPage.tokenUsage.oneModel": "{count} model",
+  "chatPage.tokenUsage.models": "{count} models",
+  "chatPage.tokenUsage.oneModelWithUnattributed": "{count} model + {unattributed} unattributed",
+  "chatPage.tokenUsage.modelsWithUnattributed": "{count} models + {unattributed} unattributed",
+  "chatPage.tokenUsage.unattributedCount": "{count} unattributed",
+  "chatPage.tokenUsage.byModel": "Usage by model",
+  "chatPage.tokenUsage.model": "Model",
+  "chatPage.tokenUsage.unknownModel": "Unknown model",
+  "chatPage.tokenUsage.unattributed": "Unattributed",
+  "chatPage.tokenUsage.mediaByModel": "Media usage",
+  "chatPage.tokenUsage.mediaCall": "{count} media call",
+  "chatPage.tokenUsage.mediaCalls": "{count} media calls",
+  "chatPage.tokenUsage.quantity": "Amount",
+  "chatPage.tokenUsage.callType": "Type",
+  "chatPage.tokenUsage.unit.images": "images",
+  "chatPage.tokenUsage.unit.seconds": "sec",
+  "chatPage.tokenUsage.unit.characters": "chars",
+  "chatPage.tokenUsage.unit.requests": "requests",
+  "chatPage.tokenUsage.unit.texts": "texts",
+  "chatPage.tokenUsage.mediaType.generate_image": "Image generation",
+  "chatPage.tokenUsage.mediaType.tts": "Text-to-speech",
+  "chatPage.tokenUsage.mediaType.video": "Video",
+}
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     locale: i18nMock.locale,
-    t: (key: string, vars?: Record<string, string | number>) => {
-      const message = {
-        "chatPage.tokenUsage.input": "Input tokens",
-        "chatPage.tokenUsage.output": "Output tokens",
-        "chatPage.tokenUsage.cached": "Cached input tokens",
-        "chatPage.tokenUsage.inputShort": "Input",
-        "chatPage.tokenUsage.outputShort": "Output",
-        "chatPage.tokenUsage.cachedShort": "Cached",
-        "chatPage.tokenUsage.cachedShare": "{pct}% cached",
-        "chatPage.tokenUsage.oneModel": "{count} model",
-        "chatPage.tokenUsage.models": "{count} models",
-        "chatPage.tokenUsage.oneModelWithUnattributed": "{count} model + {unattributed} unattributed",
-        "chatPage.tokenUsage.modelsWithUnattributed": "{count} models + {unattributed} unattributed",
-        "chatPage.tokenUsage.unattributedCount": "{count} unattributed",
-        "chatPage.tokenUsage.byModel": "Usage by model",
-        "chatPage.tokenUsage.model": "Model",
-        "chatPage.tokenUsage.unknownModel": "Unknown model",
-        "chatPage.tokenUsage.unattributed": "Unattributed",
-      }[key] ?? key
-      return Object.entries(vars ?? {}).reduce(
-        (result, [name, value]) => result.replaceAll(`{${name}}`, String(value)),
-        message,
-      )
-    },
+    t: (key: string, vars?: Record<string, string | number>) =>
+      interpolate(messages[key] ?? key, vars),
+    tDynamic: (
+      key: string,
+      fallback: string,
+      vars?: Record<string, string | number>,
+    ) => interpolate(messages[key] ?? fallback, vars),
   }),
 }))
 
@@ -263,6 +287,335 @@ describe("TokenUsageDisplay", () => {
       expect(screen.queryByRole("button")).not.toBeInTheDocument()
     },
   )
+})
+
+describe("TokenUsageDisplay media usage", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    i18nMock.locale = "en"
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("exposes media usage in its own popover with unit-formatted amounts", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 100,
+          output_tokens: 20,
+          total_tokens: 120,
+          llm_calls: 1,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "sd",
+              model_name: "stable-diffusion-xl",
+              unit: "images",
+              call_type: "generate_image",
+              resolution: "1K",
+              quantity: 3,
+              calls: 2,
+              tokens: 0,
+            },
+            {
+              model_id: "tts-1",
+              model_name: "elevenlabs-tts",
+              unit: "seconds",
+              call_type: "tts",
+              quantity: 12.5,
+              calls: 1,
+              tokens: 0,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={20} isRunning={false} />)
+
+    // 3 media calls total (2 image + 1 tts).
+    fireEvent.click(await screen.findByRole("button", { name: /3 media calls/ }))
+
+    expect(await screen.findByText("Media usage")).toBeInTheDocument()
+    expect(screen.getByText("stable-diffusion-xl")).toBeInTheDocument()
+    expect(screen.getByText("Image generation")).toBeInTheDocument()
+    expect(screen.getByText("3 images")).toBeInTheDocument()
+    expect(screen.getByText("1K")).toBeInTheDocument()
+    expect(screen.getByText("elevenlabs-tts")).toBeInTheDocument()
+    expect(screen.getByText("Text-to-speech")).toBeInTheDocument()
+    expect(screen.getByText("12.5 sec")).toBeInTheDocument()
+  })
+
+  it("renders the texts unit label used by embedding rows", async () => {
+    // The embedding modality bills in `texts`, and that key was missing from
+    // this mock while a stale `unit.tokens` lingered. With no assertion on it,
+    // the desync was structurally uncatchable: the suite passed whether or not
+    // the real locale files defined the key.
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "emb-1",
+              model_name: "text-embedding-v4",
+              unit: "texts",
+              call_type: "embedding",
+              quantity: 32,
+              calls: 1,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={31} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+
+    expect(await screen.findByText("32 texts")).toBeInTheDocument()
+  })
+
+  it("survives null and non-object media rows", async () => {
+    // token_usage_details is free-form legacy JSON. Reducing over a null row
+    // throws on property access, which would blank the whole component.
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            null,
+            "not an object",
+            42,
+            {
+              model_id: "sd",
+              model_name: "stable-diffusion-xl",
+              unit: "images",
+              call_type: "generate_image",
+              quantity: 2,
+              calls: 1,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={32} isRunning={false} />)
+
+    // The junk rows are dropped; the real one still renders and is counted.
+    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    expect(await screen.findByText("2 images")).toBeInTheDocument()
+  })
+
+  it("renders a string quantity as its real value, not zero", async () => {
+    // "4" passes a `> 0` check but fails Number.isFinite in the formatter, so
+    // before normalisation this rendered the "unmeasured" placeholder and read
+    // as if the call had cost nothing.
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "sd",
+              model_name: "stable-diffusion-xl",
+              unit: "images",
+              call_type: "generate_image",
+              quantity: "4",
+              calls: "2",
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={33} isRunning={false} />)
+
+    // The string calls count is coerced too, so the label reads 2.
+    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    expect(await screen.findByText("4 images")).toBeInTheDocument()
+  })
+
+  it("uses the singular label for a single media call", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "sd",
+              model_name: "sd",
+              unit: "images",
+              call_type: "generate_image",
+              quantity: 1,
+              calls: 1,
+              tokens: 0,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={21} isRunning={false} />)
+
+    expect(
+      await screen.findByRole("button", { name: /^1 media call$/ }),
+    ).toBeInTheDocument()
+  })
+
+  it("does not render a media popover without media usage", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 10,
+          output_tokens: 2,
+          total_tokens: 12,
+          llm_calls: 1,
+          model_usage: [],
+          media_usage: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={22} isRunning={false} />)
+
+    await screen.findByText("Input")
+    expect(
+      screen.queryByRole("button", { name: /media call/ }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("falls back to the raw call type and unit when no translation exists", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "x",
+              model_name: "custom-model",
+              unit: "widgets",
+              call_type: "custom_op",
+              quantity: 4,
+              calls: 1,
+              tokens: 0,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={23} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    expect(await screen.findByText("custom_op")).toBeInTheDocument()
+    expect(screen.getByText("4 widgets")).toBeInTheDocument()
+  })
+
+  it("renders an empty unit without a dangling trailing space", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "x",
+              model_name: "no-unit-model",
+              unit: "",
+              call_type: "video",
+              quantity: 4,
+              calls: 1,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={24} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /1 media call/ }))
+    // Exact match: "4 " with a trailing space would not satisfy this.
+    expect(await screen.findByText("4")).toBeInTheDocument()
+  })
+
+  it("renders provider tokens and marks estimated counts", async () => {
+    apiRequestMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          llm_calls: 0,
+          model_usage: [],
+          media_usage: [
+            {
+              model_id: "g",
+              model_name: "gemini-image",
+              unit: "images",
+              call_type: "generate_image",
+              quantity: 1,
+              calls: 1,
+              provider_tokens: 1120,
+              tokens_estimated: false,
+            },
+            {
+              model_id: "e",
+              model_name: "text-embed",
+              unit: "texts",
+              call_type: "embedding",
+              quantity: 3,
+              calls: 1,
+              provider_tokens: 40,
+              tokens_estimated: true,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    )
+
+    render(<TokenUsageDisplay taskId={25} isRunning={false} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: /2 media calls/ }))
+    // Real Gemini image tokens are surfaced, not silently dropped.
+    expect(await screen.findByText(/1\.12k/)).toBeInTheDocument()
+    // The estimate is visibly marked so it is not mistaken for a measurement.
+    expect(screen.getByText(/40~/)).toBeInTheDocument()
+  })
 })
 
 describe("TokenUsageDisplay cached tokens", () => {

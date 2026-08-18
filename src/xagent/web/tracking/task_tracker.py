@@ -62,6 +62,7 @@ def _copy_usage(usage: TokenUsage) -> TokenUsage:
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
         llm_calls=usage.llm_calls,
+        media_calls=usage.media_calls,
         tool_calls=usage.tool_calls,
         details=_copy_details(usage.details),
     )
@@ -100,13 +101,21 @@ def _task_seed_from_session(
             f" for run {expected_run_id}" if expected_run_id is not None else ""
         )
         raise ValueError(f"Task {task_id}{run_suffix} not found")
+    seed_details = _copy_details(getattr(task, "token_usage_details", None))
     return _TaskTrackingSeed(
         user_id=_optional_int(getattr(task, "user_id", None)),
         usage=TokenUsage(
             input_tokens=_safe_int(getattr(task, "input_tokens", 0)),
             output_tokens=_safe_int(getattr(task, "output_tokens", 0)),
             llm_calls=_safe_int(getattr(task, "llm_calls", 0)),
-            details=_copy_details(getattr(task, "token_usage_details", None)),
+            # Derived from the surviving detail rows rather than read from a
+            # column: tasks have no media_calls column, and the next turn's
+            # delta is computed against this seed, so seeding zero would
+            # re-report every media call already recorded in a prior turn.
+            media_calls=sum(
+                1 for detail in seed_details if detail.get("type") == "media"
+            ),
+            details=seed_details,
         ),
     )
 

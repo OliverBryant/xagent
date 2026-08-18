@@ -9,6 +9,8 @@ unusable if the same model sometimes reports "seconds" and sometimes
 import pytest
 
 from xagent.core.model.chat.token_context import (
+    MediaCallType,
+    MediaUnit,
     TokenContextManager,
     aggregate_media_usage_by_model,
 )
@@ -87,3 +89,107 @@ def test_resolve_billing_model_never_returns_a_placeholder() -> None:
         model_name = "None"
 
     assert resolve_billing_model(None, _Placeholder()) == "default"
+
+
+def test_record_media_usage_swallows_recording_errors(monkeypatch) -> None:
+    # The best-effort guarantee is the whole point of this wrapper: a metering
+    # bug must never break the media call the user asked for. The existing
+    # quantity=None case coerces to 0 and records fine, so it would still pass
+    # with the try/except deleted — this one would not.
+    import xagent.core.tools.core.media_usage as mu
+
+    def _boom(**kwargs: object) -> None:
+        raise RuntimeError("recording backend exploded")
+
+    monkeypatch.setattr(mu, "add_media_usage", _boom)
+
+    with TokenContextManager() as manager:
+        # Must not raise.
+        mu.record_media_usage(
+            MediaUnit.IMAGES, 1, model="m", call_type=MediaCallType.GENERATE_IMAGE
+        )
+        usage = manager.get_usage()
+
+    # And must leave no partial state behind.
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+def test_record_media_usage_swallows_invalid_unit(monkeypatch) -> None:
+    # A typo'd unit raises ValueError from the validator; the wrapper drops the
+    # record with a warning rather than propagating into the media call.
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        mu.record_media_usage("not-a-unit", 1, model="m", call_type="tts")
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+def test_record_media_seconds_swallows_invalid_call_type() -> None:
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        mu.record_media_seconds(3.0, model="m", call_type="not-a-call-type")
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+def test_record_media_seconds_ignores_non_finite_duration() -> None:
+    # inf > 0 is True, so without the finiteness guard this would record a
+    # non-JSON-serialisable quantity.
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        mu.record_media_seconds(
+            mu.coerce_duration(float("inf")), model="m", call_type=MediaCallType.ASR
+        )
+        entry = manager.get_usage().details[0]
+
+    # Treated as "no duration reported": recorded as 0 seconds, unit unchanged.
+    assert entry["unit"] == "seconds"
+    assert entry["quantity"] == 0.0
+
+
+def test_record_media_usage_forwards_optional_billing_metadata() -> None:
+    # The wrapper must mirror the core primitive's optional fields: passing them
+    # previously raised TypeError during argument binding, before the try block.
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        mu.record_media_usage(
+            MediaUnit.IMAGES,
+            1,
+            model="m",
+            call_type=MediaCallType.GENERATE_IMAGE,
+            resolution="2K",
+            input_tokens=7,
+            output_tokens=3,
+            tokens_estimated=True,
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["resolution"] == "2K"
+    assert entry["provider_tokens"] == 10
+    assert entry["tokens_estimated"] is True
+
+
+def test_resolve_billing_model_survives_raising_descriptor() -> None:
+    # Identity resolution runs before record_media_usage's try/except, so a
+    # provider whose model_name property raises would otherwise break the call.
+    import xagent.core.tools.core.media_usage as mu
+
+    class _Hostile:
+        @property
+        def model_name(self) -> str:
+            raise RuntimeError("descriptor exploded")
+
+        @property
+        def model(self) -> str:
+            return "real-name"
+
+    assert mu.resolve_billing_model(None, _Hostile()) == "real-name"

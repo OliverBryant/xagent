@@ -34,6 +34,7 @@ another sets it splits one physical model into two un-mergeable billing rows.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from typing_extensions import TypeGuard
@@ -72,7 +73,14 @@ def resolve_billing_model(
     if _usable_model_name(configured_id):
         return configured_id
     for attr in ("model_name", "model"):
-        value = getattr(model, attr, None)
+        # Guarded individually: this runs *before* record_media_usage's own
+        # try/except, so a provider whose model_name is a property that raises
+        # would break the user's media call over an accounting lookup.
+        try:
+            value = getattr(model, attr, None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reading %s for billing identity failed: %s", attr, e)
+            continue
         if _usable_model_name(value):
             return value
     return fallback
@@ -92,6 +100,12 @@ def coerce_duration(value: object) -> Optional[float]:
         seconds = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    # ``inf > 0`` is True, so non-finite values would otherwise pass as a
+    # usable duration and reach the record as a non-JSON-serialisable
+    # quantity. Treat them as "no duration reported" instead.
+    if not math.isfinite(seconds):
+        logger.warning("Ignoring non-finite duration: %r", value)
+        return None
     return seconds if seconds > 0 else None
 
 
@@ -102,6 +116,10 @@ def record_media_usage(
     model: str = "",
     model_id: str = "",
     call_type: MediaCallType | str | None = "",
+    resolution: str = "",
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    tokens_estimated: bool = False,
 ) -> None:
     """Record one media model call; swallow any error.
 
@@ -119,6 +137,10 @@ def record_media_usage(
             model=model,
             model_id=model_id,
             call_type=call_type,
+            resolution=resolution,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tokens_estimated=tokens_estimated,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to record %s media usage: %s", call_type, e)

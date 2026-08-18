@@ -7,6 +7,7 @@ statistics to be automatically collected during task execution.
 
 import contextvars
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
@@ -106,14 +107,37 @@ class TokenUsage:
     media_calls: int = 0
     tool_calls: int = 0
     details: List[Dict] = field(default_factory=list)
-    # Counter updates are read-modify-write, and one TokenUsage is routinely
-    # shared across worker threads (RAG ingestion pools, ``bind_usage_to_thread``
-    # callers). Without this, concurrent ``+=`` silently loses counts.
-    # ``repr=False``/``compare=False`` keep the lock out of the dataclass's
-    # generated ``__repr__``/``__eq__``, which tests compare on.
-    _lock: threading.Lock = field(
-        default_factory=threading.Lock, repr=False, compare=False
-    )
+
+    def __post_init__(self) -> None:
+        # Counter updates are read-modify-write, and one TokenUsage is routinely
+        # shared across worker threads (RAG ingestion pools,
+        # ``bind_usage_to_thread`` callers); without a lock, concurrent ``+=``
+        # silently loses counts.
+        #
+        # Deliberately NOT a dataclass field. As a field it would sit in
+        # ``__dataclass_fields__``, and ``dataclasses.asdict`` walks those
+        # directly (ignoring ``__getstate__``), so it would raise
+        # ``TypeError: cannot pickle '_thread.lock' object`` for any generic
+        # consumer. Keeping it in ``__dict__`` also leaves the public
+        # positional signature — ``TokenUsage(input, output, llm, media, tool,
+        # details)`` — free of a private slot.
+        self.__dict__["_lock"] = threading.Lock()
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The per-instance mutation lock (see :meth:`__post_init__`)."""
+        return self.__dict__["_lock"]
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Drop the lock: it is not picklable and is per-instance state."""
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Restore, giving the unpickled instance its own fresh lock."""
+        self.__dict__.update(state)
+        self.__dict__["_lock"] = threading.Lock()
 
     @property
     def total_tokens(self) -> int:
@@ -196,9 +220,63 @@ class TokenUsage:
         rather than a measurement (Gemini / OpenAI gpt-image), so billing can
         refuse to price an estimate.
         """
+        # Delegates to record_media_call so there is exactly ONE media write
+        # path: two copies drifted apart during review, leaving this one
+        # appending unvalidated quantities (inf/negatives) that the other
+        # rejected. The only difference is that this method does not bump
+        # media_calls — callers of the older two-step API bump it themselves via
+        # increment_media_calls — so undo that here to keep the count honest.
+        self.record_media_call(
+            unit=unit,
+            quantity=quantity,
+            model=model,
+            call_type=call_type,
+            model_id=model_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            resolution=resolution,
+            tokens_estimated=tokens_estimated,
+            # This method never bumped the counter: callers of the two-step API
+            # call increment_media_calls themselves.
+            count_call=False,
+        )
+
+    def record_media_call(
+        self,
+        unit: str,
+        quantity: float,
+        model: str = "",
+        call_type: str = "",
+        model_id: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        resolution: str = "",
+        tokens_estimated: bool = False,
+        count_call: bool = True,
+    ) -> None:
+        """Count the call and append its detail under one lock acquisition.
+
+        ``count_call=False`` appends the detail without bumping the counter, for
+        the older two-step API where the caller bumps it separately.
+
+        ``increment_media_calls`` followed by ``add_media_usage`` takes the lock
+        twice, so a concurrent ``to_dict``/``merge`` can land between them and
+        observe a counter with no matching detail row (or the reverse).
+        Consumers derive per-model rows from ``details`` and the call count from
+        the scalar, so a torn snapshot reports mutually inconsistent billing.
+        """
         unit = _validated_media_unit(unit)
         call_type = _validated_media_call_type(call_type)
+        # Validate here, not only in the module-level ``add_media_usage``: this
+        # is the actual write boundary, and a direct caller (tests, future
+        # producers holding a TokenUsage) would otherwise persist a boolean,
+        # negative, or non-finite quantity that cannot be repaired later.
+        quantity = _coerce_float(quantity)
+        input_tokens = _coerce_int(input_tokens)
+        output_tokens = _coerce_int(output_tokens)
         with self._lock:
+            if count_call:
+                self.media_calls += 1
             self.details.append(
                 {
                     "type": "media",
@@ -379,10 +457,16 @@ def estimate_tokens(text: Any) -> int:
     """
     if isinstance(text, str):
         items: List[str] = [text]
-    elif isinstance(text, (list, tuple, set)):
-        items = [item for item in text if isinstance(item, str)]
     else:
-        return 0
+        # Any iterable of strings, including generators: the docstring promises
+        # that, and an embedding producer passing a generator would otherwise
+        # silently estimate 0 tokens for a real batch. Non-iterables and
+        # non-string members are ignored rather than raising, since this runs in
+        # an accounting path.
+        try:
+            items = [item for item in text if isinstance(item, str)]
+        except TypeError:
+            return 0
 
     cjk = 0
     other = 0
@@ -399,23 +483,50 @@ def estimate_tokens(text: Any) -> int:
                 cjk += 1
             else:
                 other += 1
-    return cjk + other // 4
+    # Round up rather than truncate: `other // 4` alone estimates zero for any
+    # 1-3 character Latin string, so short non-empty text would bill nothing.
+    # A non-empty input must never estimate 0 tokens.
+    latin_tokens = -(-other // 4)  # ceil division
+    return cjk + latin_tokens
 
 
 def _coerce_float(value: Any) -> float:
-    """Best-effort float; 0.0 if the value isn't a usable number.
+    """A finite, non-negative float; 0.0 if the value isn't a usable quantity.
 
     Media quantities can be fractional (e.g. audio seconds), so quantity uses
     this rather than ``_coerce_int``.
+
+    Rejects what a billable quantity can never be, because this is the last
+    boundary before the value is persisted and it cannot be repaired
+    afterwards:
+
+    * ``bool`` — ``True``/``False`` are almost certainly a caller bug, not a
+      quantity of 1 or 0.
+    * negatives — no modality can consume a negative amount, and a negative
+      would subtract from a bill.
+    * ``NaN``/``inf`` — these are not JSON-serialisable, so they would produce
+      literal ``NaN``/``Infinity`` tokens in the persisted task and quota
+      details that strict parsers reject.
+
+    A rejected value records 0.0, matching the "call happened but is
+    unmeasured" convention rather than dropping the record entirely.
     """
     if isinstance(value, bool):
-        return float(value)
+        logger.warning("Discarding boolean media quantity: %r", value)
+        return 0.0
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         if value is not None:
             logger.warning("Discarding non-numeric media quantity: %r", value)
         return 0.0
+    if not math.isfinite(result):
+        logger.warning("Discarding non-finite media quantity: %r", value)
+        return 0.0
+    if result < 0:
+        logger.warning("Discarding negative media quantity: %r", value)
+        return 0.0
+    return result
 
 
 def _usage_field(usage: Any, name: str) -> Any:
@@ -734,8 +845,9 @@ def add_media_usage(
     call_type_value = _validated_media_call_type(call_type)
 
     usage = get_token_usage()
-    usage.increment_media_calls()
-    usage.add_media_usage(
+    # One locked operation: see TokenUsage.record_media_call for why the count
+    # and its detail row must not be observable apart.
+    usage.record_media_call(
         unit=unit_value,
         quantity=quantity,
         model=model,

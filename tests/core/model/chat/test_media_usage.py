@@ -356,3 +356,161 @@ def test_concurrent_merge_loses_no_counts() -> None:
 
     assert target.media_calls == len(sources)
     assert len(target.details) == len(sources)
+
+
+@pytest.mark.parametrize(
+    "bad_quantity",
+    [True, False, -1, -0.5, float("nan"), float("inf"), float("-inf"), "abc", None],
+)
+def test_invalid_quantities_record_zero_not_garbage(bad_quantity) -> None:
+    # This is the last boundary before the value is persisted into task and
+    # quota details, and a written record cannot be repaired. NaN/inf are not
+    # JSON-serialisable (they emit literal NaN/Infinity that strict parsers
+    # reject); negatives would subtract from a bill; booleans are a caller bug.
+    with TokenContextManager() as manager:
+        add_media_usage(
+            unit="images", quantity=bad_quantity, model="m", call_type="generate_image"
+        )
+        entry = manager.get_usage().details[0]
+
+    assert entry["quantity"] == 0.0
+    # Recorded, not dropped: the call still happened, it is just unmeasured.
+    assert manager.get_usage().media_calls == 1
+
+
+def test_valid_fractional_quantity_survives() -> None:
+    # The guard must not clamp legitimate fractional durations.
+    with TokenContextManager() as manager:
+        add_media_usage(unit="seconds", quantity=2.5, model="m", call_type="asr")
+        assert manager.get_usage().details[0]["quantity"] == 2.5
+
+
+def test_direct_record_media_call_also_validates() -> None:
+    # TokenUsage.record_media_call is the real write boundary; a caller holding
+    # a TokenUsage directly must get the same guarantees as add_media_usage.
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=float("inf"), call_type="video")
+
+    assert usage.details[0]["quantity"] == 0.0
+
+
+def test_media_count_and_detail_are_written_atomically() -> None:
+    # A snapshot taken between the counter bump and the detail append would
+    # report mutually inconsistent billing. Assert every observed snapshot has
+    # media_calls equal to the number of media detail rows.
+    usage = TokenUsage()
+    torn: list[tuple[int, int]] = []
+    stop = threading.Event()
+
+    def writer() -> None:
+        for _ in range(400):
+            usage.record_media_call(
+                unit="images", quantity=1, call_type="generate_image"
+            )
+        stop.set()
+
+    def reader() -> None:
+        while not stop.is_set():
+            snap = usage.to_dict()
+            media = sum(1 for d in snap["details"] if d.get("type") == "media")
+            if snap["media_calls"] != media:
+                torn.append((snap["media_calls"], media))
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not torn, f"observed torn snapshots: {torn[:5]}"
+    assert usage.media_calls == 400
+
+
+def test_usage_survives_asdict_deepcopy_and_pickle() -> None:
+    # The mutation lock is not picklable, so as a dataclass field it would break
+    # every generic consumer of this object (dataclasses.asdict walks
+    # __dataclass_fields__ and ignores __getstate__).
+    import copy
+    import dataclasses
+    import pickle
+
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=2, call_type="generate_image")
+
+    assert dataclasses.asdict(usage)["media_calls"] == 1
+    assert copy.deepcopy(usage).media_calls == 1
+    revived = pickle.loads(pickle.dumps(usage))
+    assert revived.media_calls == 1
+    # The revived object gets a working lock of its own, not a shared one.
+    revived.record_media_call(unit="images", quantity=1, call_type="generate_image")
+    assert revived.media_calls == 2
+
+
+def test_media_calls_is_not_positionally_before_legacy_fields() -> None:
+    # Guards the public constructor shape: media_calls sits after llm_calls and
+    # before tool_calls, and the private lock must not occupy a positional slot.
+    usage = TokenUsage(1, 2, 3, 4, 5, [])
+
+    assert usage.input_tokens == 1
+    assert usage.output_tokens == 2
+    assert usage.llm_calls == 3
+    assert usage.media_calls == 4
+    assert usage.tool_calls == 5
+
+
+def test_concurrent_merges_in_both_directions_do_not_deadlock() -> None:
+    # merge() snapshots the source under its own lock before taking the
+    # target's; holding both would deadlock on opposing merges.
+    a = TokenUsage()
+    b = TokenUsage()
+    for _ in range(50):
+        a.record_media_call(unit="images", quantity=1, call_type="generate_image")
+        b.record_media_call(unit="seconds", quantity=1, call_type="asr")
+
+    threads = [
+        threading.Thread(target=a.merge, args=(b,)),
+        threading.Thread(target=b.merge, args=(a,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    for t in threads:
+        assert not t.is_alive(), "merge deadlocked in opposing directions"
+    # Neither side lost rows: each gained at least the other's original 50.
+    assert len(a.details) >= 100
+    assert len(b.details) >= 100
+
+
+def test_estimate_tokens_accepts_any_iterable_of_strings() -> None:
+    # The docstring promises an iterable; a generator previously estimated 0,
+    # so an embedding producer passing one would have billed nothing.
+    from xagent.core.model.chat.token_context import estimate_tokens
+
+    assert estimate_tokens(x for x in ["abcd", "efgh"]) == 2
+    assert estimate_tokens(["abcd", "efgh"]) == 2
+    # Non-iterables and non-string members are ignored, never raised on.
+    assert estimate_tokens(42) == 0
+    assert estimate_tokens(["abcd", 42, None]) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("", 0), ("a", 1), ("ab", 1), ("abc", 1), ("abcd", 1), ("abcde", 2)],
+)
+def test_estimate_tokens_never_undercounts_short_text(text, expected) -> None:
+    # Truncating division estimated 0 for any 1-3 character Latin string, so
+    # short non-empty text billed nothing. Empty still estimates 0.
+    from xagent.core.model.chat.token_context import estimate_tokens
+
+    assert estimate_tokens(text) == expected
+
+
+def test_estimate_tokens_counts_cjk_per_character() -> None:
+    from xagent.core.model.chat.token_context import estimate_tokens
+
+    # CJK is roughly one token per character; a flat chars/4 heuristic would
+    # undercount Chinese by close to 4x.
+    assert estimate_tokens("中文") == 2
+    assert estimate_tokens("中文abcd") == 3

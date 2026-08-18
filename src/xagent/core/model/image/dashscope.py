@@ -211,6 +211,11 @@ class DashScopeImageModel(BaseImageModel):
                 {"usage": usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.GENERATE_IMAGE,
+                # `n` genuinely reaches DashScope: **kwargs is spread into the
+                # request `parameters` below, so the provider generates and
+                # bills for n images and this count must match its invoice.
+                # Note the parser only returns content[0], so images 2..n are
+                # paid for and discarded — a separate defect from metering.
                 image_count=kwargs.get("n", 1),
                 resolution=str(size or ""),
             )
@@ -350,6 +355,8 @@ class DashScopeImageModel(BaseImageModel):
                 {"usage": usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.EDIT_IMAGE,
+                # See generate_image: `n` reaches the provider via **kwargs, so
+                # the billed count must match what DashScope charges for.
                 image_count=kwargs.get("n", 1),
                 resolution=str(kwargs.get("size") or ""),
             )

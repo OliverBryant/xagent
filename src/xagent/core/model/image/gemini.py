@@ -387,7 +387,12 @@ class GeminiImageModel(BaseImageModel):
                 {"usage": token_usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.GENERATE_IMAGE,
-                image_count=kwargs.get("n", 1),
+                # image_count stays 1 deliberately. The Gemini API has no
+                # multi-image parameter and this client forwards only
+                # `temperature` out of **kwargs, so a caller-supplied `n` never
+                # reaches the provider; the response parser also takes just the
+                # first inlineData part. Billing `n` here would charge for
+                # images that were never generated.
                 resolution=(image_config or {}).get("imageSize", ""),
             )
 
@@ -652,7 +657,8 @@ class GeminiImageModel(BaseImageModel):
                 {"usage": token_usage},
                 model_name=self.model_name,
                 call_type=MediaCallType.EDIT_IMAGE,
-                image_count=kwargs.get("n", 1),
+                # image_count stays 1 — see generate_image: `n` never reaches
+                # the Gemini API and only one image is ever parsed back.
                 resolution=(image_config or {}).get("imageSize", ""),
             )
 

@@ -91,14 +91,34 @@ def test_estimated_tokens_are_flagged() -> None:
     assert aggregate_media_usage_by_model(details)[0]["tokens_estimated"] is True
 
 
-def test_dirty_quantity_is_coerced_and_does_not_raise() -> None:
+def test_dirty_quantity_is_coerced_on_free_quantity_units() -> None:
+    # A malformed quantity records 0 rather than raising: the provider call
+    # happened, so the row must survive as "unmeasured". Uses a duration-billed
+    # unit, because REQUESTS additionally pins its quantity to exactly 1 (see
+    # test_requests_unit_rejects_any_quantity_but_one) and would reject these.
     with TokenContextManager() as manager:
-        add_media_usage(unit="requests", quantity=None, model="x")  # type: ignore[arg-type]
-        add_media_usage(unit="requests", quantity="oops", model="x")  # type: ignore[arg-type]
+        add_media_usage(unit="seconds", quantity=None, model="x", call_type="asr")  # type: ignore[arg-type]
+        add_media_usage(unit="seconds", quantity="oops", model="x", call_type="asr")  # type: ignore[arg-type]
         usage = manager.get_usage()
 
     assert usage.media_calls == 2
     assert all(entry["quantity"] == 0.0 for entry in usage.details)
+
+
+def test_dirty_quantity_on_requests_unit_is_rejected_not_coerced() -> None:
+    # For REQUESTS the permissive path is wrong: coercing a malformed quantity
+    # to 0 would record a call whose billable quantity contradicts its own
+    # call count. Reject instead, leaving no state behind.
+    with TokenContextManager() as manager:
+        for bad in (None, "oops", 0):
+            with pytest.raises(ValueError, match="exactly one call"):
+                add_media_usage(
+                    unit="requests", quantity=bad, model="x", call_type="rerank"
+                )  # type: ignore[arg-type]
+        usage = manager.get_usage()
+
+    assert usage.media_calls == 0
+    assert usage.details == []
 
 
 def test_to_dict_from_dict_roundtrip_preserves_media() -> None:

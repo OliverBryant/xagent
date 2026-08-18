@@ -152,7 +152,10 @@ async def test_gemini_meters_billed_response_with_no_image(monkeypatch) -> None:
     assert usage.media_calls == 1
     entry = usage.details[0]
     assert entry["unit"] == "images"
-    assert entry["quantity"] == 3
+    # 1, not 3: Gemini has no multi-image parameter and this client drops `n`
+    # before the request, so billing 3 would charge for images that were never
+    # requested of the provider or returned by it.
+    assert entry["quantity"] == 1
     assert entry["provider_tokens"] == 16
 
 
@@ -202,10 +205,18 @@ async def test_dashscope_meters_billed_unparseable_response(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_gemini_edit_forwards_image_count(monkeypatch) -> None:
+async def test_gemini_edit_does_not_bill_unsupported_n(monkeypatch) -> None:
+    """Gemini must never bill `n`: it cannot honour it.
+
+    `edit_image` builds `generationConfig` with only `imageConfig`, so a
+    caller-supplied `n` is dropped before the request goes out, and the parser
+    returns a single image. Billing `n` would charge for images the provider
+    was never asked to make and never returned.
+    """
     from xagent.core.model.image import gemini as gemini_mod
 
     calls = []
+    sent = {}
 
     class _Client:
         async def __aenter__(self):
@@ -215,6 +226,7 @@ async def test_gemini_edit_forwards_image_count(monkeypatch) -> None:
             return False
 
         async def post(self, *a, **kw):
+            sent.update(kw.get("json", {}))
             return _FakeResponse(
                 {
                     "candidates": [
@@ -249,7 +261,10 @@ async def test_gemini_edit_forwards_image_count(monkeypatch) -> None:
         n=3,
     )
 
-    assert calls[0]["image_count"] == 3
+    # n was dropped on the way to the provider...
+    assert "n" not in sent.get("generationConfig", {})
+    # ...so image_count is not passed and defaults to 1 rather than billing 3.
+    assert "image_count" not in calls[0]
 
 
 @pytest.mark.asyncio

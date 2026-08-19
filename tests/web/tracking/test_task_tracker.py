@@ -1118,13 +1118,19 @@ class TestTaskTracker:
 
     @pytest.mark.asyncio
     async def test_turn_delta_pairs_details_and_tool_calls_atomically(self, db_session):
-        """The details slice and the tool-call count must describe one instant.
+        """The details tail and the tool-call count must describe one instant.
 
         ``interrupt_reason_for_quota`` polls ``_turn_delta`` at every safe point
-        against the live shared TokenUsage. Reading the two fields separately
+        — once per agent step and once per streamed LLM chunk — against the live
+        shared TokenUsage. Reading the two fields in separate lock acquisitions
         lets a concurrent write land between them, yielding a pair from two
-        different logical points in time — a row visible with its counter bump
-        missing, or the reverse — which is then fed to quota gating.
+        different logical points in time, which is then fed to quota gating.
+
+        The reader runs in a plain thread, which does NOT inherit contextvars, so
+        ``usage`` is passed explicitly: relying on ``get_token_usage()`` there
+        would lazily create a fresh empty TokenUsage and the test would observe
+        ``([], 0)`` regardless of the implementation — passing whether or not the
+        race is fixed.
         """
         import threading
 
@@ -1141,30 +1147,34 @@ class TestTaskTracker:
         await tracker.start_tracking()
         usage = get_token_usage()
 
-        # Force a write into the window between the two reads _turn_delta makes.
+        # Force a write into the window between the two reads, by making the
+        # locked read itself slow. Patching detail_tail's underlying lock
+        # acquisition is not possible, so widen the window from the writer side:
+        # the writer waits until the reader is inside the accessor.
         entered = threading.Event()
         released = threading.Event()
-        original_snapshot = type(usage).snapshot
+        real_detail_tail = type(usage).detail_tail
 
-        def slow_snapshot(self):
+        def slow_detail_tail(self, start=0):
             entered.set()
             released.wait(timeout=5)
-            return original_snapshot(self)
+            return real_detail_tail(self, start)
 
         results = {}
 
         def read_delta() -> None:
-            results["delta"] = tracker._turn_delta()
+            # usage passed explicitly — a bare thread inherits no contextvars.
+            results["delta"] = tracker._turn_delta(usage)
 
         def write_during_read() -> None:
-            entered.wait(timeout=5)
+            assert entered.wait(timeout=5), "reader never entered detail_tail"
             usage.record_media_call(
                 unit="images", quantity=1, call_type="generate_image"
             )
             usage.increment_tool_calls(1)
             released.set()
 
-        with patch.object(type(usage), "snapshot", slow_snapshot):
+        with patch.object(type(usage), "detail_tail", slow_detail_tail):
             threads = [
                 threading.Thread(target=read_delta),
                 threading.Thread(target=write_during_read),
@@ -1174,9 +1184,15 @@ class TestTaskTracker:
             for thread in threads:
                 thread.join(timeout=10)
 
+        # A silent timeout must fail rather than pass: without this the writer
+        # could never run and the assertion below would trivially hold at (0, 0).
+        assert entered.is_set(), "the interleaving never happened"
+        assert released.is_set(), "the writer never completed"
+        assert "delta" in results, "the reader never returned"
+
         delta_details, delta_actions = results["delta"]
         media_rows = sum(1 for d in delta_details if d.get("type") == "media")
-        # Whichever side of the write the snapshot landed on, the pair agrees:
+        # Whichever side of the write the locked read landed on, the pair agrees:
         # either both saw it (1 row, 1 action) or neither did (0 and 0).
         assert media_rows == delta_actions, (
             f"torn pair: {media_rows} media rows vs {delta_actions} tool calls"

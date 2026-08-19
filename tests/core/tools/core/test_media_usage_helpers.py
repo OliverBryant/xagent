@@ -47,12 +47,15 @@ def test_record_media_seconds_keeps_unit_stable_when_duration_missing() -> None:
         details = manager.get_usage().details
 
     assert [entry["unit"] for entry in details] == ["seconds", "seconds"]
-    # The unmeasured call records 0 and is dropped from the billable rollup.
+    # The unmeasured call records 0 seconds and is deliberately KEPT in the
+    # rollup: it is the only evidence that a billable provider call happened.
+    # It contributes nothing to quantity but still counts toward calls.
     assert [entry["quantity"] for entry in details] == [30.0, 0.0]
     groups = aggregate_media_usage_by_model(details)
     assert len(groups) == 1
     assert groups[0]["unit"] == "seconds"
     assert groups[0]["quantity"] == 30.0
+    assert groups[0]["calls"] == 2
 
 
 def test_record_media_seconds_warns_when_unmeasured(caplog) -> None:

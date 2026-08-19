@@ -107,9 +107,10 @@ def _task_seed_from_session(
             output_tokens=_safe_int(getattr(task, "output_tokens", 0)),
             llm_calls=_safe_int(getattr(task, "llm_calls", 0)),
             # Derived from the surviving detail rows rather than read from a
-            # column: tasks have no media_calls column, and the next turn's
-            # delta is computed against this seed, so seeding zero would
-            # re-report every media call already recorded in a prior turn.
+            # column: Task has no media_calls column. This only keeps the
+            # in-memory running total consistent with the rows it summarises —
+            # the delta path reads `details` and `tool_calls`, never this
+            # counter, so seeding zero would not re-report prior-turn calls.
             media_calls=sum(
                 1 for detail in seed_details if detail.get("type") == "media"
             ),
@@ -549,18 +550,28 @@ class TaskTracker:
         polls this at every safe point, so it is a hot concurrent path rather
         than a one-shot teardown read.
 
-        Snapshotting unconditionally — including when the caller already passed
-        a detached copy — keeps the two call sites from diverging again; the
-        cost is one extra shallow copy of a list that is about to be copied
-        anyway.
+        Relies on an invariant worth stating: every row in ``details`` is a
+        dict. ``_initial_details_len`` indexes the same filtered list the live
+        usage object holds (``TokenUsage.__post_init__`` normalises on
+        construction and every mutation path appends a literal dict), so the
+        slice below stays aligned. A future non-dict append would be filtered
+        out of the tail and shift the boundary, re-metering prior-turn rows.
+
+        Reads through ``detail_tail``, which copies only the rows past the
+        baseline. ``snapshot()`` would deep-copy the entire cumulative list and
+        then discard everything before ``_initial_details_len`` — the list grows
+        monotonically across turns, so that costs O(total usage) per poll on a
+        path hit once per agent step and once per streamed LLM chunk, while
+        holding the lock every LLM adapter needs to write tokens.
         """
         if usage is None:
             usage = get_token_usage()
-        snapshot = usage.snapshot()
-        return (
-            snapshot.details[self._initial_details_len :],
-            max(0, snapshot.tool_calls - self._initial_tool_calls),
-        )
+        # Rows come back already detached, so callers need no further copying
+        # before handing them to the quota hooks. tool_calls is the cumulative
+        # counter, so the baseline still has to be subtracted here — detail_tail
+        # slices details for us but cannot know this tracker's baseline.
+        tail, tool_calls = usage.detail_tail(self._initial_details_len)
+        return (tail, max(0, tool_calls - self._initial_tool_calls))
 
     async def interrupt_reason_for_quota(self) -> str | None:
         """Per-step interrupt-checker: return a reason when this run's live-so-far
@@ -581,9 +592,10 @@ class TaskTracker:
             return None
         try:
             delta_details, delta_actions = self._turn_delta()
+            # No _copy_details: _turn_delta already returns detached rows.
             reason = _check_quota_on_event_loop(
                 self._user_id,
-                _copy_details(delta_details),
+                delta_details,
                 delta_actions,
             )
             if reason is not None:
@@ -636,9 +648,10 @@ class TaskTracker:
         # the task. The remaining blocking risk is tracked separately from the
         # database-lifecycle changes in this PR.
         try:
+            # No _copy_details: _turn_delta already returns detached rows.
             _record_usage_on_event_loop(
                 self._user_id,
-                _copy_details(delta_details),
+                delta_details,
                 delta_actions,
             )
         except Exception as e:  # noqa: BLE001

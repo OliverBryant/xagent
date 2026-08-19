@@ -1,8 +1,15 @@
-"""Token usage tracking using contextvars.
+"""Usage tracking using contextvars, for LLM tokens and non-LLM media calls.
 
-This module provides a thread-safe way to track token usage across LLM calls
-without modifying function signatures. Using contextvars allows the token
-statistics to be automatically collected during task execution.
+Tracks usage across calls without threading it through function signatures:
+contextvars let statistics be collected automatically during task execution.
+
+Two dimensions live here. LLM tokens use ``add_token_usage`` and aggregate via
+``aggregate_token_usage_by_model``. Non-LLM media calls — image, video, TTS,
+ASR, music, sound effect, embedding, rerank — use the ``MediaUnit`` /
+``MediaCallType`` vocabulary, record through ``add_media_usage``, and aggregate
+via ``aggregate_media_usage_by_model``. Both write into the same
+``TokenUsage.details`` list, discriminated by each row's ``type``, so existing
+persistence and quota paths carry media rows with no schema change.
 """
 
 import contextvars
@@ -88,6 +95,19 @@ def _validated_media_call_type(call_type: "MediaCallType | str | None") -> str:
     return value
 
 
+def copy_detail_rows(raw_details: Any) -> List[Dict]:
+    """Detached copies of the dict rows in ``raw_details``, non-dicts dropped.
+
+    One helper for every place a details list is handed across a boundary:
+    sharing the inner dicts lets a consumer mutate live usage state, and the
+    ``isinstance`` filter keeps a malformed legacy row (``details`` is persisted
+    as free-form JSON) from raising in an accounting path.
+    """
+    if not isinstance(raw_details, list):
+        return []
+    return [dict(item) for item in raw_details if isinstance(item, dict)]
+
+
 @dataclass
 class TokenUsage:
     """Token usage statistics for a task or operation.
@@ -126,12 +146,25 @@ class TokenUsage:
         # consumer. Keeping it in ``__dict__`` also leaves the public
         # positional signature — ``TokenUsage(input, output, llm_calls,
         # tool_calls, details)`` — free of a private slot.
-        self.__dict__["_lock"] = threading.Lock()
+        self.__dict__["_lock"] = threading.RLock()
+        # Normalise once here so the constructor and from_dict both hand this
+        # object a private, dict-only list. Storing a caller's list by reference
+        # would let them mutate rows outside the lock, and a non-dict row would
+        # misalign the index-based delta slice.
+        self.details = copy_detail_rows(self.details)
 
     @property
-    def _lock(self) -> "threading.Lock":
-        """The per-instance mutation lock (see :meth:`__post_init__`)."""
-        lock: threading.Lock = self.__dict__["_lock"]
+    def _lock(self) -> "threading._RLock":
+        """The per-instance mutation lock (see :meth:`__post_init__`).
+
+        Reentrant so a future nested acquisition cannot self-deadlock: the
+        current no-nesting discipline (``to_dict`` inlines the token total rather
+        than calling ``total_tokens``, ``merge`` takes the two locks
+        sequentially) is invisible to a later editor.
+        """
+        # threading.RLock is a factory, not a class, so the annotation names the
+        # object it returns (typeshed exposes it as threading._RLock).
+        lock: threading._RLock = self.__dict__["_lock"]
         return lock
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -143,7 +176,7 @@ class TokenUsage:
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore, giving the revived instance its own fresh lock."""
         self.__dict__.update(state)
-        self.__dict__["_lock"] = threading.Lock()
+        self.__dict__["_lock"] = threading.RLock()
 
     def __copy__(self) -> "TokenUsage":
         """Shallow copy is unsupported; delegate to :meth:`snapshot`.
@@ -246,6 +279,7 @@ class TokenUsage:
         # caller holding a TokenUsage gets the same guarantees instead of
         # persisting a boolean, negative, or non-finite quantity that cannot be
         # repaired later.
+        raw_quantity = quantity
         quantity = _coerce_float(quantity)
         # REQUESTS is defined as exactly one provider call, so its quantity is
         # not a free variable. Letting 0/0.5/2 through would make the billable
@@ -260,7 +294,7 @@ class TokenUsage:
         if unit_value == MediaUnit.REQUESTS.value and quantity != 1.0:
             raise ValueError(
                 f"MediaUnit.REQUESTS means exactly one call, so quantity must "
-                f"be 1; got {quantity!r}"
+                f"be 1; got {raw_quantity!r}"
             )
         input_tokens = _coerce_int(input_tokens)
         output_tokens = _coerce_int(output_tokens)
@@ -282,6 +316,31 @@ class TokenUsage:
                 }
             )
 
+    def detail_tail(self, start: int = 0) -> tuple[List[Dict], int]:
+        """Detail rows from ``start`` onward plus the tool-call count, atomically.
+
+        The narrow read that per-turn delta computation actually needs. Both
+        values come from one lock acquisition, so they describe the same instant
+        — a concurrent ``record_media_call``/``increment_tool_calls`` cannot land
+        between them and yield a pair from two different logical points in time.
+
+        Prefer this over ``snapshot()`` whenever only the tail is wanted.
+        ``snapshot()`` deep-copies the whole cumulative ``details`` list, which
+        grows monotonically across turns (seeds are restored from the persisted
+        list), so using it to read a small tail costs O(total usage) instead of
+        O(delta) — and holds the lock that serialises every LLM adapter's token
+        write for the duration of that copy. On the quota-gate path, polled once
+        per agent step *and* once per streamed LLM chunk, that difference is
+        three orders of magnitude at a few thousand accumulated rows.
+
+        Rows are copied so the caller cannot mutate live state through them.
+        """
+        with self._lock:
+            return (
+                copy_detail_rows(self.details[start:]),
+                self.tool_calls,
+            )
+
     def snapshot(self) -> "TokenUsage":
         """A detached copy taken under the lock.
 
@@ -299,9 +358,12 @@ class TokenUsage:
                 output_tokens=self.output_tokens,
                 llm_calls=self.llm_calls,
                 tool_calls=self.tool_calls,
-                details=[dict(item) for item in self.details if isinstance(item, dict)],
                 media_calls=self.media_calls,
             )
+            # Assigned after construction, not passed in: __post_init__ would
+            # copy the list a second time, doubling the cost of a copy that is
+            # already O(total details).
+            copy.details = copy_detail_rows(self.details)
         return copy
 
     def increment_llm_calls(self) -> None:
@@ -336,7 +398,7 @@ class TokenUsage:
             # merged rows aliased to the source's, so mutating one usage object
             # would silently rewrite the other's billing rows. Same reason
             # to_dict and snapshot copy each entry.
-            details = [dict(item) for item in other.details if isinstance(item, dict)]
+            details = copy_detail_rows(other.details)
         with self._lock:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -361,7 +423,12 @@ class TokenUsage:
                 # same inner dicts lets a caller mutate the live usage object
                 # through the returned payload, entirely outside this lock.
                 # Matches snapshot(), which already does this.
-                "details": [dict(item) for item in self.details],
+                # copy_detail_rows also drops non-dict rows, which the
+                # previous inline copy here did not. Deliberate: it aligns this
+                # with snapshot/merge, and a malformed legacy row passed through
+                # here would fail later at JSON serialisation rather than being
+                # skipped at the boundary.
+                "details": copy_detail_rows(self.details),
             }
 
     @classmethod
@@ -484,7 +551,7 @@ def _coerce_int(value: Any) -> int:
     return result
 
 
-def estimate_tokens(text: Any) -> int:
+def estimate_media_tokens(text: Any) -> int:
     """Language-aware token estimate for providers that report no usage.
 
     CJK characters are roughly one token each, while Latin script averages
@@ -520,9 +587,12 @@ def estimate_tokens(text: Any) -> int:
             # all roughly one token per character.
             code = ord(char)
             if (
-                0x4E00 <= code <= 0x9FFF
-                or 0x3040 <= code <= 0x30FF
-                or 0xAC00 <= code <= 0xD7AF
+                0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+                or 0x3400 <= code <= 0x4DBF  # CJK Ext-A
+                or 0x3000 <= code <= 0x303F  # CJK punctuation (、。「」etc.)
+                or 0x3040 <= code <= 0x30FF  # Japanese kana
+                or 0xAC00 <= code <= 0xD7AF  # Hangul syllables
+                or 0xFF00 <= code <= 0xFFEF  # Fullwidth / halfwidth forms
             ):
                 cjk += 1
             else:
@@ -611,6 +681,12 @@ def aggregate_token_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     merged into an id-backed group only when that name identifies exactly one
     configured model. Entries without either an id or name are retained as an
     unattributed group rather than silently dropping tokens from the breakdown.
+
+    Pass a detached list. This iterates ``details`` without any lock, so handing
+    in a live ``TokenUsage.details`` while another thread appends risks a
+    "list changed size during iteration" RuntimeError. Use
+    ``TokenUsage.snapshot().details`` (or a value read from the DB column, as
+    the API path does) rather than the live list.
     """
     if not isinstance(details, list):
         return []
@@ -714,6 +790,12 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     the summed quantity, call count and provider-reported tokens. A group is
     marked ``tokens_estimated`` when any entry in it carried estimated tokens,
     so a consumer never prices a mixed group as if it were measured.
+
+    Pass a detached list. This iterates ``details`` without any lock, so handing
+    in a live ``TokenUsage.details`` while another thread appends risks a
+    "list changed size during iteration" RuntimeError. Use
+    ``TokenUsage.snapshot().details`` (or a value read from the DB column, as
+    the API path does) rather than the live list.
     """
     if not isinstance(details, list):
         return []
@@ -872,9 +954,14 @@ def add_media_usage(
 
     Raises:
         ValueError: If ``unit`` or ``call_type`` is not a known
-            :class:`MediaUnit` / :class:`MediaCallType` value. Producers route
-            through ``media_usage.record_media_usage``, which swallows this so
-            an accounting bug can never break the underlying media call.
+            :class:`MediaUnit` / :class:`MediaCallType` value, or if ``unit`` is
+            ``MediaUnit.REQUESTS`` and ``quantity`` is not exactly 1. The first
+            two are checked here, before the context is touched; the REQUESTS
+            constraint is enforced inside :meth:`TokenUsage.record_media_call`,
+            which still rejects before taking its lock, so no partial state is
+            left either way. Producers route through
+            ``media_usage.record_media_usage``, which swallows all three so an
+            accounting bug can never break the underlying media call.
     """
     # Coerce defensively so a provider returning a malformed count can never
     # crash the underlying media call over accounting.

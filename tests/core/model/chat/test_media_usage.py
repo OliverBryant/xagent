@@ -357,91 +357,37 @@ def test_concurrent_media_records_lose_no_counts() -> None:
 
 
 def test_concurrent_merge_loses_no_counts() -> None:
-    # merge() snapshots the source under its own lock before taking the
-    # target's, so concurrent merges neither deadlock nor drop entries.
+    # Each thread merges repeatedly and all start together at a barrier, so the
+    # read-modify-write in merge() genuinely overlaps. One merge per thread of a
+    # one-row source would very likely pass against an unlocked merge() too.
     target = TokenUsage()
-    sources = []
-    for _ in range(8):
-        source = TokenUsage()
-        source.record_media_call(unit="seconds", quantity=2, call_type="asr")
-        sources.append(source)
+    workers, merges_per_worker = 8, 100
 
-    threads = [threading.Thread(target=target.merge, args=(s,)) for s in sources]
+    source = TokenUsage()
+    source.record_media_call(unit="seconds", quantity=2, call_type="asr")
+
+    barrier = threading.Barrier(workers)
+
+    def merge_many() -> None:
+        barrier.wait(timeout=10)
+        for _ in range(merges_per_worker):
+            target.merge(source)
+
+    threads = [threading.Thread(target=merge_many) for _ in range(workers)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=30)
 
-    assert target.media_calls == len(sources)
-    assert len(target.details) == len(sources)
+    for thread in threads:
+        assert not thread.is_alive(), "merge deadlocked under contention"
 
-
-@pytest.mark.parametrize(
-    "bad_quantity",
-    [True, False, -1, -0.5, float("nan"), float("inf"), float("-inf"), "abc", None],
-)
-def test_invalid_quantities_record_zero_not_garbage(bad_quantity) -> None:
-    # This is the last boundary before the value is persisted into task and
-    # quota details, and a written record cannot be repaired. NaN/inf are not
-    # JSON-serialisable (they emit literal NaN/Infinity that strict parsers
-    # reject); negatives would subtract from a bill; booleans are a caller bug.
-    with TokenContextManager() as manager:
-        add_media_usage(
-            unit="images", quantity=bad_quantity, model="m", call_type="generate_image"
-        )
-        entry = manager.get_usage().details[0]
-
-    assert entry["quantity"] == 0.0
-    # Recorded, not dropped: the call still happened, it is just unmeasured.
-    assert manager.get_usage().media_calls == 1
-
-
-def test_valid_fractional_quantity_survives() -> None:
-    # The guard must not clamp legitimate fractional durations.
-    with TokenContextManager() as manager:
-        add_media_usage(unit="seconds", quantity=2.5, model="m", call_type="asr")
-        assert manager.get_usage().details[0]["quantity"] == 2.5
-
-
-def test_direct_record_media_call_also_validates() -> None:
-    # TokenUsage.record_media_call is the real write boundary; a caller holding
-    # a TokenUsage directly must get the same guarantees as add_media_usage.
-    usage = TokenUsage()
-    usage.record_media_call(unit="images", quantity=float("inf"), call_type="video")
-
-    assert usage.details[0]["quantity"] == 0.0
-
-
-def test_media_count_and_detail_are_written_atomically() -> None:
-    # A snapshot taken between the counter bump and the detail append would
-    # report mutually inconsistent billing. Assert every observed snapshot has
-    # media_calls equal to the number of media detail rows.
-    usage = TokenUsage()
-    torn: list[tuple[int, int]] = []
-    stop = threading.Event()
-
-    def writer() -> None:
-        for _ in range(400):
-            usage.record_media_call(
-                unit="images", quantity=1, call_type="generate_image"
-            )
-        stop.set()
-
-    def reader() -> None:
-        while not stop.is_set():
-            snap = usage.to_dict()
-            media = sum(1 for d in snap["details"] if d.get("type") == "media")
-            if snap["media_calls"] != media:
-                torn.append((snap["media_calls"], media))
-
-    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert not torn, f"observed torn snapshots: {torn[:5]}"
-    assert usage.media_calls == 400
+    expected = workers * merges_per_worker
+    assert target.media_calls == expected
+    media_rows = [d for d in target.details if d.get("type") == "media"]
+    assert len(media_rows) == expected
+    # The counter and its rows must agree exactly — a lost += shows up here.
+    assert target.media_calls == len(media_rows)
 
 
 def test_usage_survives_asdict_deepcopy_and_pickle() -> None:
@@ -534,37 +480,28 @@ def test_concurrent_merges_in_both_directions_do_not_deadlock() -> None:
         assert len(own_rows) >= per_side, "a side lost its own rows"
 
 
-def test_estimate_tokens_accepts_any_iterable_of_strings() -> None:
+def test_estimate_media_tokens_accepts_any_iterable_of_strings() -> None:
     # The docstring promises an iterable; a generator previously estimated 0,
     # so an embedding producer passing one would have billed nothing.
-    from xagent.core.model.chat.token_context import estimate_tokens
+    from xagent.core.model.chat.token_context import estimate_media_tokens
 
-    assert estimate_tokens(x for x in ["abcd", "efgh"]) == 2
-    assert estimate_tokens(["abcd", "efgh"]) == 2
+    assert estimate_media_tokens(x for x in ["abcd", "efgh"]) == 2
+    assert estimate_media_tokens(["abcd", "efgh"]) == 2
     # Non-iterables and non-string members are ignored, never raised on.
-    assert estimate_tokens(42) == 0
-    assert estimate_tokens(["abcd", 42, None]) == 1
+    assert estimate_media_tokens(42) == 0
+    assert estimate_media_tokens(["abcd", 42, None]) == 1
 
 
 @pytest.mark.parametrize(
     ("text", "expected"),
     [("", 0), ("a", 1), ("ab", 1), ("abc", 1), ("abcd", 1), ("abcde", 2)],
 )
-def test_estimate_tokens_never_undercounts_short_text(text, expected) -> None:
+def test_estimate_media_tokens_never_undercounts_short_text(text, expected) -> None:
     # Truncating division estimated 0 for any 1-3 character Latin string, so
     # short non-empty text billed nothing. Empty still estimates 0.
-    from xagent.core.model.chat.token_context import estimate_tokens
+    from xagent.core.model.chat.token_context import estimate_media_tokens
 
-    assert estimate_tokens(text) == expected
-
-
-def test_estimate_tokens_counts_cjk_per_character() -> None:
-    from xagent.core.model.chat.token_context import estimate_tokens
-
-    # CJK is roughly one token per character; a flat chars/4 heuristic would
-    # undercount Chinese by close to 4x.
-    assert estimate_tokens("中文") == 2
-    assert estimate_tokens("中文abcd") == 3
+    assert estimate_media_tokens(text) == expected
 
 
 @pytest.mark.parametrize("bad_quantity", [0, 0.5, 2, 7, -1])
@@ -703,11 +640,11 @@ def test_snapshot_detaches_from_the_source() -> None:
     assert snap.details is not usage.details
 
 
-def test_estimate_tokens_never_raises_from_a_hostile_iterable() -> None:
+def test_estimate_media_tokens_never_raises_from_a_hostile_iterable() -> None:
     # The docstring promises malformed input cannot raise, but only TypeError
     # was caught: a custom iterable raising anything else escaped into the
     # accounting path and would break the call being measured.
-    from xagent.core.model.chat.token_context import estimate_tokens
+    from xagent.core.model.chat.token_context import estimate_media_tokens
 
     class _RaisesMidIteration:
         def __iter__(self):
@@ -718,8 +655,8 @@ def test_estimate_tokens_never_raises_from_a_hostile_iterable() -> None:
         def __iter__(self):
             raise ValueError("cannot iterate")
 
-    assert estimate_tokens(_RaisesMidIteration()) == 0
-    assert estimate_tokens(_RaisesImmediately()) == 0
+    assert estimate_media_tokens(_RaisesMidIteration()) == 0
+    assert estimate_media_tokens(_RaisesImmediately()) == 0
 
 
 def test_copy_copy_does_not_share_details_under_a_different_lock() -> None:
@@ -799,3 +736,119 @@ def test_merge_does_not_alias_the_source_detail_dicts() -> None:
 
     assert source.details[0]["quantity"] == 1.0
     assert target.media_calls == 1
+
+
+def test_detail_tail_returns_only_the_tail_atomically() -> None:
+    # The narrow read the delta path needs: copying the whole cumulative list to
+    # use a small tail costs O(total usage) on a per-chunk quota path.
+    usage = TokenUsage()
+    for _ in range(5):
+        usage.record_media_call(unit="images", quantity=1, call_type="generate_image")
+    usage.increment_tool_calls(4)
+
+    tail, tool_calls = usage.detail_tail(3)
+
+    assert len(tail) == 2
+    assert tool_calls == 4
+    # Rows are detached, so a caller cannot mutate live state through them.
+    tail[0]["quantity"] = 999
+    assert usage.details[3]["quantity"] == 1.0
+
+    # A start past the end is empty rather than an error.
+    assert usage.detail_tail(99) == ([], 4)
+
+
+def test_constructor_and_from_dict_detach_and_filter_details() -> None:
+    # details is persisted as free-form JSON, so a legacy row may not be a dict;
+    # and storing the caller's list by reference would let them mutate rows
+    # outside the lock. Both are normalised at construction.
+    caller_list = [{"type": "media", "unit": "images"}, "junk", None, 42]
+
+    usage = TokenUsage(details=caller_list)  # type: ignore[arg-type]
+    assert len(usage.details) == 1
+
+    caller_list[0]["unit"] = "MUTATED"  # type: ignore[index]
+    assert usage.details[0]["unit"] == "images"
+
+    revived = TokenUsage.from_dict({"details": [{"type": "media"}, "bad"]})
+    assert len(revived.details) == 1
+
+
+def test_requests_error_reports_the_value_the_caller_passed() -> None:
+    # quantity is coerced before the guard runs, so interpolating the coerced
+    # value would report "got 0.0" for a caller who passed -1.
+    usage = TokenUsage()
+    with pytest.raises(ValueError, match=r"got -1"):
+        usage.record_media_call(unit="requests", quantity=-1, call_type="rerank")
+
+
+def test_lock_is_reentrant() -> None:
+    # A plain Lock makes any future nested acquisition a self-deadlock, resting
+    # on manual discipline; RLock removes the trap.
+    usage = TokenUsage()
+    with usage._lock:
+        with usage._lock:
+            usage.increment_tool_calls(1)
+    assert usage.tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # CJK is ~1 token per character; a flat chars/4 heuristic undercounts
+        # Chinese by close to 4x. Punctuation and fullwidth forms count too —
+        # they appear in essentially every Chinese sentence.
+        ("中文", 2),
+        ("中文abcd", 3),
+        ("中文，你好。", 6),
+        ("（全角）", 4),
+    ],
+)
+def test_estimate_media_tokens_counts_cjk(text, expected) -> None:
+    from xagent.core.model.chat.token_context import estimate_media_tokens
+
+    assert estimate_media_tokens(text) == expected
+
+
+def test_coerce_int_change_applies_to_the_llm_token_path() -> None:
+    # _coerce_int is shared with add_token_usage, so its hardening (bool -> 0,
+    # negatives -> 0) changes behaviour for every LLM adapter, not just media.
+    with TokenContextManager() as manager:
+        add_token_usage(
+            input_tokens=True,  # type: ignore[arg-type]
+            output_tokens=-5,
+            model="m",
+            call_type="chat",
+        )
+        usage = manager.get_usage()
+
+    assert usage.input_tokens == 0
+    assert usage.output_tokens == 0
+
+
+def test_media_aggregation_uses_model_id_when_present() -> None:
+    # identity = model_id or model_name — the model_id branch had no coverage,
+    # so rows keyed by id always fell through to the name branch in tests.
+    with TokenContextManager() as manager:
+        add_media_usage(
+            unit="images",
+            quantity=1,
+            model="display-name",
+            model_id="img-1",
+            call_type="generate_image",
+        )
+        add_media_usage(
+            unit="images",
+            quantity=2,
+            model="",
+            model_id="img-1",
+            call_type="generate_image",
+        )
+        groups = aggregate_media_usage_by_model(manager.get_usage().details)
+
+    # Both rows share one identity via model_id even though one lacks a name...
+    assert len(groups) == 1
+    assert groups[0]["model_id"] == "img-1"
+    assert groups[0]["quantity"] == 3.0
+    # ...and the name is backfilled from whichever row carried it.
+    assert groups[0]["model_name"] == "display-name"

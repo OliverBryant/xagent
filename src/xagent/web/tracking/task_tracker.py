@@ -538,12 +538,28 @@ class TaskTracker:
     def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
         """This turn's (detail entries, tool-call count) over the baseline seeded
         in start_tracking. Single source for the completion meter and the mid-run
-        gate so they can't disagree on what 'this run's usage' means."""
+        gate so they can't disagree on what 'this run's usage' means.
+
+        Always snapshots first. The two reads below — the details slice and the
+        tool-call counter — must describe the same instant: a concurrent
+        ``record_media_call``/``increment_tool_calls`` landing between them
+        yields a pair from two different logical points in time (a row visible
+        with its counter bump missing, or the reverse), and that inconsistent
+        pair is what gets fed to quota gating. ``interrupt_reason_for_quota``
+        polls this at every safe point, so it is a hot concurrent path rather
+        than a one-shot teardown read.
+
+        Snapshotting unconditionally — including when the caller already passed
+        a detached copy — keeps the two call sites from diverging again; the
+        cost is one extra shallow copy of a list that is about to be copied
+        anyway.
+        """
         if usage is None:
             usage = get_token_usage()
+        snapshot = usage.snapshot()
         return (
-            usage.details[self._initial_details_len :],
-            max(0, usage.tool_calls - self._initial_tool_calls),
+            snapshot.details[self._initial_details_len :],
+            max(0, snapshot.tool_calls - self._initial_tool_calls),
         )
 
     async def interrupt_reason_for_quota(self) -> str | None:

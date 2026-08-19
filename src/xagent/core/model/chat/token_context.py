@@ -141,9 +141,28 @@ class TokenUsage:
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
-        """Restore, giving the unpickled instance its own fresh lock."""
+        """Restore, giving the revived instance its own fresh lock."""
         self.__dict__.update(state)
         self.__dict__["_lock"] = threading.Lock()
+
+    def __copy__(self) -> "TokenUsage":
+        """Shallow copy is unsupported; delegate to :meth:`snapshot`.
+
+        The default shallow copy routes through the ``__getstate__`` pair above,
+        so the new instance gets a *different* lock while still referencing the
+        *same* ``details`` list. Two objects each believing they hold exclusive
+        access would then mutate one shared list under two different locks —
+        exactly the mutual exclusion the lock exists to provide. ``snapshot()``
+        is the supported way to fork a usage object, so ``copy.copy`` is routed
+        there rather than left as a trap.
+        """
+        return self.snapshot()
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "TokenUsage":
+        """Deep copy via :meth:`snapshot` so the copy is taken under the lock."""
+        copied = self.snapshot()
+        memo[id(self)] = copied
+        return copied
 
     @property
     def total_tokens(self) -> int:
@@ -199,54 +218,6 @@ class TokenUsage:
                     }
                 )
 
-    def add_media_usage(
-        self,
-        unit: "MediaUnit | str | None",
-        quantity: float,
-        model: str = "",
-        call_type: "MediaCallType | str | None" = "",
-        model_id: str = "",
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        resolution: str = "",
-        tokens_estimated: bool = False,
-    ) -> None:
-        """Record a non-LLM media model call (image/video/tts/asr/...).
-
-        ``unit`` names the billable dimension (see :class:`MediaUnit`);
-        ``quantity`` is its amount. ``resolution`` records the size tier
-        ("1K"/"2K"/"4K" or "1024x1024") so a per-(model, resolution) price table
-        can bill image models whose price varies by resolution; "" otherwise.
-
-        Token passthrough is deliberately **not** stored under ``tokens``: that
-        key means "billable LLM tokens" on input/output entries, and a consumer
-        that naively sums it across all entries must not pick up media counts.
-        ``provider_tokens`` holds the provider-reported count instead, and
-        ``tokens_estimated`` marks it as a local heuristic (embedding/rerank)
-        rather than a measurement (Gemini / OpenAI gpt-image), so billing can
-        refuse to price an estimate.
-        """
-        # Delegates to record_media_call so there is exactly ONE media write
-        # path: two copies drifted apart during review, leaving this one
-        # appending unvalidated quantities (inf/negatives) that the other
-        # rejected. The only difference is that this method does not bump
-        # media_calls — callers of the older two-step API bump it themselves via
-        # increment_media_calls — hence count_call=False below.
-        self.record_media_call(
-            unit=unit,
-            quantity=quantity,
-            model=model,
-            call_type=call_type,
-            model_id=model_id,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            resolution=resolution,
-            tokens_estimated=tokens_estimated,
-            # This method never bumped the counter: callers of the two-step API
-            # call increment_media_calls themselves.
-            count_call=False,
-        )
-
     def record_media_call(
         self,
         unit: "MediaUnit | str | None",
@@ -258,25 +229,23 @@ class TokenUsage:
         output_tokens: int = 0,
         resolution: str = "",
         tokens_estimated: bool = False,
-        count_call: bool = True,
     ) -> None:
         """Count the call and append its detail under one lock acquisition.
 
-        ``count_call=False`` appends the detail without bumping the counter, for
-        the older two-step API where the caller bumps it separately.
-
-        ``increment_media_calls`` followed by ``add_media_usage`` takes the lock
-        twice, so a concurrent ``to_dict``/``merge`` can land between them and
-        observe a counter with no matching detail row (or the reverse).
-        Consumers derive per-model rows from ``details`` and the call count from
-        the scalar, so a torn snapshot reports mutually inconsistent billing.
+        The only media write path. Bumping the counter and appending the row
+        separately would take the lock twice, letting a concurrent
+        ``to_dict``/``merge``/``snapshot`` land between them and observe a
+        counter with no matching detail row (or the reverse). Consumers derive
+        per-model rows from ``details`` and the call count from the scalar, so a
+        torn pair reports mutually inconsistent billing.
         """
         unit_value = _validated_media_unit(unit)
         call_type_value = _validated_media_call_type(call_type)
-        # Validate here, not only in the module-level ``add_media_usage``: this
-        # is the actual write boundary, and a direct caller (tests, future
-        # producers holding a TokenUsage) would otherwise persist a boolean,
-        # negative, or non-finite quantity that cannot be repaired later.
+        # Validated here rather than only in the module-level
+        # ``add_media_usage``: this is the actual write boundary, so a direct
+        # caller holding a TokenUsage gets the same guarantees instead of
+        # persisting a boolean, negative, or non-finite quantity that cannot be
+        # repaired later.
         quantity = _coerce_float(quantity)
         # REQUESTS is defined as exactly one provider call, so its quantity is
         # not a free variable. Letting 0/0.5/2 through would make the billable
@@ -286,13 +255,8 @@ class TokenUsage:
         # something else has a real bug, and silently rewriting it hides that.
         # Producers route through ``media_usage.record_media_usage``, which
         # swallows this so an accounting bug still cannot break a media call.
-        #
-        # Note the legacy two-step path (``increment_media_calls`` then
-        # ``add_media_usage``) bumps the counter in the CALLER, so a rejection
-        # there leaves a counted call with no detail row. That path is only
-        # reachable by an explicit two-step caller — every in-tree producer uses
-        # the single atomic entry point — and is exactly why the two-step API is
-        # kept only for backwards compatibility rather than used internally.
+        # Rejecting before the lock is taken means a bad call leaves no state at
+        # all — neither a counter bump nor an orphan row.
         if unit_value == MediaUnit.REQUESTS.value and quantity != 1.0:
             raise ValueError(
                 f"MediaUnit.REQUESTS means exactly one call, so quantity must "
@@ -301,8 +265,7 @@ class TokenUsage:
         input_tokens = _coerce_int(input_tokens)
         output_tokens = _coerce_int(output_tokens)
         with self._lock:
-            if count_call:
-                self.media_calls += 1
+            self.media_calls += 1
             self.details.append(
                 {
                     "type": "media",
@@ -346,13 +309,16 @@ class TokenUsage:
         with self._lock:
             self.llm_calls += 1
 
-    def increment_media_calls(self, count: int = 1) -> None:
-        """Increment the media (non-LLM) model call counter."""
-        with self._lock:
-            self.media_calls += count
-
     def increment_tool_calls(self, count: int = 1) -> None:
-        """Increment the tool-call counter (one per tool invocation)."""
+        """Increment the tool-call counter (one per tool invocation).
+
+        Negative counts are ignored: they would drive the counter below the
+        number of matching detail rows, and no caller has a reason to decrement
+        a monotonic usage counter.
+        """
+        if count < 0:
+            logger.warning("Ignoring negative tool call increment: %r", count)
+            return
         with self._lock:
             self.tool_calls += count
 
@@ -366,7 +332,11 @@ class TokenUsage:
             llm_calls = other.llm_calls
             media_calls = other.media_calls
             tool_calls = other.tool_calls
-            details = list(other.details)
+            # dict(item), not list(...): sharing the inner dicts would leave the
+            # merged rows aliased to the source's, so mutating one usage object
+            # would silently rewrite the other's billing rows. Same reason
+            # to_dict and snapshot copy each entry.
+            details = [dict(item) for item in other.details if isinstance(item, dict)]
         with self._lock:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
@@ -387,7 +357,11 @@ class TokenUsage:
                 "llm_calls": self.llm_calls,
                 "media_calls": self.media_calls,
                 "tool_calls": self.tool_calls,
-                "details": list(self.details),
+                # dict(item), not just list(...): a new outer list around the
+                # same inner dicts lets a caller mutate the live usage object
+                # through the returned payload, entirely outside this lock.
+                # Matches snapshot(), which already does this.
+                "details": [dict(item) for item in self.details],
             }
 
     @classmethod

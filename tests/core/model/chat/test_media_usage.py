@@ -142,12 +142,10 @@ def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
 
 def test_merge_combines_media_calls_and_details() -> None:
     a = TokenUsage()
-    a.add_media_usage(unit="images", quantity=1, model="x")
-    a.increment_media_calls()
+    a.record_media_call(unit="images", quantity=1, model="x", call_type="video")
 
     b = TokenUsage()
-    b.add_media_usage(unit="seconds", quantity=2, model="y")
-    b.increment_media_calls()
+    b.record_media_call(unit="seconds", quantity=2, model="y", call_type="asr")
 
     a.merge(b)
     assert a.media_calls == 2
@@ -343,8 +341,9 @@ def test_concurrent_media_records_lose_no_counts() -> None:
 
     def record() -> None:
         for _ in range(per_worker):
-            usage.increment_media_calls()
-            usage.add_media_usage(unit="images", quantity=1, call_type="generate_image")
+            usage.record_media_call(
+                unit="images", quantity=1, call_type="generate_image"
+            )
 
     threads = [threading.Thread(target=record) for _ in range(workers)]
     for thread in threads:
@@ -364,8 +363,7 @@ def test_concurrent_merge_loses_no_counts() -> None:
     sources = []
     for _ in range(8):
         source = TokenUsage()
-        source.increment_media_calls()
-        source.add_media_usage(unit="seconds", quantity=2, call_type="asr")
+        source.record_media_call(unit="seconds", quantity=2, call_type="asr")
         sources.append(source)
 
     threads = [threading.Thread(target=target.merge, args=(s,)) for s in sources]
@@ -722,3 +720,82 @@ def test_estimate_tokens_never_raises_from_a_hostile_iterable() -> None:
 
     assert estimate_tokens(_RaisesMidIteration()) == 0
     assert estimate_tokens(_RaisesImmediately()) == 0
+
+
+def test_copy_copy_does_not_share_details_under_a_different_lock() -> None:
+    # The default shallow copy routes through __getstate__/__setstate__, which
+    # gives the new instance a fresh lock while still referencing the SAME
+    # details list — two objects each believing they hold exclusive access,
+    # mutating one list under two different locks. __copy__ routes to snapshot()
+    # so copy.copy is a supported fork rather than a trap.
+    import copy
+
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=1, call_type="video")
+    clone = copy.copy(usage)
+
+    assert clone.details is not usage.details
+    assert clone._lock is not usage._lock
+
+    clone.record_media_call(unit="images", quantity=1, call_type="video")
+    assert len(usage.details) == 1, "the original saw a write through its copy"
+    assert len(clone.details) == 2
+    assert usage.media_calls == 1
+
+
+def test_deepcopy_also_routes_through_snapshot() -> None:
+    import copy
+
+    usage = TokenUsage()
+    usage.record_media_call(unit="seconds", quantity=3, call_type="asr")
+    clone = copy.deepcopy(usage)
+
+    assert clone.details is not usage.details
+    assert clone.media_calls == 1
+    clone.record_media_call(unit="seconds", quantity=1, call_type="asr")
+    assert usage.media_calls == 1
+
+
+def test_to_dict_does_not_leak_the_live_detail_dicts() -> None:
+    # to_dict takes the lock, but a new outer list around the same inner dicts
+    # lets a caller mutate the live usage object through the returned payload,
+    # entirely outside that lock.
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=2, call_type="generate_image")
+
+    payload = usage.to_dict()
+    payload["details"][0]["quantity"] = 999
+    payload["details"].append({"type": "media", "unit": "images"})
+
+    assert usage.details[0]["quantity"] == 2.0
+    assert len(usage.details) == 1
+
+
+@pytest.mark.parametrize("negative", [-1, -5, -100])
+def test_counters_ignore_negative_increments(negative) -> None:
+    # A negative count would drive the counter below the number of matching
+    # detail rows — the same counter/rows divergence the REQUESTS constraint
+    # exists to prevent.
+    usage = TokenUsage()
+    usage.increment_tool_calls(negative)
+
+    assert usage.tool_calls == 0
+
+    # Positive increments still work.
+    usage.increment_tool_calls(2)
+    assert usage.tool_calls == 2
+
+
+def test_merge_does_not_alias_the_source_detail_dicts() -> None:
+    # Sharing the inner dicts would leave merged rows aliased to the source's,
+    # so mutating one usage object silently rewrites the other's billing rows.
+    # Found by self-review as the sibling of the to_dict leak.
+    target = TokenUsage()
+    source = TokenUsage()
+    source.record_media_call(unit="images", quantity=1, call_type="generate_image")
+
+    target.merge(source)
+    target.details[0]["quantity"] = 999
+
+    assert source.details[0]["quantity"] == 1.0
+    assert target.media_calls == 1

@@ -1117,6 +1117,72 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_turn_delta_pairs_details_and_tool_calls_atomically(self, db_session):
+        """The details slice and the tool-call count must describe one instant.
+
+        ``interrupt_reason_for_quota`` polls ``_turn_delta`` at every safe point
+        against the live shared TokenUsage. Reading the two fields separately
+        lets a concurrent write land between them, yielding a pair from two
+        different logical points in time — a row visible with its counter bump
+        missing, or the reverse — which is then fed to quota gating.
+        """
+        import threading
+
+        from xagent.core.model.chat.token_context import get_token_usage
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 0
+        task.output_tokens = 0
+        task.llm_calls = 1
+        task.token_usage_details = []
+
+        tracker = TaskTracker(task_id=123, db_session=db_session)
+        await tracker.start_tracking()
+        usage = get_token_usage()
+
+        # Force a write into the window between the two reads _turn_delta makes.
+        entered = threading.Event()
+        released = threading.Event()
+        original_snapshot = type(usage).snapshot
+
+        def slow_snapshot(self):
+            entered.set()
+            released.wait(timeout=5)
+            return original_snapshot(self)
+
+        results = {}
+
+        def read_delta() -> None:
+            results["delta"] = tracker._turn_delta()
+
+        def write_during_read() -> None:
+            entered.wait(timeout=5)
+            usage.record_media_call(
+                unit="images", quantity=1, call_type="generate_image"
+            )
+            usage.increment_tool_calls(1)
+            released.set()
+
+        with patch.object(type(usage), "snapshot", slow_snapshot):
+            threads = [
+                threading.Thread(target=read_delta),
+                threading.Thread(target=write_during_read),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        delta_details, delta_actions = results["delta"]
+        media_rows = sum(1 for d in delta_details if d.get("type") == "media")
+        # Whichever side of the write the snapshot landed on, the pair agrees:
+        # either both saw it (1 row, 1 action) or neither did (0 and 0).
+        assert media_rows == delta_actions, (
+            f"torn pair: {media_rows} media rows vs {delta_actions} tool calls"
+        )
+
+    @pytest.mark.asyncio
     async def test_media_rows_report_only_the_current_turn_delta(self, db_session):
         """Media rows must behave like token rows across the TaskTracker seam.
 

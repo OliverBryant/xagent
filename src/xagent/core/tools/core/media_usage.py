@@ -143,7 +143,14 @@ def record_media_usage(
             tokens_estimated=tokens_estimated,
         )
     except Exception as e:  # noqa: BLE001
-        logger.warning("Failed to record %s media usage: %s", call_type, e)
+        # exc_info: the expected case here is the deliberate validation
+        # ValueError, but anything genuinely unexpected would otherwise surface
+        # as one context-free line. Persisted billing rows cannot be repaired
+        # after the fact, so a metering bug needs to be diagnosable from the log
+        # alone.
+        logger.warning(
+            "Failed to record %s media usage: %s", call_type, e, exc_info=True
+        )
 
 
 def record_media_seconds(

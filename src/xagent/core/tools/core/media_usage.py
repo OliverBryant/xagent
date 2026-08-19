@@ -35,9 +35,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Optional
-
-from typing_extensions import TypeGuard
+from typing import Any, Optional, TypeGuard
 
 from ...model.chat.token_context import MediaCallType, MediaUnit, add_media_usage
 
@@ -149,7 +147,15 @@ def record_media_usage(
         # after the fact, so a metering bug needs to be diagnosable from the log
         # alone.
         logger.warning(
-            "Failed to record %s media usage: %s", call_type, e, exc_info=True
+            "Failed to record media usage: call_type=%r unit=%r quantity=%r "
+            "model=%r model_id=%r: %s",
+            call_type,
+            unit,
+            quantity,
+            model,
+            model_id,
+            e,
+            exc_info=True,
         )
 
 

@@ -5,6 +5,7 @@ These modalities record usage via ``add_media_usage`` into the same
 persistence and the quota ``delta_details`` contract without special-casing.
 """
 
+import sys
 import threading
 
 import pytest
@@ -124,7 +125,7 @@ def test_dirty_quantity_on_requests_unit_is_rejected_not_coerced() -> None:
 def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
     with TokenContextManager() as manager:
         add_token_usage(input_tokens=10, output_tokens=4, model="gpt", model_id="g1")
-        add_media_usage(unit="seconds", quantity=3.5, model="tts", call_type="tts")
+        add_media_usage(unit="seconds", quantity=3.5, model="tts", call_type="asr")
         usage = manager.get_usage()
 
     data = usage.to_dict()
@@ -142,7 +143,9 @@ def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
 
 def test_merge_combines_media_calls_and_details() -> None:
     a = TokenUsage()
-    a.record_media_call(unit="images", quantity=1, model="x", call_type="video")
+    a.record_media_call(
+        unit="images", quantity=1, model="x", call_type="generate_image"
+    )
 
     b = TokenUsage()
     b.record_media_call(unit="seconds", quantity=2, model="y", call_type="asr")
@@ -175,7 +178,7 @@ def test_media_aggregation_groups_by_model_unit_and_call_type() -> None:
         add_media_usage(
             unit="images", quantity=3, model="sd", call_type="generate_image"
         )
-        add_media_usage(unit="seconds", quantity=4, model="tts", call_type="tts")
+        add_media_usage(unit="seconds", quantity=4, model="tts", call_type="asr")
         # LLM tokens must never appear in the media aggregation.
         add_token_usage(input_tokens=7, output_tokens=2, model="gpt", model_id="g1")
         details = manager.get_usage().details
@@ -236,8 +239,8 @@ def test_zero_quantity_media_entries_stay_visible() -> None:
     # made a billable provider call, and dropping it would report
     # media_calls=0 (and hide the whole popover) for a task that did.
     with TokenContextManager() as manager:
-        add_media_usage(unit="seconds", quantity=0, model="tts", call_type="tts")
-        add_media_usage(unit="seconds", quantity=5, model="tts", call_type="tts")
+        add_media_usage(unit="seconds", quantity=0, model="tts", call_type="asr")
+        add_media_usage(unit="seconds", quantity=5, model="tts", call_type="asr")
         details = manager.get_usage().details
 
     groups = aggregate_media_usage_by_model(details)
@@ -333,27 +336,55 @@ def test_enum_members_are_accepted() -> None:
     assert isinstance(entry["unit"], str)
 
 
-def test_concurrent_media_records_lose_no_counts() -> None:
-    # One TokenUsage is shared across worker threads (RAG ingestion pools,
-    # bind_usage_to_thread callers), where ``+=`` is a read-modify-write.
+def test_concurrent_snapshots_never_see_a_torn_counter_and_rows_pair() -> None:
+    # What the lock actually protects is the PAIRING of the counter with its
+    # detail rows, not `+=` itself. On CPython 3.12 a bare `self.n += 1` does not
+    # measurably lose increments even at 8x200000 threads-iterations, so a test
+    # that only counts increments passes with the lock entirely removed — an
+    # earlier version of this test did exactly that.
+    #
+    # record_media_call bumps the counter and appends the row as one operation.
+    # Without the lock a concurrent reader lands between them and observes
+    # media_calls disagreeing with the number of media rows. Mutation-verified:
+    # replacing _lock with contextlib.nullcontext() makes this fail in 30/30
+    # runs, typically within the first few hundred writes.
     usage = TokenUsage()
-    workers, per_worker = 8, 200
+    torn: list[tuple[int, int]] = []
+    stop = threading.Event()
 
-    def record() -> None:
-        for _ in range(per_worker):
+    # Required, not decoration: at the default switch interval the window is too
+    # narrow to hit, and this test passes with the lock removed. At 1e-9 the
+    # unlocked variant tears in 10/10 runs.
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-9)
+
+    def writer() -> None:
+        for _ in range(3000):
             usage.record_media_call(
                 unit="images", quantity=1, call_type="generate_image"
             )
+        stop.set()
 
-    threads = [threading.Thread(target=record) for _ in range(workers)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    def reader() -> None:
+        while not stop.is_set():
+            snap = usage.to_dict()
+            media = sum(1 for d in snap["details"] if d.get("type") == "media")
+            if snap["media_calls"] != media:
+                torn.append((snap["media_calls"], media))
+                return
 
-    expected = workers * per_worker
-    assert usage.media_calls == expected
-    assert len(usage.details) == expected
+    threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+    assert not torn, f"observed torn counter/rows pairs: {torn[:5]}"
+    assert usage.media_calls == 3000
+    assert sum(1 for d in usage.details if d.get("type") == "media") == 3000
 
 
 def test_concurrent_merge_loses_no_counts() -> None:
@@ -607,7 +638,9 @@ def test_snapshot_is_taken_under_the_lock() -> None:
 
     def writer() -> None:
         for _ in range(400):
-            usage.record_media_call(unit="images", quantity=1, call_type="video")
+            usage.record_media_call(
+                unit="images", quantity=1, call_type="generate_image"
+            )
         stop.set()
 
     def reader() -> None:
@@ -629,10 +662,10 @@ def test_snapshot_is_taken_under_the_lock() -> None:
 
 def test_snapshot_detaches_from_the_source() -> None:
     usage = TokenUsage()
-    usage.record_media_call(unit="images", quantity=1, call_type="video")
+    usage.record_media_call(unit="images", quantity=1, call_type="generate_image")
     snap = usage.snapshot()
 
-    usage.record_media_call(unit="images", quantity=1, call_type="video")
+    usage.record_media_call(unit="images", quantity=1, call_type="generate_image")
 
     # The snapshot must not see writes that landed after it was taken.
     assert snap.media_calls == 1
@@ -668,13 +701,13 @@ def test_copy_copy_does_not_share_details_under_a_different_lock() -> None:
     import copy
 
     usage = TokenUsage()
-    usage.record_media_call(unit="images", quantity=1, call_type="video")
+    usage.record_media_call(unit="images", quantity=1, call_type="generate_image")
     clone = copy.copy(usage)
 
     assert clone.details is not usage.details
     assert clone._lock is not usage._lock
 
-    clone.record_media_call(unit="images", quantity=1, call_type="video")
+    clone.record_media_call(unit="images", quantity=1, call_type="generate_image")
     assert len(usage.details) == 1, "the original saw a write through its copy"
     assert len(clone.details) == 2
     assert usage.media_calls == 1
@@ -852,3 +885,77 @@ def test_media_aggregation_uses_model_id_when_present() -> None:
     assert groups[0]["quantity"] == 3.0
     # ...and the name is backfilled from whichever row carried it.
     assert groups[0]["model_name"] == "display-name"
+
+
+@pytest.mark.parametrize("huge", [10**400, -(10**400), "1e400"])
+def test_huge_quantity_records_zero_rather_than_dropping_the_row(huge) -> None:
+    # float(10**400) raises OverflowError, which _coerce_float did not catch.
+    # An uncaught raise here propagates out and the error-swallowing wrapper
+    # drops the whole billing row — the opposite of the reject-to-0.0 contract.
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=huge, call_type="generate_image")
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["quantity"] == 0.0
+
+
+def test_add_media_usage_reports_the_raw_quantity_in_the_requests_error() -> None:
+    # The wrapper coerces one layer above record_media_call, so without
+    # threading the raw value through, a caller passing -1 saw "got 0.0".
+    with TokenContextManager():
+        with pytest.raises(ValueError, match=r"got -1"):
+            add_media_usage(unit="requests", quantity=-1, model="m", call_type="rerank")
+
+
+@pytest.mark.parametrize(
+    ("unit", "call_type"),
+    [
+        ("images", "video"),  # video bills in seconds
+        ("seconds", "tts"),  # tts bills in characters
+        ("images", "asr"),
+        ("requests", "embedding"),  # embedding bills per text
+    ],
+)
+def test_unit_must_match_the_modality(unit, call_type) -> None:
+    # "The unit is a property of the modality" was stated in three docstrings and
+    # violated by six call sites in this file. MEDIA_UNIT_BY_CALL_TYPE turns the
+    # invariant into an enforced constraint: a (model, unit) price table is only
+    # usable if one modality never reports two units.
+    usage = TokenUsage()
+    with pytest.raises(ValueError, match="bills in"):
+        usage.record_media_call(unit=unit, quantity=1, call_type=call_type)
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+@pytest.mark.parametrize(
+    ("call_type", "unit"),
+    [
+        ("generate_image", "images"),
+        ("edit_image", "images"),
+        ("video", "seconds"),
+        ("asr", "seconds"),
+        ("music", "seconds"),
+        ("sound_effect", "seconds"),
+        ("tts", "characters"),
+        ("embedding", "texts"),
+        ("rerank", "requests"),
+    ],
+)
+def test_every_call_type_accepts_its_own_unit(call_type, unit) -> None:
+    # The mapping must cover every MediaCallType member, or a legitimate
+    # producer would be rejected.
+    usage = TokenUsage()
+    usage.record_media_call(unit=unit, quantity=1, call_type=call_type)
+
+    assert usage.details[0]["unit"] == unit
+
+
+def test_unit_is_unconstrained_when_call_type_is_omitted() -> None:
+    # call_type is optional metadata; with none given there is no modality to
+    # check the unit against.
+    usage = TokenUsage()
+    usage.record_media_call(unit="images", quantity=1)
+
+    assert usage.details[0]["unit"] == "images"

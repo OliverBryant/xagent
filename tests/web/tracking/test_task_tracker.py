@@ -1126,14 +1126,18 @@ class TestTaskTracker:
         lets a concurrent write land between them, yielding a pair from two
         different logical points in time, which is then fed to quota gating.
 
-        The reader runs in a plain thread, which does NOT inherit contextvars, so
-        ``usage`` is passed explicitly: relying on ``get_token_usage()`` there
-        would lazily create a fresh empty TokenUsage and the test would observe
-        ``([], 0)`` regardless of the implementation — passing whether or not the
-        race is fixed.
+        The interleaving is forced from *inside* the locked read, by patching
+        ``copy_detail_rows`` — which ``detail_tail`` calls after taking the lock
+        and reading ``details``, but before reading ``tool_calls``. Two earlier
+        versions of this test wrapped ``detail_tail`` itself and released the
+        writer before the real accessor ran, so the write always completed
+        before the locked read began and the test passed against a deliberately
+        torn implementation. Mutation-verified: splitting ``detail_tail`` into
+        two lock acquisitions makes this fail with media=0, tool_calls=1.
         """
         import threading
 
+        from xagent.core.model.chat import token_context as tc_module
         from xagent.core.model.chat.token_context import get_token_usage
 
         task = db_session.query.return_value.filter.return_value.first.return_value
@@ -1147,18 +1151,16 @@ class TestTaskTracker:
         await tracker.start_tracking()
         usage = get_token_usage()
 
-        # Force a write into the window between the two reads, by making the
-        # locked read itself slow. Patching detail_tail's underlying lock
-        # acquisition is not possible, so widen the window from the writer side:
-        # the writer waits until the reader is inside the accessor.
-        entered = threading.Event()
-        released = threading.Event()
-        real_detail_tail = type(usage).detail_tail
+        inside_locked_read = threading.Event()
+        writer_done = threading.Event()
+        real_copy = tc_module.copy_detail_rows
 
-        def slow_detail_tail(self, start=0):
-            entered.set()
-            released.wait(timeout=5)
-            return real_detail_tail(self, start)
+        def copy_then_pause(raw_details):
+            rows = real_copy(raw_details)
+            # Inside detail_tail's lock: details已读, tool_calls 还没读.
+            inside_locked_read.set()
+            writer_done.wait(timeout=5)
+            return rows
 
         results = {}
 
@@ -1167,27 +1169,34 @@ class TestTaskTracker:
             results["delta"] = tracker._turn_delta(usage)
 
         def write_during_read() -> None:
-            assert entered.wait(timeout=5), "reader never entered detail_tail"
+            assert inside_locked_read.wait(timeout=5), (
+                "reader never entered the locked read"
+            )
+            # These block until the reader releases the lock, when detail_tail is
+            # atomic. Against a torn implementation they land between its two
+            # acquisitions.
             usage.record_media_call(
                 unit="images", quantity=1, call_type="generate_image"
             )
             usage.increment_tool_calls(1)
-            released.set()
+            writer_done.set()
 
-        with patch.object(type(usage), "detail_tail", slow_detail_tail):
+        with patch.object(tc_module, "copy_detail_rows", copy_then_pause):
             threads = [
                 threading.Thread(target=read_delta),
                 threading.Thread(target=write_during_read),
             ]
             for thread in threads:
                 thread.start()
+            # The writer must not be released by a silent timeout: give it a
+            # nudge so an atomic implementation (where the writer blocks on the
+            # lock) still completes instead of both sides waiting.
+            threads[0].join(timeout=10)
+            writer_done.set()
             for thread in threads:
                 thread.join(timeout=10)
 
-        # A silent timeout must fail rather than pass: without this the writer
-        # could never run and the assertion below would trivially hold at (0, 0).
-        assert entered.is_set(), "the interleaving never happened"
-        assert released.is_set(), "the writer never completed"
+        assert inside_locked_read.is_set(), "the interleaving never happened"
         assert "delta" in results, "the reader never returned"
 
         delta_details, delta_actions = results["delta"]

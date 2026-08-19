@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from ...core.model.chat.token_context import (
     TokenUsage,
+    copy_detail_rows,
     get_token_usage,
     set_token_usage,
 )
@@ -48,12 +49,6 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, (bool, int, float, str)):
         return _safe_int(value)
     return None
-
-
-def _copy_details(raw_details: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_details, list):
-        return []
-    return [dict(item) for item in raw_details if isinstance(item, dict)]
 
 
 def _copy_usage(usage: TokenUsage) -> TokenUsage:
@@ -99,7 +94,7 @@ def _task_seed_from_session(
             f" for run {expected_run_id}" if expected_run_id is not None else ""
         )
         raise ValueError(f"Task {task_id}{run_suffix} not found")
-    seed_details = _copy_details(getattr(task, "token_usage_details", None))
+    seed_details = copy_detail_rows(getattr(task, "token_usage_details", None))
     return _TaskTrackingSeed(
         user_id=_optional_int(getattr(task, "user_id", None)),
         usage=TokenUsage(
@@ -168,7 +163,7 @@ def _commit_task_usage_if_owned(
             Task.output_tokens: usage.output_tokens,
             Task.total_tokens: usage.total_tokens,
             Task.llm_calls: usage.llm_calls,
-            Task.token_usage_details: _copy_details(usage.details),
+            Task.token_usage_details: copy_detail_rows(usage.details),
         },
         synchronize_session=False,
     )
@@ -536,7 +531,9 @@ class TaskTracker:
         self._update_task = None
         logger.info(f"Stopped periodic token updates for task {self.task_id}")
 
-    def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
+    def _turn_delta(
+        self, usage: TokenUsage | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
         """This turn's (detail entries, tool-call count) over the baseline seeded
         in start_tracking. Single source for the completion meter and the mid-run
         gate so they can't disagree on what 'this run's usage' means.
@@ -592,7 +589,7 @@ class TaskTracker:
             return None
         try:
             delta_details, delta_actions = self._turn_delta()
-            # No _copy_details: _turn_delta already returns detached rows.
+            # No extra copy: _turn_delta already returns detached rows.
             reason = _check_quota_on_event_loop(
                 self._user_id,
                 delta_details,
@@ -648,7 +645,7 @@ class TaskTracker:
         # the task. The remaining blocking risk is tracked separately from the
         # database-lifecycle changes in this PR.
         try:
-            # No _copy_details: _turn_delta already returns detached rows.
+            # No extra copy: _turn_delta already returns detached rows.
             _record_usage_on_event_loop(
                 self._user_id,
                 delta_details,

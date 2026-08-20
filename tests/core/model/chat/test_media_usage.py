@@ -619,3 +619,41 @@ def test_unit_is_unconstrained_when_call_type_is_omitted() -> None:
     usage.record_media_call(unit="images", quantity=1)
 
     assert usage.details[0]["unit"] == "images"
+
+
+@pytest.mark.parametrize("overflowing", [float("inf"), float("-inf")])
+def test_overflowing_provider_tokens_keep_the_row(overflowing) -> None:
+    # int(float("inf")) raises OverflowError. Uncaught, it propagates out of the
+    # accounting path and the error-swallowing wrapper drops the entire billing
+    # row — losing a call that did happen in order to salvage one bad field.
+    # Image providers pass prompt_tokens straight from provider JSON, so a
+    # malformed payload reaches this boundary unfiltered.
+    usage = TokenUsage()
+    usage.record_media_call(
+        unit="images",
+        quantity=1,
+        call_type="generate_image",
+        input_tokens=overflowing,
+        output_tokens=overflowing,
+    )
+
+    assert usage.media_calls == 1
+    entry = usage.details[0]
+    assert entry["quantity"] == 1.0
+    assert entry["provider_input_tokens"] == 0
+    assert entry["provider_output_tokens"] == 0
+
+
+@pytest.mark.parametrize("unusable", [-1, -0.5, -1000.0, True, False])
+def test_unusable_quantity_records_zero(unusable) -> None:
+    # A negative quantity would subtract from a bill, and a bool is a caller bug
+    # rather than a count of 1 or 0 — `True` would otherwise bill one image.
+    # Recorded as 0 rather than rejected, because the provider call still
+    # happened: the row is the evidence, and 0 marks it unmeasured.
+    usage = TokenUsage()
+    usage.record_media_call(
+        unit="images", quantity=unusable, call_type="generate_image"
+    )
+
+    assert usage.media_calls == 1
+    assert usage.details[0]["quantity"] == 0.0

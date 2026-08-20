@@ -392,7 +392,14 @@ def _coerce_int(value: Any) -> int:
         return int(value)
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError, not just TypeError/ValueError: int(float("inf")) raises
+        # it, and this runs inside the media write path where an uncaught raise
+        # propagates out and the error-swallowing wrapper drops the entire
+        # billing row — losing a call that did happen, to salvage one bad field.
+        # Image providers pass prompt_tokens straight from provider JSON, so a
+        # malformed payload reaches here unfiltered.
+        #
         # None/absent is expected (provider omitted the field) — stay quiet.
         # A present-but-malformed value signals a provider-adapter bug worth
         # surfacing rather than silently billing it as zero.

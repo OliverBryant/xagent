@@ -312,7 +312,13 @@ class TokenUsage:
             output_tokens=data.get("output_tokens", 0),
             llm_calls=data.get("llm_calls", 0),
             tool_calls=data.get("tool_calls", 0),
-            details=data.get("details", []),
+            # Coerced, not passed through: a persisted `details: null` used to be
+            # harmless because media_calls was a stored field, but it is now
+            # derived by iterating this list, so a None would raise on every
+            # read — including inside to_dict. Non-list shapes get the same
+            # treatment; details is append-only downstream and a str/dict here
+            # would fail later and further from the cause.
+            details=(data["details"] if isinstance(data.get("details"), list) else []),
         )
 
 
@@ -702,7 +708,7 @@ def estimate_media_tokens(text: Any) -> int:
                 or 0xAC00 <= code <= 0xD7AF  # Hangul syllables
                 or 0x3100 <= code <= 0x312F  # Bopomofo
                 or 0xF900 <= code <= 0xFAFF  # CJK Compatibility Ideographs
-                or 0xFF61 <= code <= 0xFFEF  # Halfwidth/fullwidth forms
+                or 0xFF5F <= code <= 0xFFEF  # Halfwidth/fullwidth forms
                 # U+FF01-FF5E is fullwidth ASCII, which mixes two rates in one
                 # block: fullwidth *letters and digits* tokenize like Latin
                 # (billing "ＡＢＣＤ" per character over-counts ~4x), while

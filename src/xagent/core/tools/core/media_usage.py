@@ -211,21 +211,24 @@ def record_media_seconds(
     ``seconds`` with ``quantity=0`` and a warning — so the event reaches billing
     as unmeasured rather than silently mis-dimensioned.
 
-    Raises:
-        ValueError: If ``call_type`` does not bill in seconds. This is the one
-            place a caller can create that mismatch, since the unit here is
-            fixed rather than derived, and getting it wrong would discard a
-            fully measured billing row. Raised loudly so a producer sees it in
-            their own tests; ``record_media_usage`` is the swallow boundary for
-            everything downstream of this check.
+    A ``call_type`` that does not bill in seconds is a caller bug -- this is the
+    one place it can happen, since the unit here is fixed rather than derived --
+    and it drops the row rather than writing a duration under the wrong unit.
+    Logged at error level rather than raised: producers call this from inside
+    their own ``try/except Exception`` (see ``music_tool``), whose handler turns
+    any exception into ``success: False``. Raising here would therefore report a
+    generated-and-billed media call as a failed one -- destroying the user's
+    result to report an accounting mistake. Never raises.
     """
     resolved = _resolved_call_type(call_type)
     if resolved is not None and resolved.unit is not MediaUnit.SECONDS:
-        raise ValueError(
-            f"record_media_seconds is for duration-billed modalities, but "
-            f"{resolved.value!r} bills in {resolved.unit.value!r}; use "
-            f"record_media_usage instead"
+        logger.error(
+            "record_media_seconds is for duration-billed modalities, but %r "
+            "bills in %r; dropping the row. Use record_media_usage instead.",
+            resolved.value,
+            resolved.unit.value,
         )
+        return
     if seconds is None:
         logger.warning(
             "No duration reported for %s call on model %r; recording 0 seconds "

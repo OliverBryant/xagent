@@ -636,3 +636,75 @@ def test_model_identity_is_stripped_so_padding_does_not_split_billing() -> None:
     assert {d["model"] for d in usage.details} == {"sd"}
     assert {d["model_id"] for d in usage.details} == {"s1"}
     assert len(aggregate_media_usage_by_model(usage.details)) == 1
+
+
+@pytest.mark.parametrize("malformed", [None, "not-a-list", {"a": 1}, 7])
+def test_from_dict_coerces_a_malformed_details_field(malformed) -> None:
+    # media_calls is derived by iterating details, so a persisted
+    # `details: null` -- harmless while the counter was a stored field --
+    # would now raise on every read of media_calls, to_dict and merge.
+    # Coerce at the read boundary instead of making each consumer defensive.
+    restored = TokenUsage.from_dict(
+        {"input_tokens": 3, "media_calls": 9, "details": malformed}
+    )
+
+    assert restored.details == []
+    assert restored.media_calls == 0
+    assert restored.input_tokens == 3
+    # The three operations that would otherwise raise.
+    assert restored.to_dict()["media_calls"] == 0
+    TokenUsage().merge(restored)
+    restored.record_media_call(call_type=MediaCallType.ASR, quantity=1)
+    assert restored.media_calls == 1
+
+
+def test_from_dict_keeps_a_real_details_list() -> None:
+    # The coercion must not eat valid rows.
+    restored = TokenUsage.from_dict(
+        {
+            "details": [
+                {"type": "media", "unit": "seconds", "quantity": 2.0},
+                {"type": "input", "tokens": 5},
+            ]
+        }
+    )
+
+    assert len(restored.details) == 2
+    assert restored.media_calls == 1
+
+
+def test_fullwidth_ascii_is_classified_per_character_not_per_block() -> None:
+    # U+FF01-FF5E mixes two billing rates in one Unicode block, so this is
+    # asserted over the whole block rather than by example: an earlier revision
+    # narrowed the range to fix fullwidth *letters* over-counting 4x and
+    # silently regressed fullwidth *punctuation* (（）) in the same edit.
+    from xagent.core.model.chat.token_context import estimate_media_tokens
+
+    misclassified = []
+    for code in range(0xFF01, 0xFF5F):
+        char = chr(code)
+        # Every char in this block is the fullwidth form of an ASCII char.
+        is_alnum = chr(code - 0xFEE0).isalnum()
+        # CJK rate: one token per character. Latin rate: four chars per token.
+        billed_per_char = estimate_media_tokens(char * 4) == 4
+        if is_alnum == billed_per_char:
+            misclassified.append((hex(code), chr(code - 0xFEE0)))
+
+    assert misclassified == []
+
+
+@pytest.mark.parametrize(
+    "char,expected_cjk",
+    [
+        ("｟", True),  # FULLWIDTH LEFT WHITE PARENTHESIS
+        ("｠", True),  # FULLWIDTH RIGHT WHITE PARENTHESIS
+        ("｡", True),  # HALFWIDTH IDEOGRAPHIC FULL STOP
+        ("Ａ", False),  # FULLWIDTH LATIN CAPITAL A
+        ("０", False),  # FULLWIDTH DIGIT ZERO
+    ],
+)
+def test_fullwidth_range_boundaries(char, expected_cjk) -> None:
+    # U+FF5F/FF60 sat in the gap between the two ranges and billed as Latin.
+    from xagent.core.model.chat.token_context import estimate_media_tokens
+
+    assert (estimate_media_tokens(char * 4) == 4) is expected_cjk

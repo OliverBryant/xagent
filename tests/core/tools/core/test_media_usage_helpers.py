@@ -201,18 +201,24 @@ def test_resolve_billing_model_survives_raising_descriptor() -> None:
     "call_type",
     [c for c in MediaCallType if c.unit is not MediaUnit.SECONDS],
 )
-def test_record_media_seconds_rejects_non_duration_modalities(call_type) -> None:
-    # record_media_seconds coerces its argument as a duration and lets the unit
-    # come from the modality. Handing it a modality billed in images or
-    # characters used to record a row whose quantity was a duration but whose
-    # unit said otherwise — a silently mispriced row. Fail loudly instead.
+def test_record_media_seconds_drops_non_duration_modalities(call_type, caplog) -> None:
+    # Handing this a modality billed in images or characters used to record a
+    # row whose quantity was a duration but whose unit said otherwise -- a
+    # silently mispriced row. Dropped and logged instead.
+    #
+    # Deliberately not raised: producers call this from inside their own
+    # `try/except Exception` (music_tool), whose handler returns
+    # `success: False`, so raising would turn a generated-and-billed media call
+    # into a reported failure.
     import xagent.core.tools.core.media_usage as mu
 
-    with TokenContextManager() as manager:
-        with pytest.raises(ValueError, match="record_media_seconds"):
+    with caplog.at_level("ERROR"):
+        with TokenContextManager() as manager:
             mu.record_media_seconds(1.5, model="m", call_type=call_type)
+            assert manager.get_usage().details == []
 
-        assert manager.get_usage().details == []
+    assert "record_media_seconds" in caplog.text
+    assert call_type.value in caplog.text
 
 
 @pytest.mark.parametrize(

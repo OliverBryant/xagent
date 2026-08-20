@@ -108,9 +108,7 @@ def test_record_media_usage_swallows_recording_errors(monkeypatch) -> None:
 
     with TokenContextManager() as manager:
         # Must not raise.
-        mu.record_media_usage(
-            MediaUnit.IMAGES, 1, model="m", call_type=MediaCallType.GENERATE_IMAGE
-        )
+        mu.record_media_usage(MediaCallType.GENERATE_IMAGE, 1, model="m")
         usage = manager.get_usage()
 
     # And must leave no partial state behind.
@@ -118,13 +116,15 @@ def test_record_media_usage_swallows_recording_errors(monkeypatch) -> None:
     assert usage.details == []
 
 
-def test_record_media_usage_swallows_invalid_unit(monkeypatch) -> None:
-    # A typo'd unit raises ValueError from the validator; the wrapper drops the
-    # record with a warning rather than propagating into the media call.
+def test_record_media_usage_swallows_invalid_call_type() -> None:
+    # A typo'd call_type raises ValueError from the validator; the wrapper drops
+    # the record with a warning rather than propagating into the media call.
+    # Note "tts" is now a *valid* call_type -- the unit it used to be checked
+    # against no longer exists -- so the invalid value has to be a real typo.
     import xagent.core.tools.core.media_usage as mu
 
     with TokenContextManager() as manager:
-        mu.record_media_usage("tts", 1, model="m")
+        mu.record_media_usage("ttts", 1, model="m")
         usage = manager.get_usage()
 
     assert usage.media_calls == 0

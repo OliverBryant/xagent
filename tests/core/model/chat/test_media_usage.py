@@ -22,7 +22,6 @@ from xagent.core.model.chat.token_context import (
 def test_add_media_usage_appends_media_entry_and_counts_call() -> None:
     with TokenContextManager() as manager:
         add_media_usage(
-            unit="images",
             quantity=2,
             model="sd-xl",
             model_id="m1",
@@ -50,7 +49,6 @@ def test_add_media_usage_appends_media_entry_and_counts_call() -> None:
 def test_add_media_usage_carries_accompanying_tokens() -> None:
     with TokenContextManager() as manager:
         add_media_usage(
-            unit="images",
             quantity=1,
             model="gemini-image",
             call_type="generate_image",
@@ -75,7 +73,6 @@ def test_add_media_usage_carries_accompanying_tokens() -> None:
 def test_estimated_tokens_are_flagged() -> None:
     with TokenContextManager() as manager:
         add_media_usage(
-            unit="texts",
             quantity=2,
             model="embed",
             call_type="embedding",
@@ -95,8 +92,8 @@ def test_dirty_quantity_is_coerced_on_free_quantity_units() -> None:
     # unit, because REQUESTS additionally pins its quantity to exactly 1 (see
     # test_requests_unit_rejects_any_quantity_but_one) and would reject these.
     with TokenContextManager() as manager:
-        add_media_usage(unit="seconds", quantity=None, model="x", call_type="asr")  # type: ignore[arg-type]
-        add_media_usage(unit="seconds", quantity="oops", model="x", call_type="asr")  # type: ignore[arg-type]
+        add_media_usage(quantity=None, model="x", call_type="asr")  # type: ignore[arg-type]
+        add_media_usage(quantity="oops", model="x", call_type="asr")  # type: ignore[arg-type]
         usage = manager.get_usage()
 
     assert usage.media_calls == 2
@@ -110,9 +107,7 @@ def test_dirty_quantity_on_requests_unit_is_rejected_not_coerced() -> None:
     with TokenContextManager() as manager:
         for bad in (None, "oops", 0):
             with pytest.raises(ValueError, match="exactly one call"):
-                add_media_usage(
-                    unit="requests", quantity=bad, model="x", call_type="rerank"
-                )  # type: ignore[arg-type]
+                add_media_usage(quantity=bad, model="x", call_type="rerank")  # type: ignore[arg-type]
         usage = manager.get_usage()
 
     assert usage.media_calls == 0
@@ -122,7 +117,7 @@ def test_dirty_quantity_on_requests_unit_is_rejected_not_coerced() -> None:
 def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
     with TokenContextManager() as manager:
         add_token_usage(input_tokens=10, output_tokens=4, model="gpt", model_id="g1")
-        add_media_usage(unit="seconds", quantity=3.5, model="tts", call_type="asr")
+        add_media_usage(quantity=3.5, model="tts", call_type="asr")
         usage = manager.get_usage()
 
     data = usage.to_dict()
@@ -140,12 +135,10 @@ def test_to_dict_from_dict_roundtrip_preserves_media() -> None:
 
 def test_merge_combines_media_calls_and_details() -> None:
     a = TokenUsage()
-    a.record_media_call(
-        unit="images", quantity=1, model="x", call_type="generate_image"
-    )
+    a.record_media_call(quantity=1, model="x", call_type="generate_image")
 
     b = TokenUsage()
-    b.record_media_call(unit="seconds", quantity=2, model="y", call_type="asr")
+    b.record_media_call(quantity=2, model="y", call_type="asr")
 
     a.merge(b)
     assert a.media_calls == 2
@@ -155,9 +148,7 @@ def test_merge_combines_media_calls_and_details() -> None:
 def test_token_aggregation_ignores_media_entries() -> None:
     with TokenContextManager() as manager:
         add_token_usage(input_tokens=10, output_tokens=5, model="gpt", model_id="g1")
-        add_media_usage(
-            unit="images", quantity=2, model="sd", call_type="generate_image"
-        )
+        add_media_usage(quantity=2, model="sd", call_type="generate_image")
         details = manager.get_usage().details
 
     token_groups = aggregate_token_usage_by_model(details)
@@ -169,13 +160,9 @@ def test_token_aggregation_ignores_media_entries() -> None:
 
 def test_media_aggregation_groups_by_model_unit_and_call_type() -> None:
     with TokenContextManager() as manager:
-        add_media_usage(
-            unit="images", quantity=2, model="sd", call_type="generate_image"
-        )
-        add_media_usage(
-            unit="images", quantity=3, model="sd", call_type="generate_image"
-        )
-        add_media_usage(unit="seconds", quantity=4, model="tts", call_type="asr")
+        add_media_usage(quantity=2, model="sd", call_type="generate_image")
+        add_media_usage(quantity=3, model="sd", call_type="generate_image")
+        add_media_usage(quantity=4, model="tts", call_type="asr")
         # LLM tokens must never appear in the media aggregation.
         add_token_usage(input_tokens=7, output_tokens=2, model="gpt", model_id="g1")
         details = manager.get_usage().details
@@ -196,14 +183,12 @@ def test_media_aggregation_splits_by_resolution() -> None:
     # items, since an image model's price varies by resolution.
     with TokenContextManager() as manager:
         add_media_usage(
-            unit="images",
             quantity=1,
             model="gemini-image",
             call_type="generate_image",
             resolution="1K",
         )
         add_media_usage(
-            unit="images",
             quantity=1,
             model="gemini-image",
             call_type="generate_image",
@@ -236,8 +221,8 @@ def test_zero_quantity_media_entries_stay_visible() -> None:
     # made a billable provider call, and dropping it would report
     # media_calls=0 (and hide the whole popover) for a task that did.
     with TokenContextManager() as manager:
-        add_media_usage(unit="seconds", quantity=0, model="tts", call_type="asr")
-        add_media_usage(unit="seconds", quantity=5, model="tts", call_type="asr")
+        add_media_usage(quantity=0, model="tts", call_type="asr")
+        add_media_usage(quantity=5, model="tts", call_type="asr")
         details = manager.get_usage().details
 
     groups = aggregate_media_usage_by_model(details)
@@ -251,7 +236,7 @@ def test_only_unmeasured_calls_still_surface() -> None:
     # whole group is zero-quantity. It must still be reported.
     with TokenContextManager() as manager:
         for _ in range(3):
-            add_media_usage(unit="seconds", quantity=0, model="veo", call_type="video")
+            add_media_usage(quantity=0, model="veo", call_type="video")
         groups = aggregate_media_usage_by_model(manager.get_usage().details)
 
     assert len(groups) == 1
@@ -259,57 +244,10 @@ def test_only_unmeasured_calls_still_surface() -> None:
     assert groups[0]["quantity"] == 0.0
 
 
-@pytest.mark.parametrize("bad_unit", ["image", "second", "tokens", "IMAGES", ""])
-def test_unknown_unit_is_rejected(bad_unit: str) -> None:
-    # A typo'd unit mints a new billing dimension that the aggregator will
-    # happily key off, and a written usage record cannot be repaired
-    # retroactively. The write boundary is the last point it is still fixable.
-    with TokenContextManager() as manager:
-        with pytest.raises(ValueError, match="Unknown media unit"):
-            add_media_usage(unit=bad_unit, quantity=1, model="m", call_type="tts")
-        usage = manager.get_usage()
-
-    # A rejected call must leave no partial state behind: media_calls is
-    # incremented before the detail entry is appended, so validating late would
-    # record a call with no matching entry.
-    assert usage.media_calls == 0
-    assert usage.details == []
-
-
 def test_unknown_call_type_is_rejected() -> None:
     with TokenContextManager() as manager:
         with pytest.raises(ValueError, match="Unknown media call type"):
-            add_media_usage(unit="seconds", quantity=1, model="m", call_type="speech")
-        usage = manager.get_usage()
-
-    assert usage.media_calls == 0
-    assert usage.details == []
-
-
-def test_empty_call_type_is_allowed() -> None:
-    # call_type is optional metadata rather than a billing dimension of its
-    # own, so omitting it stays legal while a typo does not.
-    with TokenContextManager() as manager:
-        add_media_usage(unit="requests", quantity=1, model="m")
-        usage = manager.get_usage()
-
-    assert usage.media_calls == 1
-    assert usage.details[0]["call_type"] == ""
-
-
-def test_none_call_type_is_normalised_to_empty() -> None:
-    with TokenContextManager() as manager:
-        add_media_usage(unit="requests", quantity=1, model="m", call_type=None)
-        usage = manager.get_usage()
-
-    assert usage.media_calls == 1
-    assert usage.details[0]["call_type"] == ""
-
-
-def test_none_unit_is_rejected_with_clear_error() -> None:
-    with TokenContextManager() as manager:
-        with pytest.raises(ValueError, match="Media unit cannot be None"):
-            add_media_usage(unit=None, quantity=1, model="m")
+            add_media_usage(quantity=1, model="m", call_type="speech")
         usage = manager.get_usage()
 
     assert usage.media_calls == 0
@@ -319,7 +257,6 @@ def test_none_unit_is_rejected_with_clear_error() -> None:
 def test_enum_members_are_accepted() -> None:
     with TokenContextManager() as manager:
         add_media_usage(
-            unit=MediaUnit.SECONDS,
             quantity=3,
             model="whisper",
             call_type=MediaCallType.ASR,
@@ -349,11 +286,12 @@ def test_legacy_positional_construction_still_binds_the_same_fields() -> None:
     assert usage.details == details
     assert usage.media_calls == 0
 
-    # And it is reachable by keyword, where it cannot be confused with anything.
-    assert TokenUsage(media_calls=4).media_calls == 4
+    # media_calls is derived from details, so it cannot be set at all — which
+    # is what makes it impossible to drop on a copy or seed path.
+    assert TokenUsage(details=[{"type": "media"}]).media_calls == 1
 
-    # The private lock must not occupy a positional slot either: six positional
-    # arguments is the documented maximum (five fields plus self).
+    # Five positional arguments is the maximum: media_calls is a derived
+    # property, so there is no sixth field for an old caller to mis-bind.
     with pytest.raises(TypeError):
         TokenUsage(1, 2, 3, 4, [], 5)  # type: ignore[misc]
 
@@ -391,9 +329,7 @@ def test_requests_unit_rejects_any_quantity_but_one(bad_quantity) -> None:
     # different numbers off one record.
     usage = TokenUsage()
     with pytest.raises(ValueError, match="exactly one call"):
-        usage.record_media_call(
-            unit=MediaUnit.REQUESTS, quantity=bad_quantity, call_type="rerank"
-        )
+        usage.record_media_call(quantity=bad_quantity, call_type="rerank")
 
     # Rejected before any mutation: no counter bump, no orphan detail row.
     assert usage.media_calls == 0
@@ -402,19 +338,10 @@ def test_requests_unit_rejects_any_quantity_but_one(bad_quantity) -> None:
 
 def test_requests_unit_accepts_exactly_one() -> None:
     usage = TokenUsage()
-    usage.record_media_call(unit=MediaUnit.REQUESTS, quantity=1, call_type="rerank")
+    usage.record_media_call(quantity=1, call_type="rerank")
 
     assert usage.media_calls == 1
     assert usage.details[0]["quantity"] == 1.0
-
-
-def test_other_units_keep_free_quantities() -> None:
-    # The REQUESTS constraint must not leak into duration/count-billed units.
-    usage = TokenUsage()
-    usage.record_media_call(unit=MediaUnit.SECONDS, quantity=2.5, call_type="asr")
-    usage.record_media_call(unit=MediaUnit.IMAGES, quantity=4, call_type="edit_image")
-
-    assert [d["quantity"] for d in usage.details] == [2.5, 4.0]
 
 
 def test_requests_rejection_is_swallowed_by_the_wrapper() -> None:
@@ -423,9 +350,7 @@ def test_requests_rejection_is_swallowed_by_the_wrapper() -> None:
     from xagent.core.tools.core.media_usage import record_media_usage
 
     with TokenContextManager() as manager:
-        record_media_usage(
-            MediaUnit.REQUESTS, 3, model="m", call_type=MediaCallType.RERANK
-        )
+        record_media_usage(MediaCallType.RERANK, 3, model="m")
         usage = manager.get_usage()
 
     assert usage.media_calls == 0
@@ -437,14 +362,13 @@ def test_unusable_provider_tokens_zero_out_without_losing_the_row(bad_tokens) ->
     # The row must survive a malformed token count: the provider call happened
     # and is billable by its quantity even when the token fields are junk.
     #
-    # Scoped to what `_coerce_int` handles today. Booleans, negatives and
-    # overflowing values (`int(float("inf"))` raises) are NOT sanitised yet —
-    # that hardening belongs with the TokenUsage work split out of #1422, since
-    # `_coerce_int` is shared with every LLM adapter and changing it is not a
-    # media-billing change. Tracked in #1526.
+    # Overflow IS handled now — see test_overflowing_provider_tokens_keep_the_row.
+    # Booleans still coerce to 0/1 in the shared `_coerce_int`, which is
+    # deliberate: `add_token_usage` does `if input_tokens:`, so flooring there
+    # would flip a real value from "added" to "silently skipped" on the live LLM
+    # path. Negatives are clamped at the media boundary instead.
     usage = TokenUsage()
     usage.record_media_call(
-        unit="images",
         quantity=1,
         call_type="generate_image",
         input_tokens=bad_tokens,
@@ -462,7 +386,6 @@ def test_unusable_provider_tokens_zero_out_without_losing_the_row(bad_tokens) ->
 def test_valid_provider_tokens_survive() -> None:
     usage = TokenUsage()
     usage.record_media_call(
-        unit="images",
         quantity=1,
         call_type="generate_image",
         input_tokens=11,
@@ -498,7 +421,7 @@ def test_requests_error_reports_the_value_the_caller_passed() -> None:
     # value would report "got 0.0" for a caller who passed -1.
     usage = TokenUsage()
     with pytest.raises(ValueError, match=r"got -1"):
-        usage.record_media_call(unit="requests", quantity=-1, call_type="rerank")
+        usage.record_media_call(quantity=-1, call_type="rerank")
 
 
 @pytest.mark.parametrize(
@@ -524,14 +447,12 @@ def test_media_aggregation_uses_model_id_when_present() -> None:
     # so rows keyed by id always fell through to the name branch in tests.
     with TokenContextManager() as manager:
         add_media_usage(
-            unit="images",
             quantity=1,
             model="display-name",
             model_id="img-1",
             call_type="generate_image",
         )
         add_media_usage(
-            unit="images",
             quantity=2,
             model="",
             model_id="img-1",
@@ -553,7 +474,7 @@ def test_huge_quantity_records_zero_rather_than_dropping_the_row(huge) -> None:
     # An uncaught raise here propagates out and the error-swallowing wrapper
     # drops the whole billing row — the opposite of the reject-to-0.0 contract.
     usage = TokenUsage()
-    usage.record_media_call(unit="images", quantity=huge, call_type="generate_image")
+    usage.record_media_call(quantity=huge, call_type="generate_image")
 
     assert usage.media_calls == 1
     assert usage.details[0]["quantity"] == 0.0
@@ -564,61 +485,7 @@ def test_add_media_usage_reports_the_raw_quantity_in_the_requests_error() -> Non
     # threading the raw value through, a caller passing -1 saw "got 0.0".
     with TokenContextManager():
         with pytest.raises(ValueError, match=r"got -1"):
-            add_media_usage(unit="requests", quantity=-1, model="m", call_type="rerank")
-
-
-@pytest.mark.parametrize(
-    ("unit", "call_type"),
-    [
-        ("images", "video"),  # video bills in seconds
-        ("seconds", "tts"),  # tts bills in characters
-        ("images", "asr"),
-        ("requests", "embedding"),  # embedding bills per text
-    ],
-)
-def test_unit_must_match_the_modality(unit, call_type) -> None:
-    # "The unit is a property of the modality" was stated in three docstrings and
-    # violated by six call sites in this file. MEDIA_UNIT_BY_CALL_TYPE turns the
-    # invariant into an enforced constraint: a (model, unit) price table is only
-    # usable if one modality never reports two units.
-    usage = TokenUsage()
-    with pytest.raises(ValueError, match="bills in"):
-        usage.record_media_call(unit=unit, quantity=1, call_type=call_type)
-
-    assert usage.media_calls == 0
-    assert usage.details == []
-
-
-@pytest.mark.parametrize(
-    ("call_type", "unit"),
-    [
-        ("generate_image", "images"),
-        ("edit_image", "images"),
-        ("video", "seconds"),
-        ("asr", "seconds"),
-        ("music", "seconds"),
-        ("sound_effect", "seconds"),
-        ("tts", "characters"),
-        ("embedding", "texts"),
-        ("rerank", "requests"),
-    ],
-)
-def test_every_call_type_accepts_its_own_unit(call_type, unit) -> None:
-    # The mapping must cover every MediaCallType member, or a legitimate
-    # producer would be rejected.
-    usage = TokenUsage()
-    usage.record_media_call(unit=unit, quantity=1, call_type=call_type)
-
-    assert usage.details[0]["unit"] == unit
-
-
-def test_unit_is_unconstrained_when_call_type_is_omitted() -> None:
-    # call_type is optional metadata; with none given there is no modality to
-    # check the unit against.
-    usage = TokenUsage()
-    usage.record_media_call(unit="images", quantity=1)
-
-    assert usage.details[0]["unit"] == "images"
+            add_media_usage(quantity=-1, model="m", call_type="rerank")
 
 
 @pytest.mark.parametrize("overflowing", [float("inf"), float("-inf")])
@@ -630,7 +497,6 @@ def test_overflowing_provider_tokens_keep_the_row(overflowing) -> None:
     # malformed payload reaches this boundary unfiltered.
     usage = TokenUsage()
     usage.record_media_call(
-        unit="images",
         quantity=1,
         call_type="generate_image",
         input_tokens=overflowing,
@@ -644,16 +510,129 @@ def test_overflowing_provider_tokens_keep_the_row(overflowing) -> None:
     assert entry["provider_output_tokens"] == 0
 
 
-@pytest.mark.parametrize("unusable", [-1, -0.5, -1000.0, True, False])
+@pytest.mark.parametrize("unusable", [-1, -0.5, -1000.0, True, float("nan")])
 def test_unusable_quantity_records_zero(unusable) -> None:
     # A negative quantity would subtract from a bill, and a bool is a caller bug
     # rather than a count of 1 or 0 — `True` would otherwise bill one image.
     # Recorded as 0 rather than rejected, because the provider call still
     # happened: the row is the evidence, and 0 marks it unmeasured.
     usage = TokenUsage()
-    usage.record_media_call(
-        unit="images", quantity=unusable, call_type="generate_image"
-    )
+    usage.record_media_call(quantity=unusable, call_type="generate_image")
 
     assert usage.media_calls == 1
     assert usage.details[0]["quantity"] == 0.0
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"), "abc"])
+def test_coerce_int_change_is_safe_on_the_llm_token_path(bad) -> None:
+    # This PR's one functional change to pre-existing code adds OverflowError to
+    # `_coerce_int`, which `add_token_usage`, `extract_cached_input_tokens` and
+    # `aggregate_token_usage_by_model` all use on the live LLM path. At base
+    # `_coerce_int(float("inf"))` raised; it must now record 0 without raising.
+    with TokenContextManager() as manager:
+        add_token_usage(
+            input_tokens=bad, output_tokens=bad, model="m", call_type="chat"
+        )  # type: ignore[arg-type]
+        usage = manager.get_usage()
+
+    assert usage.input_tokens == 0
+    assert usage.output_tokens == 0
+
+
+@pytest.mark.parametrize("bad_call_type", ["not-a-type", "IMAGES", "", None])
+def test_unknown_call_type_is_rejected_and_required(bad_call_type) -> None:
+    # call_type is the only identity now — the unit is derived from it — so an
+    # unknown or missing value has nothing to derive from and must be rejected
+    # rather than silently skipping enforcement, which is what an optional
+    # call_type did in the earlier design.
+    usage = TokenUsage()
+    with pytest.raises(ValueError):
+        usage.record_media_call(call_type=bad_call_type, quantity=1)  # type: ignore[arg-type]
+
+    assert usage.media_calls == 0
+    assert usage.details == []
+
+
+def test_unit_cannot_be_passed_at_all() -> None:
+    # The whole point of the redesign: a wrong (unit, modality) pair is not
+    # rejected, it is unrepresentable.
+    usage = TokenUsage()
+    with pytest.raises(TypeError):
+        usage.record_media_call(  # type: ignore[call-arg]
+            unit="seconds", call_type="generate_image", quantity=1
+        )
+
+
+@pytest.mark.parametrize("call_type", list(MediaCallType))
+def test_every_call_type_carries_a_unit_and_records_it(call_type) -> None:
+    # Parametrised from the enum itself, not a hand-written list: a new member
+    # added without a unit fails here rather than silently skipping enforcement.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=call_type, quantity=1 if call_type.unit is MediaUnit.REQUESTS else 2
+    )
+
+    assert usage.details[0]["unit"] == call_type.unit.value
+    assert isinstance(call_type.unit, MediaUnit)
+
+
+@pytest.mark.parametrize("truthy_non_bool", ["no", "false", "0", 1, [0], object()])
+def test_tokens_estimated_only_accepts_a_real_true(truthy_non_bool) -> None:
+    # bool() is not enough here: bool("no") and bool("false") are both True, so
+    # a provider adapter forwarding a string flag would mark measured counts as
+    # estimated and let them through billing as guesses. Only an actual True
+    # sets the flag.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.ASR, quantity=1, tokens_estimated=truthy_non_bool
+    )
+
+    assert usage.details[0]["tokens_estimated"] is False
+
+
+def test_tokens_estimated_true_still_sets_the_flag() -> None:
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.ASR, quantity=1, tokens_estimated=True
+    )
+
+    assert usage.details[0]["tokens_estimated"] is True
+
+
+def test_negative_provider_tokens_are_floored_not_subtracted() -> None:
+    # A provider returning a negative token count must not credit the tenant
+    # back tokens it never spent. Floored at the media boundary only, so the
+    # LLM path's `if input_tokens:` keeps seeing real values.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.TTS,
+        quantity=10,
+        input_tokens=-500,
+        output_tokens=-7,
+    )
+    entry = usage.details[0]
+
+    assert entry["provider_input_tokens"] == 0
+    assert entry["provider_output_tokens"] == 0
+    assert entry["provider_tokens"] == 0
+    # The row survives as evidence the call happened.
+    assert entry["quantity"] == 10.0
+
+
+def test_model_identity_is_stripped_so_padding_does_not_split_billing() -> None:
+    # " sd " and "sd" are the same model; leaving the padding in produces two
+    # aggregation groups and two invoice lines for one model.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.GENERATE_IMAGE,
+        quantity=1,
+        model=" sd ",
+        model_id=" s1 ",
+    )
+    usage.record_media_call(
+        call_type=MediaCallType.GENERATE_IMAGE, quantity=1, model="sd", model_id="s1"
+    )
+
+    assert {d["model"] for d in usage.details} == {"sd"}
+    assert {d["model_id"] for d in usage.details} == {"s1"}
+    assert len(aggregate_media_usage_by_model(usage.details)) == 1

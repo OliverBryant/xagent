@@ -42,8 +42,8 @@ def test_record_media_seconds_keeps_unit_stable_when_duration_missing() -> None:
     # Same model, one call with a duration and one without: both must report
     # seconds so billing sees a single line item, not two different units.
     with TokenContextManager() as manager:
-        record_media_seconds(30.0, model="veo", call_type="video")
-        record_media_seconds(None, model="veo", call_type="video")
+        record_media_seconds(30.0, call_type="video", model="veo")
+        record_media_seconds(None, call_type="video", model="veo")
         details = manager.get_usage().details
 
     assert [entry["unit"] for entry in details] == ["seconds", "seconds"]
@@ -61,18 +61,18 @@ def test_record_media_seconds_keeps_unit_stable_when_duration_missing() -> None:
 def test_record_media_seconds_warns_when_unmeasured(caplog) -> None:
     with caplog.at_level("WARNING"):
         with TokenContextManager():
-            record_media_seconds(None, model="veo", call_type="video")
+            record_media_seconds(None, call_type="video", model="veo")
     assert "unmeasured" in caplog.text
 
 
 def test_record_media_usage_never_raises() -> None:
     # Accounting must never break the underlying media call.
     with TokenContextManager() as manager:
-        record_media_usage("seconds", None, model="m", call_type="video")  # type: ignore[arg-type]
+        record_media_usage("video", None, model="m")  # type: ignore[arg-type]
         assert manager.get_usage().media_calls == 1
 
 
-def test_resolve_billing_model_never_returns_a_placeholder() -> None:
+def test_resolve_billing_model_prefers_real_identities_over_the_fallback() -> None:
     """`_configured_model_id`-style lookups return Optional[str]; passing that
     through str() records a model literally named "None"."""
 
@@ -124,7 +124,7 @@ def test_record_media_usage_swallows_invalid_unit(monkeypatch) -> None:
     import xagent.core.tools.core.media_usage as mu
 
     with TokenContextManager() as manager:
-        mu.record_media_usage("not-a-unit", 1, model="m", call_type="tts")
+        mu.record_media_usage("tts", 1, model="m")
         usage = manager.get_usage()
 
     assert usage.media_calls == 0
@@ -135,7 +135,7 @@ def test_record_media_seconds_swallows_invalid_call_type() -> None:
     import xagent.core.tools.core.media_usage as mu
 
     with TokenContextManager() as manager:
-        mu.record_media_seconds(3.0, model="m", call_type="not-a-call-type")
+        mu.record_media_seconds(3.0, call_type="not-a-call-type", model="m")
         usage = manager.get_usage()
 
     assert usage.media_calls == 0
@@ -165,10 +165,9 @@ def test_record_media_usage_forwards_optional_billing_metadata() -> None:
 
     with TokenContextManager() as manager:
         mu.record_media_usage(
-            MediaUnit.IMAGES,
+            MediaCallType.GENERATE_IMAGE,
             1,
             model="m",
-            call_type=MediaCallType.GENERATE_IMAGE,
             resolution="2K",
             input_tokens=7,
             output_tokens=3,
@@ -196,3 +195,88 @@ def test_resolve_billing_model_survives_raising_descriptor() -> None:
             return "real-name"
 
     assert mu.resolve_billing_model(None, _Hostile()) == "real-name"
+
+
+@pytest.mark.parametrize(
+    "call_type",
+    [c for c in MediaCallType if c.unit is not MediaUnit.SECONDS],
+)
+def test_record_media_seconds_rejects_non_duration_modalities(call_type) -> None:
+    # record_media_seconds coerces its argument as a duration and lets the unit
+    # come from the modality. Handing it a modality billed in images or
+    # characters used to record a row whose quantity was a duration but whose
+    # unit said otherwise — a silently mispriced row. Fail loudly instead.
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError, match="record_media_seconds"):
+            mu.record_media_seconds(1.5, model="m", call_type=call_type)
+
+        assert manager.get_usage().details == []
+
+
+@pytest.mark.parametrize(
+    "call_type", [c for c in MediaCallType if c.unit is MediaUnit.SECONDS]
+)
+def test_record_media_seconds_accepts_every_duration_modality(call_type) -> None:
+    import xagent.core.tools.core.media_usage as mu
+
+    with TokenContextManager() as manager:
+        mu.record_media_seconds(1.5, model="m", call_type=call_type)
+        details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["unit"] == "seconds"
+    assert details[0]["quantity"] == 1.5
+
+
+@pytest.mark.parametrize(
+    "overflowing",
+    [
+        # float() of a too-large int raises OverflowError, not ValueError. A
+        # 400-digit integer literal is exactly what json.loads yields for an
+        # oversized JSON number in a provider response.
+        10**400,
+        -(10**400),
+        # These convert fine and are caught by the isfinite guard instead.
+        float("inf"),
+        float("-inf"),
+        float("nan"),
+        "1e400",
+    ],
+)
+def test_coerce_duration_survives_non_finite_values(overflowing) -> None:
+    # int(float("inf")) raises OverflowError, not ValueError; an ASR provider
+    # reporting a non-finite duration must degrade to an unmeasured row rather
+    # than break the transcription call it is measuring.
+    import xagent.core.tools.core.media_usage as mu
+
+    # None, not 0.0: the helper's documented contract distinguishes "provider
+    # reported no duration" from "provider reported zero seconds".
+    assert mu.coerce_duration(overflowing) is None
+
+    with TokenContextManager() as manager:
+        mu.record_media_seconds(
+            mu.coerce_duration(overflowing), model="m", call_type=MediaCallType.ASR
+        )
+        details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["quantity"] == 0.0
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+def test_record_media_seconds_leaves_empty_call_types_to_the_primitive(empty) -> None:
+    # An absent call_type has no modality to check the unit against, so the
+    # duration guard must not claim a mismatch. Validation belongs to
+    # add_media_usage, which produces the message listing valid options -- and
+    # the wrapper swallows it so a media call is never broken by accounting.
+    import xagent.core.tools.core.media_usage as mu
+
+    assert mu._resolved_call_type(empty) is None
+
+    with TokenContextManager() as manager:
+        mu.record_media_seconds(1.5, model="m", call_type=empty)
+
+        # Swallowed, not raised, and no half-written row left behind.
+        assert manager.get_usage().details == []

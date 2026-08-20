@@ -20,8 +20,12 @@ producer must satisfy all of these:
 3. **The unit is a property of the modality, never of the response.** A
    duration-billed modality always reports seconds, recording ``quantity=0``
    when unmeasured rather than switching units.
-4. **Never bill a placeholder identity.** ``"default"``, ``"None"`` and ``""``
-   are not models; resolve through :func:`resolve_billing_model`.
+4. **Never bill a placeholder identity** — with one documented hole.
+   ``"default"``, ``"None"`` and ``""`` are not models; resolve through
+   :func:`resolve_billing_model`. Note its own ``fallback`` default *is*
+   ``"default"`` and is returned unchecked when nothing else resolves, so the
+   invariant holds for every input it inspects but not for its last resort.
+   Returning an explicit unresolved result instead is tracked in #1460.
 
 Model identity convention
 -------------------------
@@ -64,6 +68,12 @@ def resolve_billing_model(
     that through ``str()`` records a model literally named ``"None"``. Prefer
     the configured id, fall back to the provider's own ``model_name``/``model``
     attribute, and only then to ``fallback``.
+
+    Caveat: ``fallback`` is returned as given, without the placeholder check
+    applied to ``configured_id`` — and its own default is ``"default"``, which
+    the module invariant forbids. Callers that care pass a real identity (the
+    provider class name, say). Changing the return shape to express "unresolved"
+    is tracked in #1460.
     """
 
     # The placeholder filter applies to the configured id too: a config that
@@ -84,6 +94,30 @@ def resolve_billing_model(
     return fallback
 
 
+def _resolved_call_type(
+    call_type: MediaCallType | str | None,
+) -> Optional[MediaCallType]:
+    """The enum member for ``call_type``, or None if it is unknown or empty.
+
+    Unknown values are left to ``add_media_usage``'s own validation, which
+    produces a better message listing the valid options.
+    """
+    if isinstance(call_type, MediaCallType):
+        return call_type
+    # Narrowed here rather than leaning on MediaCallType(None) happening to
+    # raise: an omitted call_type has no modality, which is a different thing
+    # from an unknown one. Validation with a good message belongs to
+    # add_media_usage either way.
+    if not call_type:
+        return None
+    try:
+        # mypy reads the multi-argument __new__ that attaches each member's unit
+        # as the constructor signature; reverse lookup by value takes one.
+        return MediaCallType(call_type)  # type: ignore[call-arg]
+    except ValueError:
+        return None
+
+
 def coerce_duration(value: object) -> Optional[float]:
     """A positive duration in seconds, or None when unusable.
 
@@ -96,7 +130,12 @@ def coerce_duration(value: object) -> Optional[float]:
         return None
     try:
         seconds = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: float(10**400) raises it, and json.loads of a 400-digit
+        # integer literal yields exactly that. This helper is documented to be
+        # called at the producer's tool call site, outside the swallow, so an
+        # uncaught raise would break the media call. _coerce_float and
+        # _coerce_int both catch it; these three must stay in step.
         return None
     # ``inf > 0`` is True, so non-finite values would otherwise pass as a
     # usable duration and reach the record as a non-JSON-serialisable
@@ -108,12 +147,11 @@ def coerce_duration(value: object) -> Optional[float]:
 
 
 def record_media_usage(
-    unit: MediaUnit | str | None,
+    call_type: MediaCallType | str,
     quantity: float,
     *,
     model: str = "",
     model_id: str = "",
-    call_type: MediaCallType | str | None = "",
     resolution: str = "",
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -122,19 +160,18 @@ def record_media_usage(
     """Record one media model call; swallow any error.
 
     Includes the ``ValueError`` ``add_media_usage`` raises for an unknown
-    ``unit``/``call_type``: a metering bug must never break the media call the
-    user actually asked for. The record is dropped and logged rather than
+    ``call_type`` or a bad ``REQUESTS`` quantity: a metering bug must never
+    break the media call the user actually asked for. The record is dropped and logged rather than
     written under a bogus billing dimension, which is unrepairable once
     persisted — so a typo surfaces as a missing row plus this warning, not as a
     silently mis-billed one.
     """
     try:
         add_media_usage(
-            unit=unit,
+            call_type=call_type,
             quantity=quantity,
             model=model,
             model_id=model_id,
-            call_type=call_type,
             resolution=resolution,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -147,10 +184,9 @@ def record_media_usage(
         # after the fact, so a metering bug needs to be diagnosable from the log
         # alone.
         logger.warning(
-            "Failed to record media usage: call_type=%r unit=%r quantity=%r "
+            "Failed to record media usage: call_type=%r quantity=%r "
             "model=%r model_id=%r: %s",
             call_type,
-            unit,
             quantity,
             model,
             model_id,
@@ -162,19 +198,34 @@ def record_media_usage(
 def record_media_seconds(
     seconds: Optional[float],
     *,
+    call_type: MediaCallType | str,
     model: str = "",
     model_id: str = "",
-    call_type: MediaCallType | str | None = "",
 ) -> None:
     """Record a duration-billed media call, keeping the unit stable.
 
-    Duration-billed modalities (video/ASR/music/sound effect) must always
-    report ``MediaUnit.SECONDS``: a price table keyed on (model, unit) breaks
-    if the same model sometimes reports "requests" just because the provider
-    omitted a duration. When the duration is unknown the call is still recorded
-    — as ``seconds`` with ``quantity=0`` and a warning — so the event is
-    visible to billing as unmeasured rather than silently mis-dimensioned.
+    Duration-billed modalities (video/ASR/music/sound effect) always report
+    ``MediaUnit.SECONDS``: a price table keyed on (model, unit) breaks if the
+    same model sometimes reports "requests" just because the provider omitted a
+    duration. When the duration is unknown the call is still recorded — as
+    ``seconds`` with ``quantity=0`` and a warning — so the event reaches billing
+    as unmeasured rather than silently mis-dimensioned.
+
+    Raises:
+        ValueError: If ``call_type`` does not bill in seconds. This is the one
+            place a caller can create that mismatch, since the unit here is
+            fixed rather than derived, and getting it wrong would discard a
+            fully measured billing row. Raised loudly so a producer sees it in
+            their own tests; ``record_media_usage`` is the swallow boundary for
+            everything downstream of this check.
     """
+    resolved = _resolved_call_type(call_type)
+    if resolved is not None and resolved.unit is not MediaUnit.SECONDS:
+        raise ValueError(
+            f"record_media_seconds is for duration-billed modalities, but "
+            f"{resolved.value!r} bills in {resolved.unit.value!r}; use "
+            f"record_media_usage instead"
+        )
     if seconds is None:
         logger.warning(
             "No duration reported for %s call on model %r; recording 0 seconds "
@@ -183,9 +234,8 @@ def record_media_seconds(
             model,
         )
     record_media_usage(
-        MediaUnit.SECONDS,
+        call_type,
         seconds or 0.0,
         model=model,
         model_id=model_id,
-        call_type=call_type,
     )

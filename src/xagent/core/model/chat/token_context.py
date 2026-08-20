@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Sentinel: "argument not supplied", distinct from any value a caller could pass.
-_UNSET: Any = object()
 
 
 class MediaUnit(str, Enum):
@@ -44,61 +43,49 @@ class MediaUnit(str, Enum):
 
 
 class MediaCallType(str, Enum):
-    """Modality/operation that produced a media usage entry."""
+    """Modality/operation that produced a media usage entry.
 
-    GENERATE_IMAGE = "generate_image"
-    EDIT_IMAGE = "edit_image"
-    VIDEO = "video"
-    TTS = "tts"
-    ASR = "asr"
-    MUSIC = "music"
-    SOUND_EFFECT = "sound_effect"
-    EMBEDDING = "embedding"
-    RERANK = "rerank"
+    Each member carries the unit it bills in, reachable as ``.unit``. That makes
+    a wrong (unit, modality) pair unrepresentable rather than merely rejected:
+    the unit is a property of the modality, never of the response, so a
+    duration-billed call whose length is unknown records ``seconds`` with
+    ``quantity=0`` rather than degrading to ``requests``. A ``(model, unit)``
+    price table is unusable if one modality can report two units.
 
-
-#: The billable unit each modality reports. This is what makes a price table
-#: keyed on (model, unit) usable: the unit is a property of the modality, never
-#: of how complete a particular response happened to be. A duration-billed call
-#: whose length is unknown records ``seconds`` with ``quantity=0``, it does not
-#: fall back to ``requests``.
-#:
-#: Enforced at the write boundary rather than only documented — the invariant was
-#: stated in three docstrings and still violated by six call sites in this
-#: module's own tests (``images`` paired with ``video``).
-MEDIA_UNIT_BY_CALL_TYPE: Dict[str, "MediaUnit"] = {
-    MediaCallType.GENERATE_IMAGE.value: MediaUnit.IMAGES,
-    MediaCallType.EDIT_IMAGE.value: MediaUnit.IMAGES,
-    MediaCallType.VIDEO.value: MediaUnit.SECONDS,
-    MediaCallType.ASR.value: MediaUnit.SECONDS,
-    MediaCallType.MUSIC.value: MediaUnit.SECONDS,
-    MediaCallType.SOUND_EFFECT.value: MediaUnit.SECONDS,
-    MediaCallType.TTS.value: MediaUnit.CHARACTERS,
-    MediaCallType.EMBEDDING.value: MediaUnit.TEXTS,
-    MediaCallType.RERANK.value: MediaUnit.REQUESTS,
-}
-
-_MEDIA_UNIT_VALUES = frozenset(member.value for member in MediaUnit)
-_MEDIA_CALL_TYPE_VALUES = frozenset(member.value for member in MediaCallType)
-
-
-def _validated_media_unit(unit: "MediaUnit | str | None") -> str:
-    """Normalise ``unit`` to a known :class:`MediaUnit` value.
-
-    A typo'd unit silently mints a new billing dimension that
-    :func:`aggregate_media_usage_by_model` will happily key off, and a usage
-    record cannot be repaired retroactively once written. Rejecting at the
-    write boundary is the only point where the error is still fixable.
+    Stating that rule in docstrings was tried and did not hold — an earlier
+    revision of this work had three docstrings asserting it and ten call sites
+    in its own tests violating it. Deriving the unit removes the opportunity.
     """
-    if unit is None:
-        raise ValueError("Media unit cannot be None")
-    value = unit.value if isinstance(unit, MediaUnit) else str(unit)
-    if value not in _MEDIA_UNIT_VALUES:
-        raise ValueError(
-            f"Unknown media unit {value!r}; expected one of "
-            f"{sorted(_MEDIA_UNIT_VALUES)}"
-        )
-    return value
+
+    # Declared so the payload set in __new__ is a typed attribute rather than
+    # one mypy has to infer through the enum metaclass.
+    _unit: "MediaUnit"
+
+    def __new__(cls, value: str, unit: "MediaUnit") -> "MediaCallType":
+        # str.__new__ so the member stays a real str: `.value`, equality with a
+        # plain string, JSON serialisation and dict-key use are all unchanged.
+        member = str.__new__(cls, value)
+        member._value_ = value
+        member._unit = unit
+        return member
+
+    @property
+    def unit(self) -> "MediaUnit":
+        """The billable dimension this modality reports in."""
+        return self._unit
+
+    GENERATE_IMAGE = ("generate_image", MediaUnit.IMAGES)
+    EDIT_IMAGE = ("edit_image", MediaUnit.IMAGES)
+    VIDEO = ("video", MediaUnit.SECONDS)
+    TTS = ("tts", MediaUnit.CHARACTERS)
+    ASR = ("asr", MediaUnit.SECONDS)
+    MUSIC = ("music", MediaUnit.SECONDS)
+    SOUND_EFFECT = ("sound_effect", MediaUnit.SECONDS)
+    EMBEDDING = ("embedding", MediaUnit.TEXTS)
+    RERANK = ("rerank", MediaUnit.REQUESTS)
+
+
+_MEDIA_CALL_TYPE_VALUES = frozenset(member.value for member in MediaCallType)
 
 
 def _validated_media_call_type(call_type: "MediaCallType | str | None") -> str:
@@ -134,10 +121,22 @@ class TokenUsage:
     llm_calls: int = 0
     tool_calls: int = 0
     details: List[Dict] = field(default_factory=list)
-    # Appended after the legacy fields and keyword-only, so the historical
-    # positional signature — TokenUsage(input, output, llm_calls, tool_calls,
-    # details) — keeps binding the way existing callers expect.
-    media_calls: int = field(default=0, kw_only=True)
+
+    @property
+    def media_calls(self) -> int:
+        """Number of media rows, derived rather than stored.
+
+        Mirrors ``total_tokens``. A stored counter has to be threaded through
+        every constructor, copy and seed path — ``TaskTracker`` has three — and
+        an earlier revision of this work dropped it in exactly those places,
+        reporting 0 while the rows survived. There is no DB column for it, so
+        deriving it makes that class of drift impossible.
+        """
+        return sum(
+            1
+            for item in self.details
+            if isinstance(item, dict) and item.get("type") == "media"
+        )
 
     @property
     def total_tokens(self) -> int:
@@ -192,67 +191,63 @@ class TokenUsage:
 
     def record_media_call(
         self,
-        unit: "MediaUnit | str | None",
+        call_type: "MediaCallType | str",
         quantity: float,
         model: str = "",
-        call_type: "MediaCallType | str | None" = "",
         model_id: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
         resolution: str = "",
         tokens_estimated: bool = False,
-        _raw_quantity: Any = _UNSET,
     ) -> None:
-        """Count the call and append its detail under one lock acquisition.
+        """Count the call and append its detail. The only media write path.
 
-        The only media write path: one function bumps the counter and appends
-        the row, so the two cannot drift apart. Consumers derive per-model rows
-        from ``details`` and the call count from the scalar, so those two must
-        always describe the same set of calls.
+        One function bumps the counter and appends the row, so the two cannot
+        drift apart: consumers derive per-model rows from ``details`` and the
+        call count from the scalar, and those must describe the same calls.
 
-        Not thread-safe on its own — ``TokenUsage`` has never been, for its
-        pre-existing counters either. Making the pairing atomic under
-        concurrency is tracked separately (see the issue in the PR body); it is
-        a change to a class used well beyond media billing and does not belong
-        in this slice.
+        The unit is not a parameter — it is derived from ``call_type``, so a
+        mismatched pair cannot be expressed. ``call_type`` is required for the
+        same reason: without it there is nothing to derive from.
+
+        **Not atomic and not thread-safe.** ``TokenUsage`` has no lock, for its
+        pre-existing ``tool_calls`` and token counters either, so a concurrent
+        reader can observe the counter bumped without its row (or the reverse).
+        Making the pairing atomic touches a class used well beyond media
+        billing and is tracked in #1526, out of scope here.
         """
-        unit_value = _validated_media_unit(unit)
         call_type_value = _validated_media_call_type(call_type)
-        # Validated here rather than only in the module-level
-        # ``add_media_usage``: this is the actual write boundary, so a direct
-        # caller holding a TokenUsage gets the same guarantees instead of
-        # persisting a boolean, negative, or non-finite quantity that cannot be
-        # repaired later.
-        # _raw_quantity lets the module-level add_media_usage, which coerces one
-        # layer up, report what its own caller actually passed.
-        raw_quantity = quantity if _raw_quantity is _UNSET else _raw_quantity
+        unit_value = MediaCallType(call_type_value).unit.value  # type: ignore[call-arg]
+        # Coerced here rather than only in the module-level ``add_media_usage``:
+        # this is the actual write boundary, so a caller holding a TokenUsage
+        # gets the same guarantees instead of persisting a boolean, negative or
+        # non-finite quantity that cannot be repaired once written.
+        #
+        # The raw value is kept only to name what the caller actually passed in
+        # the REQUESTS error below; no layer above coerces first.
+        raw_quantity = quantity
         quantity = _coerce_float(quantity)
-        # REQUESTS is defined as exactly one provider call, so its quantity is
-        # not a free variable. Letting 0/0.5/2 through would make the billable
-        # quantity disagree with the media_calls/aggregate `calls` count derived
-        # from the same row — quota and pricing would then read different
+        # REQUESTS means exactly one provider call, so its quantity is not a
+        # free variable. Letting 0/0.5/2 through would make the billable
+        # quantity disagree with the media_calls / aggregate `calls` count
+        # derived from the same row, so quota and pricing would read different
         # numbers off one record. Raised rather than clamped: a caller passing
-        # something else has a real bug, and silently rewriting it hides that.
-        # Producers route through ``media_usage.record_media_usage``, which
-        # swallows this so an accounting bug still cannot break a media call.
-        # Rejecting before the lock is taken means a bad call leaves no state at
-        # all — neither a counter bump nor an orphan row.
-        expected_unit = MEDIA_UNIT_BY_CALL_TYPE.get(call_type_value)
-        if expected_unit is not None and unit_value != expected_unit.value:
-            raise ValueError(
-                f"call_type {call_type_value!r} bills in "
-                f"{expected_unit.value!r}, not {unit_value!r}; the unit is a "
-                f"property of the modality, so a (model, unit) price table "
-                f"breaks if one modality reports two units"
-            )
+        # something else has a real bug and silently rewriting it hides that.
+        # Rejecting before any mutation means a bad call leaves no state at all
+        # — neither a counter bump nor an orphan row. Producers route through
+        # ``media_usage.record_media_usage``, which swallows this so an
+        # accounting bug still cannot break the user's media call.
         if unit_value == MediaUnit.REQUESTS.value and quantity != 1.0:
             raise ValueError(
                 f"MediaUnit.REQUESTS means exactly one call, so quantity must "
                 f"be 1; got {raw_quantity!r}"
             )
-        input_tokens = _coerce_int(input_tokens)
-        output_tokens = _coerce_int(output_tokens)
-        self.media_calls += 1
+        # max(0, ...) at the media boundary only: _coerce_int itself must keep
+        # returning negatives, because add_token_usage does `if input_tokens:`
+        # and flooring there would flip a real negative from "added" to
+        # "silently skipped" on the live LLM path.
+        input_tokens = max(0, _coerce_int(input_tokens))
+        output_tokens = max(0, _coerce_int(output_tokens))
         self.details.append(
             {
                 "type": "media",
@@ -261,9 +256,21 @@ class TokenUsage:
                 "provider_tokens": input_tokens + output_tokens,
                 "provider_input_tokens": input_tokens,
                 "provider_output_tokens": output_tokens,
-                "tokens_estimated": tokens_estimated,
-                "model": model,
-                "model_id": model_id,
+                # `is True`, not bool(...): the aggregator tests this for
+                # truthiness, so a provider string would mark the group
+                # estimated and real measured usage would go unbilled. bool()
+                # fixes the stored *type* but not that: bool("no") is True.
+                # Only a genuine True means estimated; anything else is treated
+                # as provider-reported, which is the safe default because
+                # billing refuses to price estimates.
+                "tokens_estimated": tokens_estimated is True,
+                # Stripped here, the only media write path: the aggregate strips
+                # when grouping, so an unstripped raw row would disagree with
+                # the rollup's view of it and miss a price-table join.
+                "model": model.strip() if isinstance(model, str) else model,
+                "model_id": (
+                    model_id.strip() if isinstance(model_id, str) else model_id
+                ),
                 "call_type": call_type_value,
                 "resolution": resolution,
             }
@@ -282,7 +289,6 @@ class TokenUsage:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.llm_calls += other.llm_calls
-        self.media_calls += other.media_calls
         self.tool_calls += other.tool_calls
         self.details.extend(other.details)
 
@@ -305,7 +311,6 @@ class TokenUsage:
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             llm_calls=data.get("llm_calls", 0),
-            media_calls=data.get("media_calls", 0),
             tool_calls=data.get("tool_calls", 0),
             details=data.get("details", []),
         )
@@ -406,6 +411,49 @@ def _coerce_int(value: Any) -> int:
         if value is not None:
             logger.warning("Discarding non-numeric token count: %r", value)
         return 0
+
+
+def _coerce_float(value: Any) -> float:
+    """A finite, non-negative float; 0.0 if the value isn't a usable quantity.
+
+    Media quantities can be fractional (e.g. audio seconds), so quantity uses
+    this rather than ``_coerce_int``.
+
+    Rejects what a billable quantity can never be, because this is the last
+    boundary before the value is persisted and it cannot be repaired
+    afterwards:
+
+    * ``bool`` — ``True``/``False`` are almost certainly a caller bug, not a
+      quantity of 1 or 0.
+    * negatives — no modality can consume a negative amount, and a negative
+      would subtract from a bill.
+    * ``NaN``/``inf`` — these are not JSON-serialisable, so they would produce
+      literal ``NaN``/``Infinity`` tokens in the persisted task and quota
+      details that strict parsers reject.
+
+    A rejected value records 0.0, matching the "call happened but is
+    unmeasured" convention rather than dropping the record entirely.
+    """
+    if isinstance(value, bool):
+        logger.warning("Discarding boolean media quantity: %r", value)
+        return 0.0
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError, not just TypeError/ValueError: float(10**400) raises it,
+        # and an uncaught raise here would propagate out and drop the whole
+        # billing row — the opposite of this function's reject-to-0.0 contract.
+        # _coerce_int already catches it; these two must stay in step.
+        if value is not None:
+            logger.warning("Discarding non-numeric media quantity: %r", value)
+        return 0.0
+    if not math.isfinite(result):
+        logger.warning("Discarding non-finite media quantity: %r", value)
+        return 0.0
+    if result < 0:
+        logger.warning("Discarding negative media quantity: %r", value)
+        return 0.0
+    return result
 
 
 def _usage_field(usage: Any, name: str) -> Any:
@@ -611,49 +659,6 @@ def get_and_reset_token_usage() -> TokenUsage:
     return usage
 
 
-def _coerce_float(value: Any) -> float:
-    """A finite, non-negative float; 0.0 if the value isn't a usable quantity.
-
-    Media quantities can be fractional (e.g. audio seconds), so quantity uses
-    this rather than ``_coerce_int``.
-
-    Rejects what a billable quantity can never be, because this is the last
-    boundary before the value is persisted and it cannot be repaired
-    afterwards:
-
-    * ``bool`` — ``True``/``False`` are almost certainly a caller bug, not a
-      quantity of 1 or 0.
-    * negatives — no modality can consume a negative amount, and a negative
-      would subtract from a bill.
-    * ``NaN``/``inf`` — these are not JSON-serialisable, so they would produce
-      literal ``NaN``/``Infinity`` tokens in the persisted task and quota
-      details that strict parsers reject.
-
-    A rejected value records 0.0, matching the "call happened but is
-    unmeasured" convention rather than dropping the record entirely.
-    """
-    if isinstance(value, bool):
-        logger.warning("Discarding boolean media quantity: %r", value)
-        return 0.0
-    try:
-        result = float(value)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError, not just TypeError/ValueError: float(10**400) raises it,
-        # and an uncaught raise here would propagate out and drop the whole
-        # billing row — the opposite of this function's reject-to-0.0 contract.
-        # _coerce_int already catches it; these two must stay in step.
-        if value is not None:
-            logger.warning("Discarding non-numeric media quantity: %r", value)
-        return 0.0
-    if not math.isfinite(result):
-        logger.warning("Discarding non-finite media quantity: %r", value)
-        return 0.0
-    if result < 0:
-        logger.warning("Discarding negative media quantity: %r", value)
-        return 0.0
-    return result
-
-
 def estimate_media_tokens(text: Any) -> int:
     """Language-aware token estimate for providers that report no usage.
 
@@ -695,7 +700,16 @@ def estimate_media_tokens(text: Any) -> int:
                 or 0x3000 <= code <= 0x303F  # CJK punctuation (、。「」etc.)
                 or 0x3040 <= code <= 0x30FF  # Japanese kana
                 or 0xAC00 <= code <= 0xD7AF  # Hangul syllables
-                or 0xFF00 <= code <= 0xFFEF  # Fullwidth / halfwidth forms
+                or 0x3100 <= code <= 0x312F  # Bopomofo
+                or 0xF900 <= code <= 0xFAFF  # CJK Compatibility Ideographs
+                or 0xFF61 <= code <= 0xFFEF  # Halfwidth/fullwidth forms
+                # U+FF01-FF5E is fullwidth ASCII, which mixes two rates in one
+                # block: fullwidth *letters and digits* tokenize like Latin
+                # (billing "ＡＢＣＤ" per character over-counts ~4x), while
+                # fullwidth *punctuation* like （）：！ appears in CJK text and
+                # tokenizes per character. Split on the character itself rather
+                # than on the block.
+                or (0xFF01 <= code <= 0xFF5E and not char.isalnum())
             ):
                 cjk += 1
             else:
@@ -796,10 +810,9 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
 
 
 def add_media_usage(
-    unit: "MediaUnit | str | None",
+    call_type: "MediaCallType | str",
     quantity: float,
     model: str = "",
-    call_type: "MediaCallType | str | None" = "",
     model_id: str = "",
     input_tokens: int = 0,
     output_tokens: int = 0,
@@ -808,81 +821,52 @@ def add_media_usage(
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
-    Mirrors ``add_token_usage`` for image/video/tts/asr/embedding/rerank and
-    any other non-chat modality. The resulting ``type:"media"`` detail entry
-    flows through the same ``TokenUsage.details`` list into DB persistence and
-    the quota ``delta_details`` contract, so callers need only this one call.
+    Mirrors ``add_token_usage`` for image/video/tts/asr/embedding/rerank and any
+    other non-chat modality. The resulting ``type:"media"`` detail entry flows
+    through the same ``TokenUsage.details`` list into DB persistence and the
+    quota ``delta_details`` contract, so callers need only this one call.
 
     Args:
-        unit: Billable dimension; see :class:`MediaUnit`. Must be stable for a
-            given (model, call_type) — never vary it by response completeness.
-        quantity: Amount of ``unit`` consumed (may be fractional, e.g. seconds).
-            Always 1 for ``MediaUnit.REQUESTS``.
+        call_type: Modality/operation; see :class:`MediaCallType`. Required, and
+            the billable unit is derived from it, so a mismatched (unit,
+            modality) pair cannot be expressed.
+        quantity: Amount of the derived unit consumed (may be fractional, e.g.
+            seconds). Always 1 when the unit is ``MediaUnit.REQUESTS``.
         model: Model name for tracking.
-        call_type: Modality/operation; see :class:`MediaCallType`.
         model_id: Unique model id (disambiguates identically-named models).
         input_tokens: Provider-reported input tokens; 0 if none.
         output_tokens: Provider-reported output tokens; 0 if none.
         resolution: Size tier ("1K"/"2K"/"4K" or "1024x1024") for image models
             whose price varies by resolution; "" when not applicable.
             Token-reporting providers (Gemini / OpenAI gpt-image) also fill
-            input/output_tokens, recorded as raw ``provider_tokens`` for a future
-            consumer. Deliberately NOT claimed as a pricing rule: nothing here
-            expresses or enforces "price by tokens instead of by unit", the row
-            schema carries no such discriminator, and the aggregate groups purely
-            by (model, unit, call_type, resolution). Defining that precedence is
-            tracked in #1461, with the first pricing consumer.
+            input/output_tokens, recorded as raw ``provider_tokens`` for a
+            future consumer. Deliberately NOT claimed as a pricing rule:
+            nothing here expresses or enforces "price by tokens instead of by
+            unit", the row schema carries no such discriminator, and the
+            aggregate groups purely by (model, unit, call_type, resolution).
+            Defining that precedence is tracked in #1461.
         tokens_estimated: True when the token counts are a local heuristic
             rather than provider-reported, so billing can refuse to price them.
 
     Raises:
-        ValueError: If ``unit`` or ``call_type`` is not a known
-            :class:`MediaUnit` / :class:`MediaCallType` value, or if ``unit`` is
-            ``MediaUnit.REQUESTS`` and ``quantity`` is not exactly 1. The first
-            two are checked here, before the context is touched; the REQUESTS
-            constraint is enforced inside :meth:`TokenUsage.record_media_call`,
-            which still rejects before taking its lock, so no partial state is
-            left either way. Producers route through
-            ``media_usage.record_media_usage``, which swallows all three so an
+        ValueError: If ``call_type`` is not a known :class:`MediaCallType`
+            value, or if its unit is ``MediaUnit.REQUESTS`` and ``quantity`` is
+            not exactly 1. Both are rejected before any mutation, so a bad call
+            leaves no state behind. Producers route through
+            ``media_usage.record_media_usage``, which swallows both so an
             accounting bug can never break the underlying media call.
     """
-    # Coerce defensively so a provider returning a malformed count can never
-    # crash the underlying media call over accounting.
-    # Keep the caller's raw value for the REQUESTS error message below:
-    # record_media_call reports what it was handed, which by then is already
-    # coerced, so -1 would surface as "got 0.0" without this.
-    raw_quantity = quantity
-    quantity = _coerce_float(quantity)
-    input_tokens = _coerce_int(input_tokens)
-    output_tokens = _coerce_int(output_tokens)
-    # Validate before touching the context: a rejected unit must not leave
-    # media_calls incremented with no matching detail entry behind it.
-    # Plain strings keep the details list JSON-serialisable whether the caller
-    # passed an enum member or a bare string.
-    unit_value = _validated_media_unit(unit)
-    call_type_value = _validated_media_call_type(call_type)
-
+    # No pre-coercion here: record_media_call coerces at the write boundary, and
+    # forwarding the caller's raw value lets it report what was actually passed
+    # in the REQUESTS error message.
     usage = get_token_usage()
-    # One locked operation: see TokenUsage.record_media_call for why the count
-    # and its detail row must not be observable apart.
     usage.record_media_call(
-        _raw_quantity=raw_quantity,
-        unit=unit_value,
+        call_type=call_type,
         quantity=quantity,
         model=model,
-        call_type=call_type_value,
         model_id=model_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         resolution=resolution,
         tokens_estimated=tokens_estimated,
-    )
-
-    logger.debug(
-        f"Media usage added: unit={unit_value}, quantity={quantity}, "
-        f"resolution={resolution}, model={model}, model_id={model_id}, "
-        f"call_type={call_type_value}, "
-        f"provider_tokens={input_tokens + output_tokens}"
-        f"{' (estimated)' if tokens_estimated else ''}, "
-        f"total_media_calls={usage.media_calls}"
     )

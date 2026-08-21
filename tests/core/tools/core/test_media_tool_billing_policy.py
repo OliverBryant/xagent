@@ -154,3 +154,160 @@ async def test_asr_usage_meters_duration_with_verbose() -> None:
     # Name-keyed identity across all three ASR entry points; see PR body.
     assert entries[0]["model"] == "asr-a"
     assert entries[0]["model_id"] == ""
+
+
+# --- ASR duration precedence (resolve_asr_seconds) ---------------------------
+#
+# The producer tests above cover a bare string and one ordered segment. The
+# resolver has several more branches — each provider total field, the fallback
+# to segment ends, unsorted segments and unusable values — and a regression in
+# any of them would silently change the billed quantity while leaving the
+# suite green.
+
+
+@pytest.mark.parametrize("field", ["duration", "audio_duration", "duration_seconds"])
+def test_provider_total_duration_wins_over_segments(field: str) -> None:
+    """A provider total covers trailing silence the last segment end misses."""
+    from xagent.core.model.asr.usage import resolve_asr_seconds
+
+    seconds = resolve_asr_seconds(
+        {field: 30.0},
+        [{"start": 0.0, "end": 2.5}],
+    )
+    assert seconds == 30.0
+
+
+def test_segment_ends_are_used_when_no_provider_total() -> None:
+    from xagent.core.model.asr.usage import resolve_asr_seconds
+
+    assert resolve_asr_seconds({}, [{"start": 0.0, "end": 7.5}]) == 7.5
+
+
+def test_unsorted_segments_take_the_maximum_end() -> None:
+    """Segment order is not guaranteed, so the last element is not the end."""
+    from xagent.core.model.asr.usage import resolve_asr_seconds
+
+    seconds = resolve_asr_seconds(
+        None,
+        [{"start": 5.0, "end": 9.0}, {"start": 0.0, "end": 3.0}],
+    )
+    assert seconds == 9.0
+
+
+@pytest.mark.parametrize("bad", [None, "abc", float("inf"), float("nan"), -1.0, True])
+def test_unusable_provider_total_falls_back_to_segments(bad: Any) -> None:
+    """A non-finite/negative/boolean total must not be billed as a duration."""
+    from xagent.core.model.asr.usage import resolve_asr_seconds
+
+    seconds = resolve_asr_seconds({"duration": bad}, [{"start": 0.0, "end": 4.0}])
+    assert seconds == 4.0
+
+
+def test_no_usable_timing_reports_none() -> None:
+    """None (not 0.0) so the caller can tell "unmeasured" from "zero-length";
+    record_media_seconds turns it into a 0-second row plus a warning."""
+    from xagent.core.model.asr.usage import resolve_asr_seconds
+
+    assert resolve_asr_seconds({}, []) is None
+    assert resolve_asr_seconds(None, None) is None
+    assert resolve_asr_seconds({"duration": None}, [{"start": 0.0, "end": 0.0}]) is None
+
+
+# --- Media identity field shape ---------------------------------------------
+#
+# Convention: `model` carries the human-readable provider name, `model_id` the
+# configured id. Writing the configured id into both (or leaving model_id
+# empty) loses the canonical name for display and external consumers. Each
+# case below uses a provider name and a configured id that differ, so a
+# resolver that returns the id for both fields cannot pass.
+
+
+class _NamedMusicModel:
+    model_name = "music-provider-name"
+
+    async def generate_music(self, **kwargs: Any) -> MusicResult:
+        _ = kwargs
+        return MusicResult(audio=b"x", format="mp3", raw_response={})
+
+
+@pytest.mark.asyncio
+async def test_music_records_provider_name_and_configured_id_separately() -> None:
+    tool = MusicToolCore(models={"configured-music-id": _NamedMusicModel()})
+
+    with TokenContextManager() as manager:
+        await tool.generate_music(prompt="p", music_length_seconds=10)
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "music-provider-name"
+    assert entries[0]["model_id"] == "configured-music-id"
+
+
+class _NamedSoundEffectModel:
+    model_name = "sfx-provider-name"
+
+    async def generate_sound_effect(self, **kwargs: Any) -> Any:
+        _ = kwargs
+        return {"not": "a SoundEffectResult"}
+
+
+@pytest.mark.asyncio
+async def test_sound_effect_records_provider_name_and_configured_id_separately() -> (
+    None
+):
+    tool = SoundEffectToolCore(models={"configured-sfx-id": _NamedSoundEffectModel()})
+
+    with TokenContextManager() as manager:
+        await tool.generate_sound_effect(text="p", duration_seconds=4)
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "sfx-provider-name"
+    assert entries[0]["model_id"] == "configured-sfx-id"
+
+
+class _UnnamedMusicModel:
+    """Provider exposing no model_name — Xinference's default behaves this way."""
+
+    async def generate_music(self, **kwargs: Any) -> MusicResult:
+        _ = kwargs
+        return MusicResult(audio=b"x", format="mp3", raw_response={})
+
+
+@pytest.mark.asyncio
+async def test_music_falls_back_to_configured_id_not_the_class_name() -> None:
+    """A provider with no model_name must still bill under its configured id.
+
+    The resolver's fallback is what decides this, and a Python class name is
+    not a billing identity: it is not configurable, not unique across
+    providers, and means nothing to a price table.
+    """
+    tool = MusicToolCore(models={"configured-music-id": _UnnamedMusicModel()})
+
+    with TokenContextManager() as manager:
+        await tool.generate_music(prompt="p", music_length_seconds=10)
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "configured-music-id"
+    assert entries[0]["model"] != "_UnnamedMusicModel"
+    assert entries[0]["model_id"] == "configured-music-id"
+
+
+class _UnnamedSoundEffectModel:
+    async def generate_sound_effect(self, **kwargs: Any) -> Any:
+        _ = kwargs
+        return {"not": "a SoundEffectResult"}
+
+
+@pytest.mark.asyncio
+async def test_sound_effect_falls_back_to_configured_id_not_the_class_name() -> None:
+    tool = SoundEffectToolCore(models={"configured-sfx-id": _UnnamedSoundEffectModel()})
+
+    with TokenContextManager() as manager:
+        await tool.generate_sound_effect(text="p", duration_seconds=4)
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "configured-sfx-id"
+    assert entries[0]["model"] != "_UnnamedSoundEffectModel"

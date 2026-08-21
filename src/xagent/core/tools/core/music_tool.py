@@ -161,10 +161,19 @@ file_id/file_ref.
             )
             record_media_seconds(
                 seconds,
-                # Never str(None): _configured_model_id returns Optional[str]
-                # and an inactive shared default resolves to None, which would
-                # bill against a phantom model literally named "None".
-                model=resolve_billing_model(configured_model_id, model),
+                # `model` carries the provider's name, `model_id` the
+                # configured id. Passing configured_model_id as the first
+                # argument here would return it unchanged, writing the same id
+                # into both fields and losing the provider name entirely.
+                # None is passed instead so the resolver falls through to the
+                # provider's model_name. The fallback keeps the configured id
+                # ahead of the class name -- a provider exposing no model_name
+                # (Xinference's default) would otherwise be billed under a
+                # Python class name while its real id sat unused in scope --
+                # and never the placeholder "default".
+                model=resolve_billing_model(
+                    None, model, fallback=configured_model_id or type(model).__name__
+                ),
                 model_id=configured_model_id or "",
                 call_type=MediaCallType.MUSIC,
             )

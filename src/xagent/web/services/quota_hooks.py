@@ -41,11 +41,17 @@ _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = No
 # For image models whose price varies by resolution, "resolution" ("1K"/"2K"/
 # "4K" or "1024x1024") keys a per-(model, resolution) price table. Providers
 # that report real image tokens (Gemini, OpenAI gpt-image) also fill
-# "provider_tokens" so a token-based price ($/1M tokens) can take precedence
-# over the resolution table — but only when "tokens_estimated" is False;
-# embedding/rerank counts are local heuristics and must not be priced as
-# measured tokens. Media token counts are deliberately NOT under the "tokens"
-# key, so a consumer summing "tokens" across entries cannot double-count them.
+# "provider_tokens", recorded raw for a future consumer. That is NOT a pricing
+# rule: no precedence between token-based and unit/resolution-based pricing is
+# defined here, the row schema carries no discriminator to express one, and the
+# aggregate groups purely by (model, unit, call_type, resolution). See the
+# authoritative contract on ``add_media_usage`` in
+# ``core/model/chat/token_context.py``; defining that precedence is tracked in
+# #1461. When a hook does price "provider_tokens", note "tokens_estimated"
+# marks counts that are local heuristics (embedding/rerank) rather than
+# provider-reported, so they must not be priced as measured tokens.
+# Media token counts are deliberately NOT under the "tokens" key, so a consumer
+# summing "tokens" across entries cannot double-count them.
 # Unknown entry types must be ignored, not summed as tokens.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking

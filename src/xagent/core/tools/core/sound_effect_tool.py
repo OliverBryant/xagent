@@ -174,8 +174,14 @@ The generated file is saved to the workspace and returned as file_id/file_ref.
             )
             record_media_seconds(
                 seconds,
-                # Never str(None) — see resolve_billing_model.
-                model=resolve_billing_model(configured_model_id, model),
+                # `model` is the provider name, `model_id` the configured id —
+                # see music_tool: passing configured_model_id as the first
+                # argument would put the same id in both fields and drop the
+                # provider name, while the fallback keeps it ahead of the
+                # class name for providers exposing no model_name.
+                model=resolve_billing_model(
+                    None, model, fallback=configured_model_id or type(model).__name__
+                ),
                 model_id=configured_model_id or "",
                 call_type=MediaCallType.SOUND_EFFECT,
             )

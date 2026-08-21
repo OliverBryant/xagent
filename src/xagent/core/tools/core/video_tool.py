@@ -27,7 +27,11 @@ from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
 from ...workspace import TaskWorkspace
-from .media_usage import coerce_duration, record_media_seconds
+from .media_usage import (
+    coerce_duration,
+    record_media_seconds,
+    resolve_billing_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -737,7 +741,16 @@ The generated video URL is temporary on the provider side, so completed videos a
                 per_video_seconds * billable_count
                 if per_video_seconds is not None
                 else None,
-                model=str(actual_model_id),
+                # `model` is the provider's name and `model_id` the configured
+                # id. Writing the configured id into `model` and leaving
+                # `model_id` empty loses the canonical name for display and
+                # external consumers; the aggregator groups on
+                # `model_id or model`, so populating both keeps the same row
+                # identity while carrying the name.
+                model=resolve_billing_model(
+                    None, video_model, fallback=str(actual_model_id)
+                ),
+                model_id=str(actual_model_id),
                 call_type=MediaCallType.VIDEO,
             )
 

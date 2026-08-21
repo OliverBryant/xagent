@@ -8,8 +8,25 @@ import aiohttp
 from openai import AsyncOpenAI
 
 from ..chat.token_context import MediaCallType
-from .base import BaseImageModel
+from .base import BaseImageModel, invalid_response_from
 from .usage import record_image_usage
+
+
+def _openai_image_url(response: Any) -> Optional[str]:
+    """The image URL from an OpenAI images response, or None when absent.
+
+    Raises on a shape the SDK is not supposed to produce -- a truthy but
+    non-indexable ``data`` -- rather than guessing. Callers meter first and then
+    classify that as an already-billed invalid response.
+    """
+    if not response.data:
+        return None
+    image_item = response.data[0]
+    if getattr(image_item, "url", None):
+        return str(image_item.url)
+    if getattr(image_item, "b64_json", None):
+        return f"data:image/png;base64,{image_item.b64_json}"
+    return None
 
 
 class OpenAIImageModel(BaseImageModel):
@@ -24,8 +41,15 @@ class OpenAIImageModel(BaseImageModel):
         base_url: Optional[str] = None,
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ):
         self.model_name = model_name
+        # Configured id, not the provider-facing name. Kept on the provider
+        # itself because the provider is what records usage: setting it on the
+        # retry wrapper instead left the recording layer with only model_name,
+        # and the aggregator groups on `model_id or model`, so two configured
+        # models sharing a name collapsed into one billing group.
+        self.model_id = model_id
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = (
             base_url or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1"
@@ -142,26 +166,30 @@ class OpenAIImageModel(BaseImageModel):
             **kwargs,
         )
 
-        image_url = None
-        if response.data:
-            image_item = response.data[0]
-            if getattr(image_item, "url", None):
-                image_url = image_item.url
-            elif getattr(image_item, "b64_json", None):
-                image_url = f"data:image/png;base64,{image_item.b64_json}"
-
+        # Metered before the response body is walked, as in the other
+        # providers. The typed SDK is supposed to make `data` a list or None,
+        # but that is a guarantee from another package: a truthy non-indexable
+        # `data` raised a TypeError here, before the metering call, and the
+        # retry policy treats a bare TypeError as retryable -- so one billed
+        # call became max_retries charges with no row recorded.
         result = {
-            "image_url": image_url,
+            "image_url": None,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
         record_image_usage(
             result,
             model_name=self.model_name,
+            model_id=self.model_id,
             call_type=MediaCallType.GENERATE_IMAGE,
             image_count=image_count,
             resolution=str(normalized_size or ""),
         )
+
+        try:
+            result["image_url"] = _openai_image_url(response)
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            raise invalid_response_from(e, "Invalid response format") from e
         return result
 
     async def edit_image(
@@ -218,24 +246,24 @@ class OpenAIImageModel(BaseImageModel):
             for temp_path in temp_paths:
                 Path(temp_path).unlink(missing_ok=True)
 
-        response_image_url: str | None = None
-        if response.data:
-            image_item = response.data[0]
-            if getattr(image_item, "url", None):
-                response_image_url = image_item.url
-            elif getattr(image_item, "b64_json", None):
-                response_image_url = f"data:image/png;base64,{image_item.b64_json}"
-
+        # See generate_image: metered before the body walk, and a body-walk
+        # failure classified as an invalid response rather than retried.
         result = {
-            "image_url": response_image_url,
+            "image_url": None,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
         record_image_usage(
             result,
             model_name=self.model_name,
+            model_id=self.model_id,
             call_type=MediaCallType.EDIT_IMAGE,
             image_count=image_count,
             resolution=str(normalized_size or ""),
         )
+
+        try:
+            result["image_url"] = _openai_image_url(response)
+        except (TypeError, AttributeError, KeyError, IndexError) as e:
+            raise invalid_response_from(e, "Invalid response format") from e
         return result

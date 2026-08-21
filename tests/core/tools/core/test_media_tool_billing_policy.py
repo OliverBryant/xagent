@@ -311,3 +311,186 @@ async def test_sound_effect_falls_back_to_configured_id_not_the_class_name() -> 
     assert len(entries) == 1
     assert entries[0]["model"] == "configured-sfx-id"
     assert entries[0]["model"] != "_UnnamedSoundEffectModel"
+
+
+# --- Video billing --------------------------------------------------------
+#
+# video_tool is duration-billed like music/sound effect, but bills
+# `duration * n` because the provider reports one duration while generating
+# and charging for n videos. These cover the multiplication, the identity
+# fields, and the async path that reports no duration.
+
+
+def _video_model(duration: Any, *, name: str = "video-provider") -> Any:
+    from unittest.mock import AsyncMock, Mock
+
+    from xagent.core.model.video.base import BaseVideoModel
+
+    model = Mock(spec=BaseVideoModel)
+    model.has_ability = Mock(return_value=True)
+    model.abilities = ["generate"]
+    model.model_name = name
+    result = {"task_id": "t-1", "status": "succeeded", "video_url": "", "ratio": "16:9"}
+    if duration is not None:
+        result["duration"] = duration
+    model.generate_video = AsyncMock(return_value=result)
+    return model
+
+
+@pytest.mark.asyncio
+async def test_video_bills_duration_times_count() -> None:
+    """The provider reports one duration but generates and bills for n videos."""
+    from xagent.core.tools.core.video_tool import VideoGenerationToolCore
+
+    tool = VideoGenerationToolCore(video_models={"cfg-video-id": _video_model(5)})
+
+    with TokenContextManager() as manager:
+        await tool.generate_video(prompt="p", n=3)
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["quantity"] == 15.0
+    assert entries[0]["call_type"] == "video"
+
+
+@pytest.mark.asyncio
+async def test_video_records_provider_name_and_configured_id_separately() -> None:
+    """`model` is the provider name, `model_id` the configured id."""
+    from xagent.core.tools.core.video_tool import VideoGenerationToolCore
+
+    tool = VideoGenerationToolCore(
+        video_models={"cfg-video-id": _video_model(5, name="video-provider")}
+    )
+
+    with TokenContextManager() as manager:
+        await tool.generate_video(prompt="p")
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "video-provider"
+    assert entries[0]["model_id"] == "cfg-video-id"
+
+
+@pytest.mark.asyncio
+async def test_video_without_duration_is_recorded_as_unmeasured_seconds() -> None:
+    """An async task reports no duration yet. The unit must stay seconds with
+    quantity 0 rather than degrading to another unit -- reconciling that row is
+    tracked in #1583."""
+    from xagent.core.tools.core.video_tool import VideoGenerationToolCore
+
+    tool = VideoGenerationToolCore(video_models={"cfg-video-id": _video_model(None)})
+
+    with TokenContextManager() as manager:
+        await tool.generate_video(prompt="p")
+        entries = _media_entries(manager)
+
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["quantity"] == 0.0
+
+
+# --- ASR records before post-processing -----------------------------------
+
+
+class _MalformedSegmentASR:
+    """Provider call succeeds and is billed; a segment lacks an end time.
+
+    _aggregate_segments raises ValueError on this input, which the tool's
+    broad handler turns into success:False. The provider still ran and
+    charged, so the row must already be recorded by then.
+    """
+
+    model_name = "asr-provider"
+
+    @property
+    def abilities(self) -> list:
+        return ["asr", "timestamps"]
+
+    async def transcribe(self, audio: Any, **kwargs: Any) -> Any:
+        _ = (audio, kwargs)
+        from xagent.core.model.asr.base import ASRResult, ASRSegment
+
+        return ASRResult(
+            text="hello world",
+            raw_response={"duration": 42.0},
+            segments=[
+                ASRSegment(text="hello", start=0.0, end=1.0, confidence=1.0),
+                ASRSegment(text="world", start=1.0, end=None, confidence=1.0),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_asr_bills_when_post_processing_raises() -> None:
+    """Metering must not depend on post-processing succeeding.
+
+    Recording after _aggregate_segments meant a provider call that succeeded
+    and was billed went entirely unmetered whenever segment data was
+    malformed -- the exact bug class this module's policy exists to prevent.
+    """
+    from xagent.core.tools.core.audio_tool import AudioToolCore
+
+    tool = AudioToolCore(asr_models={"asr-provider": _MalformedSegmentASR()})
+
+    with TokenContextManager() as manager:
+        result = await tool.transcribe_audio(
+            audio_file_path="/tmp/does-not-exist.wav", verbose=False
+        )
+        entries = _media_entries(manager)
+
+    # The tool still reports failure to the caller...
+    assert result["success"] is False
+    # ...but the provider call happened and was billed, so it is metered.
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["quantity"] == 42.0
+    assert entries[0]["call_type"] == "asr"
+
+
+# --- verbose=True reaches the provider ------------------------------------
+#
+# _RecordingASR exists to capture the flag. Without verbose=True the provider
+# returns a bare string with no timings and every call meters as an
+# unbillable 0 seconds, so the flag reaching the provider is what makes ASR
+# billable at all.
+
+
+@pytest.mark.asyncio
+async def test_telegram_passes_verbose_and_bills_a_real_duration(tmp_path) -> None:
+    """Drive the real Telegram method, not a re-implementation of it.
+
+    Asserting on a locally-issued transcribe() call would pass with
+    verbose=True deleted from bot.py, which is the only thing worth guarding
+    here: without it the provider returns a bare string with no timings and
+    every voice message meters as an unbillable 0 seconds.
+    """
+    from xagent.web.channels.telegram.bot import TelegramBotInstance
+
+    provider = _RecordingASR()
+    # __new__ rather than the real constructor: the method only touches a
+    # class-level timeout and a staticmethod, so a fully wired bot instance
+    # would add setup without adding coverage.
+    bot = TelegramBotInstance.__new__(TelegramBotInstance)
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"fake-ogg")
+
+    with TokenContextManager() as manager:
+        transcripts = await bot._transcribe_uploaded_voice_files(
+            ["file-1"],
+            [{"telegram_file_id": "file-1", "path": str(audio), "name": "voice.ogg"}],
+            provider,
+        )
+        entries = _media_entries(manager)
+
+    # bot.py passed verbose through to the provider...
+    assert provider.verbose_seen is True
+    assert transcripts == {"file-1": "hi"}
+    # ...so the row carries a real duration instead of an unbillable zero.
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["quantity"] == 2.5
+    # and the identity is the provider name, never the forbidden placeholder.
+    assert entries[0]["model"] == "asr-a"
+    assert entries[0]["model"] != "default"

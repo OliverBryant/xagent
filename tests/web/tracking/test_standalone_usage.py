@@ -7,7 +7,6 @@ object.
 """
 
 import asyncio
-import concurrent.futures
 from typing import Any, Optional
 
 import pytest
@@ -17,7 +16,7 @@ from xagent.core.model.chat.token_context import (
     add_media_usage,
     get_token_usage,
 )
-from xagent.web.tracking.standalone_usage import bind_usage_to_thread, usage_scope
+from xagent.web.tracking.standalone_usage import usage_scope
 
 
 def _async_return(value: Any):
@@ -182,40 +181,6 @@ def test_inactive_transaction_is_closed_without_rollback(captured) -> None:
     assert session.calls == ["close"]
 
 
-def test_bind_usage_to_thread_carries_usage_across_the_hop(captured) -> None:
-    """run_in_executor / ThreadPoolExecutor drop contextvars; the wrapper is
-    what keeps the worker's records attached to the caller."""
-    calls, _ = captured
-
-    with usage_scope(9):
-
-        def work() -> None:
-            add_media_usage(MediaCallType.ASR, 4, model="e")
-
-        bound = bind_usage_to_thread(work)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(bound).result()
-
-    assert len(calls) == 1
-    assert calls[0]["details"][0]["quantity"] == 4.0
-
-
-def test_unbound_thread_hop_loses_usage(captured) -> None:
-    """Documents why the wrapper exists: the same code without it records
-    nothing, which is the defect this module fixes."""
-    calls, _ = captured
-
-    with usage_scope(9):
-
-        def work() -> None:
-            add_media_usage(MediaCallType.ASR, 4, model="e")
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(work).result()  # not bound
-
-    assert calls == []
-
-
 def test_scope_restores_the_previous_context(captured) -> None:
     """A nested scope must not leak its usage object into the outer one."""
     _calls, _ = captured
@@ -359,3 +324,71 @@ def test_transcribe_endpoint_reports_asr_usage_for_the_authenticated_owner(
     assert media[0]["unit"] == "seconds"
     assert media[0]["quantity"] == 12.5
     assert media[0]["model"] == "asr-provider"
+
+
+def test_transcribe_falls_back_to_configured_id_for_a_placeholder_db_name(
+    captured, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """model_name is nullable=False but not constrained to be meaningful.
+
+    A row whose name is empty or literally "default" must not be billed under
+    that string -- the module invariants forbid placeholder identities -- so
+    the resolver falls back to the configured id.
+    """
+    calls, _ = captured
+
+    from xagent.core.model.asr import adapter
+    from xagent.core.model.asr.base import ASRResult
+    from xagent.web.api import model as model_api
+
+    class _FakeASR:
+        model_name = "asr-provider"
+
+        async def transcribe(self, audio: Any, **kwargs: Any) -> ASRResult:
+            _ = (audio, kwargs)
+            return ASRResult(text="hello", raw_response={"duration": 3.0})
+
+    class _PlaceholderNameDBModel:
+        id = 1
+        model_id = "configured-asr-id"
+        model_name = "default"
+        category = "speech"
+
+    class _User:
+        id = 7
+
+    class _Upload:
+        filename = "clip.wav"
+        content_type = "audio/wav"
+
+        async def read(self, *_a: Any, **_k: Any) -> bytes:
+            return b"RIFFfake"
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        model_api,
+        "_resolve_asr_model_for_transcription",
+        lambda *a, **k: _PlaceholderNameDBModel(),
+    )
+    monkeypatch.setattr(adapter, "get_asr_model_instance", lambda *a, **k: _FakeASR())
+    monkeypatch.setattr(
+        model_api,
+        "_read_transcribe_upload_with_size_limit",
+        _async_return(b"RIFFfake"),
+    )
+
+    asyncio.run(
+        model_api.transcribe_speech_input(
+            file=_Upload(),
+            language=None,
+            model_id=None,
+            db=object(),
+            user=_User(),
+        )
+    )
+
+    media = [d for d in calls[0]["details"] if d.get("type") == "media"]
+    assert media[0]["model"] == "configured-asr-id"
+    assert media[0]["model"] != "default"

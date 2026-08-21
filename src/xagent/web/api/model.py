@@ -981,6 +981,7 @@ async def transcribe_speech_input(
 
     from xagent.core.model.asr.adapter import get_asr_model_instance
     from xagent.core.model.asr.usage import record_asr_usage
+    from xagent.core.tools.core.media_usage import resolve_billing_model
 
     from ..tracking.standalone_usage import usage_scope
 
@@ -1022,7 +1023,17 @@ async def transcribe_speech_input(
             # the one identity all three share.
             record_asr_usage(
                 result,
-                model_name=str(db_model.model_name),
+                # Routed through the shared resolver rather than str() on the
+                # DB column: model_name is nullable=False but not constrained
+                # to be non-placeholder, so an empty or literally "default"
+                # name would otherwise be billed as a model identity, which
+                # the module invariants forbid. The configured id is the
+                # fallback here -- it is the one real identity in scope -- and
+                # it only ever reaches `model`, never `model_id`, so the
+                # single-identity rule above still holds.
+                model_name=resolve_billing_model(
+                    None, db_model, fallback=str(db_model.model_id)
+                ),
             )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc

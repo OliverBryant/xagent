@@ -737,6 +737,7 @@ The generated video URL is temporary on the provider side, so completed videos a
             # first video's duration was recorded.
             per_video_seconds = coerce_duration(result.get("duration"))
             billable_count = max(1, int(n or 1))
+            billing_model_id = str(actual_model_id)
             record_media_seconds(
                 per_video_seconds * billable_count
                 if per_video_seconds is not None
@@ -750,7 +751,14 @@ The generated video URL is temporary on the provider side, so completed videos a
                 model=resolve_billing_model(
                     None, video_model, fallback=str(actual_model_id)
                 ),
-                model_id=str(actual_model_id),
+                # _model_id_for_model bottoms out at the literal "default" when
+                # a model exposes neither an id nor a name, and that string is
+                # a forbidden billing identity. Drop it rather than persist it,
+                # matching music/sound_effect which pass `configured_id or ""`.
+                # The aggregator groups on `model_id or model`, so an empty id
+                # falls through to the resolved name instead of inventing a
+                # phantom model shared by every unidentifiable provider.
+                model_id=("" if billing_model_id == "default" else billing_model_id),
                 call_type=MediaCallType.VIDEO,
             )
 

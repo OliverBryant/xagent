@@ -20,17 +20,13 @@ Reproducing that at four call sites would mean four chances to get it wrong.
 
 from __future__ import annotations
 
-import functools
 import logging
 from contextlib import contextmanager
-from contextvars import copy_context
-from typing import Any, Callable, Iterator, Optional, TypeVar
+from typing import Iterator, Optional
 
 from ...core.model.chat.token_context import TokenUsage, set_token_usage
 
 logger = logging.getLogger(__name__)
-
-T = TypeVar("T")
 
 
 def _report(user_id: Optional[int], usage: TokenUsage) -> None:
@@ -39,27 +35,29 @@ def _report(user_id: Optional[int], usage: TokenUsage) -> None:
     if not details:
         return
     try:
-        from ..models.database import get_session_local
-        from ..services.quota_hooks import has_usage_record_hook, record_usage
+        from ..services.quota_hooks import has_usage_record_hook
+
+        # Imported lazily, like the hook above: this module is deliberately
+        # light so importing it costs nothing at startup, and task_tracker
+        # pulls in the whole tracking chain.
+        from .task_tracker import _record_usage_on_event_loop
 
         # Check the hook before checking out a session: with no hook installed
         # (the stock configuration) record_usage is a guaranteed no-op, and a
         # pool checkout + transaction + close per ingest/transcription is pure
-        # overhead.
+        # overhead. The sibling path in task_tracker predates this check and
+        # still pays it; extending the short-circuit there is a separate change
+        # to a hot path this PR does not otherwise touch.
         if not has_usage_record_hook():
             return
 
-        db_session = get_session_local()()
-        try:
-            # delta_actions=0: these paths make provider calls, not agent tool
-            # calls, and tool invocations are what that counter bills for.
-            record_usage(db_session, user_id, details, 0)
-        finally:
-            # The hook owns its own durability and must not leave work pending
-            # on this compatibility Session.
-            if db_session.in_transaction():
-                db_session.rollback()
-            db_session.close()
+        # Reuses task_tracker's helper rather than repeating its session
+        # lifecycle: it already owns the "hand the hook a short-lived
+        # compatibility Session, never leave it holding a transaction"
+        # contract, and two copies of that is how they drift.
+        # delta_actions=0: these paths make provider calls, not agent tool
+        # calls, and tool invocations are what that counter bills for.
+        _record_usage_on_event_loop(user_id, details, 0)
     except Exception as e:  # noqa: BLE001
         # Metering must never break the work it is measuring.
         logger.warning("Standalone usage recording failed: %s", e)
@@ -72,8 +70,10 @@ def usage_scope(user_id: Optional[int]) -> Iterator[TokenUsage]:
     Usage is reported even when the body raises: a provider call that already
     happened is billable regardless of what fails afterwards.
 
-    Note the body must not cross a thread boundary that drops contextvars —
-    see :func:`bind_usage_to_thread` for `run_in_executor`-style hops.
+    Note the body must not cross a thread boundary that drops contextvars.
+    ``asyncio.to_thread`` copies the context and is safe; a bare
+    ``ThreadPoolExecutor`` or ``run_in_executor`` is not, and would need the
+    caller's usage bound explicitly inside the worker.
     """
     from ...core.model.chat.token_context import token_context
 
@@ -101,42 +101,3 @@ def usage_scope(user_id: Optional[int]) -> Iterator[TokenUsage]:
         except Exception:  # noqa: BLE001
             pass
         _report(user_id, usage)
-
-
-def bind_usage_to_thread(fn: Callable[..., T]) -> Callable[..., T]:
-    """Wrap a callable so it records into the *calling* thread's usage.
-
-    ``loop.run_in_executor(None, fn)`` and bare ``ThreadPoolExecutor`` do not
-    propagate contextvars, so without this the worker records into a fresh
-    ``TokenUsage`` that is discarded on return. ``asyncio.to_thread`` already
-    copies the context and does not need this.
-
-    Captures at wrap time, on the calling thread — wrapping must therefore
-    happen before the hop, not inside the worker.
-
-    The binding runs inside a copied context (``copy_context()`` +
-    ``ctx.run``), the same idiom used at
-    ``core/tools/adapters/vibe/file_ingestion_tool.py``. That confines the
-    contextvar write to this one call instead of mutating the worker thread:
-    ``run_in_executor(None, ...)`` uses the loop's long-lived default executor,
-    so a plain ``set_token_usage`` would outlive the job and leak the caller's
-    ``TokenUsage`` into the next unrelated task that reuses the thread —
-    cross-tenant usage misattribution, plus a strong reference pinned for the
-    thread's lifetime. A copied context also needs no ``finally`` restore:
-    there is nothing in the caller's context left to restore.
-    """
-    from ...core.model.chat.token_context import get_token_usage
-
-    caller_usage = get_token_usage()
-
-    @functools.wraps(fn)
-    def _bound(*args: Any, **kwargs: Any) -> T:
-        def _run() -> T:
-            set_token_usage(caller_usage)
-            return fn(*args, **kwargs)
-
-        # Fresh copy per invocation: a wrapped callable may be submitted more
-        # than once, and each run must get its own isolated context.
-        return copy_context().run(_run)
-
-    return _bound

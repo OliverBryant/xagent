@@ -780,6 +780,28 @@ class AudioToolCore:
             # as a fallback) has exactly one implementation.
             audio_seconds = resolve_asr_seconds(raw_response, raw_segments)
 
+            # Recorded here, before _aggregate_segments and the rest of the
+            # post-processing below. Those steps can raise (a segment missing
+            # start/end raises ValueError), and the broad handler at the bottom
+            # turns any raise into success:False -- so recording afterwards
+            # meant a provider call that succeeded and was billed went
+            # unmetered. That is the bug class this metering exists to remove,
+            # and TTS in this same file already records before unpacking.
+            # Routed through the shared ASR recorder so every entry point
+            # meters identically.
+            record_asr_seconds(
+                audio_seconds,
+                # model_id is deliberately left unset. This tool is handed
+                # name-keyed registries (model_service keys _asr_models by
+                # model_name), so the only identity in scope here is a name —
+                # writing a name into model_id would persist it under an id
+                # field. The aggregator groups on `model_id or model`, so
+                # leaving it empty lets these rows key on the name
+                # consistently instead of inventing a third identity that can
+                # never be reconciled.
+                model_name=str(actual_model_id),
+            )
+
             segment_view = "raw" if verbose else "processed"
             segments = raw_segments
             segments_merged = False
@@ -791,23 +813,6 @@ class AudioToolCore:
                     len(segments),
                 )
                 segments_merged = len(segments) < len(raw_segments)
-
-            # Recorded only after every step that can still fail, so a call that
-            # errors out is not billed. Routed through the shared ASR recorder
-            # so every entry point meters identically.
-            record_asr_seconds(
-                audio_seconds,
-                # model_id is deliberately left unset. This tool is handed
-                # name-keyed registries (model_service keys _asr_models by
-                # model_name), so the only identity in scope here is a name —
-                # writing it into model_id would persist a name under an id
-                # field and still not match the real DB model_id that
-                # /speech/transcribe records. The aggregator groups on
-                # `model_id or model`, so leaving it empty lets these rows key
-                # on the name consistently instead of inventing a third
-                # identity that can never be reconciled.
-                model_name=str(actual_model_id),
-            )
 
             # Save transcription to JSON file if workspace is available
             file_id: Optional[str] = None

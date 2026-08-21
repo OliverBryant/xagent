@@ -1400,12 +1400,19 @@ class TelegramBotInstance:
                 )
                 # Telegram calls the ASR provider directly rather than going
                 # through audio_tool, so meter here too. Identity goes through
-                # the shared resolver so a provider exposing no model_name is
-                # never billed under a placeholder, and all three ASR entry
-                # points agree on the name the aggregator groups by.
+                # the shared resolver so all three ASR entry points agree on
+                # the name the aggregator groups by. The explicit fallback
+                # matters: resolve_billing_model's own default is the literal
+                # "default", which the module invariants forbid as a billing
+                # identity, so a provider exposing no model_name would
+                # otherwise be billed under exactly the placeholder this is
+                # meant to avoid. The provider class name is the last identity
+                # that still attributes cost to something real.
                 record_asr_usage(
                     result,
-                    model_name=resolve_billing_model(None, asr_model),
+                    model_name=resolve_billing_model(
+                        None, asr_model, fallback=type(asr_model).__name__
+                    ),
                 )
             except asyncio.TimeoutError as exc:
                 raise TelegramVoiceTranscriptionError(

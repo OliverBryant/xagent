@@ -200,21 +200,23 @@ class TokenUsage:
         resolution: str = "",
         tokens_estimated: bool = False,
     ) -> None:
-        """Count the call and append its detail. The only media write path.
+        """Append one media detail row. The only media write path.
 
-        One function bumps the counter and appends the row, so the two cannot
-        drift apart: consumers derive per-model rows from ``details`` and the
-        call count from the scalar, and those must describe the same calls.
+        There is no counter to keep in step: ``media_calls`` is derived from
+        these rows, so the call count and the per-model breakdown are two
+        readings of the same list and cannot drift apart.
 
         The unit is not a parameter — it is derived from ``call_type``, so a
         mismatched pair cannot be expressed. ``call_type`` is required for the
         same reason: without it there is nothing to derive from.
 
-        **Not atomic and not thread-safe.** ``TokenUsage`` has no lock, for its
-        pre-existing ``tool_calls`` and token counters either, so a concurrent
-        reader can observe the counter bumped without its row (or the reverse).
-        Making the pairing atomic touches a class used well beyond media
-        billing and is tracked in #1526, out of scope here.
+        **Not thread-safe.** ``TokenUsage`` has no lock, for its pre-existing
+        ``tool_calls`` and token counters either. A concurrent reader gets a
+        non-snapshot view of ``details`` — it may see a partially built list, so
+        a derived count can disagree with a separately taken reading of the same
+        list. Callers wanting a stable view should snapshot (``details.copy()``)
+        before reading. Locking a class used well beyond media billing is
+        tracked in #1526, out of scope here.
         """
         call_type_value = _validated_media_call_type(call_type)
         unit_value = MediaCallType(call_type_value).unit.value  # type: ignore[call-arg]
@@ -233,8 +235,9 @@ class TokenUsage:
         # derived from the same row, so quota and pricing would read different
         # numbers off one record. Raised rather than clamped: a caller passing
         # something else has a real bug and silently rewriting it hides that.
-        # Rejecting before any mutation means a bad call leaves no state at all
-        # — neither a counter bump nor an orphan row. Producers route through
+        # Rejecting before any mutation means a bad call leaves no state at
+        # all — no row, and so nothing for media_calls to derive from.
+        # Producers route through
         # ``media_usage.record_media_usage``, which swallows this so an
         # accounting bug still cannot break the user's media call.
         if unit_value == MediaUnit.REQUESTS.value and quantity != 1.0:
@@ -246,8 +249,14 @@ class TokenUsage:
         # returning negatives, because add_token_usage does `if input_tokens:`
         # and flooring there would flip a real negative from "added" to
         # "silently skipped" on the live LLM path.
-        input_tokens = max(0, _coerce_int(input_tokens))
-        output_tokens = max(0, _coerce_int(output_tokens))
+        # Booleans first: _coerce_int(True) is 1, so a provider returning a
+        # JSON boolean for a token count would bill one token. `quantity`
+        # already rejects bools, and a boundary that accepts them for tokens
+        # while rejecting them for quantity is inconsistent. Not fixed inside
+        # _coerce_int -- its bool handling is pre-existing and deliberate on the
+        # LLM path.
+        input_tokens = max(0, _coerce_media_tokens(input_tokens))
+        output_tokens = max(0, _coerce_media_tokens(output_tokens))
         self.details.append(
             {
                 "type": "media",
@@ -272,7 +281,12 @@ class TokenUsage:
                     model_id.strip() if isinstance(model_id, str) else model_id
                 ),
                 "call_type": call_type_value,
-                "resolution": resolution,
+                # Stripped for the same reason as model/model_id above: it is
+                # part of the aggregate key, so ' 1K ' and '1K' would bill as
+                # two separate line items for one resolution tier.
+                "resolution": (
+                    resolution.strip() if isinstance(resolution, str) else resolution
+                ),
             }
         )
 
@@ -417,6 +431,19 @@ def _coerce_int(value: Any) -> int:
         if value is not None:
             logger.warning("Discarding non-numeric token count: %r", value)
         return 0
+
+
+def _coerce_media_tokens(value: Any) -> int:
+    """``_coerce_int`` for the media boundary, where booleans are not counts.
+
+    ``_coerce_int(True)`` is ``1`` because ``bool`` is an ``int`` subclass, and
+    that is intentional on the LLM path. A provider handing back a JSON boolean
+    for a media token count is malformed metadata, not a count of one, and
+    ``quantity`` at this same boundary already rejects booleans.
+    """
+    if isinstance(value, bool):
+        return 0
+    return _coerce_int(value)
 
 
 def _coerce_float(value: Any) -> float:
@@ -742,9 +769,11 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     so a consumer never prices a mixed group as if it were measured.
 
     Pass a list you own. This iterates ``details`` directly, so handing in a
-    live ``TokenUsage.details`` that another thread is appending to risks a
-    "list changed size during iteration" RuntimeError — pass a copy, or a value
-    read from the DB column as the API path does.
+    live ``TokenUsage.details`` that another thread is appending to yields a
+    non-snapshot view: unlike dicts and sets, a list raises nothing here, it
+    just keeps handing out elements as they arrive, so the aggregate silently
+    reflects a moving list rather than any single point in time. Pass
+    ``details.copy()``, or a value read from the DB column as the API path does.
     """
     if not isinstance(details, list):
         return []

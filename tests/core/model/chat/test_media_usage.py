@@ -446,15 +446,18 @@ def test_media_aggregation_uses_model_id_when_present() -> None:
     # identity = model_id or model_name — the model_id branch had no coverage,
     # so rows keyed by id always fell through to the name branch in tests.
     with TokenContextManager() as manager:
+        # Empty-name row FIRST: with the named row first, setdefault seeds the
+        # group's model_name and the backfill branch never executes -- the test
+        # then passes with that branch deleted.
         add_media_usage(
-            quantity=1,
-            model="display-name",
+            quantity=2,
+            model="",
             model_id="img-1",
             call_type="generate_image",
         )
         add_media_usage(
-            quantity=2,
-            model="",
+            quantity=1,
+            model="display-name",
             model_id="img-1",
             call_type="generate_image",
         )
@@ -708,3 +711,46 @@ def test_fullwidth_range_boundaries(char, expected_cjk) -> None:
     from xagent.core.model.chat.token_context import estimate_media_tokens
 
     assert (estimate_media_tokens(char * 4) == 4) is expected_cjk
+
+
+@pytest.mark.parametrize("boolean", [True, False])
+def test_boolean_provider_tokens_are_not_counted_as_one(boolean) -> None:
+    # bool is an int subclass, so _coerce_int(True) is 1 and a provider handing
+    # back a JSON boolean would bill a token. `quantity` at this same boundary
+    # already rejects booleans; tokens must agree.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.TTS,
+        quantity=10,
+        input_tokens=boolean,
+        output_tokens=boolean,
+    )
+    entry = usage.details[0]
+
+    assert entry["provider_input_tokens"] == 0
+    assert entry["provider_output_tokens"] == 0
+    assert entry["provider_tokens"] == 0
+    # The row still records the measured call.
+    assert entry["quantity"] == 10.0
+
+
+def test_resolution_is_stripped_so_padding_does_not_split_billing() -> None:
+    # resolution is part of the aggregate key, so ' 1K ' and '1K' would become
+    # two billable line items for one resolution tier -- and the padded row
+    # would miss an exact price-table join.
+    usage = TokenUsage()
+    usage.record_media_call(
+        call_type=MediaCallType.GENERATE_IMAGE,
+        quantity=1,
+        model="sd",
+        resolution=" 1K ",
+    )
+    usage.record_media_call(
+        call_type=MediaCallType.GENERATE_IMAGE,
+        quantity=1,
+        model="sd",
+        resolution="1K",
+    )
+
+    assert {d["resolution"] for d in usage.details} == {"1K"}
+    assert len(aggregate_media_usage_by_model(usage.details)) == 1

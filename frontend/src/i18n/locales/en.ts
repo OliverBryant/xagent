@@ -305,11 +305,11 @@ const en = {
       quantity: "Amount",
       callType: "Type",
       unit: {
-        images: "images",
-        seconds: "sec",
-        characters: "chars",
-        requests: "requests",
-        texts: "texts",
+        images: { one: "image", other: "images" },
+        seconds: { one: "sec", other: "sec" },
+        characters: { one: "char", other: "chars" },
+        requests: { one: "request", other: "requests" },
+        texts: { one: "text", other: "texts" },
       },
       mediaType: {
         generate_image: "Image generation",

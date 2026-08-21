@@ -305,11 +305,11 @@ const zh = {
       quantity: "用量",
       callType: "类型",
       unit: {
-        images: "张",
-        seconds: "秒",
-        characters: "字符",
-        requests: "次",
-        texts: "条文本",
+        images: { one: "张", other: "张" },
+        seconds: { one: "秒", other: "秒" },
+        characters: { one: "字符", other: "字符" },
+        requests: { one: "次", other: "次" },
+        texts: { one: "条文本", other: "条文本" },
       },
       mediaType: {
         generate_image: "生图",

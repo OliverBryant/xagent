@@ -118,6 +118,18 @@ function formatMediaQuantity(value: number, locale: Locale = 'en'): string {
   const safe = Number.isFinite(value) ? Math.max(0, value) : 0;
   // Media quantities can be fractional (e.g. audio seconds); keep up to one
   // decimal but drop trailing ".0" for whole counts like image counts.
+  //
+  // A positive quantity below the rounding threshold must not render as "0":
+  // the caller already decided this row is measured (quantity > 0), so a bare
+  // "0" contradicts that and reads as "this cost nothing". Show "<0.1" instead
+  // — the exact value is not meaningful at that scale, but "some, but less
+  // than a tenth" is. Exact zero never reaches here; it takes the unmeasured
+  // branch at the call site.
+  if (safe > 0 && safe < 0.05) {
+    return `<${getFormatter(mediaQuantityFormatters, locale, {
+      maximumFractionDigits: 1,
+    }).format(0.1)}`;
+  }
   return getFormatter(mediaQuantityFormatters, locale, {
     maximumFractionDigits: 1,
   }).format(safe);
@@ -210,8 +222,16 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
           callType,
         )
       : '-';
-  const formatMediaUnit = (unit: string) =>
-    unit ? tDynamic(`chatPage.tokenUsage.unit.${unit}`, unit) : '';
+  // Plural form is chosen by the raw quantity, not the formatted string: a
+  // sub-threshold value renders as "<0.1" yet is grammatically plural, and
+  // locales without plural distinction just carry the same text in both keys.
+  const formatMediaUnit = (unit: string, quantity: number) =>
+    unit
+      ? tDynamic(
+          `chatPage.tokenUsage.unit.${unit}.${quantity === 1 ? 'one' : 'other'}`,
+          unit,
+        )
+      : '';
 
   return (
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
@@ -356,6 +376,16 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                     <span className="block truncate font-medium">
                       {media.model_name || media.model_id || t('chatPage.tokenUsage.unknownModel')}
                     </span>
+                    {/* Same secondary-identity rule as the LLM rows above: the
+                        backend groups media by `model_id or model_name`, so two
+                        distinct configured IDs sharing one provider-facing name
+                        are separate billable rows. Without the id they render
+                        identically and look like a duplicate. */}
+                    {media.model_id && media.model_name && media.model_id !== media.model_name && (
+                      <span className="block truncate text-[10px] text-muted-foreground">
+                        {media.model_id}
+                      </span>
+                    )}
                     {media.resolution && (
                       <span className="block truncate text-[10px] text-muted-foreground">
                         {media.resolution}
@@ -375,7 +405,7 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                            renders as "4" rather than "4 " with a trailing space. */
                         [
                           formatMediaQuantity(media.quantity, locale),
-                          formatMediaUnit(media.unit),
+                          formatMediaUnit(media.unit, media.quantity),
                         ]
                           .filter(Boolean)
                           .join(' ')

@@ -4706,6 +4706,9 @@ const zh = {
       nameHint: "仅支持字母、数字、连字符和下划线。将成为 {path} 下的目录名。",
       nameInvalid: "名称必须匹配 {pattern}。",
       placeholder: "开始编写 SKILL.md…",
+      importTitle: "导入技能文件",
+      importHint: "将 .zip 技能包或 SKILL.md 拖到此处，或点击选择文件。",
+      importing: "上传中…",
     },
     editor: {
       skillMd: "SKILL.md",

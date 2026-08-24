@@ -44,7 +44,17 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -510,12 +520,28 @@ def _installed_slugs(mgr: Any) -> set[str]:
 
 
 def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
-    """Read a ClawHub ZIP into a normalized skill file bundle."""
+    """Read a skill ZIP into a normalized skill file bundle."""
+    files, _root = _safe_zip_extract(zip_bytes)
+    return files
+
+
+def _safe_zip_extract(
+    zip_bytes: bytes, *, bad_zip_status: int = 502
+) -> tuple[dict[str, bytes], str]:
+    """Read a skill ZIP into ``(normalized files, root dir name)``.
+
+    ``bad_zip_status`` distinguishes who supplied the archive: 502 for a
+    registry proxy response, 400 for a user upload.
+
+    The size budget is enforced on the *actual* decompressed byte count,
+    not the sizes declared in the ZIP headers — a hostile archive can
+    declare small sizes for members that inflate far larger.
+    """
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as exc:
         raise HTTPException(
-            status_code=502, detail="ClawHub returned a bad ZIP."
+            status_code=bad_zip_status, detail="Skill archive is not a valid ZIP."
         ) from exc
 
     total = 0
@@ -523,26 +549,34 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
     for info in zf.infolist():
         if info.is_dir():
             continue
-        if info.file_size > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
-        total += info.file_size
-        if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(
-                status_code=413, detail="Skill ZIP exceeds size budget."
-            )
         path = info.filename.replace("\\", "/").lstrip("/")
         if not path or ".." in path.split("/"):
             raise HTTPException(
                 status_code=400, detail="Skill ZIP contains unsafe paths."
             )
-        raw_files[path] = zf.read(info)
+        remaining = _MAX_DOWNLOAD_BYTES - total
+        try:
+            with zf.open(info) as member:
+                content = member.read(remaining + 1)
+        except zipfile.BadZipFile as exc:
+            # zipfile validates CRC at member EOF, so a ZIP with lying
+            # headers or corrupted data raises here, not at open().
+            raise HTTPException(
+                status_code=bad_zip_status, detail="Skill archive is corrupted."
+            ) from exc
+        if len(content) > remaining:
+            raise HTTPException(
+                status_code=413, detail="Skill ZIP exceeds size budget."
+            )
+        total += len(content)
+        raw_files[path] = content
 
     skill_md_paths = sorted(
         path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md"
     )
     if not skill_md_paths:
         raise HTTPException(
-            status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it."
+            status_code=400, detail="Skill archive has no SKILL.md anywhere in it."
         )
     skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
@@ -556,7 +590,7 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
             rel = path
         if rel:
             files[rel] = content
-    return _normalize_skill_files(files)
+    return _normalize_skill_files(files), skill_root.rsplit("/", 1)[-1]
 
 
 def _check_registry_security_gate(registry: Any, detail: dict) -> None:
@@ -772,6 +806,127 @@ async def edit_installed(
         )
     logger.info("Skill Hub: edited user skill %r", name)
     return _skill_to_summary(reloaded)
+
+
+def _slugify_skill_name(raw: str) -> str:
+    """Collapse arbitrary text into the [A-Za-z0-9_-]+ shape
+    ``_validate_skill_name`` accepts; empty string if nothing survives."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip()).strip("-_")[:64]
+
+
+def _derive_upload_skill_name(filename: str, zip_root: str, skill_md: bytes) -> str:
+    """Pick a skill name for an uploaded bundle.
+
+    Priority: ZIP root directory name (how Claude-style skill folders
+    are usually zipped) → frontmatter ``name`` → upload filename stem.
+    """
+    from xagent.skills.parser import SkillParser
+
+    frontmatter = SkillParser._extract_frontmatter(  # noqa: SLF001
+        skill_md.decode("utf-8", errors="replace")
+    )
+    fm_name = frontmatter.get("name")
+    candidates = [
+        zip_root,
+        fm_name if isinstance(fm_name, str) else "",
+        Path(filename).stem,
+    ]
+    for raw in candidates:
+        slug = _slugify_skill_name(raw)
+        if slug:
+            return slug
+    raise HTTPException(
+        status_code=400, detail="Could not derive a skill name from the upload."
+    )
+
+
+@router.post("/upload", response_model=SkillSummary)
+async def upload_skill(
+    request: Request,
+    file: UploadFile = File(...),
+    scope: str = Form("personal"),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Any = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SkillSummary:
+    """Install a skill from an uploaded file.
+
+    Accepts either a ``.zip`` skill bundle (a Claude-style skill folder
+    with SKILL.md at its root, possibly nested one directory deep) or a
+    bare ``.md`` file used verbatim as SKILL.md. Same tail as
+    ``install_skill``: persist, re-parse, return the summary.
+    """
+    if scope not in ("personal", "team"):
+        raise HTTPException(
+            status_code=400, detail="scope must be 'personal' or 'team'."
+        )
+
+    data = await file.read(_MAX_DOWNLOAD_BYTES + 1)
+    if len(data) > _MAX_DOWNLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds {_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit.",
+        )
+
+    filename = (file.filename or "").strip()
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        files, zip_root = _safe_zip_extract(data, bad_zip_status=400)
+    elif lower.endswith(".md"):
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail="Markdown upload must be UTF-8 text."
+            ) from exc
+        files, zip_root = {"SKILL.md": data}, ""
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported upload — provide a .zip skill bundle or a SKILL.md file.",
+        )
+
+    name = _derive_upload_skill_name(filename, zip_root, files["SKILL.md"])
+
+    if scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            scope="team",
+            name=name,
+            files=files,
+            origin="upload",
+        )
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=name,
+            files=files,
+            origin="upload",
+        )
+
+    mgr = await _get_scoped_manager(request, context, db)
+    skill = await mgr.get_skill(name)
+    if skill is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Skill uploaded but failed to re-parse — check the YAML "
+                "frontmatter at the top of SKILL.md."
+            ),
+        )
+    logger.info(
+        "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
+        name,
+        filename,
+        len(data),
+        len(files),
+    )
+    return _skill_to_summary(skill)
 
 
 # ──────────────────────────────────────────────────────────────────────

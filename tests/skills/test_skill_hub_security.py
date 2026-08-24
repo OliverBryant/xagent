@@ -10,8 +10,11 @@ from fastapi import HTTPException
 
 from xagent.web.api.skill_hub import (
     _check_registry_security_gate,
+    _derive_upload_skill_name,
     _normalize_skill_files,
+    _safe_zip_extract,
     _safe_zip_to_files,
+    _slugify_skill_name,
 )
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -121,6 +124,251 @@ class TestSafeZipToFiles:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_to_files(data)
         assert exc.value.status_code == 413
+
+
+# ── _safe_zip_extract (upload path) ───────────────────────────────────────────
+
+
+def _tamper_declared_size(zip_bytes: bytes, declared: int) -> bytes:
+    """Rewrite the uncompressed-size field of the first member in both
+    the local header and the central directory."""
+    import struct
+
+    data = bytearray(zip_bytes)
+    local = data.find(b"PK\x03\x04")
+    data[local + 22 : local + 26] = struct.pack("<I", declared)
+    central = data.find(b"PK\x01\x02")
+    data[central + 24 : central + 28] = struct.pack("<I", declared)
+    return bytes(data)
+
+
+class TestSafeZipExtract:
+    def test_returns_nested_root_name(self):
+        data = _make_zip({"my-skill/SKILL.md": SKILL_MD, "my-skill/ref.md": b"hi"})
+        files, root = _safe_zip_extract(data)
+        assert root == "my-skill"
+        assert set(files) == {"SKILL.md", "ref.md"}
+
+    def test_returns_empty_root_for_flat_zip(self):
+        data = _make_zip({"SKILL.md": SKILL_MD})
+        files, root = _safe_zip_extract(data)
+        assert root == ""
+        assert "SKILL.md" in files
+
+    def test_bad_zip_status_is_configurable(self):
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(b"not a zip", bad_zip_status=400)
+        assert exc.value.status_code == 400
+
+    def test_error_wording_is_source_neutral(self):
+        # The extractor serves both registry installs and user uploads,
+        # so its messages must not name a specific registry.
+        for build in (
+            lambda: _safe_zip_extract(b"not a zip"),
+            lambda: _safe_zip_extract(_make_zip({"README.md": b"no skill"})),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                build()
+            assert "clawhub" not in exc.value.detail.lower()
+
+    def test_size_budget_uses_actual_bytes_not_declared(self):
+        # A header that lies *large* (declares over-budget) must not get
+        # a small honest payload rejected: the budget is enforced on the
+        # bytes actually decompressed.
+        from xagent.web.api.skill_hub import _MAX_DOWNLOAD_BYTES
+
+        data = _make_zip({"SKILL.md": SKILL_MD})
+        lying = _tamper_declared_size(data, _MAX_DOWNLOAD_BYTES + 1)
+        files, _root = _safe_zip_extract(lying)
+        assert "SKILL.md" in files
+
+    def test_corrupted_member_maps_to_http_error(self):
+        # zipfile only detects a CRC mismatch while reading a member, not
+        # at open() — that failure must surface as an HTTP error, not a 500.
+        data = bytearray(_make_zip({"SKILL.md": b"A" * 4096}))
+        local = data.find(b"PK\x03\x04")
+        header_len = 30 + data[local + 26] + data[local + 28]
+        data[local + header_len + 10] ^= 0xFF  # flip a byte of member data
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(bytes(data), bad_zip_status=400)
+        assert exc.value.status_code == 400
+
+
+# ── upload name derivation ────────────────────────────────────────────────────
+
+
+SKILL_MD_NAMED = b"""---
+name: pdf-tools
+description: Handle PDFs.
+---
+
+# PDF Tools
+"""
+
+
+class TestDeriveUploadSkillName:
+    def test_zip_root_wins(self):
+        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD_NAMED)
+        assert name == "my-skill"
+
+    def test_frontmatter_name_beats_filename(self):
+        name = _derive_upload_skill_name("archive.zip", "", SKILL_MD_NAMED)
+        assert name == "pdf-tools"
+
+    def test_filename_stem_is_last_resort(self):
+        name = _derive_upload_skill_name("My Skill.zip", "", SKILL_MD)
+        assert name == "My-Skill"
+
+    def test_no_candidate_raises(self):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("---.zip", "", SKILL_MD)
+        assert exc.value.status_code == 400
+
+    def test_slugify(self):
+        assert _slugify_skill_name("  Café menu skill!  ") == "Caf-menu-skill"
+        assert _slugify_skill_name("ok_name-1") == "ok_name-1"
+        assert _slugify_skill_name("///") == ""
+
+
+# ── POST /upload route ────────────────────────────────────────────────────────
+
+
+def _make_upload(filename: str, data: bytes):
+    from fastapi import UploadFile
+
+    return UploadFile(file=io.BytesIO(data), filename=filename)
+
+
+def _upload_args():
+    from types import SimpleNamespace
+
+    from xagent.skills.library import SkillScopeContext
+
+    return (
+        SimpleNamespace(),
+        SkillScopeContext(user_id=7, metadata={}),
+        object(),
+        SimpleNamespace(id=7),
+    )
+
+
+class TestUploadRoute:
+    @pytest.mark.asyncio
+    async def test_zip_with_traversal_rejected(self):
+        from xagent.web.api import skill_hub
+
+        data = _make_zip({"skill/SKILL.md": SKILL_MD, "skill/../../escape.py": b"evil"})
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request, _make_upload("skill.zip", data), "personal", scope, db, user
+            )
+        assert exc.value.status_code == 400
+        assert "unsafe" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_extension_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request, _make_upload("skill.tar.gz", b"x"), "personal", scope, db, user
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_oversized_upload_rejected(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setattr(skill_hub, "_MAX_DOWNLOAD_BYTES", 64)
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                _make_upload("skill.zip", b"x" * 65),
+                "personal",
+                scope,
+                db,
+                user,
+            )
+        assert exc.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_zip_happy_path_persists_with_upload_origin(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written: dict = {}
+
+        def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
+            written.update(name=name, files=files, origin=origin)
+
+        class _Manager:
+            async def get_skill(self, name):
+                return {"name": name, "scope": "personal", "path": ""}
+
+        async def _scoped(*args):
+            return _Manager()
+
+        monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+
+        data = _make_zip({"pdf-tools/SKILL.md": SKILL_MD, "pdf-tools/ref.md": b"r"})
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request, _make_upload("archive.zip", data), "personal", scope, db, user
+        )
+        assert summary.name == "pdf-tools"
+        assert written["name"] == "pdf-tools"
+        assert written["origin"] == "upload"
+        assert set(written["files"]) == {"SKILL.md", "ref.md"}
+
+    @pytest.mark.asyncio
+    async def test_bare_markdown_uses_frontmatter_name(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written: dict = {}
+
+        def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
+            written.update(name=name, files=files, origin=origin)
+
+        class _Manager:
+            async def get_skill(self, name):
+                return {"name": name, "scope": "personal", "path": ""}
+
+        async def _scoped(*args):
+            return _Manager()
+
+        monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request,
+            _make_upload("whatever.md", SKILL_MD_NAMED),
+            "personal",
+            scope,
+            db,
+            user,
+        )
+        assert summary.name == "pdf-tools"
+        assert written["files"] == {"SKILL.md": SKILL_MD_NAMED}
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_markdown_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                _make_upload("skill.md", b"\xff\xfe\x00bad"),
+                "personal",
+                scope,
+                db,
+                user,
+            )
+        assert exc.value.status_code == 400
 
 
 # ── _check_registry_security_gate ────────────────────────────────────────────

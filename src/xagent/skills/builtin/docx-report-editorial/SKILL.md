@@ -61,7 +61,18 @@ Re-open the file and count what you wrote:
 from docx import Document
 
 check = Document("market_expansion_report.docx")
-assert len(check.paragraphs) > 10 and len(check.tables) >= 1
+assert any(p.text.strip() for p in check.paragraphs), "document has no text"
+```
+
+Assert the shape the request actually asked for, never a fixed minimum. A
+multi-section report should also check its tables and headings; a one-page
+memo or letter legitimately has neither, and padding it to satisfy a
+threshold breaks the no-fabricated-content rule above.
+
+```python
+# only for a document the request asked to be structured this way
+assert len(check.tables) >= 1
+assert any(p.style.name.startswith("Heading") for p in check.paragraphs)
 ```
 
 ### 🔗 Make it clickable in chat — REQUIRED
@@ -415,6 +426,9 @@ caption_run.font.color.rgb = RGBColor.from_string(palette["ink_tint"])
 Repeat the header row across page breaks for tables longer than a page:
 
 ```python
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
 # w:trPr allows at most one w:tblHeader, so replace rather than append -- a
 # second one is schema-invalid, and a loop over tables would add one per pass.
 trPr = table.rows[0]._tr.get_or_add_trPr()
@@ -432,12 +446,15 @@ trPr.append(OxmlElement("w:tblHeader"))
 - [ ] Real `Heading 1/2/3` styles used (Word navigation pane shows an outline)
 - [ ] Page size, margins, and orientation set explicitly on the section
       (landscape = swap width/height, not just the orientation flag)
-- [ ] Cover page present, followed by an explicit page break
+- [ ] Cover page present, followed by a `WD_SECTION.NEW_PAGE` section break
+      (not an extra page break as well — that leaves a blank page)
 - [ ] Tables: ink header band, `paper_tint` zebra rows, horizontal rules only,
       numbers right-aligned, caption below
 - [ ] No fabricated data, no lorem ipsum, no placeholder headings
-- [ ] File saved with a plain filename, then re-opened and its paragraph /
-      table counts asserted (byte size proves nothing — empty is ~36 KB)
+- [ ] File saved with a plain filename, then re-opened and asserted non-empty
+      (byte size proves nothing — an empty document is already ~36 KB)
+- [ ] Any structural assertion matches what was requested — no fixed minimum
+      that a legitimate one-page memo or letter would fail
 - [ ] **Final answer FIRST LINE is `[filename](file:UUID)`** as bare markdown
 
 Then write the .docx and report path + which palette + which sections.

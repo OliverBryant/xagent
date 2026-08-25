@@ -10,13 +10,15 @@ skill actually documents and assert the invariants Word enforces.
 from __future__ import annotations
 
 import re
+import tempfile
 from pathlib import Path
 
 import pytest
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+
+MEMO_PATH = Path(tempfile.gettempdir()) / "docx_skill_memo_check.docx"
 
 SKILL_MD = (
     Path(__file__).parents[2]
@@ -67,6 +69,7 @@ def _helpers() -> dict:
     blocks = re.findall(r"^```python\n(.*?)^```", SKILL_MD.read_text(), re.S | re.M)
     source = next(b for b in blocks if "def shade_cell" in b)
     assert "def set_row_border" in source, "helpers must stay in one block"
+    # Empty namespace on purpose — the fence has to carry its own imports.
     namespace: dict = {}
     exec(source, namespace)  # noqa: S102 - executing our own documented snippet
     return namespace
@@ -181,18 +184,37 @@ def test_clearing_a_border_nils_it_in_place(helpers) -> None:
     assert borders.find(qn("w:bottom")).get(qn("w:color")) == "0A0A0B"
 
 
+def test_the_validation_snippet_accepts_a_one_page_memo() -> None:
+    """The skill advertises memos and letters and forbids padding, so the
+    documented check cannot impose a shape minimum: a >10-paragraph or
+    >=1-table assertion turns a legitimate short document into an executor
+    failure, and the only way to satisfy it is fabricated content."""
+    blocks = re.findall(r"^```python\n(.*?)^```", SKILL_MD.read_text(), re.S | re.M)
+    source = next(b for b in blocks if "check = Document(" in b)
+
+    memo = Document()
+    memo.add_heading("Q3 headcount freeze", level=1)
+    memo.add_paragraph("Hiring pauses on 1 October and resumes in January.")
+    memo.save(str(MEMO_PATH))
+
+    namespace = {"Document": Document}
+    exec(  # noqa: S102 - executing our own documented snippet
+        source.replace('"market_expansion_report.docx"', repr(str(MEMO_PATH))),
+        namespace,
+    )
+
+
 def test_the_repeat_header_snippet_stays_single(helpers) -> None:
     """w:trPr permits at most one w:tblHeader; the snippet ran twice -- an
     agent looping over tables or retrying -- used to leave two behind."""
     blocks = re.findall(r"^```python\n(.*?)^```", SKILL_MD.read_text(), re.S | re.M)
     source = next(b for b in blocks if "w:tblHeader" in b)
 
+    # Only `table` is supplied: an agent copying this fence gets whatever the
+    # fence itself imports and nothing else. Injecting qn/OxmlElement here is
+    # what let a NameError in the published snippet pass review twice.
     document = Document()
-    namespace = {
-        "table": document.add_table(rows=2, cols=2),
-        "qn": qn,
-        "OxmlElement": OxmlElement,
-    }
+    namespace = {"table": document.add_table(rows=2, cols=2)}
     exec(source, namespace)  # noqa: S102 - executing our own documented snippet
     exec(source, namespace)  # noqa: S102 - a retry must not stack a second one
 

@@ -704,8 +704,11 @@ async def _persist_and_reparse(
     origin: str,
     clawhub_slug: str | None = None,
     clawhub_version: str | None = None,
-) -> dict:
+) -> Any:
     """Write a skill bundle, re-parse it, and hand back the parsed record.
+
+    Returns the SkillManager's parsed dict. Typed ``Any`` to match the rest of
+    this module, which keeps the skills package out of its import graph.
 
     Shared by ``create_skill`` / ``upload_skill`` / ``install_skill``, which
     previously each carried their own copy of this tail with drifted status

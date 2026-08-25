@@ -200,7 +200,8 @@ normal = doc.styles["Normal"]
 normal.font.name = "Calibri"
 normal.font.size = Pt(11)
 normal.font.color.rgb = RGBColor.from_string(palette["ink"])
-normal.element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+rpr = normal.element.get_or_add_rPr()
+rpr.get_or_add_rFonts().set(qn("w:eastAsia"), "Microsoft YaHei")
 normal.paragraph_format.line_spacing = 1.4
 normal.paragraph_format.space_after = Pt(8)
 ```
@@ -277,27 +278,44 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 def shade_cell(cell, hex_fill):
-    """Solid background fill for one table cell."""
+    """Solid background fill for one table cell. Replaces any existing fill --
+    w:tcPr allows at most one w:shd, and a second one corrupts the cell."""
     tcPr = cell._tc.get_or_add_tcPr()
+    for stale in tcPr.findall(qn("w:shd")):
+        tcPr.remove(stale)
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
     shd.set(qn("w:color"), "auto")
     shd.set(qn("w:fill"), hex_fill)
     tcPr.append(shd)
 
+# w:tcBorders is an ordered sequence -- Word rejects the part if the children
+# come out of order, so insert at the schema position instead of appending.
+_BORDER_ORDER = ("top", "left", "bottom", "right", "insideH", "insideV")
+
+
 def set_row_border(row, edge, hex_color, sz=8):
-    """Horizontal hairline on a row: edge is 'top' or 'bottom'. sz is 1/8 pt."""
+    """Horizontal hairline on a row: edge is 'top' or 'bottom'. sz is 1/8 pt.
+    Re-styling an edge replaces it -- one w:<edge> per w:tcBorders."""
     for cell in row.cells:
         tcPr = cell._tc.get_or_add_tcPr()
         borders = tcPr.find(qn("w:tcBorders"))
         if borders is None:
             borders = OxmlElement("w:tcBorders")
             tcPr.append(borders)
+        for stale in borders.findall(qn(f"w:{edge}")):
+            borders.remove(stale)
         el = OxmlElement(f"w:{edge}")
         el.set(qn("w:val"), "single")
         el.set(qn("w:sz"), str(sz))          # 8 = 1pt
         el.set(qn("w:color"), hex_color)
-        borders.append(el)
+        rank = _BORDER_ORDER.index(edge)
+        later = [child for child in borders
+                 if _BORDER_ORDER.index(child.tag.split("}")[1]) > rank]
+        if later:
+            later[0].addprevious(el)
+        else:
+            borders.append(el)
 ```
 
 Editorial table rules — **horizontal rules only, no vertical borders**:

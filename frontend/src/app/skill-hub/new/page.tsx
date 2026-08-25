@@ -7,7 +7,14 @@ import { ChevronLeft, Loader2, Plus, Upload } from "lucide-react";
 
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
 import { useI18n } from "@/contexts/i18n-context";
-import { apiRequest } from "@/lib/api-wrapper";
+import {
+  UPLOAD_ERROR_MESSAGES,
+  apiRequest,
+  isJsonRecord,
+  getApiErrorMessage,
+  getUploadErrorMessage,
+  parseApiResponse,
+} from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 
 /**
@@ -78,12 +85,20 @@ export default function NewSkillPage() {
         method: "POST",
         body: form,
       });
-      const body = await res.json().catch(() => ({}));
+      const parsed = await parseApiResponse(res);
       if (!res.ok) {
-        setError(body.detail || `Upload failed (HTTP ${res.status})`);
+        setError(
+          getUploadErrorMessage(res, parsed, {
+            generic: `Upload failed (HTTP ${res.status})`,
+            tooLarge: UPLOAD_ERROR_MESSAGES.tooLarge,
+            proxy: UPLOAD_ERROR_MESSAGES.proxy,
+          }),
+        );
         return;
       }
-      router.push(body.name ? `/skill-hub/${encodeURIComponent(body.name)}` : "/skill-hub");
+      const uploaded = isJsonRecord(parsed.data) ? parsed.data : {};
+      const uploadedName = typeof uploaded.name === "string" ? uploaded.name : "";
+      router.push(uploadedName ? `/skill-hub/${encodeURIComponent(uploadedName)}` : "/skill-hub");
     } catch (e) {
       console.error(e);
       setError("Network error while uploading.");
@@ -102,8 +117,8 @@ export default function NewSkillPage() {
         body: JSON.stringify({ name, skill_md: skillMd }),
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        setError(body.detail || `Create failed (HTTP ${res.status})`);
+        const parsed = await parseApiResponse(res);
+        setError(getApiErrorMessage(res, parsed, `Create failed (HTTP ${res.status})`));
         return;
       }
       // Skip back to detail page — the create response is summary-only

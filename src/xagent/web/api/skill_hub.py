@@ -558,11 +558,15 @@ def _safe_zip_extract(
         try:
             with zf.open(info) as member:
                 content = member.read(remaining + 1)
-        except zipfile.BadZipFile as exc:
-            # zipfile validates CRC at member EOF, so a ZIP with lying
-            # headers or corrupted data raises here, not at open().
+        except (zipfile.BadZipFile, RuntimeError) as exc:
+            # BadZipFile: CRC is validated at member EOF, so lying headers or
+            # corrupted data raise here rather than at open().
+            # RuntimeError: an encrypted member needs a password, and an
+            # unsupported compression method raises NotImplementedError,
+            # which subclasses RuntimeError.
             raise HTTPException(
-                status_code=bad_zip_status, detail="Skill archive is corrupted."
+                status_code=bad_zip_status,
+                detail="Skill archive is corrupted, encrypted, or uses an unsupported compression method.",
             ) from exc
         if len(content) > remaining:
             raise HTTPException(
@@ -873,18 +877,24 @@ async def upload_skill(
     if lower.endswith(".zip"):
         files, zip_root = _safe_zip_extract(data, bad_zip_status=400)
     elif lower.endswith(".md"):
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise HTTPException(
-                status_code=400, detail="Markdown upload must be UTF-8 text."
-            ) from exc
         files, zip_root = {"SKILL.md": data}, ""
     else:
         raise HTTPException(
             status_code=400,
             detail="Unsupported upload — provide a .zip skill bundle or a SKILL.md file.",
         )
+
+    # Reject non-UTF-8 SKILL.md before persisting anything. ``SkillParser``
+    # decodes as UTF-8 with no fallback, and ``SkillManager.reload`` swallows
+    # the resulting UnicodeDecodeError per record — so without this check the
+    # row commits, the skill never loads, and the retry hits the duplicate-name
+    # 409 with no way to fix it from the UI.
+    try:
+        files["SKILL.md"].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail="SKILL.md must be UTF-8 text."
+        ) from exc
 
     name = _derive_upload_skill_name(filename, zip_root, files["SKILL.md"])
 

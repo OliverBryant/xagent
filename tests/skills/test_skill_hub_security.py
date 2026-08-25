@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import pathlib
 import zipfile
 
 import pytest
@@ -193,6 +194,39 @@ class TestSafeZipExtract:
             _safe_zip_extract(bytes(data), bad_zip_status=400)
         assert exc.value.status_code == 400
 
+    def test_encrypted_member_maps_to_http_error(self):
+        # zipfile raises RuntimeError when a member needs a password.
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = pathlib.Path(tmp) / "SKILL.md"
+            src.write_bytes(SKILL_MD)
+            out = pathlib.Path(tmp) / "enc.zip"
+            proc = subprocess.run(
+                ["zip", "-q", "-P", "hunter2", "-j", str(out), str(src)],
+                capture_output=True,
+            )
+            if proc.returncode != 0:  # pragma: no cover - zip(1) not installed
+                pytest.skip("zip(1) unavailable")
+            data = out.read_bytes()
+
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+
+    def test_unsupported_compression_method_maps_to_http_error(self):
+        # An unsupported method raises NotImplementedError, which is NOT a
+        # RuntimeError subclass — it has to be caught by name.
+        data = bytearray(_make_zip({"SKILL.md": SKILL_MD}))
+        local = data.find(b"PK\x03\x04")
+        data[local + 8 : local + 10] = (99).to_bytes(2, "little")
+        central = data.find(b"PK\x01\x02")
+        data[central + 10 : central + 12] = (99).to_bytes(2, "little")
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(bytes(data), bad_zip_status=400)
+        assert exc.value.status_code == 400
+
 
 # ── upload name derivation ────────────────────────────────────────────────────
 
@@ -353,6 +387,30 @@ class TestUploadRoute:
         )
         assert summary.name == "pdf-tools"
         assert written["files"] == {"SKILL.md": SKILL_MD_NAMED}
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_skill_md_in_zip_rejected_before_write(self, monkeypatch):
+        # The DB write commits before the re-parse check, so a non-UTF-8
+        # SKILL.md would leave an unloadable row behind and make the retry
+        # collide with the duplicate-name 409. Nothing may be persisted.
+        from xagent.web.api import skill_hub
+
+        writes: list = []
+        monkeypatch.setattr(
+            skill_hub,
+            "_write_personal_skill",
+            lambda **kwargs: writes.append(kwargs),
+        )
+
+        data = _make_zip({"skill/SKILL.md": b"\xff\xfe\x00not utf8"})
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request, _make_upload("skill.zip", data), "personal", scope, db, user
+            )
+        assert exc.value.status_code == 400
+        assert "UTF-8" in exc.value.detail
+        assert writes == []
 
     @pytest.mark.asyncio
     async def test_non_utf8_markdown_rejected(self):

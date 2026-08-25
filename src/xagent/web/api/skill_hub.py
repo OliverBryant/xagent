@@ -782,7 +782,7 @@ async def _persist_and_reparse(
                 _delete_personal_skill(db=db, user=user, name=name)
             except HTTPException:
                 logger.warning(
-                    "Skill Hub: could not roll back unparseable skill %r", name
+                    "Skill Hub: could not roll back unparsable skill %r", name
                 )
         if skill is not None:
             logger.error(

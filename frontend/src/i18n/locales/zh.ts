@@ -4709,6 +4709,13 @@ const zh = {
       importTitle: "导入技能文件",
       importHint: "将 .zip 技能包或 SKILL.md 拖到此处，或点击选择文件。",
       importing: "上传中…",
+      uploadFailed: "上传失败（HTTP {status}）。",
+      uploadTooLarge: "文件过大，请减小体积后重试。",
+      uploadProxyError: "上传在到达应用前失败，请检查服务器的上传大小限制。",
+      uploadNetworkError: "上传时发生网络错误。",
+      createFailed: "创建失败（HTTP {status}）。",
+      createNetworkError: "创建时发生网络错误。",
+      singleFileOnly: "请一次只上传一个技能 —— 本次仅会导入\"{name}\"。",
     },
     editor: {
       skillMd: "SKILL.md",

@@ -10,11 +10,11 @@ import pytest
 from fastapi import HTTPException
 
 from xagent.web.api.skill_hub import (
+    _NAME_RE,
     _check_registry_security_gate,
     _derive_upload_skill_name,
     _normalize_skill_files,
     _safe_zip_extract,
-    _safe_zip_to_files,
     _slugify_skill_name,
 )
 
@@ -76,45 +76,53 @@ class TestNormalizeSkillFiles:
         assert exc.value.status_code == 413
 
 
-# ── _safe_zip_to_files ────────────────────────────────────────────────────────
+# ── _safe_zip_extract (registry path) ────────────────────────────────────────────────────────
 
 
 class TestSafeZipToFiles:
     def test_happy_path_flat(self):
         data = _make_zip({"SKILL.md": SKILL_MD, "template.md": b"# Template"})
-        result = _safe_zip_to_files(data)
+        result = _safe_zip_extract(data)[0]
         assert "SKILL.md" in result
         assert "template.md" in result
 
     def test_happy_path_nested(self):
         """ZIP with a top-level directory wrapper."""
         data = _make_zip({"my-skill/SKILL.md": SKILL_MD, "my-skill/extra.md": b"hi"})
-        result = _safe_zip_to_files(data)
+        result = _safe_zip_extract(data)[0]
         assert "SKILL.md" in result
         assert "extra.md" in result
 
     def test_bad_zip_raises(self):
         with pytest.raises(HTTPException) as exc:
-            _safe_zip_to_files(b"not a zip")
+            _safe_zip_extract(b"not a zip")[0]
         assert exc.value.status_code == 502
 
     def test_missing_skill_md_raises(self):
+        # Registry-supplied archive: a bad artifact from upstream is a 502,
+        # while the same archive uploaded by a user reports 400.
         data = _make_zip({"README.md": b"hello"})
         with pytest.raises(HTTPException) as exc:
-            _safe_zip_to_files(data)
-        assert exc.value.status_code == 400
+            _safe_zip_extract(data)[0]
+        assert exc.value.status_code == 502
         assert "SKILL.md" in exc.value.detail
+        with pytest.raises(HTTPException) as upload_exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert upload_exc.value.status_code == 400
 
     def test_path_traversal_in_zip_raises(self):
         data = _make_zip({"SKILL.md": SKILL_MD, "../escape.py": b"evil"})
         with pytest.raises(HTTPException) as exc:
-            _safe_zip_to_files(data)
-        assert exc.value.status_code == 400
+            _safe_zip_extract(data)[0]
+        assert exc.value.status_code == 502
+        with pytest.raises(HTTPException) as upload_exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert upload_exc.value.status_code == 400
 
     def test_dotfile_in_zip_rejected_by_normalize(self):
         data = _make_zip({"SKILL.md": SKILL_MD, ".env": b"SECRET=1"})
         with pytest.raises(HTTPException) as exc:
-            _safe_zip_to_files(data)
+            _safe_zip_extract(data)[0]
         assert exc.value.status_code == 400
 
     def test_oversized_member_raises(self):
@@ -123,7 +131,7 @@ class TestSafeZipToFiles:
         big = b"x" * (_MAX_DOWNLOAD_BYTES + 1)
         data = _make_zip({"SKILL.md": SKILL_MD, "large.bin": big})
         with pytest.raises(HTTPException) as exc:
-            _safe_zip_to_files(data)
+            _safe_zip_extract(data)[0]
         assert exc.value.status_code == 413
 
 
@@ -216,8 +224,8 @@ class TestSafeZipExtract:
         assert exc.value.status_code == 400
 
     def test_unsupported_compression_method_maps_to_http_error(self):
-        # An unsupported method raises NotImplementedError, which is NOT a
-        # RuntimeError subclass — it has to be caught by name.
+        # An unsupported method raises NotImplementedError, which subclasses
+        # RuntimeError, so the (BadZipFile, RuntimeError) handler covers it.
         data = bytearray(_make_zip({"SKILL.md": SKILL_MD}))
         local = data.find(b"PK\x03\x04")
         data[local + 8 : local + 10] = (99).to_bytes(2, "little")
@@ -226,6 +234,109 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(bytes(data), bad_zip_status=400)
         assert exc.value.status_code == 400
+
+    def test_multi_root_zip_is_rejected(self):
+        # Two sibling skills: picking one would silently discard the other.
+        data = _make_zip(
+            {
+                "a/SKILL.md": SKILL_MD,
+                "a/x.md": b"ax",
+                "b/SKILL.md": SKILL_MD,
+                "b/y.md": b"by",
+            }
+        )
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data)
+        assert exc.value.status_code == 502
+        assert "multiple skills" in exc.value.detail.lower()
+
+    def test_shallowest_root_wins_over_alphabetical_order(self):
+        # "a/b/c/SKILL.md" sorts after "z/SKILL.md"; selecting lexicographically
+        # would pick the deep one and drop all of z/.
+        data = _make_zip(
+            {"z/SKILL.md": SKILL_MD, "z/keep.md": b"k", "a/b/c/SKILL.md": SKILL_MD}
+        )
+        files, root = _safe_zip_extract(data)
+        assert root == "z"
+        assert sorted(files) == ["SKILL.md", "keep.md"]
+
+    def test_member_count_cap_enforced(self):
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILES
+
+        members = {f"f{i}.txt": b"" for i in range(_MAX_SKILL_FILES + 5)}
+        members["SKILL.md"] = SKILL_MD
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(_make_zip(members))
+        assert exc.value.status_code == 413
+
+    def test_member_cap_stops_extraction_before_reading_everything(self, monkeypatch):
+        """The cap must fire inside the extraction loop, not only in the
+        post-hoc ``_normalize_skill_files`` check.
+
+        Decompressing every member first and rejecting afterwards still does
+        all the work an entry-count cap exists to avoid, so assert the loop
+        stops early rather than just that a 413 comes out somewhere.
+        """
+        from xagent.web.api import skill_hub
+
+        members = {f"f{i}.txt": b"" for i in range(skill_hub._MAX_SKILL_FILES + 50)}
+        members["SKILL.md"] = SKILL_MD
+
+        calls = {"n": 0}
+        real_normalize = skill_hub._normalize_skill_files
+
+        def counting_normalize(files):
+            calls["n"] += 1
+            return real_normalize(files)
+
+        monkeypatch.setattr(skill_hub, "_normalize_skill_files", counting_normalize)
+
+        with pytest.raises(HTTPException) as exc:
+            skill_hub._safe_zip_extract(_make_zip(members))
+        assert exc.value.status_code == 413
+        # Rejected during extraction, so normalization was never reached.
+        assert calls["n"] == 0
+
+    def test_member_cap_counts_duplicate_entries(self):
+        # A ZIP may repeat a filename; those collapse onto one dict key while
+        # still costing a decompression each, so the cap counts entries.
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILES
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("SKILL.md", SKILL_MD)
+            for _ in range(_MAX_SKILL_FILES + 5):
+                zf.writestr("same.txt", b"x")
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(buf.getvalue())
+        assert exc.value.status_code == 413
+        assert "more than" in exc.value.detail
+
+    def test_compression_bomb_rejected_by_actual_byte_budget(self):
+        # Highly compressible payload: small on the wire, huge decompressed.
+        # This is the direction the bounded read is meant to stop.
+        from xagent.web.api.skill_hub import _MAX_DOWNLOAD_BYTES
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", SKILL_MD)
+            zf.writestr("bomb.bin", b"\0" * (_MAX_DOWNLOAD_BYTES + 1024))
+        payload = buf.getvalue()
+        assert len(payload) < _MAX_DOWNLOAD_BYTES  # small on the wire
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(payload)
+        assert exc.value.status_code == 413
+
+    def test_dot_slash_sibling_is_accepted(self):
+        data = _make_zip({"SKILL.md": SKILL_MD, "./extra.md": b"x"})
+        files, _root = _safe_zip_extract(data)
+        assert sorted(files) == ["SKILL.md", "extra.md"]
+
+    def test_windows_drive_letter_path_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, "C:\\evil.py": b"x"})
+        assert exc.value.status_code == 400
+        assert "colon" in exc.value.detail.lower()
 
 
 # ── upload name derivation ────────────────────────────────────────────────────
@@ -241,27 +352,48 @@ description: Handle PDFs.
 
 
 class TestDeriveUploadSkillName:
-    def test_zip_root_wins(self):
-        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD_NAMED)
-        assert name == "my-skill"
-
-    def test_frontmatter_name_beats_filename(self):
-        name = _derive_upload_skill_name("archive.zip", "", SKILL_MD_NAMED)
+    def test_frontmatter_name_beats_zip_root(self):
+        # The folder name is an artifact of how the archive happened to be
+        # zipped; frontmatter is the author's explicit declaration.
+        name = _derive_upload_skill_name("archive.zip", "skill-v2-1", SKILL_MD_NAMED)
         assert name == "pdf-tools"
 
-    def test_filename_stem_is_last_resort(self):
-        name = _derive_upload_skill_name("My Skill.zip", "", SKILL_MD)
-        assert name == "My-Skill"
+    def test_explicit_override_beats_everything(self):
+        name = _derive_upload_skill_name(
+            "archive.zip", "zip-root", SKILL_MD_NAMED, override="user-choice"
+        )
+        assert name == "user-choice"
 
-    def test_no_candidate_raises(self):
+    def test_zip_root_used_when_no_frontmatter_name(self):
+        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD)
+        assert name == "my-skill"
+
+    def test_bare_markdown_without_name_is_rejected_not_stemmed(self):
+        # Dropping a file literally called SKILL.md must not yield "SKILL".
         with pytest.raises(HTTPException) as exc:
-            _derive_upload_skill_name("---.zip", "", SKILL_MD)
+            _derive_upload_skill_name("SKILL.md", "", SKILL_MD)
         assert exc.value.status_code == 400
+        assert "name" in exc.value.detail.lower()
+
+    def test_cjk_name_falls_back_instead_of_dead_ending(self):
+        name = _derive_upload_skill_name("a.zip", "中文技能", SKILL_MD)
+        assert name.startswith("skill-")
+        assert _NAME_RE.match(name)
+
+    def test_cjk_fallback_is_deterministic(self):
+        first = _derive_upload_skill_name("a.zip", "中文技能", SKILL_MD)
+        second = _derive_upload_skill_name("b.zip", "别的名字", SKILL_MD)
+        # Derived from content, so the same bundle yields a stable name.
+        assert first == second
 
     def test_slugify(self):
         assert _slugify_skill_name("  Café menu skill!  ") == "Caf-menu-skill"
         assert _slugify_skill_name("ok_name-1") == "ok_name-1"
         assert _slugify_skill_name("///") == ""
+
+    def test_slugify_truncation_leaves_no_trailing_separator(self):
+        raw = "a" * 63 + "-" + "b" * 20
+        assert _slugify_skill_name(raw) == "a" * 63
 
 
 # ── POST /upload route ────────────────────────────────────────────────────────
@@ -286,46 +418,48 @@ def _upload_args():
     )
 
 
+async def _call_upload(upload, scope_value="personal", name=None):
+    """Invoke the route with keyword args.
+
+    Positional calls silently rebind when the signature grows a parameter,
+    which is exactly what happened when ``name`` was added.
+    """
+    from xagent.web.api import skill_hub
+
+    request, scope, db, user = _upload_args()
+    return await skill_hub.upload_skill(
+        request,
+        file=upload,
+        scope=scope_value,
+        name=name,
+        context=scope,
+        db=db,
+        _user=user,
+    )
+
+
 class TestUploadRoute:
     @pytest.mark.asyncio
     async def test_zip_with_traversal_rejected(self):
-        from xagent.web.api import skill_hub
-
         data = _make_zip({"skill/SKILL.md": SKILL_MD, "skill/../../escape.py": b"evil"})
-        request, scope, db, user = _upload_args()
         with pytest.raises(HTTPException) as exc:
-            await skill_hub.upload_skill(
-                request, _make_upload("skill.zip", data), "personal", scope, db, user
-            )
+            await _call_upload(_make_upload("skill.zip", data))
         assert exc.value.status_code == 400
         assert "unsafe" in exc.value.detail.lower()
 
     @pytest.mark.asyncio
     async def test_unsupported_extension_rejected(self):
-        from xagent.web.api import skill_hub
-
-        request, scope, db, user = _upload_args()
         with pytest.raises(HTTPException) as exc:
-            await skill_hub.upload_skill(
-                request, _make_upload("skill.tar.gz", b"x"), "personal", scope, db, user
-            )
+            await _call_upload(_make_upload("skill.tar.gz", b"x"))
         assert exc.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_oversized_upload_rejected(self, monkeypatch):
         from xagent.web.api import skill_hub
 
-        monkeypatch.setattr(skill_hub, "_MAX_DOWNLOAD_BYTES", 64)
-        request, scope, db, user = _upload_args()
+        monkeypatch.setattr(skill_hub, "get_max_upload_size_bytes", lambda: 64)
         with pytest.raises(HTTPException) as exc:
-            await skill_hub.upload_skill(
-                request,
-                _make_upload("skill.zip", b"x" * 65),
-                "personal",
-                scope,
-                db,
-                user,
-            )
+            await _call_upload(_make_upload("skill.zip", b"x" * 65))
         assert exc.value.status_code == 413
 
     @pytest.mark.asyncio
@@ -339,6 +473,10 @@ class TestUploadRoute:
 
         class _Manager:
             async def get_skill(self, name):
+                # Answer only for what was actually written, so the route's
+                # identity check is exercised rather than short-circuited.
+                if written.get("name") != name:
+                    return None
                 return {"name": name, "scope": "personal", "path": ""}
 
         async def _scoped(*args):
@@ -348,10 +486,7 @@ class TestUploadRoute:
         monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
 
         data = _make_zip({"pdf-tools/SKILL.md": SKILL_MD, "pdf-tools/ref.md": b"r"})
-        request, scope, db, user = _upload_args()
-        summary = await skill_hub.upload_skill(
-            request, _make_upload("archive.zip", data), "personal", scope, db, user
-        )
+        summary = await _call_upload(_make_upload("archive.zip", data))
         assert summary.name == "pdf-tools"
         assert written["name"] == "pdf-tools"
         assert written["origin"] == "upload"
@@ -368,6 +503,10 @@ class TestUploadRoute:
 
         class _Manager:
             async def get_skill(self, name):
+                # Answer only for what was actually written, so the route's
+                # identity check is exercised rather than short-circuited.
+                if written.get("name") != name:
+                    return None
                 return {"name": name, "scope": "personal", "path": ""}
 
         async def _scoped(*args):
@@ -376,15 +515,7 @@ class TestUploadRoute:
         monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
         monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
 
-        request, scope, db, user = _upload_args()
-        summary = await skill_hub.upload_skill(
-            request,
-            _make_upload("whatever.md", SKILL_MD_NAMED),
-            "personal",
-            scope,
-            db,
-            user,
-        )
+        summary = await _call_upload(_make_upload("whatever.md", SKILL_MD_NAMED))
         assert summary.name == "pdf-tools"
         assert written["files"] == {"SKILL.md": SKILL_MD_NAMED}
 
@@ -403,29 +534,16 @@ class TestUploadRoute:
         )
 
         data = _make_zip({"skill/SKILL.md": b"\xff\xfe\x00not utf8"})
-        request, scope, db, user = _upload_args()
         with pytest.raises(HTTPException) as exc:
-            await skill_hub.upload_skill(
-                request, _make_upload("skill.zip", data), "personal", scope, db, user
-            )
+            await _call_upload(_make_upload("skill.zip", data))
         assert exc.value.status_code == 400
         assert "UTF-8" in exc.value.detail
         assert writes == []
 
     @pytest.mark.asyncio
     async def test_non_utf8_markdown_rejected(self):
-        from xagent.web.api import skill_hub
-
-        request, scope, db, user = _upload_args()
         with pytest.raises(HTTPException) as exc:
-            await skill_hub.upload_skill(
-                request,
-                _make_upload("skill.md", b"\xff\xfe\x00bad"),
-                "personal",
-                scope,
-                db,
-                user,
-            )
+            await _call_upload(_make_upload("skill.md", b"\xff\xfe\x00bad"))
         assert exc.value.status_code == 400
 
 

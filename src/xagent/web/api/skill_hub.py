@@ -66,6 +66,7 @@ from xagent.web.api.skill_hub_registry import (
     get_registry,
 )
 from xagent.web.auth_dependencies import get_current_user
+from xagent.web.config import format_file_size, get_max_upload_size_bytes
 from xagent.web.models.database import get_db
 from xagent.web.models.user import User
 from xagent.web.services.skill_runtime import (
@@ -355,11 +356,30 @@ def _summary_source(skill_dict: dict) -> str:
     return skill_dict.get("source") or _classify_source(skill_dict.get("path", ""))
 
 
+# One skill is a handful of files: a SKILL.md, maybe a template, some
+# reference docs. A cap well above any legitimate bundle still stops an
+# archive whose entries are individually tiny — the byte budget alone let a
+# ~11 MB upload expand into 100k rows, one INSERT each.
+_MAX_SKILL_FILES = 512
+
+
 def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
+    if len(files) > _MAX_SKILL_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Skill bundle has {len(files)} files, over the "
+                f"{_MAX_SKILL_FILES}-file limit."
+            ),
+        )
     out: dict[str, bytes] = {}
     total = 0
     for raw_path, content in files.items():
         path = str(raw_path).replace("\\", "/").lstrip("/")
+        # Strip a leading "./" so a sibling written as "./extra.md" is not
+        # mistaken for a dotfile below.
+        while path.startswith("./"):
+            path = path[2:]
         if not path or ".." in path.split("/"):
             raise HTTPException(
                 status_code=400,
@@ -368,6 +388,14 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
         if path.startswith("."):
             raise HTTPException(
                 status_code=400, detail="Skill file path must not start with a dot."
+            )
+        # Reject Windows drive letters and any other colon-bearing path.
+        # Nothing writes these to disk today, but a stored "C:/evil.py" is a
+        # trap for whatever consumes the bundle next.
+        if ":" in path:
+            raise HTTPException(
+                status_code=400,
+                detail="Skill file path must not contain a drive letter or colon.",
             )
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
@@ -519,12 +547,6 @@ def _installed_slugs(mgr: Any) -> set[str]:
     return set(mgr._skills_cache.keys())  # noqa: SLF001 — internal but stable
 
 
-def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
-    """Read a skill ZIP into a normalized skill file bundle."""
-    files, _root = _safe_zip_extract(zip_bytes)
-    return files
-
-
 def _safe_zip_extract(
     zip_bytes: bytes, *, bad_zip_status: int = 502
 ) -> tuple[dict[str, bytes], str]:
@@ -545,6 +567,7 @@ def _safe_zip_extract(
         ) from exc
 
     total = 0
+    seen_members = 0
     raw_files: dict[str, bytes] = {}
     for info in zf.infolist():
         if info.is_dir():
@@ -552,7 +575,7 @@ def _safe_zip_extract(
         path = info.filename.replace("\\", "/").lstrip("/")
         if not path or ".." in path.split("/"):
             raise HTTPException(
-                status_code=400, detail="Skill ZIP contains unsafe paths."
+                status_code=bad_zip_status, detail="Skill ZIP contains unsafe paths."
             )
         remaining = _MAX_DOWNLOAD_BYTES - total
         try:
@@ -572,17 +595,49 @@ def _safe_zip_extract(
             raise HTTPException(
                 status_code=413, detail="Skill ZIP exceeds size budget."
             )
+        # Count entries processed, not dict keys: a ZIP may repeat a filename,
+        # and those collapse onto one key while still costing a decompression
+        # each. Counting keys would let a duplicate-heavy archive slip past.
+        seen_members += 1
+        if seen_members > _MAX_SKILL_FILES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Skill ZIP has more than {_MAX_SKILL_FILES} files. Trim the "
+                    "archive to the skill's own files."
+                ),
+            )
         total += len(content)
         raw_files[path] = content
 
-    skill_md_paths = sorted(
+    skill_md_paths = [
         path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md"
-    )
+    ]
     if not skill_md_paths:
         raise HTTPException(
-            status_code=400, detail="Skill archive has no SKILL.md anywhere in it."
+            status_code=bad_zip_status,
+            detail="Skill archive has no SKILL.md anywhere in it.",
         )
-    skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
+    # Pick the shallowest SKILL.md as the skill root. Sorting the paths
+    # lexicographically instead would pick by alphabet, so "a/b/c/SKILL.md"
+    # could beat "z/SKILL.md" and everything outside the chosen root is
+    # dropped further down — silently discarding the real skill.
+    min_depth = min(path.count("/") for path in skill_md_paths)
+    shallowest = sorted(path for path in skill_md_paths if path.count("/") == min_depth)
+    if len(shallowest) > 1:
+        # Two sibling skills in one archive. Guessing which one was meant
+        # would silently discard the other, so make the user choose.
+        roots = ", ".join(
+            path.removesuffix("SKILL.md").rstrip("/") or "." for path in shallowest
+        )
+        raise HTTPException(
+            status_code=bad_zip_status,
+            detail=(
+                f"Skill archive contains multiple skills ({roots}). "
+                "Upload one skill per archive."
+            ),
+        )
+    skill_root = shallowest[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
     for path, content in raw_files.items():
         if skill_root:
@@ -621,6 +676,128 @@ def _check_registry_security_gate(registry: Any, detail: dict) -> None:
             status_code=403,
             detail=f"Install refused: skill is {moderation_state} by {registry.display_name} moderators.",
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Helpers — persist + verify round trip
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _expected_scope_source(scope: str) -> str:
+    """The ``source`` a freshly written record must report back.
+
+    ``_summary_source`` maps ``scope="personal"`` to ``"user"``; team writes
+    surface as ``"team"``.
+    """
+    return "user" if scope == "personal" else scope
+
+
+async def _persist_and_reparse(
+    *,
+    request: Request,
+    context: SkillScopeContext,
+    db: Any,
+    user: User,
+    name: str,
+    files: dict[str, bytes],
+    scope: str,
+    origin: str,
+    clawhub_slug: str | None = None,
+    clawhub_version: str | None = None,
+) -> dict:
+    """Write a skill bundle, re-parse it, and hand back the parsed record.
+
+    Shared by ``create_skill`` / ``upload_skill`` / ``install_skill``, which
+    previously each carried their own copy of this tail with drifted status
+    codes and messages.
+
+    Two failure modes this closes:
+
+    * **Orphaned rows.** ``_write_personal_skill`` commits, but the parser
+      that runs afterwards decodes every bundled file as UTF-8 with no
+      fallback and ``SkillManager.reload`` logs-and-skips the failure. A
+      bundle that commits but cannot parse used to leave a row that no API
+      verb could reach — ``GET /installed`` enumerates the parsed cache so it
+      never listed, ``DELETE`` 404'd on the same lookup, and a retry hit the
+      duplicate-name 409. The name was burned until someone touched the DB by
+      hand. We now delete the row before returning the error.
+
+    * **False success on a name collision.** ``reload`` builds a plain dict
+      keyed by name, filesystem records first, so a *builtin* of the same name
+      stays cached when the personal record fails to parse. A bare
+      ``skill is None`` check passed and the endpoint returned 200 with the
+      builtin's metadata, sending the user to an unrelated skill's page. We
+      verify the record we get back is the one we just wrote.
+    """
+    _validate_skill_name(name)
+    normalized = _normalize_skill_files(files)
+
+    if scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        metadata = None
+        if clawhub_slug is not None or clawhub_version is not None:
+            metadata = {
+                f"{origin}_slug": clawhub_slug,
+                f"{origin}_version": clawhub_version,
+            }
+        kwargs: dict[str, Any] = {
+            "scope": "team",
+            "name": name,
+            "files": normalized,
+            "origin": origin,
+        }
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            **kwargs,
+        )
+    else:
+        _write_personal_skill(
+            db=db,
+            user=user,
+            name=name,
+            files=normalized,
+            origin=origin,
+            clawhub_slug=clawhub_slug,
+            clawhub_version=clawhub_version,
+        )
+
+    mgr = await _get_scoped_manager(request, context, db)
+    skill = await mgr.get_skill(name)
+
+    expected_source = _expected_scope_source(scope)
+    actual_source = _summary_source(skill) if skill is not None else None
+    if skill is None or actual_source != expected_source:
+        # Undo the write so the name stays available. Personal rows are ours
+        # to delete; a team provider owns its own storage, so we only report.
+        if scope == "personal":
+            try:
+                _delete_personal_skill(db=db, user=user, name=name)
+            except HTTPException:
+                logger.warning(
+                    "Skill Hub: could not roll back unparseable skill %r", name
+                )
+        if skill is not None:
+            logger.error(
+                "Skill Hub: %r re-parsed as a %s skill, not the %s skill just "
+                "written — refusing to report success",
+                name,
+                actual_source,
+                expected_source,
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Skill {name!r} could not be loaded after writing and was "
+                "rolled back. Every file in the bundle must be UTF-8 text, "
+                "and the name must not collide with an existing skill."
+            ),
+        )
+    return skill
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -721,38 +898,16 @@ async def create_skill(
     refuse on duplicate names — overwrite via the edit endpoint is
     explicit, not implicit.
     """
-    if body.scope != "personal":
-        from xagent.skills.library import get_skill_write_provider
-
-        await invoke_skill_write_provider(
-            get_skill_write_provider(),
-            "create_skill",
-            _write_context(context),
-            scope=body.scope,
-            name=body.name,
-            files={"SKILL.md": body.skill_md.encode("utf-8")},
-        )
-    else:
-        _write_personal_skill(
-            db=db,
-            user=_user,
-            name=body.name,
-            files={"SKILL.md": body.skill_md.encode("utf-8")},
-        )
-
-    mgr = await _get_scoped_manager(request, context, db)
-    skill = await mgr.get_skill(body.name)
-    if skill is None:
-        # Most likely cause: malformed YAML frontmatter that the parser
-        # rejected. Leave the file on disk so the user can fix it via
-        # PUT, but tell them why nothing showed up.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Skill written to disk but failed to re-parse — check the "
-                "YAML frontmatter at the top of SKILL.md."
-            ),
-        )
+    skill = await _persist_and_reparse(
+        request=request,
+        context=context,
+        db=db,
+        user=_user,
+        name=body.name,
+        files={"SKILL.md": body.skill_md.encode("utf-8")},
+        scope=body.scope,
+        origin="custom",
+    )
     logger.info(
         "Skill Hub: created user skill %r (%d bytes)", body.name, len(body.skill_md)
     )
@@ -814,15 +969,43 @@ async def edit_installed(
 
 def _slugify_skill_name(raw: str) -> str:
     """Collapse arbitrary text into the [A-Za-z0-9_-]+ shape
-    ``_validate_skill_name`` accepts; empty string if nothing survives."""
-    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip()).strip("-_")[:64]
+    ``_validate_skill_name`` accepts; empty string if nothing survives.
+
+    Truncation happens before the final strip so a cut mid-name cannot
+    reintroduce a trailing separator.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip())[:64].strip("-_")
 
 
-def _derive_upload_skill_name(filename: str, zip_root: str, skill_md: bytes) -> str:
+def _generated_skill_name(skill_md: bytes) -> str:
+    """Deterministic fallback for a name that slugifies to nothing.
+
+    Names written entirely in a non-Latin script (Chinese, Japanese,
+    Cyrillic, …) collapse to an empty slug, which used to be a dead-end
+    400 with no way for the user to proceed. Derive a stable name from the
+    content instead so the upload succeeds and can be renamed afterwards.
+    """
+    digest = hashlib.sha256(skill_md).hexdigest()[:8]
+    return f"skill-{digest}"
+
+
+def _derive_upload_skill_name(
+    filename: str,
+    zip_root: str,
+    skill_md: bytes,
+    override: str | None = None,
+) -> str:
     """Pick a skill name for an uploaded bundle.
 
-    Priority: ZIP root directory name (how Claude-style skill folders
-    are usually zipped) → frontmatter ``name`` → upload filename stem.
+    Priority: caller-supplied ``override`` → frontmatter ``name`` → ZIP root
+    directory name → a content-derived fallback.
+
+    Frontmatter outranks the ZIP root because the directory name is an
+    accidental artifact of how the folder happened to be zipped, while
+    frontmatter is the author's explicit declaration. The bare-``.md`` path
+    deliberately does *not* fall back to the filename stem: dropping a file
+    named ``SKILL.md`` (exactly what the UI suggests) would otherwise produce
+    a skill literally named ``SKILL``.
     """
     from xagent.skills.parser import SkillParser
 
@@ -831,16 +1014,24 @@ def _derive_upload_skill_name(filename: str, zip_root: str, skill_md: bytes) -> 
     )
     fm_name = frontmatter.get("name")
     candidates = [
-        zip_root,
+        override or "",
         fm_name if isinstance(fm_name, str) else "",
-        Path(filename).stem,
+        zip_root,
     ]
     for raw in candidates:
         slug = _slugify_skill_name(raw)
         if slug:
             return slug
+    if override or any(candidates):
+        # Something was supplied but slugified away entirely (e.g. an
+        # all-CJK name) — fall back rather than dead-ending the upload.
+        return _generated_skill_name(skill_md)
     raise HTTPException(
-        status_code=400, detail="Could not derive a skill name from the upload."
+        status_code=400,
+        detail=(
+            "Could not determine a skill name. Add a 'name:' field to the "
+            "SKILL.md frontmatter, or supply a name with the upload."
+        ),
     )
 
 
@@ -849,6 +1040,7 @@ async def upload_skill(
     request: Request,
     file: UploadFile = File(...),
     scope: str = Form("personal"),
+    name: Optional[str] = Form(None),
     context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
@@ -865,11 +1057,12 @@ async def upload_skill(
             status_code=400, detail="scope must be 'personal' or 'team'."
         )
 
-    data = await file.read(_MAX_DOWNLOAD_BYTES + 1)
-    if len(data) > _MAX_DOWNLOAD_BYTES:
+    max_bytes = get_max_upload_size_bytes()
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"Upload exceeds {_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit.",
+            detail=f"Upload exceeds the {format_file_size(max_bytes)} limit.",
         )
 
     filename = (file.filename or "").strip()
@@ -884,54 +1077,39 @@ async def upload_skill(
             detail="Unsupported upload — provide a .zip skill bundle or a SKILL.md file.",
         )
 
-    # Reject non-UTF-8 SKILL.md before persisting anything. ``SkillParser``
-    # decodes as UTF-8 with no fallback, and ``SkillManager.reload`` swallows
-    # the resulting UnicodeDecodeError per record — so without this check the
-    # row commits, the skill never loads, and the retry hits the duplicate-name
-    # 409 with no way to fix it from the UI.
-    try:
-        files["SKILL.md"].decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HTTPException(
-            status_code=400, detail="SKILL.md must be UTF-8 text."
-        ) from exc
+    # Reject non-UTF-8 content before persisting anything. ``SkillParser``
+    # decodes SKILL.md *and* template.md with no fallback, so checking only
+    # SKILL.md left a bundle that committed and then failed to parse.
+    # ``_persist_and_reparse`` would roll that back, but failing up front gives
+    # the user the actual reason and names the offending file.
+    for path in ("SKILL.md", "template.md"):
+        content = files.get(path)
+        if content is None:
+            continue
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"{path} must be UTF-8 text."
+            ) from exc
 
-    name = _derive_upload_skill_name(filename, zip_root, files["SKILL.md"])
+    skill_name = _derive_upload_skill_name(
+        filename, zip_root, files["SKILL.md"], override=name
+    )
 
-    if scope == "team":
-        from xagent.skills.library import get_skill_write_provider
-
-        await invoke_skill_write_provider(
-            get_skill_write_provider(),
-            "create_skill",
-            _write_context(context),
-            scope="team",
-            name=name,
-            files=files,
-            origin="upload",
-        )
-    else:
-        _write_personal_skill(
-            db=db,
-            user=_user,
-            name=name,
-            files=files,
-            origin="upload",
-        )
-
-    mgr = await _get_scoped_manager(request, context, db)
-    skill = await mgr.get_skill(name)
-    if skill is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Skill uploaded but failed to re-parse — check the YAML "
-                "frontmatter at the top of SKILL.md."
-            ),
-        )
+    skill = await _persist_and_reparse(
+        request=request,
+        context=context,
+        db=db,
+        user=_user,
+        name=skill_name,
+        files=files,
+        scope=scope,
+        origin="upload",
+    )
     logger.info(
         "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
-        name,
+        skill_name,
         filename,
         len(data),
         len(files),
@@ -1065,44 +1243,19 @@ async def install_skill(
         )
 
     # --- Store DB bundle -----------------------------------------
-    files = _safe_zip_to_files(zip_bytes)
-    if body.scope == "team":
-        from xagent.skills.library import get_skill_write_provider
-
-        await invoke_skill_write_provider(
-            get_skill_write_provider(),
-            "create_skill",
-            _write_context(context),
-            scope="team",
-            name=body.slug,
-            files=files,
-            origin=registry.id,
-            metadata={
-                f"{registry.id}_slug": body.slug,
-                f"{registry.id}_version": body.version,
-            },
-        )
-    else:
-        _write_personal_skill(
-            db=db,
-            user=_user,
-            name=body.slug,
-            files=files,
-            origin=registry.id,
-            clawhub_slug=body.slug,
-            clawhub_version=body.version,
-        )
-
-    mgr = await _get_scoped_manager(request, context, db)
-    skill = await mgr.get_skill(body.slug)
-    if skill is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{registry.display_name} skill {body.slug!r} installed but failed "
-                "to re-parse. Inspect SKILL.md by hand or remove and retry."
-            ),
-        )
+    files, _root = _safe_zip_extract(zip_bytes, bad_zip_status=502)
+    skill = await _persist_and_reparse(
+        request=request,
+        context=context,
+        db=db,
+        user=_user,
+        name=body.slug,
+        files=files,
+        scope=body.scope,
+        origin=registry.id,
+        clawhub_slug=body.slug,
+        clawhub_version=body.version,
+    )
     logger.info(
         "Skill Hub: installed %s skill %r (v%s, scan=%s)",
         registry.id,

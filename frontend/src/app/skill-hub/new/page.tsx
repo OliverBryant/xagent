@@ -69,18 +69,21 @@ export default function NewSkillPage() {
   // The backend regex matches client-side validation here so we can
   // disable the Create button before the user wastes a round trip.
   const nameValid = /^[A-Za-z0-9_-]+$/.test(name);
-  const canSubmit = nameValid && skillMd.trim().length > 0 && !saving;
+  const canSubmit = nameValid && skillMd.trim().length > 0 && !saving && !uploading;
 
-  // Upload a .zip skill bundle or a bare SKILL.md; the backend derives
-  // the skill name (zip root dir → frontmatter name → filename stem)
-  // and redirects us to the parsed detail view.
+  // Upload a .zip skill bundle or a bare SKILL.md. The backend resolves the
+  // skill name (typed override → frontmatter name → zip root dir) and we
+  // redirect to whatever name it reports back.
   const handleUpload = async (file: File) => {
-    if (uploading) return;
+    if (uploading || saving) return;
     setUploading(true);
     setError(null);
     try {
       const form = new FormData();
       form.append("file", file);
+      // Send the typed name as an override so the user, not the archive's
+      // directory layout, has the final say over the skill name.
+      if (nameValid) form.append("name", name);
       const res = await apiRequest(`${apiBase}/api/skill-hub/upload`, {
         method: "POST",
         body: form,
@@ -89,9 +92,9 @@ export default function NewSkillPage() {
       if (!res.ok) {
         setError(
           getUploadErrorMessage(res, parsed, {
-            generic: `Upload failed (HTTP ${res.status})`,
-            tooLarge: UPLOAD_ERROR_MESSAGES.tooLarge,
-            proxy: UPLOAD_ERROR_MESSAGES.proxy,
+            generic: t("skillHub.newSkill.uploadFailed", { status: String(res.status) }),
+            tooLarge: t("skillHub.newSkill.uploadTooLarge"),
+            proxy: t("skillHub.newSkill.uploadProxyError"),
           }),
         );
         return;
@@ -101,13 +104,26 @@ export default function NewSkillPage() {
       router.push(uploadedName ? `/skill-hub/${encodeURIComponent(uploadedName)}` : "/skill-hub");
     } catch (e) {
       console.error(e);
-      setError("Network error while uploading.");
+      setError(t("skillHub.newSkill.uploadNetworkError"));
     } finally {
       setUploading(false);
     }
   };
 
+  // Only one file becomes one skill, so say so rather than silently
+  // dropping the rest of a multi-file drop.
+  const handleFileList = (list: FileList | null) => {
+    const picked = list?.[0];
+    if (!picked) return;
+    if (list && list.length > 1) {
+      setError(t("skillHub.newSkill.singleFileOnly", { name: picked.name }));
+      return;
+    }
+    void handleUpload(picked);
+  };
+
   const handleCreate = async () => {
+    if (uploading || saving) return;
     setSaving(true);
     setError(null);
     try {
@@ -118,7 +134,13 @@ export default function NewSkillPage() {
       });
       if (!res.ok) {
         const parsed = await parseApiResponse(res);
-        setError(getApiErrorMessage(res, parsed, `Create failed (HTTP ${res.status})`));
+        setError(
+          getApiErrorMessage(
+            res,
+            parsed,
+            t("skillHub.newSkill.createFailed", { status: String(res.status) }),
+          ),
+        );
         return;
       }
       // Skip back to detail page — the create response is summary-only
@@ -126,7 +148,7 @@ export default function NewSkillPage() {
       router.push(`/skill-hub/${encodeURIComponent(name)}`);
     } catch (e) {
       console.error(e);
-      setError("Network error while creating.");
+      setError(t("skillHub.newSkill.createNetworkError"));
     } finally {
       setSaving(false);
     }
@@ -158,24 +180,32 @@ export default function NewSkillPage() {
         <div
           role="button"
           tabIndex={0}
-          onClick={() => !uploading && fileInputRef.current?.click()}
+          aria-disabled={uploading || saving}
+          onClick={() => !(uploading || saving) && fileInputRef.current?.click()}
           onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+            if (e.key !== "Enter" && e.key !== " ") return;
+            // Space would otherwise scroll the page.
+            e.preventDefault();
+            if (!(uploading || saving)) fileInputRef.current?.click();
           }}
           onDragOver={(e) => {
             e.preventDefault();
             setDragOver(true);
           }}
-          onDragLeave={() => setDragOver(false)}
+          onDragLeave={(e) => {
+            // Crossing into a child fires dragleave on the zone itself; without
+            // this the highlight flickers for the whole drag.
+            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+            setDragOver(false);
+          }}
           onDrop={(e) => {
             e.preventDefault();
             setDragOver(false);
-            const f = e.dataTransfer.files?.[0];
-            if (f) void handleUpload(f);
+            handleFileList(e.dataTransfer.files);
           }}
           className={`mb-6 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed p-4 transition-colors ${
             dragOver ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
-          } ${uploading ? "pointer-events-none opacity-60" : ""}`}
+          } ${uploading || saving ? "pointer-events-none opacity-60" : ""}`}
         >
           {uploading ? (
             <Loader2 className="h-5 w-5 shrink-0 animate-spin text-muted-foreground" />
@@ -195,8 +225,7 @@ export default function NewSkillPage() {
             className="hidden"
             onClick={(e) => e.stopPropagation()}
             onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void handleUpload(f);
+              handleFileList(e.target.files);
               e.target.value = "";
             }}
           />

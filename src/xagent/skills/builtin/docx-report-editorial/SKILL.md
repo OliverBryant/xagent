@@ -53,9 +53,16 @@ Do NOT use:
 - `doc.save("output/foo.docx")` — there is no nested `output/` subdir
 - BytesIO + base64 round-trips — just save to disk directly.
 
-Verify with `os.path.getsize("market_expansion_report.docx")` before
-declaring success. A real python-docx document is **always >10 KB** —
-if your saved file is under 5 KB it's broken or empty.
+Verify the content, not the byte count: an empty `Document()` already saves
+at ~36 KB, so a size threshold cannot tell a real report from a blank one.
+Re-open the file and count what you wrote:
+
+```python
+from docx import Document
+
+check = Document("market_expansion_report.docx")
+assert len(check.paragraphs) > 10 and len(check.tables) >= 1
+```
 
 ### 🔗 Make it clickable in chat — REQUIRED
 
@@ -129,19 +136,27 @@ The UUID comes from the executor response. Do not fabricate one.
 
 Same palettes as `pdf-report-editorial` and `pptx-editorial` — keep the
 editorial family visually consistent. Each: `ink` (body text + rules),
-`paper` (page / cell background), `paper-tint` (table band + callout bg),
-`ink-tint` (kickers, captions, footer).
+`paper` (page / cell background), `paper_tint` (table band + callout bg),
+`ink_tint` (kickers, captions, footer). The keys are underscored — the dict
+below is what every snippet indexes into.
 
 - **Monocle** (default / business / tech / policy)
-  ink `0A0A0B` · paper `F1EFEA` · paper-tint `E8E5DE` · ink-tint `18181A`
+  ink `0A0A0B` · paper `F1EFEA` · paper_tint `E8E5DE` · ink_tint `18181A`
 - **Indigo Porcelain** (research / data-heavy)
-  ink `0A1F3D` · paper `F1F3F5` · paper-tint `E4E8EC` · ink-tint `152A4A`
+  ink `0A1F3D` · paper `F1F3F5` · paper_tint `E4E8EC` · ink_tint `152A4A`
 - **Forest Ink** (sustainability / impact)
-  ink `1A2E1F` · paper `F5F1E8` · paper-tint `ECE7DA` · ink-tint `253D2C`
+  ink `1A2E1F` · paper `F5F1E8` · paper_tint `ECE7DA` · ink_tint `253D2C`
 - **Kraft Paper** (humanities / qualitative)
-  ink `2A1E13` · paper `EEDFC7` · paper-tint `E0D0B6` · ink-tint `3A2A1D`
+  ink `2A1E13` · paper `EEDFC7` · paper_tint `E0D0B6` · ink_tint `3A2A1D`
 - **Dune** (art / design / fashion criticism)
-  ink `1F1A14` · paper `F0E6D2` · paper-tint `E3D7BF` · ink-tint `2D2620`
+  ink `1F1A14` · paper `F0E6D2` · paper_tint `E3D7BF` · ink_tint `2D2620`
+
+Define it once at the top of the script, then index it everywhere:
+
+```python
+palette = {"ink": "0A0A0B", "paper": "F1EFEA",
+           "paper_tint": "E8E5DE", "ink_tint": "18181A"}   # Monocle
+```
 
 python-docx takes hex without the `#` prefix, via
 `RGBColor.from_string(palette["ink"])`.
@@ -152,7 +167,7 @@ python-docx takes hex without the `#` prefix, via
 |---|---|---|---|---|
 | Cover title | `Title` | Georgia | 40pt | regular |
 | Cover subtitle / dek | body run | Calibri | 14pt | italic |
-| Kicker (small caps label) | body run | Calibri | 9pt, uppercase | bold, ink-tint |
+| Kicker (small caps label) | body run | Calibri | 9pt, uppercase | bold, ink_tint |
 | H1 section | `Heading 1` | Georgia | 22pt | regular |
 | H2 subsection | `Heading 2` | Georgia | 16pt | regular |
 | H3 sub-subsection | `Heading 3` | Calibri | 12pt | bold |
@@ -160,7 +175,7 @@ python-docx takes hex without the `#` prefix, via
 | Pull quote | `Intense Quote` | Georgia | 14pt | italic |
 | Table header | table run | Calibri | 10pt | bold, paper on ink |
 | Table body | table run | Calibri | 10pt | regular |
-| Caption / footnote | `Caption` | Calibri | 9pt | italic, ink-tint |
+| Caption / footnote | `Caption` | Calibri | 9pt | italic, ink_tint |
 
 ## 📐 Page setup
 
@@ -169,7 +184,7 @@ Set margins, size and orientation on each `section` before adding content.
 ```python
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
-from docx.enum.section import WD_ORIENT, WD_SECTION
+from docx.enum.section import WD_ORIENT
 
 doc = Document()
 sec = doc.sections[0]
@@ -240,8 +255,11 @@ meta_run = meta.add_run("Xagent Team · 2026-05-14")   # middle dot, not hyphen
 meta_run.font.size = Pt(10)
 meta_run.font.color.rgb = RGBColor.from_string(palette["ink_tint"])
 
-# Page break -> body starts on page 2
-doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+# A new section — not just a page break — is what lets the body restart page
+# numbering and carry its own header/footer.
+from docx.enum.section import WD_SECTION
+
+body = doc.add_section(WD_SECTION.NEW_PAGE)
 ```
 
 ## 🔠 Heading hierarchy
@@ -268,6 +286,17 @@ doc.add_heading("Market Size", level=2)
 ⚠️ `doc.add_heading(..., level=0)` applies the `Title` style, not a
 heading — use it only on the cover. Body sections start at `level=1`.
 
+Pull quotes use the built-in style too, so they stay in the outline-free
+body flow:
+
+```python
+quote = doc.add_paragraph(style="Intense Quote")
+quote_run = quote.add_run("Adoption is no longer the constraint; "
+                          "operating cost is.")
+quote_run.font.name, quote_run.font.size = "Georgia", Pt(14)
+quote_run.font.italic = True
+```
+
 ## 📊 Table styling
 
 python-docx has no API for cell shading or borders, so both need raw
@@ -277,45 +306,61 @@ OOXML. These two helpers are the whole toolkit — copy them verbatim.
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+# Both w:tcPr and w:tcBorders are ordered sequences: Word rejects the part when
+# children appear out of order, and each tag may appear at most once. Appending
+# is wrong on both counts, so everything below inserts at the schema position.
+_TCPR_ORDER = ("cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders",
+               "shd", "noWrap", "tcMar", "textDirection", "tcFitText",
+               "vAlign", "hideMark")
+_BORDER_ORDER = ("top", "left", "bottom", "right", "insideH", "insideV",
+                 "tl2br", "tr2bl")
+
+
+def _put(parent, tag, order):
+    """Replace parent's <w:{tag}> child, keeping the schema's element order."""
+    for stale in parent.findall(qn(f"w:{tag}")):
+        parent.remove(stale)
+    el = OxmlElement(f"w:{tag}")
+    rank = order.index(tag)
+    later = [child for child in parent
+             if child.tag.split("}")[1] in order
+             and order.index(child.tag.split("}")[1]) > rank]
+    if later:
+        later[0].addprevious(el)
+    else:
+        parent.append(el)
+    return el
+
+
 def shade_cell(cell, hex_fill):
-    """Solid background fill for one table cell. Replaces any existing fill --
-    w:tcPr allows at most one w:shd, and a second one corrupts the cell."""
+    """Solid background fill for one table cell."""
     tcPr = cell._tc.get_or_add_tcPr()
-    for stale in tcPr.findall(qn("w:shd")):
-        tcPr.remove(stale)
-    shd = OxmlElement("w:shd")
+    shd = _put(tcPr, "shd", _TCPR_ORDER)
     shd.set(qn("w:val"), "clear")
     shd.set(qn("w:color"), "auto")
     shd.set(qn("w:fill"), hex_fill)
-    tcPr.append(shd)
-
-# w:tcBorders is an ordered sequence -- Word rejects the part if the children
-# come out of order, so insert at the schema position instead of appending.
-_BORDER_ORDER = ("top", "left", "bottom", "right", "insideH", "insideV")
-
 
 def set_row_border(row, edge, hex_color, sz=8):
-    """Horizontal hairline on a row: edge is 'top' or 'bottom'. sz is 1/8 pt.
-    Re-styling an edge replaces it -- one w:<edge> per w:tcBorders."""
+    """Hairline on one edge of every cell in a row, e.g. 'top' or 'bottom'.
+    sz is in 1/8 pt. Re-styling the same edge replaces it."""
     for cell in row.cells:
         tcPr = cell._tc.get_or_add_tcPr()
         borders = tcPr.find(qn("w:tcBorders"))
         if borders is None:
-            borders = OxmlElement("w:tcBorders")
-            tcPr.append(borders)
-        for stale in borders.findall(qn(f"w:{edge}")):
-            borders.remove(stale)
-        el = OxmlElement(f"w:{edge}")
+            borders = _put(tcPr, "tcBorders", _TCPR_ORDER)
+        el = _put(borders, edge, _BORDER_ORDER)
         el.set(qn("w:val"), "single")
         el.set(qn("w:sz"), str(sz))          # 8 = 1pt
         el.set(qn("w:color"), hex_color)
-        rank = _BORDER_ORDER.index(edge)
-        later = [child for child in borders
-                 if _BORDER_ORDER.index(child.tag.split("}")[1]) > rank]
-        if later:
-            later[0].addprevious(el)
-        else:
-            borders.append(el)
+
+
+def clear_cell_border(cell, edge):
+    """Remove one edge, e.g. the verticals a full-grid table style draws."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    borders = tcPr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = _put(tcPr, "tcBorders", _TCPR_ORDER)
+    _put(borders, edge, _BORDER_ORDER).set(qn("w:val"), "nil")
 ```
 
 Editorial table rules — **horizontal rules only, no vertical borders**:
@@ -328,7 +373,7 @@ rows = [("Region", "Revenue", "YoY"),
         ("EMEA", "2.8M", "+11%")]
 
 table = doc.add_table(rows=len(rows), cols=3)
-table.style = "Table Grid"          # then strip verticals via borders
+table.style = "Table Grid"          # verticals stripped per cell below
 table.alignment = WD_TABLE_ALIGNMENT.CENTER
 table.autofit = True
 
@@ -352,6 +397,13 @@ for r, record in enumerate(rows):
         else:
             run.font.color.rgb = RGBColor.from_string(palette["ink"])
 
+# "Table Grid" draws a full grid; nil out the verticals to keep it editorial.
+for table_row in table.rows:
+    for table_cell in table_row.cells:
+        for vertical in ("left", "right", "insideV"):
+            clear_cell_border(table_cell, vertical)
+
+set_row_border(table.rows[0], "bottom", palette["ink"])
 set_row_border(table.rows[-1], "bottom", palette["ink"])
 
 caption = doc.add_paragraph(style="Caption")
@@ -363,7 +415,11 @@ caption_run.font.color.rgb = RGBColor.from_string(palette["ink_tint"])
 Repeat the header row across page breaks for tables longer than a page:
 
 ```python
+# w:trPr allows at most one w:tblHeader, so replace rather than append -- a
+# second one is schema-invalid, and a loop over tables would add one per pass.
 trPr = table.rows[0]._tr.get_or_add_trPr()
+for stale in trPr.findall(qn("w:tblHeader")):
+    trPr.remove(stale)
 trPr.append(OxmlElement("w:tblHeader"))
 ```
 
@@ -380,7 +436,8 @@ trPr.append(OxmlElement("w:tblHeader"))
 - [ ] Tables: ink header band, `paper_tint` zebra rows, horizontal rules only,
       numbers right-aligned, caption below
 - [ ] No fabricated data, no lorem ipsum, no placeholder headings
-- [ ] File saved with a plain filename and verified >10 KB via `os.path.getsize`
+- [ ] File saved with a plain filename, then re-opened and its paragraph /
+      table counts asserted (byte size proves nothing — empty is ~36 KB)
 - [ ] **Final answer FIRST LINE is `[filename](file:UUID)`** as bare markdown
 
 Then write the .docx and report path + which palette + which sections.

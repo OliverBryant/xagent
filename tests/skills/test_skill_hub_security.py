@@ -731,6 +731,44 @@ class TestPersistAndReparseFailureMessage:
         assert deleted == ["thing"]
 
     @pytest.mark.asyncio
+    async def test_rollback_failure_does_not_mask_the_real_error(self, monkeypatch):
+        # If cleanup itself fails the user must still get the original 400,
+        # told the copy was left in place — not a second, unrelated error.
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        class _Manager:
+            async def get_skill(self, name):
+                return None
+
+        async def _scoped(*args):
+            return _Manager()
+
+        def _boom(**kwargs):
+            raise RuntimeError("delete exploded")
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+        monkeypatch.setattr(skill_hub, "_write_personal_skill", lambda **k: None)
+        monkeypatch.setattr(skill_hub, "_delete_personal_skill", _boom)
+
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub._persist_and_reparse(
+                request=SimpleNamespace(),
+                context=SkillScopeContext(user_id=7, metadata={}),
+                db=object(),
+                user=SimpleNamespace(id=7),
+                name="thing",
+                files={"SKILL.md": SKILL_MD},
+                scope="personal",
+                origin="upload",
+            )
+        assert exc.value.status_code == 400
+        assert "left in place" in exc.value.detail
+        assert "rolled back" not in exc.value.detail
+
+    @pytest.mark.asyncio
     async def test_team_failure_does_not_claim_a_rollback(self, monkeypatch):
         # No provider-side delete exists, so the message must not promise one.
         err, deleted = await self._run("team", monkeypatch)

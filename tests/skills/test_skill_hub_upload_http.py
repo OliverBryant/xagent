@@ -130,6 +130,7 @@ def client_env(monkeypatch: pytest.MonkeyPatch):
 
     with TestClient(app) as client:
         yield {
+            "app": app,
             "client": client,
             "Session": Session,
             "user_id": user_id,
@@ -188,6 +189,98 @@ class TestUploadHttp:
         )
         assert second.status_code == 409
         assert _skill_rows(client_env) == ["dup"]
+
+    def test_concurrent_duplicate_name_yields_409_not_500(
+        self, client_env, monkeypatch
+    ):
+        """The duplicate check is not atomic with the INSERT.
+
+        Simulate the lost race by making the pre-check miss. The unique
+        constraint then fires on commit, and SQLAlchemy leaves the session
+        unusable — every later query raises PendingRollbackError, and get_db
+        only closes it. Without an explicit rollback the request 500s and any
+        follow-up work on that session fails too.
+        """
+        from xagent.web.api import skill_hub
+        from xagent.web.models.skill import UserSkill
+
+        skill_hub_app = client_env["app"]
+        data = _make_zip({"race/SKILL.md": SKILL_MD})
+        first = client_env["client"].post(
+            "/api/skill-hub/upload",
+            files={"file": ("a.zip", data, "application/zip")},
+        )
+        assert first.status_code == 200, first.text
+
+        real_write = skill_hub._write_personal_skill
+
+        def blind_write(**kwargs):
+            # Force the pre-check to miss, as a concurrent request would.
+            db = kwargs["db"]
+            original_query = db.query
+
+            def patched_query(model, *a, **kw):
+                q = original_query(model, *a, **kw)
+                if model is UserSkill:
+
+                    class _Blind:
+                        def filter(self, *_a, **_kw):
+                            return self
+
+                        def first(self):
+                            return None
+
+                    return _Blind()
+                return q
+
+            db.query = patched_query
+            try:
+                return real_write(**kwargs)
+            finally:
+                db.query = original_query
+
+        monkeypatch.setattr(skill_hub, "_write_personal_skill", blind_write)
+
+        # Probe the session *while the request is still open*: closing a
+        # session clears the pending-rollback state, so checking it after the
+        # response has been returned would pass either way.
+        probe: dict = {}
+        original_override = skill_hub_app.dependency_overrides[get_db]
+
+        def tracking_get_db():
+            gen = original_override()
+            db = next(gen)
+            try:
+                yield db
+            finally:
+                # Still inside the request scope, before db.close() runs.
+                try:
+                    db.query(UserSkill).count()
+                    probe["usable"] = True
+                except Exception as exc:  # PendingRollbackError without the fix
+                    probe["usable"] = False
+                    probe["error"] = type(exc).__name__
+                for _ in gen:
+                    pass
+
+        skill_hub_app.dependency_overrides[get_db] = tracking_get_db
+        try:
+            second = client_env["client"].post(
+                "/api/skill-hub/upload",
+                files={"file": ("a.zip", data, "application/zip")},
+            )
+        finally:
+            skill_hub_app.dependency_overrides[get_db] = original_override
+
+        assert second.status_code == 409, second.text
+        assert probe.get("usable") is True, (
+            f"the failing request left its session unusable: {probe.get('error')}"
+        )
+
+        # Exactly one row, and the API still works afterwards.
+        assert _skill_rows(client_env) == ["race"]
+        listed = client_env["client"].get("/api/skill-hub/installed")
+        assert listed.status_code == 200, listed.text
 
     def test_missing_file_field_returns_422(self, client_env):
         res = client_env["client"].post("/api/skill-hub/upload", data={})

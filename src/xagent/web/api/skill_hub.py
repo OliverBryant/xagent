@@ -63,6 +63,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
 from xagent.skills.library import SkillScopeContext
 from xagent.web.api.skill_hub_registry import (
@@ -483,19 +484,33 @@ def _write_personal_skill(
         updated_by_user_id=user_id,
     )
     db.add(skill)
-    db.flush()
-    for path, content in sorted(normalized.items()):
-        db.add(
-            UserSkillFile(
-                skill_id=skill.id,
-                path=path,
-                content=content,
-                size_bytes=len(content),
-                sha256=hashlib.sha256(content).hexdigest(),
-                media_type=guess_media_type(path),
+    try:
+        # flush sends the INSERT, so the unique constraint fires here rather
+        # than at commit.
+        db.flush()
+        for path, content in sorted(normalized.items()):
+            db.add(
+                UserSkillFile(
+                    skill_id=skill.id,
+                    path=path,
+                    content=content,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type=guess_media_type(path),
+                )
             )
-        )
-    db.commit()
+        db.commit()
+    except IntegrityError as exc:
+        # The duplicate-name SELECT above is not atomic with this INSERT, so a
+        # concurrent request for the same name lands here. Roll back before
+        # returning: SQLAlchemy leaves the session in a state where every
+        # later query raises PendingRollbackError, and ``get_db`` only closes
+        # the session, so without this the rest of the request fails too.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"A personal skill named {name!r} already exists.",
+        ) from exc
 
 
 def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) -> None:
@@ -839,9 +854,14 @@ async def _persist_and_reparse(
             try:
                 _delete_personal_skill(db=db, user=user, name=name)
                 rolled_back = True
-            except HTTPException:
+            except Exception:
+                # Cleanup must never replace the real error with its own.
+                # Report the write as left in place instead, so the message
+                # matches reality and the user knows to remove it.
                 logger.warning(
-                    "Skill Hub: could not roll back unparsable skill %r", name
+                    "Skill Hub: could not roll back unparsable skill %r",
+                    name,
+                    exc_info=True,
                 )
         if skill is not None:
             logger.error(

@@ -124,6 +124,118 @@ def test_config_denies_when_an_allowlist_read_precedes_a_failed_overrides_read(
         set_user_tool_overrides_hook(None)
 
 
+@pytest.mark.parametrize("accessor", ["overrides", "allowlist"])
+def test_config_propagates_pool_timeouts_instead_of_denying(
+    clear_allowlist_hook, accessor
+):
+    """A pool checkout timeout is not an unresolved policy.
+
+    The next step in the turn needs the same pool, so the caller must get the
+    timeout and retry rather than spending the turn with no tools. This matches
+    ``_load_tool_runtime_policy_snapshot``, which already re-raises.
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+    checkout_timeout = SQLAlchemyTimeoutError("pool checkout timed out")
+
+    def _timeout(db, user):
+        raise checkout_timeout
+
+    set_user_tool_allowlist_hook(_timeout)
+    set_user_tool_overrides_hook(_timeout)
+    try:
+        cfg = WebToolConfig(
+            db=MagicMock(), request=MagicMock(user=MagicMock(id=42)), user_id=42
+        )
+        read = (
+            cfg.get_user_tool_overrides
+            if accessor == "overrides"
+            else cfg.get_user_tool_allowlist
+        )
+
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            read()
+        assert exc_info.value is checkout_timeout
+
+        # Nothing recorded and nothing cached: the retry re-reads from scratch
+        # rather than inheriting a deny-all from the timed-out attempt.
+        assert cfg._unresolved_tool_policy_inputs == set()
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
+def test_config_serves_real_policy_after_a_pool_timeout_retry(clear_allowlist_hook):
+    """The retry a propagated timeout invites must see the real policy."""
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    failing = {"value": True}
+
+    def _flaky(db, user):
+        if failing["value"]:
+            raise SQLAlchemyTimeoutError("pool checkout timed out")
+        return ["only_this"]
+
+    set_user_tool_allowlist_hook(_flaky)
+    cfg = WebToolConfig(
+        db=MagicMock(), request=MagicMock(user=MagicMock(id=42)), user_id=42
+    )
+
+    with pytest.raises(SQLAlchemyTimeoutError):
+        cfg.get_user_tool_allowlist()
+
+    failing["value"] = False
+    # No refresh call needed: the timed-out read cached nothing.
+    assert cfg.get_user_tool_allowlist() == ["only_this"]
+
+
+def test_config_keeps_denying_when_an_allowlist_timeout_follows_a_failed_overrides_read(
+    clear_allowlist_hook,
+):
+    """A propagated timeout must not discard an already-unresolved input.
+
+    The allowlist read clears only its own entry before consulting the hook, so
+    an overrides input that could not be resolved has to keep denying once the
+    retried allowlist read succeeds.
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+    failing = {"value": True}
+
+    def _flaky_allowlist(db, user):
+        if failing["value"]:
+            raise SQLAlchemyTimeoutError("pool checkout timed out")
+        return None  # the hook itself says "no allowlist configured"
+
+    set_user_tool_allowlist_hook(_flaky_allowlist)
+    set_user_tool_overrides_hook(lambda db, user: {"file": {"enabled": False}})
+    try:
+        request_without_user = MagicMock()
+        del request_without_user.user
+        cfg = WebToolConfig(db=MagicMock(), request=request_without_user, user_id=42)
+
+        # The overrides read cannot reach the hook (no runtime user).
+        assert cfg.get_user_tool_overrides() == {}
+        with pytest.raises(SQLAlchemyTimeoutError):
+            cfg.get_user_tool_allowlist()
+
+        failing["value"] = False
+        # The hook now answers "no allowlist", but the unresolved overrides read
+        # still denies: a resolved allowlist does not vouch for the other input.
+        assert cfg.get_user_tool_allowlist() == []
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
 def test_config_recovers_after_a_transient_hook_failure(clear_allowlist_hook):
     calls = {"n": 0}
 

@@ -77,7 +77,11 @@ def has_user_tool_policy_hooks() -> bool:
 # Only meaningful while ``has_user_tool_policy_hooks()`` is true. With no hook
 # registered there is no policy to lose, and standalone xagent keeps its
 # unrestricted default.
-TOOL_POLICY_UNAVAILABLE_ALLOWLIST: list[str] = []
+#
+# A tuple so the constant itself cannot be mutated in place: this is the value
+# that denies every tool, and a caller that appended to it would silently widen
+# what an unresolved policy grants.
+TOOL_POLICY_UNAVAILABLE_ALLOWLIST: tuple[str, ...] = ()
 
 
 def unresolved_tool_policy_allowlist() -> list[str] | None:
@@ -86,6 +90,9 @@ def unresolved_tool_policy_allowlist() -> list[str] | None:
     ``None`` (no filtering) when no application hook is registered, so the
     fail-closed behaviour is scoped to deployments that actually delegate
     authorization to the hooks.
+
+    Returns a fresh ``list`` because the allowlist contract consumers implement
+    is ``Optional[list]``; the immutable constant above is the source value.
     """
     if not has_user_tool_policy_hooks():
         return None

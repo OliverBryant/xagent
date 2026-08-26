@@ -2189,6 +2189,8 @@ class WebToolConfig(BaseToolConfig):
         Both display layer and execution layer use this as the single
         source of truth for per-user tool policies.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._cached_tool_overrides is not None:
             return self._cached_tool_overrides
         # This read supersedes whatever the previous one concluded.
@@ -2202,7 +2204,14 @@ class WebToolConfig(BaseToolConfig):
             return {}
         try:
             self._cached_tool_overrides = get_user_tool_overrides(self.db, self._user)
-        except Exception:
+        except Exception as exc:
+            # A pool checkout timeout is not an unresolved policy: the very next
+            # step needs the same pool, so propagate it for the caller to retry
+            # rather than spending the turn with no tools. Matches
+            # ``_load_tool_runtime_policy_snapshot``. Nothing is cached and no
+            # input is recorded, so the retry re-reads from scratch.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool overrides")
             self._note_unresolved_tool_policy("overrides", "hook read failed")
             self._cached_tool_overrides = {}
@@ -2476,6 +2485,8 @@ class WebToolConfig(BaseToolConfig):
         would build the globally available tool set. With no hook registered
         there is no policy to lose and the unrestricted default is kept.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._tool_allowlist_cached:
             return self._cached_tool_allowlist
         # This read supersedes whatever the previous one concluded. The
@@ -2489,7 +2500,12 @@ class WebToolConfig(BaseToolConfig):
             self._cached_tool_allowlist = normalize_tool_allowlist(
                 get_user_tool_allowlist(self.db, self._user)
             )
-        except Exception:
+        except Exception as exc:
+            # See get_user_tool_overrides: a pool timeout propagates for retry
+            # instead of being recorded as an unresolved policy. Left uncached
+            # so the retry re-reads, and no deny-all is applied on the way out.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool allowlist")
             self._note_unresolved_tool_policy("allowlist", "hook read failed")
             self._cached_tool_allowlist = None

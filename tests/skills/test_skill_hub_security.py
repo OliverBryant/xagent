@@ -312,6 +312,56 @@ class TestSafeZipExtract:
         assert exc.value.status_code == 413
         assert "more than" in exc.value.detail
 
+    def test_max_bytes_tightens_the_decompressed_budget(self):
+        # Lowering the configured upload limit must also limit how far an
+        # archive may expand, not just its size on the wire.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", SKILL_MD)
+            zf.writestr("filler.bin", b"\0" * 8192)
+        payload = buf.getvalue()
+
+        # Permissive budget: extracts fine.
+        files, _root = _safe_zip_extract(payload, max_bytes=1024 * 1024)
+        assert "filler.bin" in files
+
+        # Tight budget: refused, even though the wire size is tiny.
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(payload, max_bytes=2048)
+        assert exc.value.status_code == 413
+
+    def test_max_bytes_cannot_raise_the_absolute_ceiling(self):
+        """A caller passing a huge ``max_bytes`` must not get a larger budget.
+
+        ``_normalize_skill_files`` would also reject this archive, so asserting
+        only "a 413 comes out" would pass with the clamp removed. Assert the
+        clamped budget directly, and that the refusal happens during extraction
+        rather than falling through to the post-hoc check.
+        """
+        from xagent.web.api import skill_hub
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", SKILL_MD)
+            zf.writestr("bomb.bin", b"\0" * (skill_hub._MAX_DOWNLOAD_BYTES + 1024))
+
+        calls = {"n": 0}
+        real_normalize = skill_hub._normalize_skill_files
+
+        def counting_normalize(files):
+            calls["n"] += 1
+            return real_normalize(files)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(skill_hub, "_normalize_skill_files", counting_normalize)
+            with pytest.raises(HTTPException) as exc:
+                skill_hub._safe_zip_extract(
+                    buf.getvalue(), max_bytes=skill_hub._MAX_DOWNLOAD_BYTES * 10
+                )
+        assert exc.value.status_code == 413
+        assert "ZIP exceeds size budget" in exc.value.detail
+        assert calls["n"] == 0
+
     def test_compression_bomb_rejected_by_actual_byte_budget(self):
         # Highly compressible payload: small on the wire, huge decompressed.
         # This is the direction the bounded read is meant to stop.

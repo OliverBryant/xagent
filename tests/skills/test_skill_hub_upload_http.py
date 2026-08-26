@@ -223,6 +223,28 @@ class TestUploadHttp:
         assert res.status_code == 400
         assert _skill_rows(client_env) == []
 
+    def test_configured_limit_bounds_decompressed_size(self, client_env, monkeypatch):
+        # Lowering XAGENT_MAX_UPLOAD_SIZE must also stop an archive that is
+        # small on the wire but expands past the limit — otherwise the route
+        # only caps the upload and leaves expansion on the 50 MiB default.
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setattr(skill_hub, "get_max_upload_size_bytes", lambda: 4096)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("big/SKILL.md", SKILL_MD)
+            zf.writestr("big/filler.bin", b"\0" * 65536)
+        payload = buf.getvalue()
+        assert len(payload) < 4096  # passes the wire-size check
+
+        res = client_env["client"].post(
+            "/api/skill-hub/upload",
+            files={"file": ("big.zip", payload, "application/zip")},
+        )
+        assert res.status_code == 413, res.text
+        assert _skill_rows(client_env) == []
+
     def test_non_utf8_template_is_refused_before_writing(self, client_env):
         # SKILL.md is fine, template.md is not. The parser decodes both, so
         # this is caught up front and never reaches the database.

@@ -398,6 +398,9 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                 detail="Skill file path must not contain a drive letter or colon.",
             )
         total += len(content)
+        # Absolute ceiling for every caller, including ones that build a bundle
+        # without going through _safe_zip_extract. Archive uploads are already
+        # held to the (possibly tighter) configured limit during extraction.
         if total > _MAX_DOWNLOAD_BYTES:
             raise HTTPException(
                 status_code=413, detail="Skill files exceed size budget."
@@ -548,17 +551,27 @@ def _installed_slugs(mgr: Any) -> set[str]:
 
 
 def _safe_zip_extract(
-    zip_bytes: bytes, *, bad_zip_status: int = 502
+    zip_bytes: bytes, *, bad_zip_status: int = 502, max_bytes: int | None = None
 ) -> tuple[dict[str, bytes], str]:
     """Read a skill ZIP into ``(normalized files, root dir name)``.
 
     ``bad_zip_status`` distinguishes who supplied the archive: 502 for a
     registry proxy response, 400 for a user upload.
 
+    ``max_bytes`` bounds the *decompressed* total, defaulting to the registry
+    download budget. The upload route passes the operator-configured upload
+    limit so that lowering ``XAGENT_MAX_UPLOAD_SIZE`` also tightens how far an
+    archive may expand, instead of only capping its size on the wire.
+
     The size budget is enforced on the *actual* decompressed byte count,
     not the sizes declared in the ZIP headers — a hostile archive can
     declare small sizes for members that inflate far larger.
     """
+    budget = (
+        _MAX_DOWNLOAD_BYTES
+        if max_bytes is None
+        else min(max_bytes, _MAX_DOWNLOAD_BYTES)
+    )
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as exc:
@@ -577,7 +590,7 @@ def _safe_zip_extract(
             raise HTTPException(
                 status_code=bad_zip_status, detail="Skill ZIP contains unsafe paths."
             )
-        remaining = _MAX_DOWNLOAD_BYTES - total
+        remaining = budget - total
         try:
             with zf.open(info) as member:
                 content = member.read(remaining + 1)
@@ -1071,7 +1084,9 @@ async def upload_skill(
     filename = (file.filename or "").strip()
     lower = filename.lower()
     if lower.endswith(".zip"):
-        files, zip_root = _safe_zip_extract(data, bad_zip_status=400)
+        files, zip_root = _safe_zip_extract(
+            data, bad_zip_status=400, max_bytes=max_bytes
+        )
     elif lower.endswith(".md"):
         files, zip_root = {"SKILL.md": data}, ""
     else:

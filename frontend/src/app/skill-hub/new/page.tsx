@@ -8,7 +8,6 @@ import { ChevronLeft, Loader2, Plus, Upload } from "lucide-react";
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
 import { useI18n } from "@/contexts/i18n-context";
 import {
-  UPLOAD_ERROR_MESSAGES,
   apiRequest,
   isJsonRecord,
   getApiErrorMessage,
@@ -53,6 +52,10 @@ Spell out the scenarios where the agent should pick this skill.
 3. Final output
 `;
 
+// Mirrors the backend's _NAME_RE so the client can refuse a bad name
+// before spending a round trip on it.
+const NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+
 export default function NewSkillPage() {
   const apiBase = getApiUrl();
   const router = useRouter();
@@ -68,7 +71,7 @@ export default function NewSkillPage() {
 
   // The backend regex matches client-side validation here so we can
   // disable the Create button before the user wastes a round trip.
-  const nameValid = /^[A-Za-z0-9_-]+$/.test(name);
+  const nameValid = NAME_PATTERN.test(name);
   const canSubmit = nameValid && skillMd.trim().length > 0 && !saving && !uploading;
 
   // Upload a .zip skill bundle or a bare SKILL.md. The backend resolves the
@@ -82,8 +85,23 @@ export default function NewSkillPage() {
       const form = new FormData();
       form.append("file", file);
       // Send the typed name as an override so the user, not the archive's
-      // directory layout, has the final say over the skill name.
-      if (nameValid) form.append("name", name);
+      // directory layout, has the final say over the skill name. A name that
+      // is present but unusable is reported rather than silently dropped in
+      // favour of an archive-derived one.
+      const typedName = name.trim();
+      if (typedName.length > 0) {
+        // Validate the trimmed value, not the raw field: "  my-skill  " is a
+        // usable name and should not be refused for its whitespace.
+        if (!NAME_PATTERN.test(typedName)) {
+          setError(t("skillHub.newSkill.nameInvalid", { pattern: "[A-Za-z0-9_-]+" }));
+          return;
+        }
+        if (typedName.length > 64) {
+          setError(t("skillHub.newSkill.nameTooLong", { max: "64" }));
+          return;
+        }
+        form.append("name", typedName);
+      }
       const res = await apiRequest(`${apiBase}/api/skill-hub/upload`, {
         method: "POST",
         body: form,

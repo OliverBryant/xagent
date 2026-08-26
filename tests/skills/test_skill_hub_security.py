@@ -86,6 +86,33 @@ class TestNormalizeSkillFiles:
         out = _normalize_skill_files({"SKILL.md": SKILL_MD, "%2e%2e/x.py": b"x"})
         assert "%2e%2e/x.py" in out
 
+    def test_overlong_path_rejected_before_the_db(self):
+        # UserSkillFile.path is VARCHAR(500); PostgreSQL rejects a longer value
+        # at INSERT time and that surfaced as a 500, while SQLite accepted it.
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILE_PATH_CHARS
+
+        long_path = "d/" + "x" * _MAX_SKILL_FILE_PATH_CHARS + ".md"
+        assert len(long_path) > _MAX_SKILL_FILE_PATH_CHARS
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, long_path: b"y"})
+        assert exc.value.status_code == 400
+        assert "longer than" in exc.value.detail
+
+    def test_skill_md_limit_counts_characters_not_bytes(self):
+        # CreateSkillRequest accepts max_length=200_000 *characters*, so a byte
+        # check refused a CJK document the authoring routes accept — the same
+        # content rejected only for arriving as an archive.
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_CHARS
+
+        at_limit = ("\u4e2d" * _MAX_SKILL_MD_CHARS).encode("utf-8")
+        assert len(at_limit) > _MAX_SKILL_MD_CHARS  # 3 bytes per character
+        assert _normalize_skill_files({"SKILL.md": at_limit})["SKILL.md"]
+
+        over = ("\u4e2d" * (_MAX_SKILL_MD_CHARS + 1)).encode("utf-8")
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": over})
+        assert exc.value.status_code == 413
+
     def test_empty_skill_md_rejected(self):
         # create/edit enforce min_length=1; an archive must not be able to
         # register a contentless skill that parses fine and teaches nothing.
@@ -99,16 +126,16 @@ class TestNormalizeSkillFiles:
         # SKILL.md is injected into the LLM system context in full, so it is
         # capped at the same length the create/edit request models enforce,
         # well below the bundle-wide byte budget.
-        from xagent.web.api.skill_hub import _MAX_SKILL_MD_BYTES
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_CHARS
 
-        oversized = b"#" * (_MAX_SKILL_MD_BYTES + 1)
+        oversized = b"#" * (_MAX_SKILL_MD_CHARS + 1)
         with pytest.raises(HTTPException) as exc:
             _normalize_skill_files({"SKILL.md": oversized})
         assert exc.value.status_code == 413
         assert "SKILL.md" in exc.value.detail
 
         # Just under the cap is accepted.
-        ok = b"#" * (_MAX_SKILL_MD_BYTES - 1)
+        ok = b"#" * (_MAX_SKILL_MD_CHARS - 1)
         assert _normalize_skill_files({"SKILL.md": ok})["SKILL.md"] == ok
 
     def test_size_cap_raises(self):
@@ -164,10 +191,14 @@ class TestSafeZipToFiles:
         assert upload_exc.value.status_code == 400
 
     def test_dotfile_in_zip_rejected_by_normalize(self):
+        # Registry default is 502 for a bad artifact; an upload reports 400.
         data = _make_zip({"SKILL.md": SKILL_MD, ".env": b"SECRET=1"})
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(data)[0]
-        assert exc.value.status_code == 400
+        assert exc.value.status_code == 502
+        with pytest.raises(HTTPException) as upload_exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert upload_exc.value.status_code == 400
 
     def test_oversized_member_raises(self):
         from xagent.web.api.skill_hub import _MAX_DOWNLOAD_BYTES
@@ -248,8 +279,12 @@ class TestSafeZipExtract:
 
     def test_encrypted_member_maps_to_http_error(self):
         # zipfile raises RuntimeError when a member needs a password.
+        import shutil
         import subprocess
         import tempfile
+
+        if shutil.which("zip") is None:  # pragma: no cover - depends on the host
+            pytest.skip("zip(1) unavailable")
 
         with tempfile.TemporaryDirectory() as tmp:
             src = pathlib.Path(tmp) / "SKILL.md"
@@ -259,8 +294,8 @@ class TestSafeZipExtract:
                 ["zip", "-q", "-P", "hunter2", "-j", str(out), str(src)],
                 capture_output=True,
             )
-            if proc.returncode != 0:  # pragma: no cover - zip(1) not installed
-                pytest.skip("zip(1) unavailable")
+            if proc.returncode != 0:  # pragma: no cover - depends on the host
+                pytest.skip(f"zip(1) failed: {proc.stderr[:200]!r}")
             data = out.read_bytes()
 
         with pytest.raises(HTTPException) as exc:
@@ -294,6 +329,68 @@ class TestSafeZipExtract:
         assert exc.value.status_code == 502
         assert "multiple skills" in exc.value.detail.lower()
 
+    def test_independent_skill_outside_the_root_is_rejected(self):
+        # Depth does not make a second skill safe to drop: selecting "z" and
+        # discarding "a/b/c" is the same data loss as two same-depth roots.
+        data = _make_zip(
+            {
+                "z/SKILL.md": SKILL_MD,
+                "z/keep.md": b"k",
+                "a/b/c/SKILL.md": SKILL_MD,
+            }
+        )
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data)
+        assert exc.value.status_code == 502
+        assert "multiple skills" in exc.value.detail.lower()
+
+    def test_example_skill_inside_the_root_is_kept(self):
+        # A SKILL.md nested within the chosen root is a bundled example, not a
+        # competing skill: it must survive as an ordinary member.
+        data = _make_zip({"s/SKILL.md": SKILL_MD, "s/examples/demo/SKILL.md": SKILL_MD})
+        files, root = _safe_zip_extract(data)
+        assert root == "s"
+        assert sorted(files) == ["SKILL.md", "examples/demo/SKILL.md"]
+
+    def test_directory_entries_count_toward_the_entry_cap(self):
+        # Directories carry no bytes and were skipped before the cap, so an
+        # archive of nothing but directory entries slipped past it entirely.
+        from xagent.web.api.skill_hub import _MAX_SKILL_FILES
+
+        members = {f"d{i}/": b"" for i in range(_MAX_SKILL_FILES + 10)}
+        members["SKILL.md"] = SKILL_MD
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(_make_zip(members))
+        assert exc.value.status_code == 413
+        assert "entries" in exc.value.detail
+
+    def test_corrupted_deflate_stream_maps_to_http_error(self):
+        # zlib.error is neither BadZipFile nor RuntimeError, so a damaged
+        # DEFLATE stream used to escape as a 500. ZIP_STORED corruption trips
+        # the CRC check instead, which is why the earlier test missed this.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("SKILL.md", b"B" * 20000)
+        data = bytearray(buf.getvalue())
+        local = data.find(b"PK\x03\x04")
+        header_len = 30 + data[local + 26] + data[local + 28]
+        for offset in range(header_len, header_len + 8):
+            data[local + offset] = 0xAB
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(bytes(data), bad_zip_status=400)
+        assert exc.value.status_code == 400
+
+    def test_registry_status_applies_to_normalization_errors(self):
+        # A registry-supplied archive must report 502 for content problems too,
+        # not only for the branches raised directly by the extractor.
+        for members in (
+            {"SKILL.md": SKILL_MD, ".env": b"S=1"},
+            {"SKILL.md": b""},
+        ):
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(_make_zip(members))
+            assert exc.value.status_code == 502, exc.value.detail
+
     def test_multi_root_message_is_bounded(self):
         # The message names archive-supplied directories, so a crafted archive
         # must not turn it into kilobytes of reflected content.
@@ -305,10 +402,12 @@ class TestSafeZipExtract:
         assert "and 45 more" in exc.value.detail
 
     def test_shallowest_root_wins_over_alphabetical_order(self):
-        # "a/b/c/SKILL.md" sorts after "z/SKILL.md"; selecting lexicographically
-        # would pick the deep one and drop all of z/.
+        # "a/b/c/SKILL.md" sorts after "z/SKILL.md", so a lexicographic pick
+        # would choose the deep one. Only non-SKILL.md members sit outside the
+        # root here, so the shallowest selection is observable without
+        # tripping the multiple-skills guard.
         data = _make_zip(
-            {"z/SKILL.md": SKILL_MD, "z/keep.md": b"k", "a/b/c/SKILL.md": SKILL_MD}
+            {"z/SKILL.md": SKILL_MD, "z/keep.md": b"k", "a/b/c/other.md": b"o"}
         )
         files, root = _safe_zip_extract(data)
         assert root == "z"
@@ -352,8 +451,8 @@ class TestSafeZipExtract:
         assert calls["n"] == 0
 
     def test_member_cap_counts_duplicate_entries(self):
-        # A ZIP may repeat a filename; those collapse onto one dict key while
-        # still costing a decompression each, so the cap counts entries.
+        # A ZIP may repeat a filename; those collapse onto one dict key, so the
+        # cap counts central-directory entries rather than resulting files.
         from xagent.web.api.skill_hub import _MAX_SKILL_FILES
 
         buf = io.BytesIO()
@@ -364,7 +463,7 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(buf.getvalue())
         assert exc.value.status_code == 413
-        assert "more than" in exc.value.detail
+        assert "entries" in exc.value.detail
 
     def test_max_bytes_tightens_the_decompressed_budget(self):
         # Lowering the configured upload limit must also limit how far an
@@ -490,23 +589,30 @@ class TestDeriveUploadSkillName:
     def test_frontmatter_name_beats_zip_root(self):
         # The folder name is an artifact of how the archive happened to be
         # zipped; frontmatter is the author's explicit declaration.
-        name = _derive_upload_skill_name("archive.zip", "skill-v2-1", SKILL_MD_NAMED)
+        name = _derive_upload_skill_name(
+            "archive.zip", "skill-v2-1", {"SKILL.md": SKILL_MD_NAMED}
+        )
         assert name == "pdf-tools"
 
     def test_explicit_override_beats_everything(self):
         name = _derive_upload_skill_name(
-            "archive.zip", "zip-root", SKILL_MD_NAMED, override="user-choice"
+            "archive.zip",
+            "zip-root",
+            {"SKILL.md": SKILL_MD_NAMED},
+            override="user-choice",
         )
         assert name == "user-choice"
 
     def test_zip_root_used_when_no_frontmatter_name(self):
-        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD)
+        name = _derive_upload_skill_name(
+            "archive.zip", "my-skill", {"SKILL.md": SKILL_MD}
+        )
         assert name == "my-skill"
 
     def test_bare_markdown_without_name_is_rejected_not_stemmed(self):
         # Dropping a file literally called SKILL.md must not yield "SKILL".
         with pytest.raises(HTTPException) as exc:
-            _derive_upload_skill_name("SKILL.md", "", SKILL_MD)
+            _derive_upload_skill_name("SKILL.md", "", {"SKILL.md": SKILL_MD})
         assert exc.value.status_code == 400
         assert "name" in exc.value.detail.lower()
 
@@ -514,26 +620,42 @@ class TestDeriveUploadSkillName:
         # YAML types a bare "name: 12345" as an int; it is still a valid skill
         # name once slugified, so it must not dead-end the upload.
         md = b"---\nname: 12345\ndescription: d\n---\n# S\n"
-        assert _derive_upload_skill_name("a.zip", "", md) == "12345"
+        assert _derive_upload_skill_name("a.zip", "", {"SKILL.md": md}) == "12345"
 
     def test_boolean_frontmatter_name_is_ignored(self):
         # bool subclasses int, and naming a skill "True" is nonsense: fall
         # through to the next candidate instead.
         md = b"---\nname: true\ndescription: d\n---\n# S\n"
-        assert _derive_upload_skill_name("a.zip", "real-root", md) == "real-root"
+        assert (
+            _derive_upload_skill_name("a.zip", "real-root", {"SKILL.md": md})
+            == "real-root"
+        )
 
     def test_non_scalar_frontmatter_name_is_ignored(self):
         md = b"---\nname:\n  - a\n  - b\ndescription: d\n---\n# S\n"
-        assert _derive_upload_skill_name("a.zip", "real-root", md) == "real-root"
+        assert (
+            _derive_upload_skill_name("a.zip", "real-root", {"SKILL.md": md})
+            == "real-root"
+        )
 
     def test_cjk_name_falls_back_instead_of_dead_ending(self):
-        name = _derive_upload_skill_name("a.zip", "中文技能", SKILL_MD)
+        name = _derive_upload_skill_name("a.zip", "中文技能", {"SKILL.md": SKILL_MD})
         assert name.startswith("skill-")
         assert _NAME_RE.match(name)
 
+    def test_generated_fallback_differs_for_different_bundles(self):
+        # Hashing only SKILL.md gave two different skills the same name, and
+        # the second upload then hit the duplicate-name 409 unrecoverably.
+        base = {"SKILL.md": SKILL_MD}
+        with_extra = {"SKILL.md": SKILL_MD, "reference.md": b"more"}
+        first = _derive_upload_skill_name("a.zip", "\u4e2d\u6587", base)
+        second = _derive_upload_skill_name("a.zip", "\u4e2d\u6587", with_extra)
+        assert first != second
+        assert _NAME_RE.match(first) and _NAME_RE.match(second)
+
     def test_cjk_fallback_is_deterministic(self):
-        first = _derive_upload_skill_name("a.zip", "中文技能", SKILL_MD)
-        second = _derive_upload_skill_name("b.zip", "别的名字", SKILL_MD)
+        first = _derive_upload_skill_name("a.zip", "中文技能", {"SKILL.md": SKILL_MD})
+        second = _derive_upload_skill_name("b.zip", "别的名字", {"SKILL.md": SKILL_MD})
         # Derived from content, so the same bundle yields a stable name.
         assert first == second
 

@@ -47,6 +47,7 @@ import io
 import logging
 import re
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -367,15 +368,31 @@ def _summary_source(skill_dict: dict) -> str:
 # reference docs. A cap well above any legitimate bundle still stops an
 # archive whose entries are individually tiny — the byte budget alone let a
 # ~11 MB upload expand into 100k rows, one INSERT each.
+#
+# Enforced in two places on purpose, and they are not redundant:
+#   * ``_safe_zip_extract`` counts central-directory *entries*, including
+#     directories, to bound the work before anything is decompressed.
+#   * ``_normalize_skill_files`` counts the resulting *files*, so a caller that
+#     builds a bundle without going through the extractor is bounded too.
 _MAX_SKILL_FILES = 512
 
 # Matches the ``max_length`` the create/edit request models enforce. SKILL.md
 # lands in the LLM system context in full, so the archive paths need the same
 # ceiling rather than only the bundle-wide byte budget.
-_MAX_SKILL_MD_BYTES = 200_000
+_MAX_SKILL_MD_CHARS = 200_000
+
+# Matches UserSkillFile.path's VARCHAR(500).
+_MAX_SKILL_FILE_PATH_CHARS = 500
 
 
-def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
+def _normalize_skill_files(
+    files: dict[str, bytes], *, bad_status: int = 400
+) -> dict[str, bytes]:
+    """Validate and key a skill bundle by relative path.
+
+    ``bad_status`` lets a registry-supplied archive report 502 for content
+    problems, matching ``_safe_zip_extract``; a user upload keeps 400.
+    """
     if len(files) > _MAX_SKILL_FILES:
         raise HTTPException(
             status_code=413,
@@ -394,19 +411,20 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
             path = path[2:]
         if not path or ".." in path.split("/"):
             raise HTTPException(
-                status_code=400,
+                status_code=bad_status,
                 detail="Skill file path contains a path-traversal sequence.",
             )
         if path.startswith("."):
             raise HTTPException(
-                status_code=400, detail="Skill file path must not start with a dot."
+                status_code=bad_status,
+                detail="Skill file path must not start with a dot.",
             )
         # Reject Windows drive letters and any other colon-bearing path.
         # Nothing writes these to disk today, but a stored "C:/evil.py" is a
         # trap for whatever consumes the bundle next.
         if ":" in path:
             raise HTTPException(
-                status_code=400,
+                status_code=bad_status,
                 detail="Skill file path must not contain a drive letter or colon.",
             )
         # A NUL or control character in a name is never legitimate and is the
@@ -414,8 +432,19 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
         # stored path as a C string or a filesystem path.
         if any(ch == "\x00" or ord(ch) < 32 for ch in path):
             raise HTTPException(
-                status_code=400,
+                status_code=bad_status,
                 detail="Skill file path must not contain control characters.",
+            )
+        # UserSkillFile.path is VARCHAR(500); without this a longer relative
+        # path reaches the INSERT and PostgreSQL raises, surfacing as a 500
+        # (SQLite silently accepts it, which is why tests missed this).
+        if len(path) > _MAX_SKILL_FILE_PATH_CHARS:
+            raise HTTPException(
+                status_code=bad_status,
+                detail=(
+                    "Skill file path is longer than "
+                    f"{_MAX_SKILL_FILE_PATH_CHARS} characters."
+                ),
             )
         total += len(content)
         # Absolute ceiling for every caller, including ones that build a bundle
@@ -427,7 +456,7 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
             )
         out[path] = bytes(content)
     if "SKILL.md" not in out:
-        raise HTTPException(status_code=400, detail="Skill has no SKILL.md.")
+        raise HTTPException(status_code=bad_status, detail="Skill has no SKILL.md.")
     # The whole SKILL.md is injected into the agent's system context on every
     # LLM call, so cap it at the same size the authoring routes enforce via
     # their request models. Archive-based paths otherwise had no limit below
@@ -436,13 +465,21 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
         # The authoring routes enforce min_length=1; without the same floor an
         # archive could register a skill with no content, which parses fine and
         # then sits in the agent's index as an entry that teaches it nothing.
-        raise HTTPException(status_code=400, detail="SKILL.md is empty.")
-    if len(out["SKILL.md"]) > _MAX_SKILL_MD_BYTES:
+        raise HTTPException(status_code=bad_status, detail="SKILL.md is empty.")
+    # Count characters, not bytes: CreateSkillRequest/EditSkillRequest accept
+    # max_length=200_000 *characters*, so a byte check would reject a
+    # 200k-character CJK document that the authoring routes happily accept —
+    # the same content, refused only because it arrived as an archive.
+    # Non-UTF-8 content is rejected upstream by the route, and this decode is
+    # tolerant so a bundle that skipped that path cannot 500 here.
+    skill_md_chars = len(out["SKILL.md"].decode("utf-8", errors="replace"))
+    if skill_md_chars > _MAX_SKILL_MD_CHARS:
         raise HTTPException(
             status_code=413,
             detail=(
-                f"SKILL.md is larger than {_MAX_SKILL_MD_BYTES // 1000}k characters. "
-                "Move reference material into separate files in the bundle."
+                f"SKILL.md is {skill_md_chars} characters, over the "
+                f"{_MAX_SKILL_MD_CHARS}-character limit. Move reference "
+                "material into separate files in the bundle."
             ),
         )
     return out
@@ -630,10 +667,25 @@ def _safe_zip_extract(
             status_code=bad_zip_status, detail="Skill archive is not a valid ZIP."
         ) from exc
 
+    # Bound total entries before any per-member work. Directories carry no
+    # bytes and used to be skipped before the cap, so an archive of nothing but
+    # directory entries slipped past it entirely: 200k of them in 17 MiB took
+    # 6.3s of event-loop time. The central directory is already materialized by
+    # ZipFile(), so this is the earliest point the count is known.
+    entries = zf.infolist()
+    if len(entries) > _MAX_SKILL_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Skill ZIP has {len(entries)} entries, over the "
+                f"{_MAX_SKILL_FILES}-entry limit. Trim the archive to the "
+                "skill's own files."
+            ),
+        )
+
     total = 0
-    seen_members = 0
     raw_files: dict[str, bytes] = {}
-    for info in zf.infolist():
+    for info in entries:
         if info.is_dir():
             continue
         path = info.filename.replace("\\", "/").lstrip("/")
@@ -645,7 +697,7 @@ def _safe_zip_extract(
         try:
             with zf.open(info) as member:
                 content = member.read(remaining + 1)
-        except (zipfile.BadZipFile, RuntimeError) as exc:
+        except (zipfile.BadZipFile, RuntimeError, zlib.error) as exc:
             # BadZipFile: CRC is validated at member EOF, so lying headers or
             # corrupted data raise here rather than at open().
             # RuntimeError: an encrypted member needs a password, and an
@@ -658,18 +710,6 @@ def _safe_zip_extract(
         if len(content) > remaining:
             raise HTTPException(
                 status_code=413, detail="Skill ZIP exceeds size budget."
-            )
-        # Count entries processed, not dict keys: a ZIP may repeat a filename,
-        # and those collapse onto one key while still costing a decompression
-        # each. Counting keys would let a duplicate-heavy archive slip past.
-        seen_members += 1
-        if seen_members > _MAX_SKILL_FILES:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"Skill ZIP has more than {_MAX_SKILL_FILES} files. Trim the "
-                    "archive to the skill's own files."
-                ),
             )
         total += len(content)
         raw_files[path] = content
@@ -684,18 +724,31 @@ def _safe_zip_extract(
         )
     # Pick the shallowest SKILL.md as the skill root. Sorting the paths
     # lexicographically instead would pick by alphabet, so "a/b/c/SKILL.md"
-    # could beat "z/SKILL.md" and everything outside the chosen root is
-    # dropped further down — silently discarding the real skill.
+    # could beat "z/SKILL.md".
     min_depth = min(path.count("/") for path in skill_md_paths)
     shallowest = sorted(path for path in skill_md_paths if path.count("/") == min_depth)
-    if len(shallowest) > 1:
-        # Two sibling skills in one archive. Guessing which one was meant
-        # would silently discard the other, so make the user choose.
+    skill_root = shallowest[0].removesuffix("SKILL.md").rstrip("/")
+
+    # Anything below is dropped when it falls outside the chosen root, so a
+    # second SKILL.md *anywhere* outside it means we would silently discard an
+    # independent skill and still report success. Depth is irrelevant: both
+    # "a/SKILL.md" + "b/SKILL.md" and "z/SKILL.md" + "a/b/c/SKILL.md" lose one.
+    # A SKILL.md nested *within* the chosen root (a bundled example) is kept as
+    # an ordinary member, so only genuinely separate skills are refused.
+    root_prefix = f"{skill_root}/" if skill_root else ""
+    outside = [
+        path
+        for path in skill_md_paths
+        if not (root_prefix and path.startswith(root_prefix))
+        and path != f"{root_prefix}SKILL.md"
+    ]
+    if outside:
         # Name a few roots so the user can find them, but do not echo an
         # archive-controlled list of unbounded length into the response and
         # the logs: 50 long directory names made this a 10 KB error string.
         names = [
-            path.removesuffix("SKILL.md").rstrip("/") or "." for path in shallowest
+            path.removesuffix("SKILL.md").rstrip("/") or "."
+            for path in sorted([shallowest[0], *outside])
         ]
         shown = [name[:60] for name in names[:5]]
         roots = ", ".join(shown)
@@ -708,7 +761,6 @@ def _safe_zip_extract(
                 "Upload one skill per archive."
             ),
         )
-    skill_root = shallowest[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
     for path, content in raw_files.items():
         if skill_root:
@@ -720,7 +772,10 @@ def _safe_zip_extract(
             rel = path
         if rel:
             files[rel] = content
-    return _normalize_skill_files(files), skill_root.rsplit("/", 1)[-1]
+    return (
+        _normalize_skill_files(files, bad_status=bad_zip_status),
+        skill_root.rsplit("/", 1)[-1],
+    )
 
 
 def _check_registry_security_gate(registry: Any, detail: dict) -> None:
@@ -830,6 +885,14 @@ async def _persist_and_reparse(
             **kwargs,
         )
     else:
+        # Deliberately NOT offloaded. ``run_db_io_cancellation_safe`` — the
+        # sanctioned way to move DB work off the loop here — requires the
+        # operation to own and close its own Session and return detached data.
+        # This writes through the request-scoped session, which is not
+        # thread-safe and whose ORM objects would be touched again on the loop
+        # afterwards, so handing it to a worker thread would trade a latency
+        # problem for a correctness one. Hashing dominates the cost and is
+        # already bounded by the file-count and byte caps above.
         _write_personal_skill(
             db=db,
             user=user,
@@ -840,29 +903,44 @@ async def _persist_and_reparse(
             clawhub_version=clawhub_version,
         )
 
-    mgr = await _get_scoped_manager(request, context, db)
-    skill = await mgr.get_skill(name)
+    def _compensate() -> bool:
+        """Undo the write so the name stays available.
+
+        Personal rows are ours to delete; a team provider owns its own
+        storage, so there we can only report. Returns whether the row was
+        actually removed, because the caller's message must not claim a
+        rollback that never ran.
+        """
+        if scope != "personal":
+            return False
+        try:
+            _delete_personal_skill(db=db, user=user, name=name)
+            return True
+        except Exception:
+            # Cleanup must never replace the real error with its own.
+            logger.warning(
+                "Skill Hub: could not roll back unparsable skill %r",
+                name,
+                exc_info=True,
+            )
+            return False
+
+    # The write is already durable, so every path out of the readback needs
+    # compensation — not just the "it did not parse" one. A transient failure
+    # or a cancellation here previously left the row committed and the name
+    # taken, with the client seeing only an error.
+    try:
+        mgr = await _get_scoped_manager(request, context, db)
+        skill = await mgr.get_skill(name)
+    except BaseException:
+        # BaseException so asyncio.CancelledError is covered too.
+        _compensate()
+        raise
 
     expected_source = _expected_scope_source(scope)
     actual_source = _summary_source(skill) if skill is not None else None
     if skill is None or actual_source != expected_source:
-        # Undo the write so the name stays available. Personal rows are ours
-        # to delete; a team provider owns its own storage, so we can only
-        # report — and the message must not claim a rollback that never ran.
-        rolled_back = False
-        if scope == "personal":
-            try:
-                _delete_personal_skill(db=db, user=user, name=name)
-                rolled_back = True
-            except Exception:
-                # Cleanup must never replace the real error with its own.
-                # Report the write as left in place instead, so the message
-                # matches reality and the user knows to remove it.
-                logger.warning(
-                    "Skill Hub: could not roll back unparsable skill %r",
-                    name,
-                    exc_info=True,
-                )
+        rolled_back = _compensate()
         if skill is not None:
             logger.error(
                 "Skill Hub: %r re-parsed as a %s skill, not the %s skill just "
@@ -1064,22 +1142,31 @@ def _slugify_skill_name(raw: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip())[:64].strip("-_")
 
 
-def _generated_skill_name(skill_md: bytes) -> str:
+def _generated_skill_name(files: dict[str, bytes]) -> str:
     """Deterministic fallback for a name that slugifies to nothing.
 
     Names written entirely in a non-Latin script (Chinese, Japanese,
     Cyrillic, …) collapse to an empty slug, which used to be a dead-end
     400 with no way for the user to proceed. Derive a stable name from the
     content instead so the upload succeeds and can be renamed afterwards.
+
+    The digest covers every file, not just SKILL.md: two bundles sharing a
+    SKILL.md but differing in their support files are different skills, and
+    hashing only SKILL.md gave them the same name — the second upload then
+    hit the duplicate-name 409 with no way to rename it.
     """
-    digest = hashlib.sha256(skill_md).hexdigest()[:8]
-    return f"skill-{digest}"
+    digest = hashlib.sha256()
+    for path, content in sorted(files.items()):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(content).digest())
+    return f"skill-{digest.hexdigest()[:12]}"
 
 
 def _derive_upload_skill_name(
     filename: str,
     zip_root: str,
-    skill_md: bytes,
+    files: dict[str, bytes],
     override: str | None = None,
 ) -> str:
     """Pick a skill name for an uploaded bundle.
@@ -1097,7 +1184,7 @@ def _derive_upload_skill_name(
     from xagent.skills.parser import SkillParser
 
     frontmatter = SkillParser._extract_frontmatter(  # noqa: SLF001
-        skill_md.decode("utf-8", errors="replace")
+        files["SKILL.md"].decode("utf-8", errors="replace")
     )
     # YAML types a bare ``name: 12345`` as an int and ``name: true`` as a bool.
     # Those are legitimate skill names once slugified, so accept any scalar
@@ -1122,7 +1209,7 @@ def _derive_upload_skill_name(
     if override or any(candidates):
         # Something was supplied but slugified away entirely (e.g. an
         # all-CJK name) — fall back rather than dead-ending the upload.
-        return _generated_skill_name(skill_md)
+        return _generated_skill_name(files)
     raise HTTPException(
         status_code=400,
         detail=(
@@ -1165,8 +1252,12 @@ async def upload_skill(
     filename = (file.filename or "").strip()
     lower = filename.lower()
     if lower.endswith(".zip"):
-        files, zip_root = _safe_zip_extract(
-            data, bad_zip_status=400, max_bytes=max_bytes
+        # Parsing and decompressing a large archive is CPU-bound and blocking:
+        # a 17 MiB archive of 200k entries held the loop for over six seconds.
+        # The rest of this module already offloads its blocking work the same
+        # way, so keep the event loop free here too.
+        files, zip_root = await asyncio.to_thread(
+            _safe_zip_extract, data, bad_zip_status=400, max_bytes=max_bytes
         )
     elif lower.endswith(".md"):
         files, zip_root = {"SKILL.md": data}, ""
@@ -1192,9 +1283,7 @@ async def upload_skill(
                 status_code=400, detail=f"{path} must be UTF-8 text."
             ) from exc
 
-    skill_name = _derive_upload_skill_name(
-        filename, zip_root, files["SKILL.md"], override=name
-    )
+    skill_name = _derive_upload_skill_name(filename, zip_root, files, override=name)
 
     skill = await _persist_and_reparse(
         request=request,
@@ -1344,7 +1433,9 @@ async def install_skill(
         )
 
     # --- Store DB bundle -----------------------------------------
-    files, _root = _safe_zip_extract(zip_bytes, bad_zip_status=502)
+    files, _root = await asyncio.to_thread(
+        _safe_zip_extract, zip_bytes, bad_zip_status=502
+    )
     skill = await _persist_and_reparse(
         request=request,
         context=context,

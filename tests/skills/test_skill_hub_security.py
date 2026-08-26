@@ -443,6 +443,37 @@ class TestSafeZipExtract:
         assert "colon" in exc.value.detail.lower()
 
 
+# ── UTF-8 pre-check stays in step with the parser ─────────────────────────────
+
+
+def test_utf8_precheck_covers_every_file_the_parser_decodes():
+    """The upload route pre-checks a fixed list of filenames.
+
+    That list mirrors what ``SkillParser.parse_bundle`` decodes. If the parser
+    grows a third decoded file the pre-check silently goes stale and that file
+    reaches the DB before failing to parse, so fail here instead.
+    """
+    import inspect
+    import re
+
+    from xagent.skills.parser import SkillParser
+    from xagent.web.api import skill_hub
+
+    parser_src = inspect.getsource(SkillParser.parse_bundle)
+    decoded = set(re.findall(r'files(?:\.get)?[\[(]"([^"]+)"', parser_src))
+
+    route_src = inspect.getsource(skill_hub.upload_skill)
+    checked = set(
+        re.findall(r"for path in \(([^)]*)\)", route_src)[0].replace('"', "").split(",")
+    )
+    checked = {name.strip() for name in checked if name.strip()}
+
+    assert decoded <= checked, (
+        f"parse_bundle decodes {sorted(decoded - checked)}, which the upload "
+        "route does not pre-check for UTF-8"
+    )
+
+
 # ── upload name derivation ────────────────────────────────────────────────────
 
 

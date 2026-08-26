@@ -362,6 +362,11 @@ def _summary_source(skill_dict: dict) -> str:
 # ~11 MB upload expand into 100k rows, one INSERT each.
 _MAX_SKILL_FILES = 512
 
+# Matches the ``max_length`` the create/edit request models enforce. SKILL.md
+# lands in the LLM system context in full, so the archive paths need the same
+# ceiling rather than only the bundle-wide byte budget.
+_MAX_SKILL_MD_BYTES = 200_000
+
 
 def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     if len(files) > _MAX_SKILL_FILES:
@@ -397,6 +402,14 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                 status_code=400,
                 detail="Skill file path must not contain a drive letter or colon.",
             )
+        # A NUL or control character in a name is never legitimate and is the
+        # classic truncation trick against anything that later treats the
+        # stored path as a C string or a filesystem path.
+        if any(ch == "\x00" or ord(ch) < 32 for ch in path):
+            raise HTTPException(
+                status_code=400,
+                detail="Skill file path must not contain control characters.",
+            )
         total += len(content)
         # Absolute ceiling for every caller, including ones that build a bundle
         # without going through _safe_zip_extract. Archive uploads are already
@@ -408,6 +421,18 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
         out[path] = bytes(content)
     if "SKILL.md" not in out:
         raise HTTPException(status_code=400, detail="Skill has no SKILL.md.")
+    # The whole SKILL.md is injected into the agent's system context on every
+    # LLM call, so cap it at the same size the authoring routes enforce via
+    # their request models. Archive-based paths otherwise had no limit below
+    # the multi-megabyte bundle budget.
+    if len(out["SKILL.md"]) > _MAX_SKILL_MD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"SKILL.md is larger than {_MAX_SKILL_MD_BYTES // 1000}k characters. "
+                "Move reference material into separate files in the bundle."
+            ),
+        )
     return out
 
 

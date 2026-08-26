@@ -113,7 +113,11 @@ export default function NewSkillPage() {
   // Only one file becomes one skill, so say so rather than silently
   // dropping the rest of a multi-file drop.
   const handleFileList = (list: FileList | null) => {
+    if (uploading || saving) return;
     const picked = list?.[0];
+    // Clear any previous failure before reacting to a fresh selection, so a
+    // stale message never sits above an unrelated new attempt.
+    setError(null);
     if (!picked) return;
     if (list && list.length > 1) {
       setError(t("skillHub.newSkill.singleFileOnly", { name: picked.name }));

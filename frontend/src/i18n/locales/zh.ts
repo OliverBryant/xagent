@@ -4707,7 +4707,7 @@ const zh = {
       nameInvalid: "名称必须匹配 {pattern}。",
       placeholder: "开始编写 SKILL.md…",
       importTitle: "导入技能文件",
-      importHint: "将 .zip 技能包或 SKILL.md 拖到此处，或点击选择文件。",
+      importHint: "将 .zip 技能包或 SKILL.md 拖到此处，或点击选择文件。若下方填写了名称则以其为准，否则从文件中推导。",
       importing: "上传中…",
       uploadFailed: "上传失败（HTTP {status}）。",
       uploadTooLarge: "文件过大，请减小体积后重试。",

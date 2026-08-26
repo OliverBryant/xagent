@@ -67,6 +67,41 @@ class TestNormalizeSkillFiles:
         result = _normalize_skill_files({"SKILL.md": SKILL_MD, "sub\\file.md": b"hi"})
         assert "sub/file.md" in result
 
+    def test_control_characters_in_path_rejected(self):
+        # A NUL in a stored name is the classic truncation trick against any
+        # later consumer that treats it as a C string or a real path.
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, "a\x00.py": b"x"})
+        assert exc.value.status_code == 400
+        assert "control" in exc.value.detail.lower()
+
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": SKILL_MD, "a\nb.py": b"x"})
+        assert exc.value.status_code == 400
+
+    def test_literal_encoded_dots_are_not_traversal(self):
+        # These are stored as literal names; they are only dangerous if a
+        # consumer decodes or normalizes them, and none does. Pinning the
+        # current behaviour so a future normalizer change is a visible break.
+        out = _normalize_skill_files({"SKILL.md": SKILL_MD, "%2e%2e/x.py": b"x"})
+        assert "%2e%2e/x.py" in out
+
+    def test_skill_md_size_cap(self):
+        # SKILL.md is injected into the LLM system context in full, so it is
+        # capped at the same length the create/edit request models enforce,
+        # well below the bundle-wide byte budget.
+        from xagent.web.api.skill_hub import _MAX_SKILL_MD_BYTES
+
+        oversized = b"#" * (_MAX_SKILL_MD_BYTES + 1)
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": oversized})
+        assert exc.value.status_code == 413
+        assert "SKILL.md" in exc.value.detail
+
+        # Just under the cap is accepted.
+        ok = b"#" * (_MAX_SKILL_MD_BYTES - 1)
+        assert _normalize_skill_files({"SKILL.md": ok})["SKILL.md"] == ok
+
     def test_size_cap_raises(self):
         from xagent.web.api.skill_hub import _MAX_DOWNLOAD_BYTES
 

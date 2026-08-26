@@ -22,9 +22,11 @@ machinery (``SkillManager`` + ``SkillParser``):
 
   4. **File import** — install a skill the user already has on disk
      (``POST /upload``), either a ``.zip`` bundle of a skill folder or a
-     bare ``.md`` used as SKILL.md. The name comes from an explicit
-     override, then the frontmatter ``name``, then the archive's root
-     directory.
+     bare ``.md`` used as SKILL.md. The name resolves in order: an explicit
+     override, the frontmatter ``name``, the archive's root directory, then
+     a content-derived fallback for names that slugify to nothing. Bare
+     Markdown with none of the first three is refused rather than named
+     after its file.
 
 GitHub-URL import was removed in this iteration: we previously
 shipped a ``git clone --depth=1`` path, but ClawHub gives us trusted
@@ -457,15 +459,16 @@ def _normalize_skill_files(
         out[path] = bytes(content)
     if "SKILL.md" not in out:
         raise HTTPException(status_code=bad_status, detail="Skill has no SKILL.md.")
-    # The whole SKILL.md is injected into the agent's system context on every
-    # LLM call, so cap it at the same size the authoring routes enforce via
-    # their request models. Archive-based paths otherwise had no limit below
-    # the multi-megabyte bundle budget.
     if not out["SKILL.md"].strip():
         # The authoring routes enforce min_length=1; without the same floor an
         # archive could register a skill with no content, which parses fine and
         # then sits in the agent's index as an entry that teaches it nothing.
         raise HTTPException(status_code=bad_status, detail="SKILL.md is empty.")
+    # The whole SKILL.md is injected into the agent's system context on every
+    # LLM call, so cap it at the same size the authoring routes enforce via
+    # their request models; the archive paths otherwise had no limit below the
+    # multi-megabyte bundle budget.
+    #
     # Count characters, not bytes: CreateSkillRequest/EditSkillRequest accept
     # max_length=200_000 *characters*, so a byte check would reject a
     # 200k-character CJK document that the authoring routes happily accept —
@@ -539,14 +542,34 @@ def _write_personal_skill(
         db.commit()
     except IntegrityError as exc:
         # The duplicate-name SELECT above is not atomic with this INSERT, so a
-        # concurrent request for the same name lands here. Roll back before
-        # returning: SQLAlchemy leaves the session in a state where every
-        # later query raises PendingRollbackError, and ``get_db`` only closes
-        # the session, so without this the rest of the request fails too.
+        # concurrent request for the same name lands here. Roll back either
+        # way: SQLAlchemy leaves the session in a state where every later query
+        # raises PendingRollbackError, and ``get_db`` only closes the session,
+        # so without this the rest of the request fails too.
         db.rollback()
+        # Other constraints on these tables (the per-skill file-path unique
+        # index, the user foreign keys) would also arrive here, and reporting
+        # those as "already exists" would send the user chasing the wrong
+        # problem. Only claim a duplicate when the row really is one.
+        if (
+            db.query(UserSkill)
+            .filter(UserSkill.user_id == user_id, UserSkill.name == name)
+            .first()
+            is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A personal skill named {name!r} already exists.",
+            ) from exc
+        logger.error(
+            "Skill Hub: writing personal skill %r violated a constraint other "
+            "than the name uniqueness",
+            name,
+            exc_info=True,
+        )
         raise HTTPException(
-            status_code=409,
-            detail=f"A personal skill named {name!r} already exists.",
+            status_code=400,
+            detail=f"Skill {name!r} could not be stored: {exc.orig.__class__.__name__}.",
         ) from exc
 
 
@@ -703,6 +726,8 @@ def _safe_zip_extract(
             # RuntimeError: an encrypted member needs a password, and an
             # unsupported compression method raises NotImplementedError,
             # which subclasses RuntimeError.
+            # zlib.error: a damaged DEFLATE stream, which subclasses neither
+            # of the above and so escaped as a 500 until it was named here.
             raise HTTPException(
                 status_code=bad_zip_status,
                 detail="Skill archive is corrupted, encrypted, or uses an unsupported compression method.",
@@ -840,7 +865,7 @@ async def _persist_and_reparse(
     previously each carried their own copy of this tail with drifted status
     codes and messages.
 
-    Two failure modes this closes:
+    Three failure modes this closes:
 
     * **Orphaned rows.** ``_write_personal_skill`` commits, but the parser
       that runs afterwards decodes every bundled file as UTF-8 with no
@@ -857,6 +882,11 @@ async def _persist_and_reparse(
       ``skill is None`` check passed and the endpoint returned 200 with the
       builtin's metadata, sending the user to an unrelated skill's page. We
       verify the record we get back is the one we just wrote.
+
+    * **A durable row with no compensation.** The write commits before the
+      readback runs, so a transient read failure or a cancellation used to
+      leave the row behind with the client seeing only an error. Every exit
+      from the readback now compensates.
     """
     _validate_skill_name(name)
     normalized = _normalize_skill_files(files)

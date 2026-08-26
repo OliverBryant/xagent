@@ -215,13 +215,18 @@ class TestUploadHttp:
         real_write = skill_hub._write_personal_skill
 
         def blind_write(**kwargs):
-            # Force the pre-check to miss, as a concurrent request would.
+            # Blind only the *first* UserSkill lookup — the pre-check — so it
+            # misses exactly as it would in a real race. The handler's own
+            # confirmation query afterwards must still see the committed row,
+            # which is what lets it distinguish a duplicate from any other
+            # constraint violation.
             db = kwargs["db"]
             original_query = db.query
+            blinded = {"done": False}
 
             def patched_query(model, *a, **kw):
-                q = original_query(model, *a, **kw)
-                if model is UserSkill:
+                if model is UserSkill and not blinded["done"]:
+                    blinded["done"] = True
 
                     class _Blind:
                         def filter(self, *_a, **_kw):
@@ -231,7 +236,7 @@ class TestUploadHttp:
                             return None
 
                     return _Blind()
-                return q
+                return original_query(model, *a, **kw)
 
             db.query = patched_query
             try:
@@ -295,6 +300,21 @@ class TestUploadHttp:
             data={"scope": "everyone"},
         )
         assert res.status_code == 400
+        assert _skill_rows(client_env) == []
+
+    def test_team_scope_upload_reports_no_writer(self, client_env):
+        # No team write provider is registered in this repo, so the only
+        # honest assertion is that the route reports that rather than
+        # half-writing or 500ing. Pins the contract for whenever one exists.
+        data = _make_zip({"t/SKILL.md": SKILL_MD})
+        res = client_env["client"].post(
+            "/api/skill-hub/upload",
+            files={"file": ("t.zip", data, "application/zip")},
+            data={"scope": "team"},
+        )
+        assert res.status_code == 400, res.text
+        assert "writer" in res.text.lower()
+        # A refused team write must not leave a personal row behind.
         assert _skill_rows(client_env) == []
 
     def test_zero_byte_upload_rejected(self, client_env):

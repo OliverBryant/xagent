@@ -276,6 +276,7 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(bytes(data), bad_zip_status=400)
         assert exc.value.status_code == 400
+        assert "corrupted, encrypted, or uses an unsupported" in exc.value.detail
 
     def test_encrypted_member_maps_to_http_error(self):
         # zipfile raises RuntimeError when a member needs a password.
@@ -301,6 +302,7 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(data, bad_zip_status=400)
         assert exc.value.status_code == 400
+        assert "corrupted, encrypted, or uses an unsupported" in exc.value.detail
 
     def test_unsupported_compression_method_maps_to_http_error(self):
         # An unsupported method raises NotImplementedError, which subclasses
@@ -313,6 +315,7 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(bytes(data), bad_zip_status=400)
         assert exc.value.status_code == 400
+        assert "corrupted, encrypted, or uses an unsupported" in exc.value.detail
 
     def test_multi_root_zip_is_rejected(self):
         # Two sibling skills: picking one would silently discard the other.
@@ -379,6 +382,7 @@ class TestSafeZipExtract:
         with pytest.raises(HTTPException) as exc:
             _safe_zip_extract(bytes(data), bad_zip_status=400)
         assert exc.value.status_code == 400
+        assert "corrupted, encrypted, or uses an unsupported" in exc.value.detail
 
     def test_registry_status_applies_to_normalization_errors(self):
         # A registry-supplied archive must report 502 for content problems too,
@@ -711,6 +715,50 @@ async def _call_upload(upload, scope_value="personal", name=None):
     )
 
 
+def _install_recording_write(monkeypatch) -> dict:
+    """Record what the route writes, and answer reads only for that name.
+
+    The signature mirrors ``_write_personal_skill`` exactly — no ``**kwargs``
+    — so a renamed or added parameter fails here instead of being swallowed.
+    """
+    from xagent.web.api import skill_hub
+
+    written: dict = {}
+
+    def _fake_write(
+        *,
+        db,
+        user,
+        name,
+        files,
+        origin="custom",
+        clawhub_slug=None,
+        clawhub_version=None,
+    ):
+        written.update(
+            name=name,
+            files=files,
+            origin=origin,
+            clawhub_slug=clawhub_slug,
+            clawhub_version=clawhub_version,
+        )
+
+    class _Manager:
+        async def get_skill(self, name):
+            # Answer only for what was actually written, so the route's
+            # identity check is exercised rather than short-circuited.
+            if written.get("name") != name:
+                return None
+            return {"name": name, "scope": "personal", "path": ""}
+
+    async def _scoped(*args):
+        return _Manager()
+
+    monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
+    monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+    return written
+
+
 class TestUploadRoute:
     @pytest.mark.asyncio
     async def test_zip_with_traversal_rejected(self):
@@ -737,26 +785,7 @@ class TestUploadRoute:
 
     @pytest.mark.asyncio
     async def test_zip_happy_path_persists_with_upload_origin(self, monkeypatch):
-        from xagent.web.api import skill_hub
-
-        written: dict = {}
-
-        def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
-            written.update(name=name, files=files, origin=origin)
-
-        class _Manager:
-            async def get_skill(self, name):
-                # Answer only for what was actually written, so the route's
-                # identity check is exercised rather than short-circuited.
-                if written.get("name") != name:
-                    return None
-                return {"name": name, "scope": "personal", "path": ""}
-
-        async def _scoped(*args):
-            return _Manager()
-
-        monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
-        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+        written = _install_recording_write(monkeypatch)
 
         data = _make_zip({"pdf-tools/SKILL.md": SKILL_MD, "pdf-tools/ref.md": b"r"})
         summary = await _call_upload(_make_upload("archive.zip", data))
@@ -767,26 +796,7 @@ class TestUploadRoute:
 
     @pytest.mark.asyncio
     async def test_bare_markdown_uses_frontmatter_name(self, monkeypatch):
-        from xagent.web.api import skill_hub
-
-        written: dict = {}
-
-        def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
-            written.update(name=name, files=files, origin=origin)
-
-        class _Manager:
-            async def get_skill(self, name):
-                # Answer only for what was actually written, so the route's
-                # identity check is exercised rather than short-circuited.
-                if written.get("name") != name:
-                    return None
-                return {"name": name, "scope": "personal", "path": ""}
-
-        async def _scoped(*args):
-            return _Manager()
-
-        monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
-        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+        written = _install_recording_write(monkeypatch)
 
         summary = await _call_upload(_make_upload("whatever.md", SKILL_MD_NAMED))
         assert summary.name == "pdf-tools"

@@ -1219,6 +1219,21 @@ def _derive_upload_skill_name(
     # YAML types a bare ``name: 12345`` as an int and ``name: true`` as a bool.
     # Those are legitimate skill names once slugified, so accept any scalar
     # rather than dead-ending the upload on the frontmatter's YAML type.
+    # An explicit override is the caller stating intent, so a value that would
+    # be silently rewritten is refused instead: slugifying "bad name!" into
+    # "bad-name" hands back a skill the caller did not ask for, and the
+    # client-side check is bypassable by anyone calling the API directly.
+    if override is not None and override.strip():
+        candidate = override.strip()
+        if _slugify_skill_name(candidate) != candidate:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Skill name must match [A-Za-z0-9_-]+ and be at most 64 "
+                    "characters; it is not rewritten for you."
+                ),
+            )
+
     fm_name = frontmatter.get("name")
     # bool is a subclass of int, and "name: true" naming a skill ``True`` is
     # nonsense, so exclude it explicitly.

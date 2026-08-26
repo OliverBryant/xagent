@@ -598,6 +598,26 @@ class TestDeriveUploadSkillName:
         )
         assert name == "pdf-tools"
 
+    def test_invalid_override_is_refused_not_rewritten(self):
+        # Found by end-to-end testing, which no unit test covered: the server
+        # silently slugified a bad override ("bad name!" -> "bad-name"), so an
+        # API caller got a skill they did not ask for and the client-side check
+        # was bypassable.
+        for bad in ("bad name!", "../evil", "my/skill", "x" * 65):
+            with pytest.raises(HTTPException) as exc:
+                _derive_upload_skill_name(
+                    "a.zip", "root", {"SKILL.md": SKILL_MD}, override=bad
+                )
+            assert exc.value.status_code == 400, bad
+            assert "must match" in exc.value.detail
+
+    def test_override_with_surrounding_whitespace_is_accepted(self):
+        # Trimmed first, so a usable name is not refused for its whitespace.
+        name = _derive_upload_skill_name(
+            "a.zip", "root", {"SKILL.md": SKILL_MD}, override="  my-skill  "
+        )
+        assert name == "my-skill"
+
     def test_explicit_override_beats_everything(self):
         name = _derive_upload_skill_name(
             "archive.zip",

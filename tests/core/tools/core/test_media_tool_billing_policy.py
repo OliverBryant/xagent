@@ -7,6 +7,7 @@ validated, because a call that succeeded at the HTTP level but came back empty
 or malformed was still charged for.
 """
 
+from pathlib import Path
 from typing import Any, Optional
 
 import pytest
@@ -16,37 +17,67 @@ from xagent.core.model.music.base import MusicResult
 from xagent.core.tools.core.music_tool import MusicToolCore
 from xagent.core.tools.core.sound_effect_tool import SoundEffectToolCore
 
+# Sentinel distinguishing "this fake has no model_name attribute at all"
+# (Xinference's default model behaves this way) from "its name is empty".
+_NO_NAME = object()
 
-class _EmptyMusicModel:
-    """Provider that returns a well-formed-but-empty result. Still billed."""
-
-    model_name = "music-a"
-
-    async def generate_music(self, **kwargs: Any) -> MusicResult:
-        _ = kwargs
-        return MusicResult(audio=b"", format="mp3", raw_response={})
+# The two ways a provider call can succeed at the HTTP level and still yield
+# nothing usable. Both are billed, which is the policy this module guards.
+_EMPTY_MUSIC = MusicResult(audio=b"", format="mp3", raw_response={})
+_GARBAGE = {"not": "a result object"}
+_PLAYABLE_MUSIC = MusicResult(audio=b"x", format="mp3", raw_response={})
 
 
-class _GarbageMusicModel:
-    """Provider that returns the wrong type entirely. Still billed."""
+def _music_model(result: Any = _GARBAGE, *, name: Any = "music-a") -> Any:
+    """A music provider returning ``result``; ``name=_NO_NAME`` exposes none."""
 
-    model_name = "music-b"
+    class _FakeMusicModel:
+        async def generate_music(self, **kwargs: Any) -> Any:
+            _ = kwargs
+            return result
 
-    async def generate_music(self, **kwargs: Any) -> Any:
-        _ = kwargs
-        return {"not": "a MusicResult"}
+    if name is not _NO_NAME:
+        _FakeMusicModel.model_name = name  # type: ignore[attr-defined]
+    return _FakeMusicModel()
+
+
+def _sound_effect_model(*, name: Any = "sfx-a") -> Any:
+    """A sound-effect provider returning the wrong type; still billed."""
+
+    class _FakeSoundEffectModel:
+        async def generate_sound_effect(self, **kwargs: Any) -> Any:
+            _ = kwargs
+            return _GARBAGE
+
+    if name is not _NO_NAME:
+        _FakeSoundEffectModel.model_name = name  # type: ignore[attr-defined]
+    return _FakeSoundEffectModel()
 
 
 def _media_entries(manager: TokenContextManager) -> list[dict]:
     return [d for d in manager.get_usage().details if d.get("type") == "media"]
 
 
+@pytest.mark.parametrize(
+    ("bad_result", "seconds"),
+    [
+        pytest.param(_EMPTY_MUSIC, 30.0, id="well-formed-but-empty"),
+        pytest.param(_GARBAGE, 12.0, id="wrong-type-entirely"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_music_bills_empty_audio_response() -> None:
-    tool = MusicToolCore(models={"music-a": _EmptyMusicModel()})
+async def test_music_bills_a_call_that_returned_nothing_usable(
+    bad_result: Any, seconds: float
+) -> None:
+    """Both ways a call can succeed at the HTTP level and yield nothing.
+
+    The unit stays seconds in both: a (model, unit) price table breaks if the
+    unit varies with how complete the response happened to be.
+    """
+    tool = MusicToolCore(models={"music-a": _music_model(bad_result)})
 
     with TokenContextManager() as manager:
-        result = await tool.generate_music(prompt="p", music_length_seconds=30)
+        result = await tool.generate_music(prompt="p", music_length_seconds=seconds)
         entries = _media_entries(manager)
 
     # The tool still reports failure to the caller...
@@ -54,37 +85,13 @@ async def test_music_bills_empty_audio_response() -> None:
     # ...but the provider call happened and was billed, so it is metered.
     assert len(entries) == 1
     assert entries[0]["unit"] == "seconds"
-    assert entries[0]["quantity"] == 30.0
+    assert entries[0]["quantity"] == seconds
     assert entries[0]["call_type"] == "music"
 
 
 @pytest.mark.asyncio
-async def test_music_bills_malformed_response() -> None:
-    tool = MusicToolCore(models={"music-b": _GarbageMusicModel()})
-
-    with TokenContextManager() as manager:
-        result = await tool.generate_music(prompt="p", music_length_seconds=12)
-        entries = _media_entries(manager)
-
-    assert result["success"] is False
-    assert len(entries) == 1
-    # Unit stays seconds even though nothing usable came back: a (model, unit)
-    # price table breaks if the unit varies with response completeness.
-    assert entries[0]["unit"] == "seconds"
-    assert entries[0]["quantity"] == 12.0
-
-
-class _EmptySoundEffectModel:
-    model_name = "sfx-a"
-
-    async def generate_sound_effect(self, **kwargs: Any) -> Any:
-        _ = kwargs
-        return {"not": "a SoundEffectResult"}
-
-
-@pytest.mark.asyncio
 async def test_sound_effect_bills_malformed_response() -> None:
-    tool = SoundEffectToolCore(models={"sfx-a": _EmptySoundEffectModel()})
+    tool = SoundEffectToolCore(models={"sfx-a": _sound_effect_model()})
 
     with TokenContextManager() as manager:
         result = await tool.generate_sound_effect(text="p", duration_seconds=4)
@@ -222,17 +229,15 @@ def test_no_usable_timing_reports_none() -> None:
 # resolver that returns the id for both fields cannot pass.
 
 
-class _NamedMusicModel:
-    model_name = "music-provider-name"
-
-    async def generate_music(self, **kwargs: Any) -> MusicResult:
-        _ = kwargs
-        return MusicResult(audio=b"x", format="mp3", raw_response={})
-
-
 @pytest.mark.asyncio
 async def test_music_records_provider_name_and_configured_id_separately() -> None:
-    tool = MusicToolCore(models={"configured-music-id": _NamedMusicModel()})
+    """`model` carries the provider's name, `model_id` the configured id.
+
+    Writing the id into both fields loses the canonical name for display and
+    for external consumers.
+    """
+    model = _music_model(_PLAYABLE_MUSIC, name="music-provider-name")
+    tool = MusicToolCore(models={"configured-music-id": model})
 
     with TokenContextManager() as manager:
         await tool.generate_music(prompt="p", music_length_seconds=10)
@@ -243,19 +248,12 @@ async def test_music_records_provider_name_and_configured_id_separately() -> Non
     assert entries[0]["model_id"] == "configured-music-id"
 
 
-class _NamedSoundEffectModel:
-    model_name = "sfx-provider-name"
-
-    async def generate_sound_effect(self, **kwargs: Any) -> Any:
-        _ = kwargs
-        return {"not": "a SoundEffectResult"}
-
-
 @pytest.mark.asyncio
 async def test_sound_effect_records_provider_name_and_configured_id_separately() -> (
     None
 ):
-    tool = SoundEffectToolCore(models={"configured-sfx-id": _NamedSoundEffectModel()})
+    model = _sound_effect_model(name="sfx-provider-name")
+    tool = SoundEffectToolCore(models={"configured-sfx-id": model})
 
     with TokenContextManager() as manager:
         await tool.generate_sound_effect(text="p", duration_seconds=4)
@@ -266,14 +264,6 @@ async def test_sound_effect_records_provider_name_and_configured_id_separately()
     assert entries[0]["model_id"] == "configured-sfx-id"
 
 
-class _UnnamedMusicModel:
-    """Provider exposing no model_name — Xinference's default behaves this way."""
-
-    async def generate_music(self, **kwargs: Any) -> MusicResult:
-        _ = kwargs
-        return MusicResult(audio=b"x", format="mp3", raw_response={})
-
-
 @pytest.mark.asyncio
 async def test_music_falls_back_to_configured_id_not_the_class_name() -> None:
     """A provider with no model_name must still bill under its configured id.
@@ -282,7 +272,8 @@ async def test_music_falls_back_to_configured_id_not_the_class_name() -> None:
     not a billing identity: it is not configurable, not unique across
     providers, and means nothing to a price table.
     """
-    tool = MusicToolCore(models={"configured-music-id": _UnnamedMusicModel()})
+    model = _music_model(_PLAYABLE_MUSIC, name=_NO_NAME)
+    tool = MusicToolCore(models={"configured-music-id": model})
 
     with TokenContextManager() as manager:
         await tool.generate_music(prompt="p", music_length_seconds=10)
@@ -290,19 +281,14 @@ async def test_music_falls_back_to_configured_id_not_the_class_name() -> None:
 
     assert len(entries) == 1
     assert entries[0]["model"] == "configured-music-id"
-    assert entries[0]["model"] != "_UnnamedMusicModel"
+    assert entries[0]["model"] != type(model).__name__
     assert entries[0]["model_id"] == "configured-music-id"
-
-
-class _UnnamedSoundEffectModel:
-    async def generate_sound_effect(self, **kwargs: Any) -> Any:
-        _ = kwargs
-        return {"not": "a SoundEffectResult"}
 
 
 @pytest.mark.asyncio
 async def test_sound_effect_falls_back_to_configured_id_not_the_class_name() -> None:
-    tool = SoundEffectToolCore(models={"configured-sfx-id": _UnnamedSoundEffectModel()})
+    model = _sound_effect_model(name=_NO_NAME)
+    tool = SoundEffectToolCore(models={"configured-sfx-id": model})
 
     with TokenContextManager() as manager:
         await tool.generate_sound_effect(text="p", duration_seconds=4)
@@ -310,7 +296,7 @@ async def test_sound_effect_falls_back_to_configured_id_not_the_class_name() -> 
 
     assert len(entries) == 1
     assert entries[0]["model"] == "configured-sfx-id"
-    assert entries[0]["model"] != "_UnnamedSoundEffectModel"
+    assert entries[0]["model"] != type(model).__name__
 
 
 # --- Video billing --------------------------------------------------------
@@ -457,7 +443,9 @@ async def test_asr_bills_when_post_processing_raises() -> None:
 
 
 @pytest.mark.asyncio
-async def test_telegram_passes_verbose_and_bills_a_real_duration(tmp_path) -> None:
+async def test_telegram_passes_verbose_and_bills_a_real_duration(
+    tmp_path: Path,
+) -> None:
     """Drive the real Telegram method, not a re-implementation of it.
 
     Asserting on a locally-issued transcribe() call would pass with

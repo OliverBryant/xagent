@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ChevronLeft, Loader2, Plus } from "lucide-react";
+import { ChevronLeft, Loader2, Plus, Upload } from "lucide-react";
 
 import { MarkdownEditor } from "@/components/skill-hub/markdown-editor";
 import { useI18n } from "@/contexts/i18n-context";
@@ -54,12 +54,54 @@ export default function NewSkillPage() {
   const [name, setName] = useState("");
   const [skillMd, setSkillMd] = useState(STARTER_TEMPLATE);
   const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // The backend regex matches client-side validation here so we can
   // disable the Create button before the user wastes a round trip.
   const nameValid = /^[A-Za-z0-9_-]+$/.test(name);
   const canSubmit = nameValid && skillMd.trim().length > 0 && !saving;
+
+  // Upload a .zip skill bundle or a bare SKILL.md. The backend resolves the
+  // name (typed override → zip root dir → frontmatter name → filename stem)
+  // and we redirect to whatever name it reports back.
+  const handleUpload = async (file: File) => {
+    if (uploading) return;
+    setUploading(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      // Let the typed name win over whatever the archive happens to be
+      // called; the backend refuses one it would have to rewrite.
+      const typedName = name.trim();
+      if (typedName.length > 0) form.append("name", typedName);
+      const res = await apiRequest(`${apiBase}/api/skill-hub/upload`, {
+        method: "POST",
+        body: form,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // FastAPI returns `detail` as a string for our own HTTPExceptions but
+        // as an array of objects for 422 validation failures; rendering that
+        // array as a React child throws.
+        setError(
+          typeof body.detail === "string" && body.detail
+            ? body.detail
+            : `Upload failed (HTTP ${res.status})`,
+        );
+        return;
+      }
+      router.push(body.name ? `/skill-hub/${encodeURIComponent(body.name)}` : "/skill-hub");
+    } catch (e) {
+      console.error(e);
+      setError("Network error while uploading.");
+    } finally {
+      setUploading(false);
+    }
+  };
 
   const handleCreate = async () => {
     setSaving(true);
@@ -107,6 +149,53 @@ export default function NewSkillPage() {
             {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
             {saving ? t("skillHub.newSkill.creating") : t("skillHub.newSkill.create")}
           </button>
+        </div>
+
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => !uploading && fileInputRef.current?.click()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) void handleUpload(f);
+          }}
+          className={`mb-6 flex cursor-pointer items-center gap-3 rounded-lg border border-dashed p-4 transition-colors ${
+            dragOver ? "border-primary bg-primary/5" : "border-border hover:border-primary/50"
+          } ${uploading ? "pointer-events-none opacity-60" : ""}`}
+        >
+          {uploading ? (
+            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-muted-foreground" />
+          ) : (
+            <Upload className="h-5 w-5 shrink-0 text-muted-foreground" />
+          )}
+          <div>
+            <p className="text-sm font-medium">
+              {uploading ? t("skillHub.newSkill.importing") : t("skillHub.newSkill.importTitle")}
+            </p>
+            <p className="text-xs text-muted-foreground">{t("skillHub.newSkill.importHint")}</p>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".zip,.md"
+            className="hidden"
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void handleUpload(f);
+              e.target.value = "";
+            }}
+          />
         </div>
 
         <div className="mb-4">

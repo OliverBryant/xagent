@@ -44,7 +44,17 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -345,6 +355,23 @@ def _summary_source(skill_dict: dict) -> str:
     return skill_dict.get("source") or _classify_source(skill_dict.get("path", ""))
 
 
+# Archiving a folder on macOS sweeps in Finder and resource-fork droppings.
+# The demo path for this feature is "zip an Anthropic skill folder and drop it
+# in", so refusing the whole upload over a .DS_Store would fail that flow on
+# any Finder-touched folder. These carry nothing a skill needs: drop them.
+_IGNORED_ARCHIVE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+
+
+def _is_archive_cruft(path: str) -> bool:
+    """True for OS bookkeeping files that are never part of a skill."""
+    if path.startswith("__MACOSX/"):
+        return True
+    segments = path.split("/")
+    return any(
+        seg in _IGNORED_ARCHIVE_NAMES or seg.startswith("._") for seg in segments
+    )
+
+
 def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
     total = 0
@@ -355,9 +382,18 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                 status_code=400,
                 detail="Skill file path contains a path-traversal sequence.",
             )
-        if path.startswith("."):
+        if _is_archive_cruft(path):
+            continue
+        # Check every segment, not just the first character of the whole path:
+        # ".env" at the root was refused while "sub/.env" sailed through.
+        dotted = next((seg for seg in path.split("/") if seg.startswith(".")), None)
+        if dotted is not None:
             raise HTTPException(
-                status_code=400, detail="Skill file path must not start with a dot."
+                status_code=400,
+                detail=(
+                    f"Skill bundle contains a hidden file ({dotted}). Remove it "
+                    "and upload again."
+                ),
             )
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
@@ -510,41 +546,99 @@ def _installed_slugs(mgr: Any) -> set[str]:
 
 
 def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
-    """Read a ClawHub ZIP into a normalized skill file bundle."""
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(
-            status_code=502, detail="ClawHub returned a bad ZIP."
-        ) from exc
+    """Read a skill ZIP into a normalized skill file bundle."""
+    files, _root = _safe_zip_extract(zip_bytes)
+    return files
 
+
+def _safe_zip_extract(
+    zip_bytes: bytes, *, bad_zip_status: int = 502
+) -> tuple[dict[str, bytes], str]:
+    """Read a skill ZIP into ``(normalized files, root dir name)``.
+
+    ``bad_zip_status`` distinguishes who supplied the archive: 502 for a
+    registry proxy response, 400 for a user upload.
+
+    The size budget is enforced on the *actual* decompressed byte count,
+    not the sizes declared in the ZIP headers — a hostile archive can
+    declare small sizes for members that inflate far larger.
+    """
+    # One guard around the whole "read an untrusted archive" region, rather than
+    # naming exception types per call site. Enumerating them only ever covers
+    # what was thought of: a tampered end-of-central-directory offset raises
+    # ValueError from the constructor, an encrypted member RuntimeError, a
+    # broken DEFLATE stream zlib.error, BZIP2/LZMA corruption OSError or
+    # lzma.LZMAError — none of which subclass one another. Whatever zipfile
+    # raises next is covered here too. Our own HTTPExceptions re-raise unchanged
+    # so their specific status and message survive.
     total = 0
     raw_files: dict[str, bytes] = {}
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        if info.file_size > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
-        total += info.file_size
-        if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(
-                status_code=413, detail="Skill ZIP exceeds size budget."
-            )
-        path = info.filename.replace("\\", "/").lstrip("/")
-        if not path or ".." in path.split("/"):
-            raise HTTPException(
-                status_code=400, detail="Skill ZIP contains unsafe paths."
-            )
-        raw_files[path] = zf.read(info)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            path = info.filename.replace("\\", "/").lstrip("/")
+            if not path or ".." in path.split("/"):
+                raise HTTPException(
+                    status_code=400, detail="Skill ZIP contains unsafe paths."
+                )
+            remaining = _MAX_DOWNLOAD_BYTES - total
+            with zf.open(info) as member:
+                content = member.read(remaining + 1)
+            if len(content) > remaining:
+                raise HTTPException(
+                    status_code=413, detail="Skill ZIP exceeds size budget."
+                )
+            total += len(content)
+            raw_files[path] = content
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Skill Hub: unreadable archive (%s)", type(exc).__name__, exc_info=True
+        )
+        raise HTTPException(
+            status_code=bad_zip_status,
+            detail="Skill archive is not a readable ZIP.",
+        ) from exc
 
-    skill_md_paths = sorted(
-        path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md"
-    )
+    # Choose the root by depth, not by alphabet. A plain sort asserted the
+    # wrong invariant: a skill folder shipping its own "Examples/SKILL.md"
+    # sorts before the real root marker, so the example was imported *as* the
+    # skill — named "Examples", with the true root's files silently dropped and
+    # a 200 returned. Cruft is filtered first so a crafted "__MACOSX/SKILL.md"
+    # cannot win either.
+    skill_md_paths = [
+        path
+        for path in raw_files
+        if (path.endswith("/SKILL.md") or path == "SKILL.md")
+        and not _is_archive_cruft(path)
+    ]
     if not skill_md_paths:
         raise HTTPException(
-            status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it."
+            status_code=400, detail="Skill archive has no SKILL.md anywhere in it."
         )
-    skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
+    min_depth = min(path.count("/") for path in skill_md_paths)
+    shallowest = sorted(p for p in skill_md_paths if p.count("/") == min_depth)
+    if len(shallowest) > 1:
+        # Two skills at the same depth: picking one would discard the other, so
+        # make the user say which. Bounded so a crafted archive cannot reflect
+        # an unlimited list of its own directory names back through the error.
+        roots = ", ".join(
+            (path.removesuffix("SKILL.md").rstrip("/") or ".")[:60]
+            for path in shallowest[:5]
+        )
+        if len(shallowest) > 5:
+            roots += f", and {len(shallowest) - 5} more"
+        raise HTTPException(
+            status_code=bad_zip_status,
+            detail=(
+                f"Skill archive contains multiple skills ({roots}). "
+                "Upload one skill per archive."
+            ),
+        )
+    skill_root = shallowest[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
     for path, content in raw_files.items():
         if skill_root:
@@ -556,7 +650,7 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
             rel = path
         if rel:
             files[rel] = content
-    return _normalize_skill_files(files)
+    return _normalize_skill_files(files), skill_root.rsplit("/", 1)[-1]
 
 
 def _check_registry_security_gate(registry: Any, detail: dict) -> None:
@@ -772,6 +866,243 @@ async def edit_installed(
         )
     logger.info("Skill Hub: edited user skill %r", name)
     return _skill_to_summary(reloaded)
+
+
+def _slugify_skill_name(raw: str) -> str:
+    """Collapse arbitrary text into the [A-Za-z0-9_-]+ shape
+    ``_validate_skill_name`` accepts; empty string if nothing survives."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip()).strip("-_")[:64]
+
+
+def _is_utf8(content: bytes) -> bool:
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _assert_bundle_parses(files: dict[str, bytes]) -> None:
+    """Refuse a bundle that ``SkillManager.reload`` would fail to load.
+
+    Runs the same ``SkillParser.parse_bundle`` the reload path uses, so this
+    tracks the parser instead of guessing at its failure modes: non-UTF-8
+    content, unparsable frontmatter, and anything added later are all covered
+    by construction.
+    """
+    from xagent.skills.parser import SkillParser
+
+    try:
+        SkillParser.parse_bundle(name="upload", files=files)
+    except HTTPException:
+        raise
+    except RecursionError as exc:
+        # Deeply nested YAML blows the stack inside yaml.safe_load, which
+        # ``_extract_frontmatter`` does not catch (it guards yaml.YAMLError).
+        raise HTTPException(
+            status_code=400,
+            detail="SKILL.md frontmatter is nested too deeply to parse.",
+        ) from exc
+    except UnicodeDecodeError as exc:
+        # parse_bundle does not say which file failed, and that is the
+        # actionable half of the message, so identify it here.
+        culprit = next(
+            (path for path, content in sorted(files.items()) if not _is_utf8(content)),
+            None,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{culprit} must be UTF-8 text."
+                if culprit
+                else "Every file in the bundle must be UTF-8 text."
+            ),
+        ) from exc
+    except Exception as exc:
+        logger.warning(
+            "Skill Hub: rejecting an upload that failed to parse", exc_info=True
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Skill bundle could not be parsed: {type(exc).__name__}.",
+        ) from exc
+
+
+def _derive_upload_skill_name(
+    filename: str, zip_root: str, skill_md: bytes, override: str | None = None
+) -> str:
+    """Pick a skill name for an uploaded bundle.
+
+    Priority: caller-supplied ``override`` → ZIP root directory name (how
+    Claude-style skill folders are usually zipped) → frontmatter ``name`` →
+    upload filename stem.
+
+    An override is the caller stating intent, so one that would be rewritten
+    by slugification is refused instead: quietly turning "bad name!" into
+    "bad-name" hands back a skill nobody asked for.
+    """
+    from xagent.skills.parser import SkillParser
+
+    if override is not None and override.strip():
+        candidate = override.strip()
+        # Validate against the rule the message quotes, not a slugifier
+        # round-trip. The slugifier strips leading and trailing "-"/"_", so it
+        # rejected names like "_foo" and "my_skill_" that _NAME_RE accepts and
+        # POST /create takes — with an error citing the regex they do match.
+        if not _NAME_RE.match(candidate) or len(candidate) > 64:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Skill name must match [A-Za-z0-9_-]+ and be at most 64 "
+                    "characters; it is not rewritten for you."
+                ),
+            )
+        return candidate
+
+    frontmatter = SkillParser._extract_frontmatter(  # noqa: SLF001
+        skill_md.decode("utf-8", errors="replace")
+    )
+    fm_name = frontmatter.get("name")
+    candidates = [
+        zip_root,
+        fm_name if isinstance(fm_name, str) else "",
+        Path(filename).stem,
+    ]
+    for raw in candidates:
+        slug = _slugify_skill_name(raw)
+        if slug:
+            return slug
+    raise HTTPException(
+        status_code=400, detail="Could not derive a skill name from the upload."
+    )
+
+
+@router.post("/upload", response_model=SkillSummary)
+async def upload_skill(
+    request: Request,
+    file: UploadFile = File(...),
+    scope: str = Form("personal"),
+    name: Optional[str] = Form(None),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Any = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SkillSummary:
+    """Install a skill from an uploaded file.
+
+    Accepts either a ``.zip`` skill bundle (a Claude-style skill folder
+    with SKILL.md at its root, possibly nested one directory deep) or a
+    bare ``.md`` file used verbatim as SKILL.md. Same tail as
+    ``install_skill``: persist, re-parse, return the summary.
+    """
+    if scope not in ("personal", "team"):
+        raise HTTPException(
+            status_code=400, detail="scope must be 'personal' or 'team'."
+        )
+
+    data = await file.read(_MAX_DOWNLOAD_BYTES + 1)
+    if len(data) > _MAX_DOWNLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds {_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit.",
+        )
+
+    filename = (file.filename or "").strip()
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        files, zip_root = _safe_zip_extract(data, bad_zip_status=400)
+    elif lower.endswith(".md"):
+        files, zip_root = {"SKILL.md": data}, ""
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported upload — provide a .zip skill bundle or a SKILL.md file.",
+        )
+
+    # Validate the bundle before anything reads it — naming included. Deriving
+    # the name parses frontmatter itself, so leaving validation until after
+    # would let an unparsable bundle raise from the naming step instead.
+    # Validation must not depend on which naming branch a request happens to
+    # take; that ordering coupling is what made the override path a bypass.
+    # ``name`` only labels the parse error, so validating before the name is
+    # known loses nothing and keeps the check independent of naming.
+    _assert_bundle_parses(files)
+
+    skill_name = _derive_upload_skill_name(
+        filename, zip_root, files["SKILL.md"], override=name
+    )
+
+    if scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            scope="team",
+            name=skill_name,
+            files=files,
+            origin="upload",
+        )
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=skill_name,
+            files=files,
+            origin="upload",
+        )
+
+    mgr = await _get_scoped_manager(request, context, db)
+    skill = await mgr.get_skill(skill_name)
+    # Check identity, not just presence. ``reload`` keys the cache by name with
+    # filesystem records loaded first, so when a personal record fails to parse
+    # a same-named builtin stays resident — and a bare ``is None`` test would
+    # return 200 carrying that unrelated skill's content while the real row sat
+    # orphaned. What we wrote must come back as what we wrote.
+    expected_source = "user" if scope == "personal" else scope
+    if skill is not None and _summary_source(skill) != expected_source:
+        logger.error(
+            "Skill Hub: %r read back as a %s skill, not the %s skill just "
+            "written — refusing to report success",
+            skill_name,
+            _summary_source(skill),
+            expected_source,
+        )
+        skill = None
+    if skill is None:
+        # The write is already durable. Undo it so the name stays available;
+        # the pre-check above catches the predictable causes, but anything it
+        # misses must not squat a name the user can never reclaim.
+        rolled_back = False
+        if scope == "personal":
+            try:
+                _delete_personal_skill(db=db, user=_user, name=skill_name)
+                rolled_back = True
+            except Exception:
+                logger.warning(
+                    "Skill Hub: could not roll back unloadable skill %r",
+                    skill_name,
+                    exc_info=True,
+                )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Skill {skill_name!r} was written but could not be loaded. "
+                + (
+                    "It was rolled back, so the name is free to reuse."
+                    if rolled_back
+                    else "Remove the written copy before retrying."
+                )
+            ),
+        )
+    logger.info(
+        "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
+        skill_name,
+        filename,
+        len(data),
+        len(files),
+    )
+    return _skill_to_summary(skill)
 
 
 # ──────────────────────────────────────────────────────────────────────

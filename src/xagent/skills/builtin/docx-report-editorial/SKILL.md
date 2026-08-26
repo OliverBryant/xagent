@@ -217,28 +217,33 @@ sec.page_width, sec.page_height = Cm(29.7), Cm(21.0)   # swap explicitly
 ```
 
 Set the default body font once on the `Normal` style so every paragraph
-inherits it (including CJK, which needs the `eastAsia` attribute):
+inherits it:
 
 ```python
-from docx.oxml.ns import qn
+from docx.shared import Pt, RGBColor
 
 normal = doc.styles["Normal"]
 normal.font.name = "Calibri"
 normal.font.size = Pt(11)
 normal.font.color.rgb = RGBColor.from_string(palette["ink"])
-rpr = normal.element.get_or_add_rPr()
-rpr.get_or_add_rFonts().set(qn("w:eastAsia"), "Microsoft YaHei")
 normal.paragraph_format.line_spacing = 1.4
 normal.paragraph_format.space_after = Pt(8)
 ```
 
+Do not pin `w:eastAsia` to a named CJK face. Rule 2 is that Chinese renders
+through each platform's own fallback — writing `Microsoft YaHei` into the
+style hard-codes a font that is absent on macOS and Linux, which is the
+substitution the rule exists to prevent. Leaving the attribute unset is what
+lets Word pick PingFang, YaHei or Noto per platform.
+
 ## 🏛️ Cover page pattern
 
 The cover is its own section so the body can restart page numbering and
-use different headers. Structure: kicker → title → dek → rule → meta row.
+use different headers. Structure: kicker → title → dek → meta row.
 
 ```python
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.shared import Pt, RGBColor
+
 
 def add_kicker(doc, text):
     p = doc.add_paragraph()
@@ -378,6 +383,8 @@ Editorial table rules — **horizontal rules only, no vertical borders**:
 
 ```python
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, RGBColor
 
 rows = [("Region", "Revenue", "YoY"),
         ("North America", "4.2M", "+18%"),
@@ -442,7 +449,8 @@ trPr.append(OxmlElement("w:tblHeader"))
 - [ ] `from docx import Document` (import name is `docx`, not `python_docx`)
 - [ ] LANGUAGE matches the user's prompt — no English kickers in a ZH report
 - [ ] One palette, only its 4 hex values appear anywhere
-- [ ] Only Georgia + Calibri; `Normal` style carries the body font + eastAsia
+- [ ] Only Georgia + Calibri; `Normal` carries the body font, and no named
+      CJK face is pinned to `w:eastAsia`
 - [ ] Real `Heading 1/2/3` styles used (Word navigation pane shows an outline)
 - [ ] Page size, margins, and orientation set explicitly on the section
       (landscape = swap width/height, not just the orientation flag)

@@ -9,6 +9,8 @@ skill actually documents and assert the invariants Word enforces.
 
 from __future__ import annotations
 
+import ast
+import builtins
 import re
 import tempfile
 from pathlib import Path
@@ -202,6 +204,109 @@ def test_the_validation_snippet_accepts_a_one_page_memo() -> None:
         source.replace('"market_expansion_report.docx"', repr(str(MEMO_PATH))),
         namespace,
     )
+
+
+def test_every_self_contained_fence_imports_what_it_uses() -> None:
+    """A fence that opens with its own import line reads as copy-and-run, so
+    its import list has to be complete. Listing some of what it uses is the
+    worst shape: it looks self-contained and fails at the missing name. Two
+    rounds of review found one each (the repeat-header block, then the cover
+    block, which imported the two enums it had stopped using and omitted the
+    Pt and RGBColor it still called).
+
+    Fences that continue from earlier ones are exempt -- they legitimately
+    build on `doc`, `sec`, `table` and `palette` -- so the check is scoped to
+    fences that declare imports of their own.
+    """
+    fences = re.findall(r"^```python\n(.*?)^```", SKILL_MD.read_text(), re.S | re.M)
+    carried_over = {"doc", "sec", "table", "row", "cell", "check", "palette"}
+    # Helpers an earlier fence defines are carried forward the same way the
+    # document objects are -- the skill tells the model to copy them once.
+    carried_over |= {
+        node.name
+        for fence in fences
+        for node in ast.walk(ast.parse(fence))
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    # Static analysis rather than exec: running a fence against stub objects
+    # raises AttributeError on the first stub call, which masks every missing
+    # name after it. The point is the whole import list, not the first line.
+    offenders = []
+    for fence in fences:
+        if not re.match(r"\s*(from|import)\s", fence):
+            continue  # a continuation fence, not advertised as standalone
+        tree = ast.parse(fence)
+        bound = set(dir(builtins)) | carried_over
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                bound |= {a.asname or a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                bound.add(node.name)
+                bound |= {a.arg for a in node.args.args}
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, ast.comprehension):
+                bound |= {
+                    n.id for n in ast.walk(node.target) if isinstance(n, ast.Name)
+                }
+        used = {
+            n.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+        }
+        missing = sorted(used - bound)
+        if missing:
+            offenders.append((fence.strip().splitlines()[0], missing))
+
+    assert not offenders, f"fences missing imports: {offenders}"
+
+
+def test_the_prose_does_not_promise_what_the_snippets_omit() -> None:
+    """Four rounds of review found prose describing behaviour the code below
+    it did not have: a page break where the code opens a section, verticals
+    "stripped" by a call that was not there, a cover rule with no rule, an
+    eastAsia font pinned against the rule forbidding it. Each was found by
+    reading. These pin the ones that are mechanically checkable.
+    """
+    text = SKILL_MD.read_text()
+    fences = "\n".join(re.findall(r"^```python\n(.*?)^```", text, re.S | re.M))
+
+    # The cover: prose names the section break, so the code must open one.
+    assert "add_section" in fences
+    assert "WD_BREAK.PAGE" not in fences, (
+        "a page break next to the section break is the blank-page trap"
+    )
+
+    # The table: prose says horizontal rules only, so the verticals the
+    # "Table Grid" style draws have to actually be cleared.
+    if '"Table Grid"' in fences:
+        # A call, not a mention: the helper's own definition contains each edge
+        # name, so searching the text passes even with every call deleted.
+        sample = next(
+            f
+            for f in re.findall(r"^```python\n(.*?)^```", text, re.S | re.M)
+            if '"Table Grid"' in f
+        )
+        calls = [
+            node
+            for node in ast.walk(ast.parse(sample))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "clear_cell_border"
+        ]
+        assert calls, "the sample never clears the grid's verticals"
+        cleared = " ".join(ast.dump(c) for c in calls) + sample
+        for vertical in ("left", "right", "insideV"):
+            assert vertical in cleared, f"{vertical} border never cleared"
+
+    # Rule 2 puts CJK on platform fallback, so no named face may be pinned.
+    assert 'qn("w:eastAsia")' not in fences, "rule 2 forbids pinning a CJK face"
+
+    # The validation snippet must not reimpose a shape floor.
+    assert "len(check.paragraphs) > 10" not in fences
 
 
 def test_the_repeat_header_snippet_stays_single(helpers) -> None:

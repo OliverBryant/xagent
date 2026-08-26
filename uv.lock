@@ -7937,6 +7937,7 @@ dev = [
     { name = "pytest-socket" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "python-docx" },
     { name = "ruff" },
     { name = "types-docker" },
     { name = "types-openpyxl" },
@@ -7980,6 +7981,7 @@ test = [
     { name = "pytest-socket" },
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
+    { name = "python-docx" },
 ]
 
 [package.metadata]
@@ -8135,6 +8137,7 @@ dev = [
     { name = "pytest-socket", specifier = ">=0.7.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
     { name = "ruff", specifier = ">=0.12.3" },
     { name = "types-docker", specifier = ">=7.1.0.20251009" },
     { name = "types-openpyxl", specifier = ">=3.1.5" },
@@ -8178,6 +8181,7 @@ test = [
     { name = "pytest-socket", specifier = ">=0.7.0" },
     { name = "pytest-timeout", specifier = ">=2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.0" },
+    { name = "python-docx", specifier = ">=1.1.0" },
 ]
 
 [[package]]

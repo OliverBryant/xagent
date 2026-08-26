@@ -1209,7 +1209,9 @@ async def upload_skill(
     logger.info(
         "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
         skill_name,
-        filename,
+        # The client controls this and it is not length-bounded anywhere,
+        # unlike skill_name; truncate so one request cannot bloat a log line.
+        filename[:120],
         len(data),
         len(files),
     )

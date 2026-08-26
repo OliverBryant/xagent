@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,7 @@ from ..services.mcp_oauth import (
     select_mcp_oauth_grants,
     validate_mcp_oauth_persisted_value,
 )
-from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS, normalize_transport
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
@@ -121,6 +121,17 @@ class MCPServerCreate(BaseModel):
         False, description="Allow runtime Authorization header binding"
     )
 
+    # Canonicalize before anything reads it: transport is free-form here, and
+    # the value validated by TransportFieldValidator / stored on the row is the
+    # one every later comparison (exact and case-insensitive alike) must agree
+    # on. Also applies to the update endpoint, which rebuilds this model from
+    # the request and the stored row, so editing a legacy mixed-case server
+    # heals it.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        return normalize_transport(value)
+
 
 class MCPServerUpdate(BaseModel):
     """Request model for updating MCP server."""
@@ -144,6 +155,15 @@ class MCPServerUpdate(BaseModel):
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
     )
+
+    # Same canonicalization as MCPServerCreate, applied before
+    # _global_config_tampered compares the incoming transport with the stored
+    # one — otherwise a payload that only re-cases an unchanged transport would
+    # read as a global-config edit by a non-owner.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else normalize_transport(value)
 
 
 class MCPAppConnectRequest(BaseModel):
@@ -609,7 +629,7 @@ def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP server is not configured for MCP OAuth",
         )
-    if server.transport not in HTTP_MCP_TRANSPORTS:
+    if normalize_transport(server.transport) not in HTTP_MCP_TRANSPORTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP OAuth is only supported for HTTP MCP transports",

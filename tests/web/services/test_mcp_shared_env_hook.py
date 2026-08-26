@@ -186,3 +186,68 @@ def test_build_mcp_runtime_connection_without_user_id_does_not_scrub_forged_over
     )
 
     assert build.connection["env"]["XAGENT_MCP_CALLER_ID"] == "spoofed"
+
+
+class _FakeHttpOAuthServer:
+    """Stand-in for an mcp_oauth-authorized HTTP MCPServer row."""
+
+    def __init__(self, transport, server_id=7):
+        self.id = server_id
+        self.name = "remote-notes"
+        self.transport = transport
+        self.url = "https://mcp.example.com/mcp"
+
+    def to_connection_dict(self):
+        return {
+            "transport": self.transport,
+            "url": self.url,
+            "auth": {"type": "mcp_oauth"},
+        }
+
+    def _decrypt_auth_config(self, auth):
+        return {"type": "mcp_oauth"}
+
+
+def test_mcp_oauth_http_classification_is_case_insensitive():
+    """A row stored before write-time transport normalization can hold
+    "Streamable_HTTP". A False here is not a rejection: the caller returns
+    the connection as-is, skipping the per-user OAuth token exchange, so the
+    server would be handed to the runtime without a grant."""
+    server = _FakeHttpOAuthServer("Streamable_HTTP")
+
+    assert (
+        mcp_runtime._is_mcp_oauth_http_server(server, server._decrypt_auth_config(None))
+        is True
+    )
+
+
+def test_mcp_oauth_http_classification_still_excludes_stdio():
+    """Case-insensitivity must not pull a non-HTTP transport into the
+    OAuth runtime path."""
+    server = _FakeHttpOAuthServer("stdio")
+
+    assert (
+        mcp_runtime._is_mcp_oauth_http_server(server, server._decrypt_auth_config(None))
+        is False
+    )
+
+
+def test_mixed_case_mcp_oauth_server_is_not_served_without_a_grant():
+    """The end-to-end consequence: build_mcp_runtime_connection must refuse a
+    mixed-case mcp_oauth row (no db/user context to resolve a grant) rather
+    than fall through and return it unauthorized."""
+    server = _FakeHttpOAuthServer("Streamable_HTTP")
+
+    build = asyncio.run(
+        mcp_runtime.build_mcp_runtime_connection(db=None, server=server, user_id=42)
+    )
+
+    assert build.connection is None
+    assert build.diagnostic is not None
+    assert build.diagnostic["code"] == "authorization_required"
+
+
+def test_normalize_transport_canonicalizes_case_and_padding():
+    assert mcp_runtime.normalize_transport("  Streamable_HTTP ") == "streamable_http"
+    assert mcp_runtime.normalize_transport("SSE") == "sse"
+    assert mcp_runtime.normalize_transport(None) == ""

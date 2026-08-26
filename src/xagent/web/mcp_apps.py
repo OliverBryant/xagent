@@ -106,9 +106,10 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """
     # Reuses the runtime's notion of which transports are remote ("oauth"
     # here instead means a static-provider redirect wrapping our own stdio
-    # module). Lowercased like the builtin_oauth check above: an admin PATCH
-    # can store a mixed-case transport, and the two halves of this feature
-    # must not disagree about the same row.
+    # module). Lowercased like the builtin_oauth check above: transport is
+    # normalized on write now, but rows stored before that may still be
+    # mixed-case, and the two halves of this feature must not disagree about
+    # the same row.
     from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
 
     if str(transport or "").lower() == "oauth":

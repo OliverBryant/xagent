@@ -66,6 +66,18 @@ def has_user_tool_policy_hooks() -> bool:
     )
 
 
+def has_user_tool_overrides_hook() -> bool:
+    """Return whether an application registered the overrides hook specifically.
+
+    A caller deciding that an overrides read was *unresolvable* needs this
+    rather than :func:`has_user_tool_policy_hooks`: with no overrides hook
+    registered, ``get_user_tool_overrides`` returns ``{}`` without consulting
+    ``user`` at all, so a missing runtime user resolves that input rather than
+    leaving it unresolved.
+    """
+    return _get_user_tool_overrides_hook is not None
+
+
 # The allowlist value that means "policy could not be resolved". A registering
 # application enforces authorization through the hooks above, so a failed or
 # missing runtime ``User`` reload must not be reported as "no policy

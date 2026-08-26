@@ -62,6 +62,7 @@ from ..services.tool_credentials import (
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
+    has_user_tool_overrides_hook,
     has_user_tool_policy_hooks,
     resolve_tool_credential,
     unresolved_tool_policy_allowlist,
@@ -2199,7 +2200,14 @@ class WebToolConfig(BaseToolConfig):
             # No user to hand the hook: the policy is unresolved, not absent.
             # The overrides mapping stays a dict (the tool-listing API indexes
             # it); ``get_user_tool_allowlist`` carries the fail-closed signal.
-            self._note_unresolved_tool_policy("overrides", "no runtime user")
+            #
+            # Gated on the overrides hook specifically, not on either hook:
+            # with no overrides hook registered ``get_user_tool_overrides``
+            # ignores ``user`` and returns ``{}`` regardless, so a missing user
+            # resolves this input. Recording it would deny an allowlist-only
+            # deployment whose allowlist hook answered successfully.
+            if has_user_tool_overrides_hook():
+                self._note_unresolved_tool_policy("overrides", "no runtime user")
             self._cached_tool_overrides = {}
             return {}
         try:

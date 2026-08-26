@@ -236,6 +236,47 @@ def test_config_keeps_denying_when_an_allowlist_timeout_follows_a_failed_overrid
         set_user_tool_overrides_hook(None)
 
 
+def test_missing_user_does_not_deny_an_allowlist_only_deployment(clear_allowlist_hook):
+    """A missing runtime user must not deny when no overrides hook is registered.
+
+    With no overrides hook, ``get_user_tool_overrides`` ignores ``user`` and
+    returns ``{}`` regardless, so that input is resolved rather than unresolved.
+    Recording it would discard an allowlist the hook returned successfully.
+    """
+    from unittest.mock import MagicMock
+
+    set_user_tool_allowlist_hook(lambda db, user: ["shell", "file"])
+    request_without_user = MagicMock()
+    del request_without_user.user
+    cfg = WebToolConfig(db=MagicMock(), request=request_without_user, user_id=42)
+
+    # Read order matches the factory's (overrides at factory.py:632, then
+    # allowlist at :651) so the cross-input path is exercised.
+    assert cfg.get_user_tool_overrides() == {}
+    assert cfg.get_user_tool_allowlist() == ["shell", "file"]
+
+
+def test_missing_user_still_denies_when_the_overrides_hook_is_registered(
+    clear_allowlist_hook,
+):
+    """The narrower gate must not reopen the fail-open path it guards."""
+    from unittest.mock import MagicMock
+
+    from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+    set_user_tool_allowlist_hook(lambda db, user: ["shell"])
+    set_user_tool_overrides_hook(lambda db, user: {"file": {"enabled": False}})
+    try:
+        request_without_user = MagicMock()
+        del request_without_user.user
+        cfg = WebToolConfig(db=MagicMock(), request=request_without_user, user_id=42)
+
+        assert cfg.get_user_tool_overrides() == {}
+        assert cfg.get_user_tool_allowlist() == []
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
 def test_config_recovers_after_a_transient_hook_failure(clear_allowlist_hook):
     calls = {"n": 0}
 

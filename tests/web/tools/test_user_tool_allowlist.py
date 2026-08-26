@@ -75,14 +75,71 @@ def test_config_caches_none_result(clear_allowlist_hook):
     assert calls["n"] == 1
 
 
-def test_config_swallows_hook_errors(clear_allowlist_hook):
+def test_config_fails_closed_on_hook_errors(clear_allowlist_hook):
     def _boom(db, user):
         raise RuntimeError("hook failed")
 
     set_user_tool_allowlist_hook(_boom)
     cfg = _config()
-    # A failing hook must not break tool building; treated as "no allowlist".
-    assert cfg.get_user_tool_allowlist() is None
+    # A failing hook must not break tool building, but it must not be reported
+    # as "no allowlist configured" either: the application enforces
+    # authorization through this hook, so an unresolved read denies every tool
+    # instead of skipping the positive filter and building the full set.
+    assert cfg.get_user_tool_allowlist() == []
+
+
+def test_config_reports_no_allowlist_when_no_hook_registered(clear_allowlist_hook):
+    # Standalone xagent registers no policy hook, so there is no policy to
+    # lose: the accessor still means "no filtering", not "deny every tool".
+    assert _config().get_user_tool_allowlist() is None
+
+
+def test_config_denies_when_an_allowlist_read_precedes_a_failed_overrides_read(
+    clear_allowlist_hook,
+):
+    """The deny must not depend on which policy input is read first.
+
+    The allowlist read caches "no allowlist configured". If a later overrides
+    read cannot be resolved, that cached ``None`` must not keep reporting "no
+    filtering" — which is exactly the full-tool-set fail-open path.
+    """
+    from unittest.mock import MagicMock
+
+    from xagent.web.services.tool_credentials import set_user_tool_overrides_hook
+
+    set_user_tool_allowlist_hook(lambda db, user: None)
+    set_user_tool_overrides_hook(lambda db, user: {"file": {"enabled": False}})
+    try:
+        request_without_user = MagicMock()
+        del request_without_user.user
+        cfg = WebToolConfig(db=MagicMock(), request=request_without_user, user_id=42)
+
+        # Allowlist first: nothing has failed yet, so "no allowlist" is right.
+        assert cfg.get_user_tool_allowlist() is None
+        # The overrides read cannot reach the hook (no runtime user).
+        assert cfg.get_user_tool_overrides() == {}
+        # That failure has to invalidate the cached allowlist and deny.
+        assert cfg.get_user_tool_allowlist() == []
+    finally:
+        set_user_tool_overrides_hook(None)
+
+
+def test_config_recovers_after_a_transient_hook_failure(clear_allowlist_hook):
+    calls = {"n": 0}
+
+    def _flaky(db, user):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("hook failed")
+        return ["only_this"]
+
+    set_user_tool_allowlist_hook(_flaky)
+    cfg = _config()
+
+    assert cfg.get_user_tool_allowlist() == []
+    # Fail closed must not latch: once the hook answers again the turn gets the
+    # real policy rather than staying denied for the life of the config.
+    assert cfg.refresh_user_tool_allowlist() == ["only_this"]
 
 
 @pytest.mark.parametrize(

@@ -66,6 +66,32 @@ def has_user_tool_policy_hooks() -> bool:
     )
 
 
+# The allowlist value that means "policy could not be resolved". A registering
+# application enforces authorization through the hooks above, so a failed or
+# missing runtime ``User`` reload must not be reported as "no policy
+# configured": that would build the globally available tool set and run the
+# turn unrestricted. Resolving to an empty allowlist reuses the hook's existing
+# "an empty list means no tools allowed" contract, so every consumer that
+# already honours a concrete allowlist fails closed with no new branch.
+#
+# Only meaningful while ``has_user_tool_policy_hooks()`` is true. With no hook
+# registered there is no policy to lose, and standalone xagent keeps its
+# unrestricted default.
+TOOL_POLICY_UNAVAILABLE_ALLOWLIST: list[str] = []
+
+
+def unresolved_tool_policy_allowlist() -> list[str] | None:
+    """Return the fail-closed allowlist for an unresolvable policy read.
+
+    ``None`` (no filtering) when no application hook is registered, so the
+    fail-closed behaviour is scoped to deployments that actually delegate
+    authorization to the hooks.
+    """
+    if not has_user_tool_policy_hooks():
+        return None
+    return list(TOOL_POLICY_UNAVAILABLE_ALLOWLIST)
+
+
 TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
     "exa_web_search": {
         "api_key": {

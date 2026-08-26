@@ -1,6 +1,6 @@
 """Skill Hub API — manage user-installed skills (saas closed-source).
 
-The Hub composes three capabilities on top of xagent's existing skill
+The Hub composes four capabilities on top of xagent's existing skill
 machinery (``SkillManager`` + ``SkillParser``):
 
   1. **Local skill management** — list / detail / delete the skills
@@ -20,13 +20,19 @@ machinery (``SkillManager`` + ``SkillParser``):
      (``PUT /installed/{name}``). Edits and creates both invalidate
      the same cache the chat runtime reads from.
 
+  4. **File import** — install a skill the user already has on disk
+     (``POST /upload``), either a ``.zip`` bundle of a skill folder or a
+     bare ``.md`` used as SKILL.md. The name comes from an explicit
+     override, then the frontmatter ``name``, then the archive's root
+     directory.
+
 GitHub-URL import was removed in this iteration: we previously
 shipped a ``git clone --depth=1`` path, but ClawHub gives us trusted
 binaries with provenance and scan results, so we don't need to
 re-implement that surface area. If someone really wants an
 unscanned-source install path back, ``git`` is still on the box.
 
-All writes (installs, creates, edits) persist to the database via
+All writes (installs, creates, edits, uploads) persist to the database via
 ``UserSkill`` / ``UserSkillFile`` models.  The ``XagentPersonalDbSkillProvider``
 (``skills/personal_db.py``) surfaces them back to the SkillManager; because
 scoped managers are built fresh per request (no per-user cache), changes are
@@ -425,6 +431,11 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     # LLM call, so cap it at the same size the authoring routes enforce via
     # their request models. Archive-based paths otherwise had no limit below
     # the multi-megabyte bundle budget.
+    if not out["SKILL.md"].strip():
+        # The authoring routes enforce min_length=1; without the same floor an
+        # archive could register a skill with no content, which parses fine and
+        # then sits in the agent's index as an entry that teaches it nothing.
+        raise HTTPException(status_code=400, detail="SKILL.md is empty.")
     if len(out["SKILL.md"]) > _MAX_SKILL_MD_BYTES:
         raise HTTPException(
             status_code=413,
@@ -665,9 +676,16 @@ def _safe_zip_extract(
     if len(shallowest) > 1:
         # Two sibling skills in one archive. Guessing which one was meant
         # would silently discard the other, so make the user choose.
-        roots = ", ".join(
+        # Name a few roots so the user can find them, but do not echo an
+        # archive-controlled list of unbounded length into the response and
+        # the logs: 50 long directory names made this a 10 KB error string.
+        names = [
             path.removesuffix("SKILL.md").rstrip("/") or "." for path in shallowest
-        )
+        ]
+        shown = [name[:60] for name in names[:5]]
+        roots = ", ".join(shown)
+        if len(names) > len(shown):
+            roots += f", and {len(names) - len(shown)} more"
         raise HTTPException(
             status_code=bad_zip_status,
             detail=(
@@ -814,10 +832,13 @@ async def _persist_and_reparse(
     actual_source = _summary_source(skill) if skill is not None else None
     if skill is None or actual_source != expected_source:
         # Undo the write so the name stays available. Personal rows are ours
-        # to delete; a team provider owns its own storage, so we only report.
+        # to delete; a team provider owns its own storage, so we can only
+        # report — and the message must not claim a rollback that never ran.
+        rolled_back = False
         if scope == "personal":
             try:
                 _delete_personal_skill(db=db, user=user, name=name)
+                rolled_back = True
             except HTTPException:
                 logger.warning(
                     "Skill Hub: could not roll back unparsable skill %r", name
@@ -830,12 +851,17 @@ async def _persist_and_reparse(
                 actual_source,
                 expected_source,
             )
+        remedy = (
+            "It was rolled back, so the name is free to reuse."
+            if rolled_back
+            else "The written copy was left in place; remove it before retrying."
+        )
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Skill {name!r} could not be loaded after writing and was "
-                "rolled back. Every file in the bundle must be UTF-8 text, "
-                "and the name must not collide with an existing skill."
+                f"Skill {name!r} could not be loaded after writing. {remedy} "
+                "Every file in the bundle must be UTF-8 text, and the name "
+                "must not collide with an existing skill."
             ),
         )
     return skill
@@ -1053,10 +1079,20 @@ def _derive_upload_skill_name(
     frontmatter = SkillParser._extract_frontmatter(  # noqa: SLF001
         skill_md.decode("utf-8", errors="replace")
     )
+    # YAML types a bare ``name: 12345`` as an int and ``name: true`` as a bool.
+    # Those are legitimate skill names once slugified, so accept any scalar
+    # rather than dead-ending the upload on the frontmatter's YAML type.
     fm_name = frontmatter.get("name")
+    # bool is a subclass of int, and "name: true" naming a skill ``True`` is
+    # nonsense, so exclude it explicitly.
+    fm_text = (
+        str(fm_name)
+        if isinstance(fm_name, (str, int, float)) and not isinstance(fm_name, bool)
+        else ""
+    )
     candidates = [
         override or "",
-        fm_name if isinstance(fm_name, str) else "",
+        fm_text,
         zip_root,
     ]
     for raw in candidates:

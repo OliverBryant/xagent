@@ -86,6 +86,15 @@ class TestNormalizeSkillFiles:
         out = _normalize_skill_files({"SKILL.md": SKILL_MD, "%2e%2e/x.py": b"x"})
         assert "%2e%2e/x.py" in out
 
+    def test_empty_skill_md_rejected(self):
+        # create/edit enforce min_length=1; an archive must not be able to
+        # register a contentless skill that parses fine and teaches nothing.
+        for body in (b"", b"   \n\n  "):
+            with pytest.raises(HTTPException) as exc:
+                _normalize_skill_files({"SKILL.md": body})
+            assert exc.value.status_code == 400
+            assert "empty" in exc.value.detail.lower()
+
     def test_skill_md_size_cap(self):
         # SKILL.md is injected into the LLM system context in full, so it is
         # capped at the same length the create/edit request models enforce,
@@ -285,6 +294,16 @@ class TestSafeZipExtract:
         assert exc.value.status_code == 502
         assert "multiple skills" in exc.value.detail.lower()
 
+    def test_multi_root_message_is_bounded(self):
+        # The message names archive-supplied directories, so a crafted archive
+        # must not turn it into kilobytes of reflected content.
+        members = {f"{'r' * 200}{i}/SKILL.md": SKILL_MD for i in range(50)}
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(_make_zip(members))
+        assert exc.value.status_code == 502
+        assert len(exc.value.detail) < 600
+        assert "and 45 more" in exc.value.detail
+
     def test_shallowest_root_wins_over_alphabetical_order(self):
         # "a/b/c/SKILL.md" sorts after "z/SKILL.md"; selecting lexicographically
         # would pick the deep one and drop all of z/.
@@ -460,6 +479,22 @@ class TestDeriveUploadSkillName:
         assert exc.value.status_code == 400
         assert "name" in exc.value.detail.lower()
 
+    def test_numeric_frontmatter_name_is_accepted(self):
+        # YAML types a bare "name: 12345" as an int; it is still a valid skill
+        # name once slugified, so it must not dead-end the upload.
+        md = b"---\nname: 12345\ndescription: d\n---\n# S\n"
+        assert _derive_upload_skill_name("a.zip", "", md) == "12345"
+
+    def test_boolean_frontmatter_name_is_ignored(self):
+        # bool subclasses int, and naming a skill "True" is nonsense: fall
+        # through to the next candidate instead.
+        md = b"---\nname: true\ndescription: d\n---\n# S\n"
+        assert _derive_upload_skill_name("a.zip", "real-root", md) == "real-root"
+
+    def test_non_scalar_frontmatter_name_is_ignored(self):
+        md = b"---\nname:\n  - a\n  - b\ndescription: d\n---\n# S\n"
+        assert _derive_upload_skill_name("a.zip", "real-root", md) == "real-root"
+
     def test_cjk_name_falls_back_instead_of_dead_ending(self):
         name = _derive_upload_skill_name("a.zip", "中文技能", SKILL_MD)
         assert name.startswith("skill-")
@@ -630,6 +665,79 @@ class TestUploadRoute:
         with pytest.raises(HTTPException) as exc:
             await _call_upload(_make_upload("skill.md", b"\xff\xfe\x00bad"))
         assert exc.value.status_code == 400
+
+
+# ── _persist_and_reparse failure reporting ───────────────────────────────────
+
+
+class TestPersistAndReparseFailureMessage:
+    """The failure message must describe what actually happened.
+
+    The personal path deletes the row it just wrote, so the name is reusable.
+    The team path cannot: a write provider owns its own storage. Claiming a
+    rollback there would tell the user to retry a name that is still taken.
+    """
+
+    @staticmethod
+    async def _run(scope: str, monkeypatch):
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        class _Manager:
+            async def get_skill(self, name):
+                return None  # force the failure branch
+
+        async def _scoped(*args):
+            return _Manager()
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+        monkeypatch.setattr(skill_hub, "_write_personal_skill", lambda **kwargs: None)
+        deleted: list = []
+        monkeypatch.setattr(
+            skill_hub,
+            "_delete_personal_skill",
+            lambda **kwargs: deleted.append(kwargs["name"]),
+        )
+
+        async def _invoker(provider, method, context, **kwargs):
+            return None
+
+        monkeypatch.setattr(skill_hub, "invoke_skill_write_provider", _invoker)
+        monkeypatch.setattr(
+            "xagent.skills.library.get_skill_write_provider", lambda: object()
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub._persist_and_reparse(
+                request=SimpleNamespace(),
+                context=SkillScopeContext(user_id=7, metadata={}),
+                db=object(),
+                user=SimpleNamespace(id=7),
+                name="thing",
+                files={"SKILL.md": SKILL_MD},
+                scope=scope,
+                origin="upload",
+            )
+        return exc.value, deleted
+
+    @pytest.mark.asyncio
+    async def test_personal_failure_says_rolled_back(self, monkeypatch):
+        err, deleted = await self._run("personal", monkeypatch)
+        assert err.status_code == 400
+        assert "rolled back" in err.detail
+        assert "left in place" not in err.detail
+        assert deleted == ["thing"]
+
+    @pytest.mark.asyncio
+    async def test_team_failure_does_not_claim_a_rollback(self, monkeypatch):
+        # No provider-side delete exists, so the message must not promise one.
+        err, deleted = await self._run("team", monkeypatch)
+        assert err.status_code == 400
+        assert "left in place" in err.detail
+        assert "rolled back" not in err.detail
+        assert deleted == []
 
 
 # ── _check_registry_security_gate ────────────────────────────────────────────

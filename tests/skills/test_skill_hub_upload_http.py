@@ -223,6 +223,31 @@ class TestUploadHttp:
         assert res.status_code == 400
         assert _skill_rows(client_env) == []
 
+    def test_failure_message_states_the_name_was_freed(self, client_env, monkeypatch):
+        # The personal path does roll back, so the message must say the name is
+        # reusable — and must not claim a rollback on a path that has none.
+        from xagent.skills.parser import SkillParser
+
+        real_parse = SkillParser.parse_bundle
+
+        def flaky_parse(name: str, files: dict, path: str = "", **kwargs):
+            if name == "msg-check":
+                raise ValueError("synthetic parse failure")
+            return real_parse(name=name, files=files, path=path, **kwargs)
+
+        monkeypatch.setattr(SkillParser, "parse_bundle", staticmethod(flaky_parse))
+
+        data = _make_zip({"msg-check/SKILL.md": SKILL_MD})
+        res = client_env["client"].post(
+            "/api/skill-hub/upload",
+            files={"file": ("m.zip", data, "application/zip")},
+        )
+        assert res.status_code == 400
+        detail = res.json()["detail"]
+        assert "rolled back" in detail
+        assert "left in place" not in detail
+        assert _skill_rows(client_env) == []
+
     def test_configured_limit_bounds_decompressed_size(self, client_env, monkeypatch):
         # Lowering XAGENT_MAX_UPLOAD_SIZE must also stop an archive that is
         # small on the wire but expands past the limit — otherwise the route

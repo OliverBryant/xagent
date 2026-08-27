@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from xagent.web.services import mcp_runtime
 
 
@@ -221,10 +223,17 @@ def test_mcp_oauth_http_classification_is_case_insensitive():
     )
 
 
-def test_mcp_oauth_http_classification_still_excludes_stdio():
-    """Case-insensitivity must not pull a non-HTTP transport into the
-    OAuth runtime path."""
-    server = _FakeHttpOAuthServer("stdio")
+@pytest.mark.parametrize(
+    "transport",
+    ["stdio", "oauth", "oauth2", "http", "streamable", "custom_api", ""],
+    ids=["stdio", "oauth", "oauth2", "http", "prefix", "custom-api", "empty"],
+)
+def test_mcp_oauth_http_classification_excludes_non_http_transports(transport):
+    """Normalizing case must not widen the set. `stdio` alone does not
+    discriminate -- it is excluded with or without normalization. These
+    include values that a sloppy normalizer (substring/prefix matching, or
+    treating "oauth" as HTTP) would wrongly admit."""
+    server = _FakeHttpOAuthServer(transport)
 
     assert (
         mcp_runtime._is_mcp_oauth_http_server(server, server._decrypt_auth_config(None))

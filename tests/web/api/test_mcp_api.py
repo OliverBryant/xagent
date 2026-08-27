@@ -919,10 +919,16 @@ class TestOAuthServerLookupTransportNormalization:
         assert _is_oauth_server_for_app(server, self.APP) is True
         assert _lookup_oauth_server_for_app(self.APP, lookup) is server
 
-    def test_non_oauth_transport_is_still_excluded(self):
-        """Normalization must not pull a genuinely non-OAuth row into the
-        builtin_oauth branch."""
-        server = self._server("stdio")
+    @pytest.mark.parametrize(
+        "transport",
+        ["stdio", "oauth2", "streamable_http", "custom_api", "auth", ""],
+        ids=["stdio", "oauth2", "http", "custom-api", "substring", "empty"],
+    )
+    def test_non_oauth_transport_is_still_excluded(self, transport: str):
+        """Normalization must not widen the set. `stdio` alone does not
+        discriminate; `oauth2` and `auth` would be admitted by a normalizer
+        that matched loosely instead of on the exact canonical value."""
+        server = self._server(transport)
         assert _is_oauth_server_for_app(server, self.APP) is False
 
 
@@ -949,13 +955,20 @@ class TestMcpOAuthServerTransportNormalization:
         )
         assert _is_mcp_oauth_server(server) is True
 
-    def test_stdio_is_not_an_mcp_oauth_server(self):
+    @pytest.mark.parametrize(
+        "transport",
+        ["STDIO", "oauth", "http", "streamable", "custom_api", ""],
+        ids=["stdio-upper", "oauth", "http", "prefix", "custom-api", "empty"],
+    )
+    def test_non_http_transport_is_not_an_mcp_oauth_server(self, transport: str):
+        """Includes values a loose normalizer would wrongly admit ("http" as a
+        substring of no canonical value, "streamable" as a prefix of one)."""
         from xagent.web.api.mcp import _is_mcp_oauth_server
 
         server = MCPServer(
             id=1,
             name="local",
-            transport="STDIO",
+            transport=transport,
             auth={"type": "mcp_oauth"},
             managed="external",
         )

@@ -1708,11 +1708,14 @@ def _oauth_keys_for_app(app: dict) -> list[str]:
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
-    # Normalized to match _build_active_oauth_server_lookup and
-    # _server_catalog_keys, which admit a row into the lookup via
-    # _normalize_app_key. An exact check here rejects a row those two just
-    # accepted, so _lookup_oauth_server_for_app returns None and a connected
-    # OAuth app renders as disconnected.
+    # Normalized so this agrees with _build_active_oauth_server_lookup and
+    # _server_catalog_keys, which admit a row into the lookup. Note those two
+    # use a *different* helper (_normalize_app_key); the two normalizers agree
+    # on every transport value (both strip and lowercase, and transports carry
+    # no internal whitespace for _normalize_app_key to hyphenate), which is
+    # what makes this safe. An exact check here would reject a row those two
+    # just accepted, so _lookup_oauth_server_for_app returns None and a
+    # connected OAuth app renders as disconnected.
     if normalize_transport(server.transport) != "oauth":
         return False
 

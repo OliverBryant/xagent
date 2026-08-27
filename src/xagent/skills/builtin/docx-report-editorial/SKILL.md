@@ -216,8 +216,9 @@ lets Word pick PingFang, YaHei or Noto per platform.
 
 ## 🏛️ Cover page pattern
 
-The cover is its own section so the body can restart page numbering and
-use different headers. Structure: kicker → title → dek → meta row.
+The cover is its own section, so the body starts on a fresh page and can
+later be given its own header, footer or page numbering without touching the
+cover. Structure: kicker → title → dek → meta row.
 
 ```python
 from docx.oxml.ns import qn
@@ -268,8 +269,9 @@ meta_run = meta.add_run("Xagent Team · 2026-05-14")   # middle dot, not hyphen
 meta_run.font.size = Pt(10)
 meta_run.font.color.rgb = RGBColor.from_string(palette["ink_tint"])
 
-# A new section — not just a page break — is what lets the body restart page
-# numbering and carry its own header/footer.
+# A new section, not just a page break: the body gets its own section
+# properties, so a header, footer or page numbering added later applies to
+# it without touching the cover.
 from docx.enum.section import WD_SECTION
 
 body = doc.add_section(WD_SECTION.NEW_PAGE)

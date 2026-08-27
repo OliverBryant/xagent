@@ -374,3 +374,28 @@ def test_classify_app_auth_normalizes_transport_for_keyless(transport: str):
 )
 def test_classify_app_auth_normalizes_transport_for_builtin_oauth(transport: str):
     assert classify_app_auth(transport, {"command": "npx"}) == "builtin_oauth"
+
+
+def test_catalog_listing_reports_normalized_transport(catalog_db):
+    """The connector listing's `transport` and `auth_type` come from the same
+    row; auth_type is derived from the normalized value, so transport must be
+    normalized too or the two disagree about one app."""
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="padded-remote",
+            name="Padded Remote",
+            transport=" Streamable_HTTP ",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    catalog_db.commit()
+
+    app = next(
+        a for a in mcp_apps.get_all_mcp_apps(catalog_db) if a["id"] == "padded-remote"
+    )
+
+    assert app["transport"] == "streamable_http"
+    assert app["auth_type"] == "mcp_oauth"

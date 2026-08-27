@@ -147,6 +147,8 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
 
 
 def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
+    from .services.mcp_runtime import normalize_transport
+
     # One registry scan (not two - see the helper's own docstring) since
     # this runs per app on the connector-listing path.
     execution_fields, optional_oauth_scopes = (
@@ -155,7 +157,10 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     if execution_fields is None:
         execution_fields = {
             "name": app.name,
-            "transport": app.transport,
+            # Normalized on read: the connector list is compared exactly by the
+            # frontend, and auth_type below is already derived from the
+            # normalized value -- the two must not disagree about one row.
+            "transport": normalize_transport(app.transport),
             "provider_name": app.provider_name,
             "oauth_scopes": deepcopy(app.oauth_scopes or []),
             "launch_config": deepcopy(app.launch_config or {}),

@@ -2814,3 +2814,39 @@ async def test_mixed_case_http_transport_takes_the_http_dispatch_branch(
     await _tool_config(db, user).get_mcp_server_configs()
 
     assert [s.name for s in calls] == ["remote-notes"]
+
+
+@pytest.mark.asyncio
+async def test_built_config_reports_normalized_transport(db_session):
+    """The `transport` value in the returned config is consumed by the core
+    session layer's exact-match dispatch (via ToolFactory), so it must be the
+    canonical form -- not the raw stored value.
+
+    Selecting the right branch is not enough: a legacy row that takes the
+    correct branch but carries "Streamable_HTTP" downstream still dies with
+    `ValueError: Unsupported transport` at session creation.
+    """
+    db, user = db_session
+    server = MCPServer(
+        name="remote-raw-transport",
+        description="remote",
+        managed="external",
+        transport="Streamable_HTTP",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "streamable_http"

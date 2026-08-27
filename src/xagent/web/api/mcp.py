@@ -1528,7 +1528,10 @@ def _db_server_to_response(
         id=server.id,
         user_id=user_mcp.user_id,
         name=server.name,
-        transport=server.transport,
+        # Normalized on read too: the frontend compares this value exactly, so
+        # an un-migrated row must not report a spelling the API itself would no
+        # longer accept on write.
+        transport=normalize_transport(server.transport),
         description=server.description,
         config=config,
         is_active=user_mcp.is_active,
@@ -2379,7 +2382,7 @@ def list_mcp_apps(
                 "description": server.description or "Custom MCP Server",
                 "icon": "",
                 "users": "1",
-                "transport": server.transport,
+                "transport": normalize_transport(server.transport),
                 # F1: this loop's own membership check above (name-based)
                 # doesn't gate on a real grant, so a custom mcp_oauth
                 # server the user abandoned mid-consent must not be
@@ -3324,10 +3327,25 @@ def update_mcp_server(
 
         # Build update config - only include provided fields. Non-owners keep the
         # existing global config untouched.
+        # An explicitly-supplied transport must not fall back to the stored
+        # value just because it normalized to "". Before write-time
+        # normalization a blank/whitespace-only transport failed
+        # MCPServerConfig.validate_transport with a 400; the `or` fallback
+        # below would silently keep the old transport instead, turning a
+        # rejected edit into a no-op the caller never learns about.
+        if can_edit_global and server_data.transport is not None:
+            if not server_data.transport:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Transport must not be blank",
+                )
+            requested_transport = server_data.transport
+        else:
+            requested_transport = server.transport
+
         update_data = MCPServerCreate(
             name=(server_data.name if can_edit_global else None) or server.name,
-            transport=(server_data.transport if can_edit_global else None)
-            or server.transport,
+            transport=requested_transport,
             description=server_data.description
             if can_edit_global and server_data.description is not None
             else server.description,

@@ -3,7 +3,7 @@ Test MCP API endpoints and functions
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -960,3 +960,82 @@ class TestMcpOAuthServerTransportNormalization:
             managed="external",
         )
         assert _is_mcp_oauth_server(server) is False
+
+
+class TestTransportNormalizationOnRead:
+    """Stored transport must not be reported raw: the frontend compares these
+    values exactly, and `auth_type` on the same payload is already derived from
+    the normalized value."""
+
+    def test_server_response_reports_normalized_transport(self):
+        server = MCPServer(
+            id=1,
+            name="remote",
+            transport=" Streamable_HTTP ",
+            url="https://mcp.example.com/mcp",
+            managed="external",
+        )
+        user_mcp = MagicMock()
+        user_mcp.user_id = 1
+        user_mcp.is_active = True
+        user_mcp.is_default = False
+        user_mcp.is_owner = True
+        user_mcp.env = None
+        user_mcp.env_source = None
+
+        response = _db_server_to_response(
+            server=server,
+            user_mcp=user_mcp,
+            manager=MagicMock(),
+        )
+
+        assert response.transport == "streamable_http"
+
+
+class TestOAuthTransportNormalizationCoverage:
+    """Positive coverage for the gate the review flagged as fixed-but-untested:
+    a mixed-case "OAuth" row must pass it, not just a lowercase one.
+
+    These drive the real functions rather than re-asserting normalize_transport,
+    so they fail if the call site reverts to an exact comparison."""
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["oauth", "OAuth", " oauth ", "OAUTH"],
+        ids=["canonical", "mixed-case", "padded", "upper"],
+    )
+    def test_mixed_case_oauth_server_is_enriched_as_an_oauth_server(
+        self, transport: str
+    ):
+        """_enrich_oauth_server_info returns (None, None, None) for a
+        non-OAuth transport, so a legacy "OAuth" row would lose its app_id,
+        provider and connected-account in the server listing."""
+        from xagent.web.api.mcp import _enrich_oauth_server_info
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        server = MCPServer(
+            id=1, name="no-such-app", transport=transport, managed="external"
+        )
+
+        # No catalog app matches, so it still returns (None, None, None) --
+        # but only after passing the transport gate. Patch the lookup to prove
+        # the gate was passed rather than short-circuited.
+        with patch(
+            "xagent.web.api.mcp.get_app_by_name",
+            return_value={"id": "slack", "provider": "slack"},
+        ):
+            app_id, provider, _ = _enrich_oauth_server_info(db, server, {})
+
+        assert (app_id, provider) == ("slack", "slack")
+
+    def test_non_oauth_transport_is_not_enriched(self):
+        """The gate must still exclude a genuinely non-OAuth row."""
+        from xagent.web.api.mcp import _enrich_oauth_server_info
+
+        server = MCPServer(id=1, name="local", transport="stdio", managed="external")
+        assert _enrich_oauth_server_info(MagicMock(), server, {}) == (
+            None,
+            None,
+            None,
+        )

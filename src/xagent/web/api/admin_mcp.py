@@ -3,13 +3,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import (
-    BaseModel,
-    Field,
-    ValidationError,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -24,6 +18,11 @@ from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.public_mcp import PublicMCPApp, PublicMCPAppAudit
 from ..models.user import User
+from ..services.mcp_runtime import (
+    NormalizedTransport,
+    OptionalNormalizedTransport,
+    normalize_transport,
+)
 
 admin_mcp_router = APIRouter(prefix="/api/admin/mcp", tags=["Admin MCP"])
 
@@ -96,24 +95,19 @@ class PublicMCPAppBase(BaseModel):
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
-    # Validators live on the write models only, not PublicMCPAppBase — otherwise
-    # PublicMCPAppResponse would inherit them and re-run on response serialization,
-    # turning one legacy/partial DB row into a full-list 500 on read (and, for
-    # the transport normalizer below, reporting a lowercased transport for a row
-    # that is still stored mixed-case).
-
-    # Canonicalize the stored transport: it is a free-form string, and an
-    # admin-authored mixed-case value ("Streamable_HTTP") passes the shape check
-    # below (classify_app_auth compares case-insensitively) yet produces a shared
-    # server row that the connect path's exact comparisons reject. Storing the
-    # lowercase form keeps the catalog and the connect path from disagreeing
-    # about the same app.
-    @field_validator("transport")
-    @classmethod
-    def _normalize_transport(cls, value: str) -> str:
-        from ..services.mcp_runtime import normalize_transport
-
-        return normalize_transport(value)
+    # Both the transport override below and _enforce_auth_classification live on
+    # the write models only, not on PublicMCPAppBase — PublicMCPAppResponse
+    # inherits from that base, so putting them there would re-run them on
+    # response serialization: one legacy/partial DB row would turn a full-list
+    # read into a 500, and a row still stored mixed-case would be *reported*
+    # lowercased, a read that lies about the table.
+    #
+    # Redeclaring the field narrows the inherited `str` to the shared
+    # annotated type. Transport is free-form, and an admin-authored
+    # "Streamable_HTTP" passes the shape check below (classify_app_auth compares
+    # case-insensitively) yet produces a shared server row the connect path's
+    # exact comparisons reject.
+    transport: NormalizedTransport = "oauth"
 
     @model_validator(mode="after")
     def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
@@ -158,7 +152,7 @@ class PublicMCPAppUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     icon: Optional[str] = None
-    transport: Optional[str] = None
+    transport: OptionalNormalizedTransport = None
     provider_name: Optional[str] = None
     category: Optional[str] = None
     oauth_scopes: Optional[List[str]] = None
@@ -167,15 +161,6 @@ class PublicMCPAppUpdate(BaseModel):
         default=None,
         description=_LAUNCH_CONFIG_DESCRIPTION,
     )
-
-    # Same canonicalization as PublicMCPAppCreate, so a PATCH that re-cases a
-    # transport can't reintroduce a mixed-case row.
-    @field_validator("transport")
-    @classmethod
-    def _normalize_transport(cls, value: Optional[str]) -> Optional[str]:
-        from ..services.mcp_runtime import normalize_transport
-
-        return None if value is None else normalize_transport(value)
 
 
 _PUBLIC_MCP_APP_FIELDS = tuple(PublicMCPAppBase.model_fields)
@@ -315,6 +300,22 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
         writable_changes = {
             field: value for field, value in changes.items() if field != "app_id"
         }
+
+    # Heal the stored transport even when this PATCH doesn't touch it. The
+    # write models normalize what they receive, but `exclude_unset=True` means
+    # an edit to an unrelated field (icon, category) persists nothing for
+    # transport, so a row authored before normalization stays padded/mixed-case
+    # forever. That un-healed value is then compared against the *normalized*
+    # value written into `mcp_servers`, and the catalog connect path 409s on
+    # every connect after the first. Only rewrite when normalization actually
+    # changes something, so an already-canonical row is a byte-identical no-op
+    # and this never shows up as a spurious change in the audit trail.
+    if "transport" not in writable_changes:
+        stored_transport = persisted.get("transport")
+        if isinstance(stored_transport, str):
+            healed = normalize_transport(stored_transport)
+            if healed != stored_transport:
+                writable_changes = {**writable_changes, "transport": healed}
 
     for field, value in writable_changes.items():
         setattr(db_app, field, value)

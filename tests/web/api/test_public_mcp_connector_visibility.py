@@ -2340,10 +2340,14 @@ def test_admin_catalog_write_normalizes_transport_case() -> None:
         )
         assert created.status_code == 200
         app_pk = created.json()["id"]
+        # The response body, not just the row: an endpoint that echoed the raw
+        # input back would leave the caller believing a mixed-case value stuck.
+        assert created.json()["transport"] == "streamable_http"
 
         db = next(get_db())
         try:
-            stored = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            stored = db.get(PublicMCPApp, app_pk)
+            assert stored is not None
             assert stored.transport == "streamable_http"
         finally:
             db.close()
@@ -2355,11 +2359,196 @@ def test_admin_catalog_write_normalizes_transport_case() -> None:
             json={"transport": "SSE"},
         )
         assert patched.status_code == 200
+        assert patched.json()["transport"] == "sse"
 
         db = next(get_db())
         try:
-            stored = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            stored = db.get(PublicMCPApp, app_pk)
+            assert stored is not None
             assert stored.transport == "sse"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_catalog_patch_heals_a_legacy_transport_it_does_not_touch() -> None:
+    """Write-side normalization alone leaves legacy rows stranded.
+
+    `exclude_unset=True` means a PATCH of an unrelated field persists nothing
+    for `transport`, so a row authored before normalization keeps its padded
+    value forever while the `mcp_servers` row the connect path writes is
+    canonical -- and the two are then compared. Heal the stored value on any
+    edit so the catalog converges instead of drifting further apart."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            # Written directly: the API would reject this shape now, which is
+            # exactly why only a pre-existing row can be in this state.
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-padded",
+                    name="LegacyPadded",
+                    transport=" Streamable_HTTP ",
+                    launch_config={
+                        "url": "https://mcp.example.com/mcp",
+                        "auth": {"type": "mcp_oauth"},
+                    },
+                )
+            )
+            db.commit()
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-padded")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        # Edit something entirely unrelated to transport.
+        patched = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "new-icon"},
+        )
+        assert patched.status_code == 200
+
+        db = next(get_db())
+        try:
+            stored = db.get(PublicMCPApp, app_pk)
+            assert stored is not None
+            assert stored.icon == "new-icon"
+            assert stored.transport == "streamable_http"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_catalog_patch_leaves_a_canonical_transport_byte_identical() -> None:
+    """The healing write must fire only when normalization changes something,
+    so an ordinary edit to an already-canonical row doesn't show up in the
+    audit trail as a transport change it never made."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "already-canonical",
+                "name": "AlreadyCanonical",
+                "transport": "streamable_http",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        patched = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "another-icon"},
+        )
+        assert patched.status_code == 200
+
+        db = next(get_db())
+        try:
+            stored = db.get(PublicMCPApp, app_pk)
+            assert stored is not None
+            assert stored.transport == "streamable_http"
+
+            # No audit row may report a transport change: the healing write is
+            # gated on normalization actually altering the value.
+            audits = (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "already-canonical")
+                .all()
+            )
+            assert audits, "expected the create and patch to be audited"
+            for entry in audits:
+                before = (entry.before_values or {}).get("transport")
+                after = (entry.after_values or {}).get("transport")
+                if before is not None and after is not None:
+                    assert before == after == "streamable_http"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_builtin_patch_treats_a_case_only_transport_change_as_a_no_op() -> None:
+    """Documented behaviour change, previously unlisted.
+
+    The builtin protected-field guard compares the incoming value against the
+    registry's canonical one. That incoming value is now normalized before the
+    comparison, so `{"transport": "OAuth"}` against a canonical "oauth" no
+    longer 409s "managed by code" -- it compares equal and changes nothing.
+    A transport that differs by more than case is still rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            builtin = (
+                db.query(PublicMCPApp).filter(PublicMCPApp.transport == "oauth").first()
+            )
+            assert builtin is not None, "expected a seeded builtin oauth app"
+            app_pk = builtin.id
+        finally:
+            db.close()
+
+        case_only = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"transport": "OAuth"},
+        )
+        assert case_only.status_code == 200
+        assert case_only.json()["transport"] == "oauth"
+
+        # A genuinely different transport is still managed by code.
+        real_change = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"transport": "sse"},
+        )
+        assert real_change.status_code == 409
+
+        db = next(get_db())
+        try:
+            stored = db.get(PublicMCPApp, app_pk)
+            assert stored is not None
+            assert stored.transport == "oauth"
         finally:
             db.close()
     finally:

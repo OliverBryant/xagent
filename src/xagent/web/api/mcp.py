@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,12 @@ from ..services.mcp_oauth import (
     select_mcp_oauth_grants,
     validate_mcp_oauth_persisted_value,
 )
-from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS, normalize_transport
+from ..services.mcp_runtime import (
+    HTTP_MCP_TRANSPORTS,
+    NormalizedTransport,
+    OptionalNormalizedTransport,
+    normalize_transport,
+)
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
@@ -102,7 +107,12 @@ class MCPServerCreate(BaseModel):
     """Request model for creating MCP server."""
 
     name: str = Field(..., min_length=1, max_length=100, description="Server name")
-    transport: str = Field(
+    # Trimmed, lowercased and blank-rejected by the shared annotated type, so
+    # the value TransportFieldValidator reads and the row stores is the one
+    # every later comparison must agree on. Also applies to the update
+    # endpoint, which rebuilds this model from the request and the stored row,
+    # so editing a legacy mixed-case server heals it.
+    transport: NormalizedTransport = Field(
         ..., description="Transport type (stdio, sse, websocket, streamable_http)"
     )
     description: Optional[str] = Field(None, description="Server description")
@@ -121,17 +131,6 @@ class MCPServerCreate(BaseModel):
         False, description="Allow runtime Authorization header binding"
     )
 
-    # Canonicalize before anything reads it: transport is free-form here, and
-    # the value validated by TransportFieldValidator / stored on the row is the
-    # one every later comparison (exact and case-insensitive alike) must agree
-    # on. Also applies to the update endpoint, which rebuilds this model from
-    # the request and the stored row, so editing a legacy mixed-case server
-    # heals it.
-    @field_validator("transport")
-    @classmethod
-    def _normalize_transport(cls, value: str) -> str:
-        return normalize_transport(value)
-
 
 class MCPServerUpdate(BaseModel):
     """Request model for updating MCP server."""
@@ -139,7 +138,12 @@ class MCPServerUpdate(BaseModel):
     name: Optional[str] = Field(
         None, min_length=1, max_length=100, description="Server name"
     )
-    transport: Optional[str] = Field(None, description="Transport type")
+    # Normalized before _global_config_tampered compares the incoming transport
+    # with the stored one, so a payload that only re-cases an unchanged
+    # transport doesn't read as a global-config edit by a non-owner. Blank is
+    # rejected here rather than in the endpoint body so it 400s uniformly and
+    # ahead of the ownership branch.
+    transport: OptionalNormalizedTransport = Field(None, description="Transport type")
     description: Optional[str] = Field(None, description="Server description")
     config: Optional[dict] = Field(None, description="Transport-specific configuration")
     is_active: Optional[bool] = Field(None, description="Whether the server is active")
@@ -155,15 +159,6 @@ class MCPServerUpdate(BaseModel):
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
     )
-
-    # Same canonicalization as MCPServerCreate, applied before
-    # _global_config_tampered compares the incoming transport with the stored
-    # one — otherwise a payload that only re-cases an unchanged transport would
-    # read as a global-config edit by a non-owner.
-    @field_validator("transport")
-    @classmethod
-    def _normalize_transport(cls, value: Optional[str]) -> Optional[str]:
-        return None if value is None else normalize_transport(value)
 
 
 class MCPAppConnectRequest(BaseModel):
@@ -228,18 +223,13 @@ class MCPConnectionTest(BaseModel):
     """Request model for testing MCP connection."""
 
     name: str = Field(..., description="Connection name")
-    transport: str = Field(..., description="Transport type")
+    # Same spelling rules as the save path (MCPServerCreate), so Test and Save
+    # agree on how a transport is written. Spelling only: Test still does not
+    # validate against MCPServerConfig's allowed-value list, so an unknown
+    # transport is accepted here and fails at connect time, where Save rejects
+    # it up front.
+    transport: NormalizedTransport = Field(..., description="Transport type")
     config: dict[str, Any] = Field(..., description="Connection configuration")
-
-    # Same case/whitespace canonicalization as the save path
-    # (MCPServerCreate), so Test and Save agree on how a transport is spelled.
-    # This is spelling parity only: Test still does not validate against
-    # MCPServerConfig's allowed-value list, so an unknown transport is accepted
-    # here and fails at connect time, where Save rejects it up front.
-    @field_validator("transport")
-    @classmethod
-    def _normalize_transport(cls, value: str) -> str:
-        return normalize_transport(value)
 
 
 class MCPConnectionTestResponse(BaseModel):
@@ -1432,11 +1422,14 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
     fields_set = server_data.model_fields_set
     if server_data.name is not None and server_data.name != server.name:
         return True
-    # Both sides normalized: server_data.transport has already been through the
-    # MCPServerUpdate validator, while server.transport is the raw stored value,
-    # which for a row written before that validator shipped may still be
-    # mixed-case or padded. Comparing normalized-vs-raw would flag a non-owner
-    # who merely echoes the row's own unchanged transport as tampering.
+    # Both sides normalized. The right side is the raw stored value, which for
+    # a row written before this validator shipped may still be mixed-case or
+    # padded; comparing it against the already-normalized left side would flag
+    # a non-owner who merely echoes the row's own unchanged transport as
+    # tampering. The left side is re-normalized only so the two sides are
+    # visibly symmetric -- it has already been through the model's annotated
+    # type, and normalize_transport is idempotent, so that call is a no-op
+    # kept for the reader rather than for the result.
     if server_data.transport is not None and normalize_transport(
         server_data.transport
     ) != normalize_transport(server.transport):
@@ -2818,7 +2811,10 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         if (
             server.command != command
             or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
+            # Normalized like the mcp_oauth reuse check below. Inert today
+            # (the right side is a literal), but the same shape, and the row
+            # on the left is the one this feature keeps un-normalized.
+            or normalize_transport(server.transport) != "stdio"
         ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2877,8 +2873,14 @@ def _ensure_catalog_mcp_oauth_server(
     # may be a hijack (a custom server someone created with a different remote
     # URL), so only reuse it if it matches the official configuration.
     if server:
+        # Both sides through the shared helper, not a bare .lower(): the
+        # catalog value may still be padded (a PATCH that doesn't touch
+        # transport persists the stored value unchanged), while the shared row
+        # was written through MCPServerCreate and is therefore normalized.
+        # Lowercasing without stripping compares " sse " against "sse" and
+        # 409s every connect after the first, with no way to fix it from the UI.
         if (
-            str(server.transport or "").lower() != transport.lower()
+            normalize_transport(server.transport) != normalize_transport(transport)
             or server.url != url
         ):
             raise HTTPException(
@@ -3317,23 +3319,26 @@ def update_mcp_server(
                     detail=f"MCP server '{server_data.name}' already exists",
                 )
 
-        # Build update config - only include provided fields. Non-owners keep the
-        # existing global config untouched.
-        # An explicitly-supplied transport must not fall back to the stored
-        # value just because it normalized to "". Before write-time
-        # normalization a blank/whitespace-only transport failed
-        # MCPServerConfig.validate_transport with a 400; the `or` fallback
-        # below would silently keep the old transport instead, turning a
-        # rejected edit into a no-op the caller never learns about.
-        if can_edit_global and server_data.transport is not None:
-            if not server_data.transport:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Transport must not be blank",
-                )
-            requested_transport = server_data.transport
-        else:
-            requested_transport = server.transport
+        # Build update config - only include provided fields. Non-owners keep
+        # the existing global config: _global_config_tampered above already
+        # rejected any payload that would change it, so the values below fall
+        # back to the stored row. (Transport is the one exception, and only in
+        # spelling: a non-owner's request still round-trips the stored value
+        # through MCPServerCreate, which canonicalizes it, so a legacy
+        # mixed-case row is healed as a byproduct. The transport *type* is
+        # unchanged -- a real change would have been caught as tampering.)
+        #
+        # An explicitly-supplied transport is passed through rather than
+        # `or`-ed against the stored value: normalization maps a
+        # whitespace-only transport to "", which is falsy, so the old fallback
+        # would have silently kept the stored transport. MCPServerUpdate now
+        # rejects a blank transport outright, before this point and before the
+        # ownership branch above, so nothing blank reaches here.
+        requested_transport = (
+            server_data.transport
+            if can_edit_global and server_data.transport is not None
+            else server.transport
+        )
 
         update_data = MCPServerCreate(
             name=(server_data.name if can_edit_global else None) or server.name,

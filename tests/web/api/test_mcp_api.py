@@ -877,3 +877,94 @@ class TestMCPApiModels:
         response = MCPConnectionTestResponse(**minimal_response)
         assert response.success is False
         assert response.details is None
+
+
+class TestTransportNormalizationOnWriteModels:
+    """All five write models share one annotated type, so they must agree on
+    spelling and on rejecting a transport that normalizes away to nothing."""
+
+    @staticmethod
+    def _build(model_name: str, transport: str):
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate, PublicMCPAppUpdate
+        from xagent.web.api.mcp import MCPConnectionTest
+
+        url = "https://mcp.example.com/mcp"
+        builders = {
+            "MCPServerCreate": lambda t: MCPServerCreate(
+                name="remote", transport=t, config={"url": url}
+            ),
+            "MCPServerUpdate": lambda t: MCPServerUpdate(transport=t),
+            "MCPConnectionTest": lambda t: MCPConnectionTest(
+                name="remote", transport=t, config={"url": url}
+            ),
+            "PublicMCPAppCreate": lambda t: PublicMCPAppCreate(
+                app_id="a", name="A", transport=t
+            ),
+            "PublicMCPAppUpdate": lambda t: PublicMCPAppUpdate(transport=t),
+        }
+        return builders[model_name](transport)
+
+    ALL_MODELS = [
+        "MCPServerCreate",
+        "MCPServerUpdate",
+        "MCPConnectionTest",
+        "PublicMCPAppCreate",
+        "PublicMCPAppUpdate",
+    ]
+
+    @pytest.mark.parametrize("model_name", ALL_MODELS)
+    @pytest.mark.parametrize(
+        "raw",
+        ["streamable_http", "Streamable_HTTP", "  STREAMABLE_HTTP\t", " sse "],
+        ids=["canonical", "mixed-case", "padded-upper", "padded"],
+    )
+    def test_transport_is_canonicalized(self, model_name: str, raw: str):
+        expected = raw.strip().lower()
+        assert self._build(model_name, raw).transport == expected
+
+    @pytest.mark.parametrize("model_name", ALL_MODELS)
+    @pytest.mark.parametrize(
+        "blank", ["", "   ", "\t\n"], ids=["empty", "spaces", "tabs"]
+    )
+    def test_blank_transport_is_rejected(self, model_name: str, blank: str):
+        """Uniform across all five: an endpoint-level guard on one model let a
+        blank transport persist through the other four (a catalog app with
+        transport="" is silently unconnectable, answered with a 200)."""
+        with pytest.raises(ValidationError):
+            self._build(model_name, blank)
+
+    @pytest.mark.parametrize("model_name", ["MCPServerUpdate", "PublicMCPAppUpdate"])
+    def test_omitted_transport_stays_none_on_patch_models(self, model_name: str):
+        """None means "unchanged" and must not be swept up by the blank check."""
+        from xagent.web.api.admin_mcp import PublicMCPAppUpdate
+
+        model = {
+            "MCPServerUpdate": MCPServerUpdate,
+            "PublicMCPAppUpdate": PublicMCPAppUpdate,
+        }[model_name]
+        assert model().transport is None
+        assert model(transport=None).transport is None
+
+    def test_catalog_create_keeps_its_default_transport(self):
+        """The annotated type is applied by redeclaring the inherited field;
+        the default must survive that redeclaration."""
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate
+
+        assert PublicMCPAppCreate(app_id="a", name="A").transport == "oauth"
+
+    def test_non_string_transport_reaches_the_normalizer_not_a_type_error(self):
+        """The normalizing step is a BeforeValidator, so a non-string body
+        value is normalized rather than failing the str type check first. 123
+        normalizes to "123", which is not blank, so it is accepted here and
+        rejected later by MCPServerConfig's allowed-value list."""
+        assert (
+            MCPServerCreate(
+                name="remote", transport=123, config={"url": "https://e/x"}
+            ).transport
+            == "123"
+        )
+        # None is falsy, so it normalizes to "" and is rejected as blank.
+        with pytest.raises(ValidationError):
+            MCPServerCreate(
+                name="remote", transport=None, config={"url": "https://e/x"}
+            )

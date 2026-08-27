@@ -19,7 +19,10 @@ tags:
 # Editorial Report (.docx)
 
 You will generate one `.docx` file via python-docx by writing a Python
-program and running it through the `execute_python_code` tool. Save to
+program and running it through the `execute_python_code` tool. The blocks
+below are parts of that one program, not separate runs -- later ones use the
+`doc`, `palette` and helpers the earlier ones define, so assemble them into a
+single script before executing. Save to
 the workspace, then report the path + a 1-line content summary.
 
 ## 📦 Required runtime packages
@@ -109,7 +112,6 @@ not return one — the reference is already on the executor result.
    - clipart, emoji as decoration, stock-photo placeholders
    - centered body paragraphs (left-align / justify only)
    - all-caps body text (kickers and labels only)
-   - more than one heading font
    - Comic Sans, Arial Black, Times New Roman as a deliberate choice
 5. **Real content only.** No lorem ipsum, no `[Title here]` placeholders,
    no fabricated statistics, no fake citations. If a section has no user
@@ -274,7 +276,7 @@ meta_run.font.color.rgb = RGBColor.from_string(palette["ink_tint"])
 # it without touching the cover.
 from docx.enum.section import WD_SECTION
 
-body = doc.add_section(WD_SECTION.NEW_PAGE)
+doc.add_section(WD_SECTION.NEW_PAGE)
 ```
 
 ## 🔠 Heading hierarchy
@@ -345,8 +347,10 @@ from docx.oxml import OxmlElement
 # Both w:tcPr and w:tcBorders are ordered sequences: Word rejects the part when
 # children appear out of order, and each tag may appear at most once. Appending
 # is wrong on both counts, so everything below inserts at the schema position.
-# Relative order from the OOXML schema, trimmed to the tags used here.
-_TCPR_ORDER = ("tcBorders", "shd")
+# Relative order from the OOXML schema. vAlign is here even though no recipe
+# below sets it: it sorts after shd, so if a caller centres a cell before
+# shading it, _put has to see vAlign to insert ahead of rather than after it.
+_TCPR_ORDER = ("tcBorders", "shd", "vAlign")
 _BORDER_ORDER = ("top", "left", "bottom", "right")
 
 

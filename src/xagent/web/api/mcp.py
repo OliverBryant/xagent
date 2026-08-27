@@ -231,6 +231,14 @@ class MCPConnectionTest(BaseModel):
     transport: str = Field(..., description="Transport type")
     config: dict[str, Any] = Field(..., description="Connection configuration")
 
+    # Same canonicalization as the save path (MCPServerCreate): testing a
+    # connection must not accept a transport spelling that saving it would
+    # reject, or vice versa.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        return normalize_transport(value)
+
 
 class MCPConnectionTestResponse(BaseModel):
     """Response model for MCP connection test."""
@@ -1422,7 +1430,14 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
     fields_set = server_data.model_fields_set
     if server_data.name is not None and server_data.name != server.name:
         return True
-    if server_data.transport is not None and server_data.transport != server.transport:
+    # Both sides normalized: server_data.transport has already been through the
+    # MCPServerUpdate validator, while server.transport is the raw stored value,
+    # which for a row written before that validator shipped may still be
+    # mixed-case or padded. Comparing normalized-vs-raw would flag a non-owner
+    # who merely echoes the row's own unchanged transport as tampering.
+    if server_data.transport is not None and normalize_transport(
+        server_data.transport
+    ) != normalize_transport(server.transport):
         return True
     if (
         server_data.description is not None
@@ -1935,7 +1950,7 @@ def _is_mcp_oauth_server(server: MCPServer) -> bool:
     whether the server counts as connected."""
     auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
     return (
-        str(server.transport or "").lower() in HTTP_MCP_TRANSPORTS
+        normalize_transport(server.transport) in HTTP_MCP_TRANSPORTS
         and auth.get("type") == "mcp_oauth"
     )
 
@@ -2801,7 +2816,7 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         if (
             server.command != command
             or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
+            or normalize_transport(server.transport) != "stdio"
         ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2861,7 +2876,7 @@ def _ensure_catalog_mcp_oauth_server(
     # URL), so only reuse it if it matches the official configuration.
     if server:
         if (
-            str(server.transport or "").lower() != transport.lower()
+            normalize_transport(server.transport) != normalize_transport(transport)
             or server.url != url
         ):
             raise HTTPException(

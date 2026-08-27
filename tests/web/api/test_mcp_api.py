@@ -664,6 +664,28 @@ class TestMCPApiFunctions:
         # Changed top-level name -> tampered
         assert _global_config_tampered(MCPServerUpdate(name="other"), server)
 
+    def test_global_config_tampered_normalizes_both_sides_of_transport(self):
+        """MCPServerUpdate.transport is normalized by its validator, but the
+        stored value on a row written before that validator shipped is not.
+        Comparing normalized-vs-raw would flag a non-owner who merely echoes
+        the row's own unchanged transport as tampering (spurious 403)."""
+        server = MCPServer.from_config(
+            {
+                "name": "svc",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+            }
+        )
+        # Simulate a legacy row stored before write-time normalization.
+        server.transport = "Streamable_HTTP"
+
+        echoed = MCPServerUpdate(transport="Streamable_HTTP")
+        assert _global_config_tampered(echoed, server) is False
+
+        # A genuinely different transport is still caught.
+        assert _global_config_tampered(MCPServerUpdate(transport="sse"), server)
+
     def test_auth_metadata_tampered(self):
         """Non-secret auth metadata is diffed; secrets/masked values are ignored."""
         current = {"type": "oauth2", "client_id": "abc", "client_secret": "enc"}

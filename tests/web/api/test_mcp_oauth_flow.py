@@ -3304,3 +3304,83 @@ def test_mcp_server_create_normalizes_transport():
     updated = MCPServerUpdate(transport="SSE")
     assert updated.transport == "sse"
     assert MCPServerUpdate().transport is None
+
+    # The test-connection path must agree with the save path, so a transport
+    # spelling can't be accepted by one and rejected by the other.
+    tested = mcp_api.MCPConnectionTest(
+        name="remote",
+        transport=" Streamable_HTTP ",
+        config={"url": "https://mcp.example.com/mcp"},
+    )
+    assert tested.transport == "streamable_http"
+
+
+@pytest.mark.asyncio
+async def test_connect_app_reuses_shared_row_for_padded_catalog_transport(
+    db_session, monkeypatch
+):
+    """A padded legacy catalog transport must not 409 against a canonical
+    shared row.
+
+    classify_app_auth routes the app here by normalizing (strip + lower), so
+    the reuse check must normalize identically. A local .lower() there would
+    leave " streamable_http " != "streamable_http" and reject the row as a
+    different configuration -- admitted by one half of the chain, rejected by
+    the other, which is the very class of bug this feature guards against.
+    """
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    db.add(
+        PublicMCPApp(
+            app_id="padded-notes",
+            name="PaddedNotes",
+            transport=" streamable_http ",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    db.add(
+        MCPServer(
+            name="padded-notes",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    response = await connect_mcp_oauth_app(
+        "padded-notes",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    assert db.query(MCPServer).filter(MCPServer.name == "padded-notes").count() == 1

@@ -225,11 +225,16 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 
 
-def clear_paragraph_border(paragraph):
-    """Drop a built-in style's decorative border (w:pBdr)."""
-    pPr = paragraph._p.get_or_add_pPr()
-    for bdr in pPr.findall(qn("w:pBdr")):
-        pPr.remove(bdr)
+def strip_style_border(doc, style_name):
+    """Drop a built-in style's decorative border.
+
+    The border lives on the *style*, not on paragraphs using it, so clearing
+    a paragraph's own pPr does nothing -- it never had one. Title and Intense
+    Quote both ship an accent-blue w:pBdr that is in none of the palettes.
+    """
+    style_pPr = doc.styles[style_name].element.get_or_add_pPr()
+    for bdr in style_pPr.findall(qn("w:pBdr")):
+        style_pPr.remove(bdr)
 
 
 def add_kicker(doc, text):
@@ -243,11 +248,13 @@ def add_kicker(doc, text):
 doc.add_paragraph().paragraph_format.space_after = Pt(160)  # vertical push
 add_kicker(doc, "Research Brief")
 
+# Title and Intense Quote ship an accent-blue border, and Intense Quote and
+# Caption default to bold. None of that is in the palette. Clearing the border
+# once on the style covers every paragraph that uses it.
+strip_style_border(doc, "Title")
+strip_style_border(doc, "Intense Quote")
+
 title = doc.add_paragraph(style="Title")
-# The built-in Title carries an accent-blue bottom border; Intense Quote and
-# Caption default to bold with the same accent colour. None of that is in the
-# palette, so clear it wherever these styles are used.
-clear_paragraph_border(title)
 title_run = title.add_run("Agent Infrastructure in 2026")
 title_run.font.name, title_run.font.size = "Georgia", Pt(40)
 title_run.font.color.rgb = RGBColor.from_string(palette["ink"])
@@ -317,7 +324,6 @@ body flow:
 
 ```python
 quote = doc.add_paragraph(style="Intense Quote")
-clear_paragraph_border(quote)          # accent-blue rule is not in the palette
 quote_run = quote.add_run("Adoption is no longer the constraint; "
                           "operating cost is.")
 quote_run.font.name, quote_run.font.size = "Georgia", Pt(14)
@@ -338,11 +344,9 @@ from docx.oxml import OxmlElement
 # Both w:tcPr and w:tcBorders are ordered sequences: Word rejects the part when
 # children appear out of order, and each tag may appear at most once. Appending
 # is wrong on both counts, so everything below inserts at the schema position.
-_TCPR_ORDER = ("cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders",
-               "shd", "noWrap", "tcMar", "textDirection", "tcFitText",
-               "vAlign", "hideMark")
-_BORDER_ORDER = ("top", "left", "bottom", "right", "insideH", "insideV",
-                 "tl2br", "tr2bl")
+# Relative order from the OOXML schema, trimmed to the tags used here.
+_TCPR_ORDER = ("tcBorders", "shd")
+_BORDER_ORDER = ("top", "left", "bottom", "right")
 
 
 def _hex6(value):
@@ -360,11 +364,14 @@ def _put(parent, tag, order):
     """Replace parent's <w:{tag}> child, keeping the schema's element order."""
     for stale in parent.findall(qn(f"w:{tag}")):
         parent.remove(stale)
+    if tag not in order:
+        raise ValueError(f"unknown element {tag!r}; expected one of {order}")
     el = OxmlElement(f"w:{tag}")
     rank = order.index(tag)
     later = [child for child in parent
-             if child.tag.split("}")[1] in order
-             and order.index(child.tag.split("}")[1]) > rank]
+             if isinstance(child.tag, str)
+             and child.tag.rsplit("}", 1)[-1] in order
+             and order.index(child.tag.rsplit("}", 1)[-1]) > rank]
     if later:
         later[0].addprevious(el)
     else:
@@ -397,14 +404,6 @@ def set_row_border(row, edge, hex_color, sz=8):
         el.set(qn("w:sz"), str(sz))          # 8 = 1pt
         el.set(qn("w:color"), hex_color)
 
-
-def clear_cell_border(cell, edge):
-    """Remove one edge, e.g. the verticals a full-grid table style draws."""
-    tcPr = cell._tc.get_or_add_tcPr()
-    borders = tcPr.find(qn("w:tcBorders"))
-    if borders is None:
-        borders = _put(tcPr, "tcBorders", _TCPR_ORDER)
-    _put(borders, edge, _BORDER_ORDER).set(qn("w:val"), "nil")
 ```
 
 Editorial table rules — **horizontal rules only, no vertical borders**:
@@ -418,8 +417,12 @@ rows = [("Region", "Revenue", "YoY"),
         ("North America", "4.2M", "+18%"),
         ("EMEA", "2.8M", "+11%")]
 
-table = doc.add_table(rows=len(rows), cols=3)
-table.style = "Table Grid"          # verticals stripped per cell below
+# No table style: the stock "Table Grid" draws all six edges in black
+# (w:color="auto"), which is not a palette value, and nilling the verticals
+# per cell still leaves its black top/bottom/insideH rules behind. An
+# unstyled table starts with no borders at all, so the only rules on it are
+# the ones drawn below.
+table = doc.add_table(rows=len(rows), cols=len(rows[0]))
 table.alignment = WD_TABLE_ALIGNMENT.CENTER
 table.autofit = True
 
@@ -428,8 +431,9 @@ for r, record in enumerate(rows):
         cell = table.cell(r, c)
         cell.text = str(value)
         para = cell.paragraphs[0]
-        # numbers right-aligned, text left-aligned
-        para.alignment = (WD_ALIGN_PARAGRAPH.RIGHT if c > 0 and r > 0
+        # Numeric columns right-aligned, including their header, so the
+        # column reads as one edge rather than a ragged one.
+        para.alignment = (WD_ALIGN_PARAGRAPH.RIGHT if c > 0
                           else WD_ALIGN_PARAGRAPH.LEFT)
         run = para.runs[0]
         run.font.name, run.font.size = "Calibri", Pt(10)
@@ -443,13 +447,8 @@ for r, record in enumerate(rows):
         else:
             run.font.color.rgb = RGBColor.from_string(palette["ink"])
 
-# "Table Grid" draws a full grid; nil out the verticals to keep it editorial.
-for table_row in table.rows:
-    for table_cell in table_row.cells:
-        for vertical in ("left", "right", "insideV"):
-            clear_cell_border(table_cell, vertical)
-
-set_row_border(table.rows[0], "bottom", palette["ink"])
+# One rule under the table. Nothing under the header row -- it is already a
+# solid ink band, so an ink rule there would be invisible against itself.
 set_row_border(table.rows[-1], "bottom", palette["ink"])
 
 caption = doc.add_paragraph(style="Caption")

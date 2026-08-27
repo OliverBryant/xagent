@@ -213,3 +213,134 @@ def test_backfill_tolerates_missing_table(db_url: str) -> None:
     engine.dispose()
 
     assert transport == "streamable_http"
+
+
+_CREATE_MCP_SERVERS_WITHOUT_TRANSPORT = """
+CREATE TABLE mcp_servers (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(100) NOT NULL
+)
+"""
+
+
+def test_backfill_tolerates_table_without_transport_column(db_url: str) -> None:
+    """The column-existence guard must actually fire.
+
+    Without a test, a typo in the table or column name would make the guard
+    skip every table and the backfill would silently no-op in production.
+    """
+    config = _stamp_parent(
+        db_url,
+        create_tables=(
+            _CREATE_MCP_SERVERS_WITHOUT_TRANSPORT,
+            _CREATE_PUBLIC_MCP_APPS_TABLE,
+        ),
+    )
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO mcp_servers (id, name) VALUES (1, 's1')"))
+        conn.execute(
+            text(
+                "INSERT INTO public_mcp_apps (id, app_id, name, transport) "
+                "VALUES (1, 'mixed', 'Mixed', 'Streamable_HTTP')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config, TARGET_REVISION)
+
+    # The transport-less table was skipped, and the other one was still
+    # backfilled -- the guard is per-table, not all-or-nothing.
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        assert (
+            conn.execute(
+                text("SELECT transport FROM public_mcp_apps WHERE id = 1")
+            ).scalar_one()
+            == "streamable_http"
+        )
+    engine.dispose()
+
+
+def test_backfill_is_idempotent_across_repeated_runs(
+    db_url: str, config_at_parent_revision: Config
+) -> None:
+    """A true re-run, not just one upgrade over canonical data: stamp back to
+    the parent and upgrade again, which is what a re-applied migration does."""
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO mcp_servers (id, name, transport) "
+                "VALUES (1, 's1', ' Streamable_HTTP ')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config_at_parent_revision, TARGET_REVISION)
+    command.stamp(config_at_parent_revision, PARENT_REVISION)
+    command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        transport = conn.execute(
+            text("SELECT transport FROM mcp_servers WHERE id = 1")
+        ).scalar_one()
+    engine.dispose()
+
+    assert transport == "streamable_http"
+
+
+def test_backfill_normalizes_whitespace_only_transport_to_empty_string(
+    db_url: str, config_at_parent_revision: Config
+) -> None:
+    """A whitespace-only value trims to ''. It stays a non-connectable row
+    either way, but the stored form must be the canonical one so every
+    comparison agrees about it."""
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO mcp_servers (id, name, transport) "
+                "VALUES (1, 's1', '   '), (2, 's2', '')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config_at_parent_revision, TARGET_REVISION)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        stored = dict(conn.execute(text("SELECT id, transport FROM mcp_servers")).all())
+    engine.dispose()
+
+    assert stored == {1: "", 2: ""}
+
+
+def test_downgrade_is_a_documented_no_op(
+    db_url: str, config_at_parent_revision: Config
+) -> None:
+    """downgrade() deliberately does not restore the original spellings; it
+    must at least run cleanly and leave the normalized data intact."""
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO mcp_servers (id, name, transport) "
+                "VALUES (1, 's1', 'Streamable_HTTP')"
+            )
+        )
+    engine.dispose()
+
+    command.upgrade(config_at_parent_revision, TARGET_REVISION)
+    command.downgrade(config_at_parent_revision, PARENT_REVISION)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        transport = conn.execute(
+            text("SELECT transport FROM mcp_servers WHERE id = 1")
+        ).scalar_one()
+    engine.dispose()
+
+    assert transport == "streamable_http"

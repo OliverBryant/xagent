@@ -2,6 +2,7 @@
 Test MCP API endpoints and functions
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,10 +18,13 @@ from xagent.web.api.mcp import (
     MCPServerCreate,
     MCPServerUpdate,
     _auth_metadata_tampered,
+    _build_active_oauth_server_lookup,
     _build_server_config,
     _check_mcp_permission,
     _db_server_to_response,
     _global_config_tampered,
+    _is_oauth_server_for_app,
+    _lookup_oauth_server_for_app,
     _mask_env,
     _merge_masked_env,
     get_mcp_servers,
@@ -877,3 +881,82 @@ class TestMCPApiModels:
         response = MCPConnectionTestResponse(**minimal_response)
         assert response.success is False
         assert response.details is None
+
+
+class TestOAuthServerLookupTransportNormalization:
+    """The lookup that decides whether a connected OAuth app renders as
+    connected spans three helpers. Two normalize transport via
+    _normalize_app_key; the confirmation check must agree with them, or a row
+    they admit is rejected downstream and the app shows as disconnected."""
+
+    @staticmethod
+    def _server(transport: str) -> MCPServer:
+        return MCPServer(
+            id=1,
+            name="slack",
+            transport=transport,
+            auth={"app_id": "slack", "provider": "slack"},
+            managed="external",
+        )
+
+    APP = {"id": "slack", "provider": "slack", "name": "Slack"}
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["oauth", "OAuth", " oauth ", "OAUTH"],
+        ids=["canonical", "mixed-case", "padded", "upper"],
+    )
+    def test_connected_oauth_app_is_found_regardless_of_transport_spelling(
+        self, transport: str
+    ):
+        server = self._server(transport)
+        user_mcp = SimpleNamespace(is_active=True)
+
+        lookup = _build_active_oauth_server_lookup([(server, user_mcp)])
+        # The row is admitted into the lookup by the normalizing builder...
+        assert lookup, "row should be admitted by the normalizing lookup builder"
+        # ...so the confirmation check must not reject it.
+        assert _is_oauth_server_for_app(server, self.APP) is True
+        assert _lookup_oauth_server_for_app(self.APP, lookup) is server
+
+    def test_non_oauth_transport_is_still_excluded(self):
+        """Normalization must not pull a genuinely non-OAuth row into the
+        builtin_oauth branch."""
+        server = self._server("stdio")
+        assert _is_oauth_server_for_app(server, self.APP) is False
+
+
+class TestMcpOAuthServerTransportNormalization:
+    """`_is_mcp_oauth_server` backs both the connection-state gate and the
+    connector picker's auth_type hint, so it must classify a legacy row the
+    same way the rest of the chain does."""
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["streamable_http", "Streamable_HTTP", " streamable_http ", "SSE"],
+        ids=["canonical", "mixed-case", "padded", "upper-sse"],
+    )
+    def test_mcp_oauth_server_detected_regardless_of_spelling(self, transport: str):
+        from xagent.web.api.mcp import _is_mcp_oauth_server
+
+        server = MCPServer(
+            id=1,
+            name="remote",
+            transport=transport,
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+        assert _is_mcp_oauth_server(server) is True
+
+    def test_stdio_is_not_an_mcp_oauth_server(self):
+        from xagent.web.api.mcp import _is_mcp_oauth_server
+
+        server = MCPServer(
+            id=1,
+            name="local",
+            transport="STDIO",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+        assert _is_mcp_oauth_server(server) is False

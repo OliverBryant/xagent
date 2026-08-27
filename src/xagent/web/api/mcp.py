@@ -231,9 +231,11 @@ class MCPConnectionTest(BaseModel):
     transport: str = Field(..., description="Transport type")
     config: dict[str, Any] = Field(..., description="Connection configuration")
 
-    # Same canonicalization as the save path (MCPServerCreate): testing a
-    # connection must not accept a transport spelling that saving it would
-    # reject, or vice versa.
+    # Same case/whitespace canonicalization as the save path
+    # (MCPServerCreate), so Test and Save agree on how a transport is spelled.
+    # This is spelling parity only: Test still does not validate against
+    # MCPServerConfig's allowed-value list, so an unknown transport is accepted
+    # here and fails at connect time, where Save rejects it up front.
     @field_validator("transport")
     @classmethod
     def _normalize_transport(cls, value: str) -> str:
@@ -1585,7 +1587,7 @@ def _enrich_oauth_server_info(
     Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
     This encapsulates the logic of looking up app information in O(1) time.
     """
-    if server.transport != "oauth":
+    if normalize_transport(server.transport) != "oauth":
         return None, None, None
 
     app_info = get_app_by_name(db, str(server.name))
@@ -1703,7 +1705,12 @@ def _oauth_keys_for_app(app: dict) -> list[str]:
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
-    if server.transport != "oauth":
+    # Normalized to match _build_active_oauth_server_lookup and
+    # _server_catalog_keys, which admit a row into the lookup via
+    # _normalize_app_key. An exact check here rejects a row those two just
+    # accepted, so _lookup_oauth_server_for_app returns None and a connected
+    # OAuth app renders as disconnected.
+    if normalize_transport(server.transport) != "oauth":
         return False
 
     app_id = _normalize_app_key(app.get("id"))
@@ -3435,7 +3442,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
     with no signal to the admin. A catalog row with no platform key is not
     special and cascades away as before.
     """
-    if str(getattr(server, "transport", "") or "").lower() == "oauth":
+    if normalize_transport(getattr(server, "transport", None)) == "oauth":
         return False
     env = getattr(server, "env", None)
     if not env:
@@ -3505,7 +3512,7 @@ async def delete_mcp_server(
             )
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
-        if server.transport == "oauth":
+        if normalize_transport(server.transport) == "oauth":
             from ..mcp_apps import get_app_by_name
 
             # Find the corresponding app_id and provider

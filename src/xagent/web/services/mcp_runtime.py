@@ -14,6 +14,20 @@ from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
 
 
+def normalize_transport(transport: Any) -> str:
+    """Canonicalize a transport identifier to its stored lowercase form.
+
+    Transport is a free-form string on the API models, so a mixed-case value
+    ("Streamable_HTTP") can be authored through the admin catalog or the
+    server create/update endpoints. Half of this feature compares it
+    case-insensitively and half compares it exactly, so an un-normalized row
+    is classified as connectable by one half and rejected by the other.
+    Normalizing at every write keeps the stored value in the one form all of
+    those comparisons agree on.
+    """
+    return str(transport or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class MCPRuntimeConnectionBuild:
     """Executable MCP connection plus any runtime authorization diagnostic."""

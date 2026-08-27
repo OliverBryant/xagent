@@ -3193,3 +3193,68 @@ async def test_status_reports_discovered_grant_without_configured_selectors(db_s
     status_response = await get_mcp_oauth_status(server.id, user, db)
 
     assert [item.id for item in status_response.grants] == [grant.id]
+
+
+def test_mcp_server_create_normalizes_transport():
+    """Write-time normalization is what keeps mixed-case rows from being
+    created in the first place."""
+    created = mcp_api.MCPServerCreate(
+        name="remote",
+        transport="  Streamable_HTTP ",
+        config={"url": "https://mcp.example.com/mcp"},
+    )
+    assert created.transport == "streamable_http"
+
+    updated = MCPServerUpdate(transport="SSE")
+    assert updated.transport == "sse"
+    assert MCPServerUpdate().transport is None
+
+    # The test-connection path must agree with the save path, so a transport
+    # spelling can't be accepted by one and rejected by the other.
+    tested = mcp_api.MCPConnectionTest(
+        name="remote",
+        transport=" Streamable_HTTP ",
+        config={"url": "https://mcp.example.com/mcp"},
+    )
+    assert tested.transport == "streamable_http"
+
+
+def test_update_rejects_blank_transport_instead_of_silently_keeping_the_old_one(
+    db_session,
+):
+    """`normalize_transport("   ")` is `""`, which is falsy. The update path's
+    `or server.transport` fallback would therefore silently keep the stored
+    transport, turning an invalid edit into a no-op the caller never learns
+    about -- before write-time normalization this failed with a 400."""
+    db, user, _ = db_session
+    server = MCPServer(
+        name="editable",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+            can_edit=True,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        update_mcp_server(
+            server.id,
+            MCPServerUpdate(transport="   "),
+            user,
+            db,
+        )
+    assert exc.value.status_code == 400
+
+    db.refresh(server)
+    assert server.transport == "streamable_http"

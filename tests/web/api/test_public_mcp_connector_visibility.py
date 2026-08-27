@@ -2625,3 +2625,64 @@ def test_apply_update_heals_a_padded_transport_on_an_unrelated_edit() -> None:
     _apply_public_mcp_app_update(row, {"icon": "new-icon"})
     assert row.transport == "streamable_http"
     assert row.icon == "new-icon"
+
+
+def test_admin_catalog_heal_is_recorded_in_the_audit_trail() -> None:
+    """A heal genuinely changes the row, so it must appear in the audit as a
+    before/after difference rather than being applied invisibly."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-audited",
+                    name="LegacyAudited",
+                    transport=" Streamable_HTTP ",
+                    launch_config={
+                        "url": "https://mcp.example.com/mcp",
+                        "auth": {"type": "mcp_oauth"},
+                    },
+                )
+            )
+            db.commit()
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-audited")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        assert (
+            client.patch(
+                f"/api/admin/mcp/apps/{app_pk}",
+                headers=admin_headers,
+                json={"icon": "new-icon"},
+            ).status_code
+            == 200
+        )
+
+        db = next(get_db())
+        try:
+            entry = (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "legacy-audited")
+                .one()
+            )
+            assert (entry.before_values or {})["transport"] == " Streamable_HTTP "
+            assert (entry.after_values or {})["transport"] == "streamable_http"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass

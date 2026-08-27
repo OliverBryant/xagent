@@ -1237,3 +1237,38 @@ def test_connect_coerces_scalar_env_values(test_db):
     )
     assoc2 = test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).first()
     assert assoc2.env is None
+
+
+def test_connect_reuses_shared_stdio_row_with_padded_transport(test_db):
+    """The stdio reuse guard must normalize like its mcp_oauth sibling.
+
+    This comparison's right side is a literal "stdio", so lowercasing alone
+    was enough while nothing normalized the left side. It is the same shape as
+    the mcp_oauth check that produced a permanent 409 lockout for catalog
+    apps, and the row on the left is exactly the one this feature leaves
+    un-normalized until the backfill lands: a legacy " stdio " row is the same
+    stdio server, and rejecting it as a different configuration would strand
+    the catalog app for every user until someone hand-edits the database."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.models.mcp import MCPServer
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport=" Stdio ",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "alice-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    # Reused, not duplicated or rejected with a 409.
+    assert test_db.query(MCPServer).filter(MCPServer.name == "google-maps").count() == 1

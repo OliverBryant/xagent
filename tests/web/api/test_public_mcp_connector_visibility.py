@@ -2559,3 +2559,69 @@ def test_admin_builtin_patch_treats_a_case_only_transport_change_as_a_no_op() ->
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_apply_update_does_not_touch_an_already_canonical_transport() -> None:
+    """The healing write is gated on normalization changing the value.
+
+    Asserting the stored value alone cannot detect an ungated write --
+    rewriting "streamable_http" over "streamable_http" is invisible in the
+    row and in the audit diff. Watch the attribute instead: an ungated heal
+    sets `transport` on every edit, which dirties the ORM row (and the audit's
+    changed-field set) for a value nobody changed."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    class _Recorder:
+        app_id = "already-canonical"
+        name = "AlreadyCanonical"
+        description = None
+        icon = "old-icon"
+        transport = "streamable_http"
+        provider_name = None
+        category = None
+        oauth_scopes: list = []
+        is_visible_in_connector = True
+        launch_config = {
+            "url": "https://mcp.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+
+        def __init__(self) -> None:
+            self.assigned: list = []
+
+        def __setattr__(self, key, value):
+            if key != "assigned":
+                self.assigned.append(key)
+            object.__setattr__(self, key, value)
+
+    row = _Recorder()
+    _apply_public_mcp_app_update(row, {"icon": "new-icon"})
+    assert row.icon == "new-icon"
+    assert "transport" not in row.assigned
+    assert row.transport == "streamable_http"
+
+
+def test_apply_update_heals_a_padded_transport_on_an_unrelated_edit() -> None:
+    """Mirror of the test above: when normalization *does* change the value,
+    the heal must fire even though the PATCH never mentioned transport."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    class _Row:
+        app_id = "legacy-padded"
+        name = "LegacyPadded"
+        description = None
+        icon = "old-icon"
+        transport = " Streamable_HTTP "
+        provider_name = None
+        category = None
+        oauth_scopes: list = []
+        is_visible_in_connector = True
+        launch_config = {
+            "url": "https://mcp.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+
+    row = _Row()
+    _apply_public_mcp_app_update(row, {"icon": "new-icon"})
+    assert row.transport == "streamable_http"
+    assert row.icon == "new-icon"

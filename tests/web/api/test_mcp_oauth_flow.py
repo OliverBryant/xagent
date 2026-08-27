@@ -3251,6 +3251,57 @@ def test_blank_transport_400s_for_a_non_owner_rather_than_403(db_session):
     assert server.transport == "streamable_http"
 
 
+def test_update_does_not_fall_back_to_stored_transport_for_a_blank_value(
+    db_session,
+):
+    """Defense in depth for the `or server.transport` fallback that was here.
+
+    MCPServerUpdate now rejects a blank transport, so `""` cannot reach this
+    endpoint through the API -- the model is built with validation bypassed to
+    exercise the endpoint's own handling of a value the model would refuse.
+    The old `or` fallback treated `""` as "not supplied" and silently kept the
+    stored transport, answering 200 for an edit that never happened. The
+    explicit `is not None` check passes the blank through instead, where
+    MCPServerCreate rejects it and the endpoint surfaces a failure.
+
+    The status here is 500 rather than 400: a ValidationError raised while
+    rebuilding MCPServerCreate lands in the endpoint's generic handler. That
+    is acceptable precisely because this path is unreachable through the API
+    -- the 400 for a blank transport is produced by the model, before the
+    endpoint runs (see test_update_rejects_blank_transport_at_the_model_
+    boundary). What this test pins is that the value is not silently
+    swallowed."""
+    db, user, _ = db_session
+    server = MCPServer(
+        name="editable",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+            can_edit=True,
+        )
+    )
+    db.commit()
+
+    blank = MCPServerUpdate.model_construct(transport="")
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        update_mcp_server(server.id, blank, user, db)
+    assert exc.value.status_code >= 400
+    assert "blank" in str(exc.value.detail).lower()
+
+    db.refresh(server)
+    assert server.transport == "streamable_http"
+
+
 def test_update_keeps_stored_transport_when_none_is_supplied(db_session):
     """The `or server.transport` fallback was replaced with an explicit
     `is not None` check. An omitted transport must still leave the stored

@@ -109,7 +109,6 @@ not return one — the reference is already on the executor result.
    - clipart, emoji as decoration, stock-photo placeholders
    - centered body paragraphs (left-align / justify only)
    - all-caps body text (kickers and labels only)
-   - colored hyperlinks other than `ink` (links = ink + underline)
    - more than one heading font
    - Comic Sans, Arial Black, Times New Roman as a deliberate choice
 5. **Real content only.** No lorem ipsum, no `[Title here]` placeholders,
@@ -126,7 +125,7 @@ not return one — the reference is already on the executor result.
 
 Same palettes as `pdf-report-editorial` and `pptx-editorial` — keep the
 editorial family visually consistent. Each: `ink` (body text + rules),
-`paper` (page / cell background), `paper_tint` (table band + callout bg),
+`paper` (text on an ink band), `paper_tint` (table band + callout bg),
 `ink_tint` (kickers, captions, footer). The keys are underscored — the dict
 below is what every snippet indexes into.
 

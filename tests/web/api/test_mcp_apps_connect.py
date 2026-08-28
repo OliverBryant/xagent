@@ -1329,7 +1329,13 @@ def test_connect_does_not_blank_a_transport_it_cannot_heal(test_db):
     assert row.transport == "   "
 
     # A non-string stored value is left alone rather than stringified.
-    row2 = MCPServer(name="odd", managed="external", transport="stdio")
-    row2.transport = None
-    _heal_server_transport(row2)
-    assert row2.transport is None
+    # `None` alone doesn't discriminate -- it normalizes to "" and the blank
+    # guard above would block the write anyway. A value that normalizes to
+    # something non-blank is what proves the isinstance check is load-bearing:
+    # healing canonicalizes a transport, it does not coerce whatever type
+    # happens to be in the column.
+    for odd in (None, 123, ["sse"], True):
+        row2 = MCPServer(name="odd", managed="external", transport="stdio")
+        row2.transport = odd
+        _heal_server_transport(row2)
+        assert row2.transport is odd

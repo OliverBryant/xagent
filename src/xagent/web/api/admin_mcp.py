@@ -283,34 +283,31 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
     persisted = _public_mcp_app_values(db_app)
     enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
 
-    # Heal a legacy stored transport *before* validation, not after, and by
-    # folding it into `persisted` so it flows through the same validated model
-    # as every other value.
+    # Decide the heal up front, before validation runs.
     #
     # `exclude_unset=True` means a PATCH of an unrelated field persists nothing
     # for transport, so a row authored before the write models normalized would
     # otherwise stay padded forever while the `mcp_servers` row written on
     # connect is canonical -- the two then disagree and the connect path 409s.
     #
-    # Ordering matters in both directions. Healing after validation left the
-    # dirty value in the merged dict, so a routine launch_config edit on such a
-    # row was rejected with an opaque 422 about a field the admin never
-    # touched; and because that late write bypassed the model entirely, a
-    # whitespace-only legacy transport was normalized to "" and persisted --
-    # precisely the silently-unconnectable state these validators exist to
-    # prevent. Healing here means a blank result is caught by the same
-    # validation as any other blank.
+    # Deciding it here rather than after validation is what keeps the blank
+    # case safe: an earlier revision computed the heal *after* the merged state
+    # was validated and assigned it with no re-check, so a whitespace-only
+    # legacy transport was normalized to "" and persisted -- precisely the
+    # silently-unconnectable state these validators exist to prevent. The
+    # `normalize_transport(...)` truthiness test below is that guard: a value
+    # with nothing left after trimming is not healed at all, and the row is
+    # left for the backfill migration.
+    #
+    # (Only the write below matters, not the validated dict: the write models
+    # normalize transport on the way in, so a padded value validates
+    # identically either way.)
     stored_transport = persisted.get("transport")
-    if (
-        "transport" not in changes
-        and isinstance(stored_transport, str)
-        and normalize_transport(stored_transport)
-        and normalize_transport(stored_transport) != stored_transport
-    ):
-        healed_transport: Optional[str] = normalize_transport(stored_transport)
-        persisted["transport"] = healed_transport
-    else:
-        healed_transport = None
+    healed_transport: Optional[str] = None
+    if "transport" not in changes and isinstance(stored_transport, str):
+        candidate = normalize_transport(stored_transport)
+        if candidate and candidate != stored_transport:
+            healed_transport = candidate
 
     if canonical is not None:
         for field in _BUILTIN_PROTECTED_FIELDS.intersection(changes):

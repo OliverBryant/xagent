@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
-from typing import Any, cast
 from types import SimpleNamespace
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import httpx

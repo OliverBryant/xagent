@@ -952,17 +952,39 @@ class TestTransportNormalizationOnWriteModels:
 
         assert PublicMCPAppCreate(app_id="a", name="A").transport == "oauth"
 
-    def test_non_string_transport_reaches_the_normalizer_not_a_type_error(self):
-        """The normalizing step is a BeforeValidator, so a non-string body
-        value is normalized rather than failing the str type check first. 123
-        normalizes to "123", which is not blank, so it is accepted here and
-        rejected later by MCPServerConfig's allowed-value list."""
-        assert (
-            MCPServerCreate(
-                name="remote", transport=123, config={"url": "https://e/x"}
-            ).transport
-            == "123"
+    def test_non_string_transport_is_coerced_not_rejected(self):
+        """Known gap, pinned so it cannot drift silently.
+
+        The normalizing step is a BeforeValidator, so it runs ahead of
+        pydantic's own `str` check and a non-string body value is stringified
+        rather than rejected. For MCPServerCreate that is contained --
+        MCPServerConfig's allowed-value list rejects the result downstream, as
+        asserted below. It is *not* contained for the catalog write models,
+        where a payload like {"transport": ["sse"]} with no recognized
+        launch_config shape persists transport="['sse']".
+
+        Tightening this means splitting normalization from coercion so the
+        type check runs first, which changes the shared annotated type used by
+        all five models; tracked with the other normalization-consolidation
+        work in #1828 rather than widened into this PR. This test documents
+        the current behaviour, it does not endorse it."""
+        coerced = MCPServerCreate(
+            name="remote", transport=123, config={"url": "https://e/x"}
         )
+        assert coerced.transport == "123"
+
+        # Contained here: the allowed-value list rejects it before storage.
+        with pytest.raises(ValueError, match="Invalid transport"):
+            _build_server_config(coerced)
+
+        # Not contained on the catalog write models.
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate
+
+        assert (
+            PublicMCPAppCreate(app_id="a", name="A", transport=["sse"]).transport
+            == "['sse']"
+        )
+
         # None is falsy, so it normalizes to "" and is rejected as blank.
         with pytest.raises(ValidationError):
             MCPServerCreate(

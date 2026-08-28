@@ -256,6 +256,22 @@ def _validate_public_mcp_app_values(
     try:
         model.model_validate(values)
     except ValidationError:
+        # A legacy row can hold a blank transport (there is no DB-level
+        # non-empty constraint, and these models only started rejecting it
+        # recently). Such a row cannot be healed -- there is no canonical value
+        # to strip down to, and writing "" would be the very state this
+        # rejection exists to prevent -- so the edit genuinely cannot proceed.
+        # Name the reason rather than answering with a bare "invalid
+        # configuration" about a field the admin may not have touched.
+        if not str(values.get("transport") or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "This app has no transport set. Include a valid "
+                    "'transport' in this request to repair it before "
+                    "editing its other fields."
+                ),
+            ) from None
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid MCP app configuration",
@@ -266,6 +282,35 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
     canonical = get_builtin_public_mcp_app(db_app.app_id)
     persisted = _public_mcp_app_values(db_app)
     enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
+
+    # Heal a legacy stored transport *before* validation, not after, and by
+    # folding it into `persisted` so it flows through the same validated model
+    # as every other value.
+    #
+    # `exclude_unset=True` means a PATCH of an unrelated field persists nothing
+    # for transport, so a row authored before the write models normalized would
+    # otherwise stay padded forever while the `mcp_servers` row written on
+    # connect is canonical -- the two then disagree and the connect path 409s.
+    #
+    # Ordering matters in both directions. Healing after validation left the
+    # dirty value in the merged dict, so a routine launch_config edit on such a
+    # row was rejected with an opaque 422 about a field the admin never
+    # touched; and because that late write bypassed the model entirely, a
+    # whitespace-only legacy transport was normalized to "" and persisted --
+    # precisely the silently-unconnectable state these validators exist to
+    # prevent. Healing here means a blank result is caught by the same
+    # validation as any other blank.
+    stored_transport = persisted.get("transport")
+    if (
+        "transport" not in changes
+        and isinstance(stored_transport, str)
+        and normalize_transport(stored_transport)
+        and normalize_transport(stored_transport) != stored_transport
+    ):
+        healed_transport: Optional[str] = normalize_transport(stored_transport)
+        persisted["transport"] = healed_transport
+    else:
+        healed_transport = None
 
     if canonical is not None:
         for field in _BUILTIN_PROTECTED_FIELDS.intersection(changes):
@@ -301,21 +346,13 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
             field: value for field, value in changes.items() if field != "app_id"
         }
 
-    # Heal the stored transport even when this PATCH doesn't touch it. The
-    # write models normalize what they receive, but `exclude_unset=True` means
-    # an edit to an unrelated field (icon, category) persists nothing for
-    # transport, so a row authored before normalization stays padded/mixed-case
-    # forever. That un-healed value is then compared against the *normalized*
-    # value written into `mcp_servers`, and the catalog connect path 409s on
-    # every connect after the first. Only rewrite when normalization actually
-    # changes something, so an already-canonical row is a byte-identical no-op
-    # and this never shows up as a spurious change in the audit trail.
-    if "transport" not in writable_changes:
-        stored_transport = persisted.get("transport")
-        if isinstance(stored_transport, str):
-            healed = normalize_transport(stored_transport)
-            if healed != stored_transport:
-                writable_changes = {**writable_changes, "transport": healed}
+    # Only persist the heal once the merged state above validated cleanly. A
+    # builtin's transport is a protected field, so it is excluded from
+    # writable_changes by design -- but healing only ever strips and lowercases,
+    # never moves a row away from its canonical value, so applying it there is
+    # safe and converges the row.
+    if healed_transport is not None:
+        writable_changes = {**writable_changes, "transport": healed_transport}
 
     for field, value in writable_changes.items():
         setattr(db_app, field, value)

@@ -37,7 +37,13 @@ def _reject_blank_transport(transport: str) -> str:
     same way for every write model and *before* any permission branching: an
     endpoint-level check inside an owner-only branch makes a non-owner who
     sends a blank transport fail the ownership comparison first and receive a
-    403 about the shared configuration instead of a 400 about their input.
+    403 about the shared configuration instead of an error about their input.
+
+    Raising here surfaces as FastAPI's 422 for a request-body validation
+    failure -- the /api/mcp/* routes have no handler that rewrites that to a
+    400 (the app's RequestValidationError handler only reshapes /v1/ and
+    /api/a2a/ responses). 422 rather than 400 is the shape callers should
+    expect for every blank-transport rejection on these endpoints.
     """
     if not transport:
         raise ValueError("Transport must not be blank")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from typing import Any, cast
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -3212,45 +3213,6 @@ def test_update_rejects_blank_transport_at_the_model_boundary(blank: str):
         MCPServerUpdate(transport=blank)
 
 
-def test_blank_transport_400s_for_a_non_owner_rather_than_403(db_session):
-    """Regression guard for where this check lives.
-
-    While the blank check sat in the endpoint body it was only reachable
-    inside the `can_edit_global` branch, so a non-owner sending a blank
-    transport was measured against the stored value by
-    _global_config_tampered first ("" != "streamable_http" -> tampering) and
-    got a 403 about the shared configuration -- a permission error for what is
-    really a malformed field. Rejecting at the model boundary means the caller
-    never reaches the ownership branch."""
-    db, user, _ = db_session
-    server = MCPServer(
-        name="shared",
-        managed="external",
-        transport="streamable_http",
-        url="https://mcp.example.com/mcp",
-    )
-    db.add(server)
-    db.commit()
-    db.refresh(server)
-    db.add(
-        UserMCPServer(
-            user_id=user.id,
-            mcpserver_id=server.id,
-            is_owner=False,
-            is_active=True,
-            can_edit=False,
-        )
-    )
-    db.commit()
-
-    with pytest.raises(ValidationError):
-        MCPServerUpdate(transport="   ")
-
-    # And the stored row is untouched: nothing got as far as the endpoint.
-    db.refresh(server)
-    assert server.transport == "streamable_http"
-
-
 def test_update_does_not_fall_back_to_stored_transport_for_a_blank_value(
     db_session,
 ):
@@ -3391,6 +3353,16 @@ async def test_padded_catalog_transport_does_not_lock_out_repeat_connects(
 
     # The shared row was written canonical...
     row = db.query(MCPServer).filter(MCPServer.name == "padded-notes").one()
+    assert row.transport == "streamable_http"
+
+    # ...and a legacy shared row admitted by the tolerant comparison is healed
+    # rather than left dirty for the exact-match consumers downstream.
+    cast(Any, row).transport = " Streamable_HTTP "
+    db.commit()
+    await connect_mcp_oauth_app(
+        "padded-notes", MCPOAuthConnectRequest(redirect_after="/x"), user, db
+    )
+    db.refresh(row)
     assert row.transport == "streamable_http"
 
     # ...and the second connect must reuse it rather than 409.

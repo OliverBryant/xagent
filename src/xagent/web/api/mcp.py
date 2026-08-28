@@ -2769,6 +2769,27 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
         )
 
 
+def _heal_server_transport(server: MCPServer) -> None:
+    """Canonicalize a shared row's stored transport in place.
+
+    Called from the catalog reuse branches, which compare transport
+    tolerantly and would otherwise leave a legacy row dirty for every
+    exact-match consumer downstream.
+
+    Skips a value that normalizes to blank rather than persisting "": that is
+    the one state the write models exist to prevent, and healing must never be
+    the thing that creates it. Such a row is left alone for the backfill
+    migration to deal with -- it was already unusable, and blanking it would
+    make it silently unconnectable instead.
+    """
+    stored = getattr(server, "transport", None)
+    if not isinstance(stored, str):
+        return
+    healed = normalize_transport(stored)
+    if healed and healed != stored:
+        cast(Any, server).transport = healed
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based or keyless
     catalog app exists, without creating any per-user association. Returns
@@ -2821,6 +2842,14 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Accepting a legacy row obliges us to heal it. The comparison above
+        # is deliberately tolerant, but everything downstream is not:
+        # MCPServerConfig.to_connection_dict() dispatches on an exact
+        # transport match, so a row left as " Stdio " reaches the runtime with
+        # no command/args/env at all -- a silently broken connection where the
+        # un-normalized row used to produce a loud 409. Tolerate on read,
+        # canonicalize on write, in the same breath.
+        _heal_server_transport(server)
     if not server:
         try:
             config = _build_server_config(
@@ -2888,6 +2917,11 @@ def _ensure_catalog_mcp_oauth_server(
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Same obligation as the stdio path above: the tolerant comparison
+        # admits a legacy row, so canonicalize it before any exact-match
+        # consumer (the runtime's transport dispatch, _is_mcp_oauth_http_server)
+        # sees it.
+        _heal_server_transport(server)
         # The catalog stays the source of truth for the row's auth config: if
         # the registry entry's auth changed since this shared row was created
         # (e.g. a scope hint or static client_id was added), sync it so

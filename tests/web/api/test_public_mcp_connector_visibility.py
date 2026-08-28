@@ -2686,3 +2686,167 @@ def test_admin_catalog_heal_is_recorded_in_the_audit_trail() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def _legacy_catalog_row(transport: str):
+    """A catalog row shaped like one written before the write models validated
+    transport. Built as a plain stand-in so the test can seed states the API
+    would now refuse to create."""
+
+    class _Row:
+        app_id = "legacy"
+        name = "Legacy"
+        description = None
+        icon = "old-icon"
+        provider_name = None
+        category = None
+        is_visible_in_connector = True
+        launch_config = {
+            "url": "https://mcp.example.com/mcp",
+            "auth": {"type": "mcp_oauth"},
+        }
+
+        def __init__(self) -> None:
+            self.transport = transport
+            self.oauth_scopes: list = []
+
+    return _Row()
+
+
+def test_blank_legacy_transport_is_never_healed_to_empty_string() -> None:
+    """Healing must not create the state the validators exist to prevent.
+
+    A whitespace-only legacy transport normalizes to "". Persisting that would
+    turn an already-broken row into a silently unconnectable one, answered with
+    a 200 and no audit anomaly. The row is left exactly as found for the
+    backfill migration."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    row = _legacy_catalog_row("   ")
+    _apply_public_mcp_app_update(row, {"icon": "new-icon"})
+
+    assert row.transport == "   "
+    assert row.icon == "new-icon"
+
+
+def test_blank_legacy_transport_does_not_block_an_edit_opaquely() -> None:
+    """A shape-checked edit on a blank-transport row still cannot proceed --
+    there is no transport to validate a connect shape against -- but the error
+    must name the actual problem and the way out, not answer with a bare
+    "invalid configuration" about a field the admin never touched."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    row = _legacy_catalog_row("   ")
+    with pytest.raises(HTTPException) as exc:
+        _apply_public_mcp_app_update(
+            row,
+            {"launch_config": {"url": "https://e/y", "auth": {"type": "mcp_oauth"}}},
+        )
+    assert exc.value.status_code == 422
+    assert "transport" in str(exc.value.detail).lower()
+
+    # And the way out the message names actually works.
+    row2 = _legacy_catalog_row("   ")
+    _apply_public_mcp_app_update(
+        row2,
+        {
+            "transport": "sse",
+            "launch_config": {"url": "https://e/y", "auth": {"type": "mcp_oauth"}},
+        },
+    )
+    assert row2.transport == "sse"
+
+
+def test_padded_legacy_transport_does_not_block_an_unrelated_shape_edit() -> None:
+    """The regression that motivated moving the heal ahead of validation.
+
+    With healing after validation, the merged dict still carried the dirty
+    stored transport, so a routine launch_config edit on a legacy row was
+    rejected with an opaque 422 about a field the request never mentioned."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    row = _legacy_catalog_row(" Streamable_HTTP ")
+    _apply_public_mcp_app_update(
+        row,
+        {"launch_config": {"url": "https://e/y", "auth": {"type": "mcp_oauth"}}},
+    )
+    assert row.transport == "streamable_http"
+    assert row.launch_config["url"] == "https://e/y"
+
+
+def test_blank_transport_update_returns_422_over_http_for_a_non_owner() -> None:
+    """End-to-end status for the layering fix, asserted over a real request.
+
+    Two things this pins that a direct model construction cannot. First, the
+    status is 422, not the 400 an earlier revision of this PR claimed: the
+    /api/mcp/* routes have no handler rewriting FastAPI's request-validation
+    response. Second, a non-owner gets that 422 rather than the 403 the check
+    produced while it lived in the endpoint body -- the model rejects the
+    payload before any ownership branch runs."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        owner_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/mcp/servers",
+            headers=owner_headers,
+            json={
+                "name": "shared-server",
+                "transport": "streamable_http",
+                "config": {"url": "https://mcp.example.com/mcp"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        server_id = created.json()["id"]
+
+        registered = client.post(
+            "/api/auth/register",
+            json={
+                "username": "outsider",
+                "email": "outsider@example.com",
+                "password": "outsider123",
+            },
+        )
+        assert registered.status_code in (200, 201), registered.text
+
+        db = next(get_db())
+        try:
+            outsider = db.query(User).filter(User.username == "outsider").one()
+            db.add(
+                UserMCPServer(
+                    user_id=outsider.id,
+                    mcpserver_id=server_id,
+                    is_owner=False,
+                    can_edit=False,
+                    is_active=True,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        outsider_headers = _login("outsider", "outsider123")
+        response = client.put(
+            f"/api/mcp/servers/{server_id}",
+            headers=outsider_headers,
+            json={"transport": "   "},
+        )
+        assert response.status_code == 422, response.text
+
+        # The stored row is untouched: nothing reached the endpoint body.
+        db = next(get_db())
+        try:
+            stored = db.get(MCPServer, server_id)
+            assert stored is not None
+            assert stored.transport == "streamable_http"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass

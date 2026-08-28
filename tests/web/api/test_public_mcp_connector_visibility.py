@@ -2850,3 +2850,17 @@ def test_blank_transport_update_returns_422_over_http_for_a_non_owner() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_an_explicit_transport_change_is_not_overwritten_by_the_heal() -> None:
+    """The heal must never win over what the admin actually asked for.
+
+    It is computed from the *stored* value, so without the `"transport" not in
+    changes` guard a PATCH that deliberately changes a legacy row's transport
+    would have that edit silently replaced by the canonicalized old value --
+    the admin sees 200 and a transport they did not choose."""
+    from xagent.web.api.admin_mcp import _apply_public_mcp_app_update
+
+    row = _legacy_catalog_row(" Streamable_HTTP ")
+    _apply_public_mcp_app_update(row, {"transport": "sse"})
+    assert row.transport == "sse"

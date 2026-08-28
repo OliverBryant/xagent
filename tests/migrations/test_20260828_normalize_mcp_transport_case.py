@@ -50,6 +50,10 @@ ALL_TABLES = ("alembic_version",) + TABLES
 TAB = chr(9)
 LF = chr(10)
 CR = chr(13)
+VT = chr(11)
+FF = chr(12)
+FS = chr(28)
+US = chr(31)
 NBSP = chr(0xA0)
 IDEOGRAPHIC_SPACE = chr(0x3000)
 
@@ -233,6 +237,12 @@ BACKFILL_CASES: dict[int, tuple[str | None, str | None]] = {
     # behind it matches exactly.
     13: ("OAuth", "oauth"),
     14: (" oauth ", "oauth"),
+    # The rest of the ASCII whitespace str.strip() removes that single-argument
+    # SQL TRIM() does not. Unlike NBSP/U+3000 these are single-byte and so are
+    # nameable on every supported encoding.
+    18: (VT + "STDIO" + FF, "stdio"),
+    19: (FS + "oauth" + US, "oauth"),
+    20: (VT + FF + " Streamable_HTTP " + FS, "streamable_http"),
     # Interior padding characters that would *spell* a canonical transport if
     # they were deleted rather than translated to a space. The helper leaves
     # these alone, so the migration must too: deleting would let the backfill
@@ -387,6 +397,61 @@ class TestPostgresBackfill(_BackfillContract):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.postgresql
+@pytest.mark.parametrize("table", TABLES)
+def test_backfill_is_locale_independent_on_postgres(table: str) -> None:
+    """A Turkish-locale database must not defeat the canonical-set guard.
+
+    PostgreSQL's LOWER() is locale-sensitive: under ICU tr-TR, LOWER('STDIO')
+    is 'stdıo' with a dotless i (U+0131), which is not in _CANONICAL_TRANSPORTS,
+    so the guard rejects the row and the backfill silently leaves 'STDIO'
+    unfixed while every other value normalizes. The repository does not restrict
+    the database locale, so this has to be pinned against a real Turkish server
+    rather than assumed away.
+    """
+    url = _postgres_url()
+    if not url:
+        pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    database = "xagent_transport_tr"
+    try:
+        with admin.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {database}"))
+            conn.execute(
+                text(
+                    f"CREATE DATABASE {database} TEMPLATE template0 "
+                    "ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'"
+                )
+            )
+    except sa.exc.DBAPIError as exc:
+        pytest.skip(f"server cannot create an ICU Turkish database: {exc}")
+    finally:
+        admin.dispose()
+
+    turkish_url = create_engine(url).url.set(database=database)
+    engine = create_engine(turkish_url)
+    try:
+        # Guard against a false pass: if this server's LOWER is not actually
+        # Turkish-sensitive, the test would prove nothing about the collation.
+        with engine.begin() as conn:
+            assert conn.execute(text("SELECT LOWER('STDIO')")).scalar_one() != "stdio"
+
+        _pre_migration_metadata().create_all(bind=engine)
+        _stamp_parent_revision(engine)
+        _insert(engine, table, {1: "STDIO", 2: "OAuth", 3: "SSE"})
+
+        _upgrade(engine)
+
+        assert _stored(engine, table) == {1: "stdio", 2: "oauth", 3: "sse"}
+    finally:
+        engine.dispose()
+        admin = create_engine(url, isolation_level="AUTOCOMMIT")
+        with admin.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {database}"))
+        admin.dispose()
+
+
 def _engine_with_tables(tmp_path: Path, metadata: sa.MetaData) -> sa.engine.Engine:
     engine = create_engine(f"sqlite:///{tmp_path / 'partial.db'}")
     metadata.create_all(bind=engine)
@@ -463,8 +528,13 @@ def _offline_sql(dialect: str, operation: str = "upgrade") -> str:
         "postgresql": "postgresql://user:pw@localhost/db",
     }[dialect]
     output = StringIO()
-    config = Config(stdout=output)
-    config.set_main_option("script_location", "src/xagent/migrations")
+    # Derive script_location from the installed package, like the online
+    # callsite, so this helper does not require pytest to run from the
+    # repository root. Only the URL is overridden -- the real
+    # command.upgrade(sql=True) / env.py path this test exists to exercise is
+    # preserved.
+    config = create_alembic_config(create_engine(url))
+    config.stdout = output
     config.set_main_option("sqlalchemy.url", url)
 
     revisions = (

@@ -31,9 +31,12 @@ descriptions above are written against the post-#1829/#1830 tree:
   2. Read-side tolerance (#1830) normalizes on read, so a not-yet-backfilled
      row behaves like its canonical equivalent.
 
-Before those land, a non-canonical row is rejected fairly uniformly rather than
-split -- no current reader strips whitespace, and the runtime OAuth gate
-(`_is_mcp_oauth_http_server`) still matches exactly. The backfill is worth
+Before those land the two axes differ. A whitespace-padded row is rejected
+fairly uniformly, because no current reader strips whitespace and the runtime
+OAuth gate (`_is_mcp_oauth_http_server`) still matches exactly. A mixed-case row
+already splits today: `classify_app_auth` lowercases, so it admits
+"Streamable_HTTP" and "OAuth", while the exact-matching gates behind it reject
+the same row. The backfill is worth
 running either way, because the divergence above is what the row hits once the
 tolerant readers are deployed, and because an admin catalog write can still
 author a mixed-case value today.
@@ -90,16 +93,28 @@ _CANONICAL_TRANSPORTS = ("stdio", "sse", "websocket", "streamable_http", "oauth"
 # in the emitted SQL -- an offline (--sql) artifact carrying a raw newline
 # inside a string literal is a hazard for whoever runs it by hand.
 #
-# Deliberately ASCII-only. str.strip() also removes NBSP (U+00A0) and the
-# ideographic space (U+3000), but neither can be named portably here: on a
-# database whose encoding cannot represent them, PostgreSQL's chr() raises
-# "requested character too large for encoding" and aborts the whole upgrade,
-# and a U&'...' literal fails the same way. Verified against a SQL_ASCII
-# server. A row padded with one of those is therefore left untouched rather
-# than fixed -- the wrong trade for a one-shot data migration would be to make
-# it crash on a database whose encoding it never had to care about. Such a row
-# is also unstorable in exactly the encodings where the fix is unexpressible.
-_PADDING_WHITESPACE = (9, 10, 13)  # TAB, LF, CR
+# ASCII-only, and that boundary is a portability constraint rather than a
+# preference. str.strip() also removes NBSP (U+00A0) and the ideographic space
+# (U+3000), but neither can be named portably here: on a database whose encoding
+# cannot represent them, PostgreSQL's chr() raises "requested character too
+# large for encoding" and aborts the whole upgrade, and a U&'...' literal fails
+# the same way (both verified against a SQL_ASCII server). A row padded with one
+# of those is left untouched rather than fixed -- for a one-shot data migration,
+# crashing on a database whose encoding it never had to care about is the worse
+# trade. Such a row is also unstorable in exactly the encodings where the fix is
+# unexpressible. Every code point below is single-byte ASCII and so is
+# expressible on every supported encoding.
+_PADDING_WHITESPACE = (
+    9,  # TAB
+    10,  # LF
+    11,  # VT
+    12,  # FF
+    13,  # CR
+    28,  # FS
+    29,  # GS
+    30,  # RS
+    31,  # US
+)
 
 # PostgreSQL spells the code-point-to-character function CHR(); SQLite spells it
 # CHAR(). Both take one integer argument and need no extension. Indexed rather
@@ -108,14 +123,27 @@ _PADDING_WHITESPACE = (9, 10, 13)  # TAB, LF, CR
 # loudly here rather than silently receive a narrower backfill.
 _CHAR_FUNCTION = {"postgresql": "chr", "sqlite": "char"}
 
+# PostgreSQL's LOWER() is locale-sensitive. On a database created with a Turkish
+# locale (ICU tr-TR is supported and unrestricted here), LOWER('STDIO') yields
+# 'stdıo' with a dotless i (U+0131), which is not in _CANONICAL_TRANSPORTS -- so
+# the guard below rejects the row and the backfill silently leaves 'STDIO'
+# unfixed while every other value normalizes. Forcing the C collation on LOWER's
+# *input* makes the case mapping ASCII and locale-independent. It must be the
+# input, not the result: `LOWER(x) COLLATE "C"` still lowercases under the
+# database locale and only relabels the output.
+#
+# SQLite needs no equivalent -- its LOWER() maps ASCII A-Z only, by design.
+_LOWER_COLLATION = {"postgresql": ' COLLATE "C"', "sqlite": ""}
+
 
 def _normalized_expression(dialect_name: str) -> str:
     """SQL canonicalizing `transport` the way normalize_transport() does."""
     char_fn = _CHAR_FUNCTION[dialect_name]
+    collation = _LOWER_COLLATION[dialect_name]
     expression = "transport"
     for code_point in _PADDING_WHITESPACE:
         expression = f"REPLACE({expression}, {char_fn}({code_point}), ' ')"
-    return f"LOWER(TRIM({expression}))"
+    return f"LOWER(TRIM({expression}){collation})"
 
 
 def _tables_with_transport() -> list[str]:

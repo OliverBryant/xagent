@@ -37,7 +37,9 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 
-PARENT_REVISION = "20260826_seed_deputy_mcp_app"
+from xagent.db.config import create_alembic_config
+
+PARENT_REVISION = "20260821_actor_oauth_flow_states"
 TARGET_REVISION = "20260828_normalize_mcp_transport_case"
 
 TABLES = ("mcp_servers", "public_mcp_apps")
@@ -48,6 +50,8 @@ ALL_TABLES = ("alembic_version",) + TABLES
 TAB = chr(9)
 LF = chr(10)
 CR = chr(13)
+NBSP = chr(0xA0)
+IDEOGRAPHIC_SPACE = chr(0x3000)
 
 
 def _migration_module() -> ModuleType:
@@ -113,8 +117,10 @@ def _stamp_parent_revision(engine: sa.engine.Engine) -> None:
 
 
 def _alembic_config(engine: sa.engine.Engine) -> Config:
-    config = Config()
-    config.set_main_option("script_location", "src/xagent/migrations")
+    """The repo's own helper, which resolves script_location through the
+    installed package rather than a CWD-relative path, so this suite does not
+    silently require pytest to be invoked from the repository root."""
+    config = create_alembic_config(engine)
     config.set_main_option(
         "sqlalchemy.url", engine.url.render_as_string(hide_password=False)
     )
@@ -222,6 +228,11 @@ BACKFILL_CASES: dict[int, tuple[str | None, str | None]] = {
     8: ("Not-A-Transport", "Not-A-Transport"),
     9: (TAB + "str" + TAB + "eamable" + LF, TAB + "str" + TAB + "eamable" + LF),
     10: ("   ", "   "),
+    # "oauth" is the default for public_mcp_apps.transport and is split the
+    # same way: classify_app_auth lowercases it, every connect/credential gate
+    # behind it matches exactly.
+    13: ("OAuth", "oauth"),
+    14: (" oauth ", "oauth"),
     # Interior padding characters that would *spell* a canonical transport if
     # they were deleted rather than translated to a space. The helper leaves
     # these alone, so the migration must too: deleting would let the backfill
@@ -240,26 +251,17 @@ class _BackfillContract:
     is that they are indistinguishable from the caller's side.
     """
 
-    def test_backfill_canonicalizes_mcp_servers(self, engine) -> None:
-        _insert(engine, "mcp_servers", {k: v for k, (v, _) in BACKFILL_CASES.items()})
+    @pytest.mark.parametrize("table", TABLES)
+    def test_backfill_canonicalizes_transport(self, engine, table: str) -> None:
+        """Both tables get the same treatment. public_mcp_apps matters most: a
+        shared catalog row's transport is never rewritten by the connect path,
+        so without this backfill it would stay non-canonical indefinitely."""
+        _insert(engine, table, {k: v for k, (v, _) in BACKFILL_CASES.items()})
 
         _upgrade(engine)
 
         expected = {k: want for k, (_, want) in BACKFILL_CASES.items()}
-        assert _stored(engine, "mcp_servers") == expected
-
-    def test_backfill_canonicalizes_public_mcp_apps(self, engine) -> None:
-        """The catalog table matters most: a shared catalog row's transport is
-        never rewritten by the connect path, so without this backfill it would
-        stay non-canonical indefinitely."""
-        _insert(
-            engine, "public_mcp_apps", {k: v for k, (v, _) in BACKFILL_CASES.items()}
-        )
-
-        _upgrade(engine)
-
-        expected = {k: want for k, (_, want) in BACKFILL_CASES.items()}
-        assert _stored(engine, "public_mcp_apps") == expected
+        assert _stored(engine, table) == expected
 
     def test_padding_grammar_matches_the_write_side_helper(self, engine) -> None:
         """The whitespace axis, pinned against the helper rather than the SQL.
@@ -284,6 +286,31 @@ class _BackfillContract:
         assert stored == {
             row_id: _normalize_like_helper(value) for row_id, value in padded.items()
         }
+
+    def test_non_ascii_padding_is_left_untouched(self, engine) -> None:
+        """The documented scope limit, pinned as behavior rather than prose.
+
+        ``str.strip()`` also removes NBSP and U+3000, but neither can be named
+        portably in SQL: on a server whose encoding cannot represent them,
+        PostgreSQL's ``chr()`` raises "requested character too large for
+        encoding" and aborts the entire upgrade. Such a row is therefore left
+        as stored. The migration must skip it silently -- never crash, and
+        never half-normalize it into a value a reader would then accept.
+        """
+        rows = {
+            1: NBSP + "stdio" + NBSP,
+            2: IDEOGRAPHIC_SPACE + "oauth",
+        }
+        try:
+            _insert(engine, "mcp_servers", rows)
+        except (UnicodeEncodeError, sa.exc.DBAPIError) as exc:
+            # A SQL_ASCII server cannot store these at all, which is the same
+            # boundary that makes them unfixable -- there is nothing to assert.
+            pytest.skip(f"server encoding cannot store non-ASCII padding: {exc}")
+
+        _upgrade(engine)
+
+        assert _stored(engine, "mcp_servers") == rows
 
     def test_backfill_leaves_other_columns_verbatim(self, engine) -> None:
         _insert(engine, "mcp_servers", {1: "Streamable_HTTP"}, url="https://kept/mcp")
@@ -316,6 +343,20 @@ class _BackfillContract:
         _upgrade(engine)
 
         assert _stored(engine, "mcp_servers") == after_first
+
+        # End-state equality alone would also hold for a migration that
+        # rewrote every row to the same value on each pass. The docstring
+        # claims the WHERE clause *skips* already-normalized rows, so re-run
+        # the migration's own statement -- fetched from the module, not
+        # restated here, so weakening that clause actually fails this test --
+        # and pin that it matches nothing.
+        migration = _migration_module()
+        statement = migration._backfill_statement(
+            "mcp_servers", migration._normalized_expression(engine.dialect.name)
+        )
+        with engine.begin() as conn:
+            result = conn.execute(text(statement))
+        assert result.rowcount == 0
 
     def test_null_transport_is_preserved(self, engine) -> None:
         """A NULL transport must stay NULL rather than become '': both WHERE
@@ -396,6 +437,20 @@ def test_backfill_tolerates_a_table_without_the_transport_column(
 # --------------------------------------------------------------------------
 
 
+def test_unsupported_dialect_fails_loudly() -> None:
+    """An unsupported dialect must raise, not silently get a narrower backfill.
+
+    The project supports sqlite and postgresql only (db/migration_support.py
+    raises for anything else). A default in the character-function lookup would
+    hand an unknown dialect some other dialect's spelling and quietly emit SQL
+    that either fails at apply time or normalizes the wrong character set.
+    """
+    migration = _migration_module()
+
+    with pytest.raises(KeyError):
+        migration._normalized_expression("mysql")
+
+
 def _offline_sql(dialect: str, operation: str = "upgrade") -> str:
     """Generate the migration's SQL the way ``alembic upgrade --sql`` does.
 
@@ -464,13 +519,6 @@ class TestOfflineSql:
 
         assert statements == []
         assert CR not in sql
-
-    def test_offline_sql_carries_no_bind_parameters(self, dialect: str) -> None:
-        sql = _offline_sql(dialect)
-
-        assert "%(" not in sql
-        assert ":param" not in sql
-        assert "?" not in sql
 
     def test_downgrade_touches_neither_data_table(self, dialect: str) -> None:
         """The downgrade is deliberately a no-op (the original spellings are

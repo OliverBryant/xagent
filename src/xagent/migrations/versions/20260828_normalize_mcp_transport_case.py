@@ -1,55 +1,68 @@
 r"""Normalize stored MCP transport values to their canonical form
 
 Revision ID: 20260828_normalize_mcp_transport_case
-Revises: 20260826_seed_deputy_mcp_app
+Revises: 20260821_actor_oauth_flow_states
 Create Date: 2026-08-28
 
-`transport` is a free-form string on the MCP API models, so rows written
-before the write-time normalizing validators shipped may hold a mixed-case or
-whitespace-padded value (e.g. "Streamable_HTTP", "\tstreamable_http"). Such a
-row is classified as connectable by the normalizing half of the MCP OAuth
-feature and rejected by the exact-matching half: the web runtime treats it as
-an HTTP server and runs the per-user token exchange, while the core
-serializer's exact `transport in ["sse", "websocket", "streamable_http"]` test
-fails and drops the row's `url` from the connection dict entirely. Backfill
-the two web-layer tables once so the stored values agree with what every
-reader expects.
+`transport` is a free-form string on the MCP API models, so rows written before
+the write-time normalizing validators shipped may hold a mixed-case or
+whitespace-padded value (e.g. "Streamable_HTTP", "OAuth", "\tstdio"). The
+readers of that column do not agree on how to compare it: `classify_app_auth`
+(web/mcp_apps.py) lowercases before matching, while the connect and credential
+paths match exactly -- `api/mcp.py`'s `server.transport != "oauth"` gates,
+`api/auth.py:2087`, `web/tools/config.py:3547`, and the core serializer's
+`transport in ["sse", "websocket", "streamable_http"]` branch. A row stored as
+"OAuth" is therefore classified `builtin_oauth` by the catalog and rejected by
+every exact-matching gate behind it.
+
+A shared catalog row's transport is never rewritten by the connect path, so an
+un-migrated row stays in that split state indefinitely. Backfill the two
+web-layer tables once so the stored values agree with what every reader
+expects.
+
+State of the readers when this lands. This migration is the third of the three
+changes tracked in #1828 and is sequenced behind both of the others, so the
+descriptions above are written against the post-#1829/#1830 tree:
+
+  1. Write-side canonicalization (#1829) introduces `normalize_transport()`
+     (`web/services/mcp_runtime.py`) and applies it on every write path, so no
+     new non-canonical row is created. That helper does not exist yet on this
+     branch; the whitespace grammar below is specified against it.
+  2. Read-side tolerance (#1830) normalizes on read, so a not-yet-backfilled
+     row behaves like its canonical equivalent.
+
+Before those land, a non-canonical row is rejected fairly uniformly rather than
+split -- no current reader strips whitespace, and the runtime OAuth gate
+(`_is_mcp_oauth_http_server`) still matches exactly. The backfill is worth
+running either way, because the divergence above is what the row hits once the
+tolerant readers are deployed, and because an admin catalog write can still
+author a mixed-case value today.
 
 Covered value set. A row is rewritten only when normalizing it yields one of
-the four transports the application actually dispatches on (see
-_CANONICAL_TRANSPORTS below). That bound makes the rewrite safe to audit: the
-migration can only ever move a row onto a value the readers already agree on,
-never invent one, and an unrecognized string is left exactly as stored rather
-than being reshaped into different garbage.
+the transports the application dispatches on (see _CANONICAL_TRANSPORTS below).
+That bound makes the rewrite safe to audit: the migration can only ever move a
+row onto a value the readers already agree on, never invent one, and an
+unrecognized string is left exactly as stored rather than reshaped into
+different garbage.
 
-Whitespace grammar. The write-side helper `normalize_transport()` canonicalizes
-with Python's `str.strip().lower()`, which strips tabs and newlines as well as
-ASCII spaces; single-argument SQL `TRIM()` strips only ASCII spaces. The
-TAB/LF/CR characters are therefore translated to spaces before `TRIM` runs, so
-padding written with them is stripped too. Translating rather than deleting
-keeps `TRIM`'s edges-only semantics: an interior character is never removed,
-and the covered-value-set bound above means an interior space cannot change
-which row is eligible. Without this a tab-padded row survives the one-shot
-backfill and stays in the split-classification state described above
-indefinitely.
+Whitespace grammar, scoped to ASCII. The write-side helper canonicalizes with
+Python's `str.strip().lower()`; single-argument SQL `TRIM()` strips only ASCII
+spaces, so TAB/LF/CR are translated to spaces before `TRIM` runs. Translating
+rather than deleting keeps `TRIM`'s edges-only semantics: an interior character
+is never removed, so the migration cannot splice a canonical transport out of a
+value the helper leaves alone. The non-ASCII whitespace `str.strip()` also
+removes (NBSP, U+3000) is out of scope and left unfixed -- see
+_PADDING_WHITESPACE for why naming it portably is not possible.
 
 Rollout ordering. This is a one-shot UPDATE with no CHECK constraint or trigger
 behind it, so it converges only if no application instance running the
 pre-validator models is still serving admin writes when it lands; the startup
-migration lock serializes migrators, not request sessions. The expand phase
-that provides that guarantee is the two changes this migration is sequenced
-behind:
-
-  1. Write-side canonicalization (#1829) -- every write path stores a canonical
-     transport, so no new non-canonical row is created.
-  2. Read-side tolerance (#1830) -- web-layer reads normalize on read, so a
-     not-yet-backfilled row behaves like its canonical equivalent.
-
-Deploy 1 and 2, drain the old instances, then run this backfill. Run out of
-order it is still safe -- it only ever rewrites a value to the form every
-reader already agrees on -- but it is not guaranteed to leave the table
-canonical, because a surviving old writer can insert a fresh mixed-case row
-after the UPDATE commits.
+migration lock serializes migrators, not request sessions. Deploy #1829 and
+#1830, drain the old instances, then run this backfill. Run out of order it is
+still safe -- it only ever rewrites a value toward the form every reader agrees
+on -- but it is not guaranteed to leave the table canonical, because a
+surviving old writer can insert a fresh non-canonical row after the UPDATE
+commits.
 
 Idempotent: the normalizing expression is a no-op on already-canonical values,
 and the WHERE clause skips rows that are already normalized.
@@ -60,41 +73,48 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "20260828_normalize_mcp_transport_case"
-down_revision = "20260826_seed_deputy_mcp_app"
+down_revision = "20260821_actor_oauth_flow_states"
 branch_labels = None
 depends_on = None
 
 _TABLES = ("mcp_servers", "public_mcp_apps")
 
-# The transports the application dispatches on. Mirrors the stdio branch and
-# HTTP_MCP_TRANSPORTS in the MCP model/runtime; a row is only rewritten when it
-# normalizes onto one of these.
-_CANONICAL_TRANSPORTS = ("stdio", "sse", "websocket", "streamable_http")
+# The transports the application dispatches on: the stdio branch and
+# HTTP_MCP_TRANSPORTS in the MCP model/runtime, plus "oauth", which is the
+# default for public_mcp_apps.transport and drives the builtin_oauth catalog
+# classification. A row is only rewritten when it normalizes onto one of these.
+_CANONICAL_TRANSPORTS = ("stdio", "sse", "websocket", "streamable_http", "oauth")
 
-# The whitespace characters Python's str.strip() removes that single-argument
-# SQL TRIM() does not. Spelled as code points so no literal control character
-# is embedded in the emitted SQL -- an offline (--sql) artifact carrying a raw
-# newline inside a string literal is a hazard for whoever runs it by hand.
+# Whitespace that Python's str.strip() removes but single-argument SQL TRIM()
+# does not. Spelled as code points so no literal control character is embedded
+# in the emitted SQL -- an offline (--sql) artifact carrying a raw newline
+# inside a string literal is a hazard for whoever runs it by hand.
+#
+# Deliberately ASCII-only. str.strip() also removes NBSP (U+00A0) and the
+# ideographic space (U+3000), but neither can be named portably here: on a
+# database whose encoding cannot represent them, PostgreSQL's chr() raises
+# "requested character too large for encoding" and aborts the whole upgrade,
+# and a U&'...' literal fails the same way. Verified against a SQL_ASCII
+# server. A row padded with one of those is therefore left untouched rather
+# than fixed -- the wrong trade for a one-shot data migration would be to make
+# it crash on a database whose encoding it never had to care about. Such a row
+# is also unstorable in exactly the encodings where the fix is unexpressible.
 _PADDING_WHITESPACE = (9, 10, 13)  # TAB, LF, CR
 
 # PostgreSQL spells the code-point-to-character function CHR(); SQLite spells it
-# CHAR(). Both take one integer argument and need no extension.
+# CHAR(). Both take one integer argument and need no extension. Indexed rather
+# than looked up with a default: these are the only two dialects the project
+# supports (see db/migration_support.py), and an unsupported one should fail
+# loudly here rather than silently receive a narrower backfill.
 _CHAR_FUNCTION = {"postgresql": "chr", "sqlite": "char"}
 
 
 def _normalized_expression(dialect_name: str) -> str:
-    """SQL canonicalizing `transport` the way normalize_transport() does.
-
-    On a dialect whose character function is not known here this degrades to a
-    bare LOWER(TRIM(...)): case and ASCII-space padding are still fixed, which
-    is the behavior every supported dialect had before, so an unknown dialect
-    gets a narrower backfill rather than invalid SQL.
-    """
-    char_fn = _CHAR_FUNCTION.get(dialect_name)
+    """SQL canonicalizing `transport` the way normalize_transport() does."""
+    char_fn = _CHAR_FUNCTION[dialect_name]
     expression = "transport"
-    if char_fn is not None:
-        for code_point in _PADDING_WHITESPACE:
-            expression = f"REPLACE({expression}, {char_fn}({code_point}), ' ')"
+    for code_point in _PADDING_WHITESPACE:
+        expression = f"REPLACE({expression}, {char_fn}({code_point}), ' ')"
     return f"LOWER(TRIM({expression}))"
 
 
@@ -117,20 +137,28 @@ def _tables_with_transport() -> list[str]:
     return present
 
 
-def _backfill(table: str, normalized: str) -> None:
+def _backfill_statement(table: str, normalized: str) -> str:
+    """The one UPDATE this migration runs, as text.
+
+    Split out from _backfill so a test can execute the exact statement the
+    migration would rather than restating its WHERE clause -- a restated copy
+    keeps passing when the real clause changes.
+    """
     canonical_list = ", ".join(f"'{value}'" for value in _CANONICAL_TRANSPORTS)
     # NULL transports are left alone: both comparisons below are NULL-safe
     # (they evaluate to NULL, not true), so those rows are skipped rather than
     # rewritten to ''.
-    op.execute(
-        f"""
+    return f"""
         UPDATE {table}
         SET transport = {normalized}
         WHERE transport IS NOT NULL
           AND transport <> {normalized}
           AND {normalized} IN ({canonical_list})
-        """
-    )
+    """
+
+
+def _backfill(table: str, normalized: str) -> None:
+    op.execute(_backfill_statement(table, normalized))
 
 
 def upgrade() -> None:

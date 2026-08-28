@@ -1,6 +1,6 @@
 """Skill Hub API — manage user-installed skills (saas closed-source).
 
-The Hub composes three capabilities on top of xagent's existing skill
+The Hub composes four capabilities on top of xagent's existing skill
 machinery (``SkillManager`` + ``SkillParser``):
 
   1. **Local skill management** — list / detail / delete the skills
@@ -20,6 +20,14 @@ machinery (``SkillManager`` + ``SkillParser``):
      (``PUT /installed/{name}``). Edits and creates both invalidate
      the same cache the chat runtime reads from.
 
+  4. **File import** — install from an uploaded ``.zip`` skill folder or
+     a bare ``SKILL.md`` (``POST /upload``). This is the only path that
+     takes an archive straight from the client, so it bounds entry count,
+     path length and content size before persisting, validates the bundle
+     against the parser *before* naming it, and compensates the write if
+     the skill cannot be read back — including when the request is
+     cancelled mid-flight.
+
 GitHub-URL import was removed in this iteration: we previously
 shipped a ``git clone --depth=1`` path, but ClawHub gives us trusted
 binaries with provenance and scan results, so we don't need to
@@ -36,6 +44,7 @@ visible immediately on the next API call without an explicit ``reload()``.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import io
 import logging
@@ -44,7 +53,17 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
@@ -419,7 +438,19 @@ def _canonical_skill_path(raw_path: str) -> str:
     return "/".join(segments)
 
 
-def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
+def _normalize_skill_files(
+    files: dict[str, bytes], *, max_bytes: int | None = None
+) -> dict[str, bytes]:
+    # ``max_bytes`` lets a caller that advertised a smaller ceiling than the
+    # shared one hold the *decompressed* bundle to the number it published.
+    # Without it a lowered XAGENT_MAX_UPLOAD_SIZE bounded only the wire read,
+    # and a compressed archive under that limit still expanded and persisted
+    # up to the shared budget.
+    budget = (
+        _MAX_DOWNLOAD_BYTES
+        if max_bytes is None
+        else min(max_bytes, _MAX_DOWNLOAD_BYTES)
+    )
     out: dict[str, bytes] = {}
     total = 0
     for raw_path, content in files.items():
@@ -476,7 +507,7 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                 ),
             )
         total += len(content)
-        if total > _MAX_DOWNLOAD_BYTES:
+        if total > budget:
             raise HTTPException(
                 status_code=413, detail="Skill files exceed size budget."
             )
@@ -572,6 +603,14 @@ def _assert_bundle_parses(files: dict[str, bytes]) -> None:
 
     try:
         SkillParser.parse_bundle(name=_VALIDATION_PLACEHOLDER_NAME, files=files)
+    except RecursionError as exc:
+        # Deeply nested YAML blows the stack inside yaml.safe_load, which
+        # ``_extract_frontmatter`` does not catch (it guards yaml.YAMLError).
+        # Not a service defect: the input chose the depth, so it is a 400.
+        raise HTTPException(
+            status_code=400,
+            detail="SKILL.md frontmatter is nested too deeply to parse.",
+        ) from exc
     except UnicodeDecodeError as exc:
         # parse_bundle does not say which file failed, and that is the
         # actionable half of the message. Only the files the parser actually
@@ -611,7 +650,9 @@ def _is_skill_name_unique_violation(error: BaseException) -> bool:
     SQLite names the columns (``user_skills.user_id, user_skills.name``).
     Matching either keeps an unrelated IntegrityError -- a foreign-key
     violation, or the ``(skill_id, path)`` file constraint -- from being
-    reported as a duplicate name.
+    reported as a duplicate name. Modelled on
+    ``is_agent_name_unique_violation``, which solves the same problem for
+    agents.
     """
     current: BaseException | None = error
     seen: set[int] = set()
@@ -873,7 +914,7 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
 
 
 def _safe_zip_extract(
-    zip_bytes: bytes, *, bad_zip_status: int = 502
+    zip_bytes: bytes, *, bad_zip_status: int = 502, max_bytes: int | None = None
 ) -> tuple[dict[str, bytes], str]:
     """Read a skill ZIP into ``(normalized files, root dir name)``.
 
@@ -895,6 +936,11 @@ def _safe_zip_extract(
     # lzma.LZMAError — none of which subclass one another. Whatever zipfile
     # raises next is covered here too. Our own HTTPExceptions re-raise unchanged
     # so their specific status and message survive.
+    budget = (
+        _MAX_DOWNLOAD_BYTES
+        if max_bytes is None
+        else min(max_bytes, _MAX_DOWNLOAD_BYTES)
+    )
     total = 0
     raw_files: dict[str, bytes] = {}
     try:
@@ -943,7 +989,7 @@ def _safe_zip_extract(
                         "Remove the duplicate and try again."
                     ),
                 )
-            remaining = _MAX_DOWNLOAD_BYTES - total
+            remaining = budget - total
             # Reject on the declared size before inflating anything. zipfile
             # validates each member against its declared length and CRC while
             # reading, so a header that under-declares fails the read rather
@@ -1041,7 +1087,10 @@ def _safe_zip_extract(
             rel = path
         if rel:
             files[rel] = content
-    return _normalize_skill_files(files), skill_root.rsplit("/", 1)[-1]
+    return (
+        _normalize_skill_files(files, max_bytes=max_bytes),
+        skill_root.rsplit("/", 1)[-1],
+    )
 
 
 def _check_registry_security_gate(registry: Any, detail: dict) -> None:
@@ -1285,6 +1334,213 @@ async def edit_installed(
         )
     logger.info("Skill Hub: edited user skill %r", name)
     return _skill_to_summary(reloaded)
+
+
+def _slugify_skill_name(raw: str) -> str:
+    """Collapse arbitrary text into the [A-Za-z0-9_-]+ shape
+    ``_validate_skill_name`` accepts; empty string if nothing survives."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", raw.strip()).strip("-_")[:64]
+
+
+def _derive_upload_skill_name(
+    filename: str, zip_root: str, skill_md: bytes, override: str | None = None
+) -> str:
+    """Pick a skill name for an uploaded bundle.
+
+    Priority: caller-supplied ``override`` → ZIP root directory name (how
+    Claude-style skill folders are usually zipped) → frontmatter ``name`` →
+    upload filename stem.
+
+    An override is the caller stating intent, so one that would be rewritten
+    by slugification is refused instead: quietly turning "bad name!" into
+    "bad-name" hands back a skill nobody asked for.
+    """
+    from xagent.skills.parser import SkillParser
+
+    if override is not None and override.strip():
+        candidate = override.strip()
+        # Validate against the rule the message quotes, not a slugifier
+        # round-trip. The slugifier strips leading and trailing "-"/"_", so it
+        # rejected names like "_foo" and "my_skill_" that _NAME_RE accepts and
+        # POST /create takes — with an error citing the regex they do match.
+        if not _NAME_RE.match(candidate) or len(candidate) > 64:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Skill name must match [A-Za-z0-9_-]+ and be at most 64 "
+                    "characters; it is not rewritten for you."
+                ),
+            )
+        return candidate
+
+    frontmatter = SkillParser._extract_frontmatter(  # noqa: SLF001
+        skill_md.decode("utf-8", errors="replace")
+    )
+    fm_name = frontmatter.get("name")
+    candidates = [
+        zip_root,
+        fm_name if isinstance(fm_name, str) else "",
+        Path(filename).stem,
+    ]
+    for raw in candidates:
+        slug = _slugify_skill_name(raw)
+        if slug:
+            return slug
+    raise HTTPException(
+        status_code=400, detail="Could not derive a skill name from the upload."
+    )
+
+
+@router.post("/upload", response_model=SkillSummary)
+async def upload_skill(
+    request: Request,
+    file: UploadFile = File(...),
+    scope: str = Form("personal"),
+    name: Optional[str] = Form(None),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Any = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> SkillSummary:
+    """Install a skill from an uploaded file.
+
+    Accepts either a ``.zip`` skill bundle (a Claude-style skill folder
+    with SKILL.md at its root, possibly nested one directory deep) or a
+    bare ``.md`` file used verbatim as SKILL.md.
+
+    The tail follows ``install_skill`` -- persist, re-parse, return the
+    summary. The bundle is validated before the write, so a committed row is
+    one the skill machinery can read and there is nothing to undo afterwards;
+    a read side that is merely behind answers from the validated bundle.
+    """
+    if scope not in ("personal", "team"):
+        raise HTTPException(
+            status_code=400, detail="scope must be 'personal' or 'team'."
+        )
+
+    # Honour the deployment's configured upload limit, clamped to the budget
+    # the extractor enforces on decompressed bytes: advertising a 100 MiB limit
+    # while silently reading 50 MiB reports the wrong number in both
+    # directions -- a smaller XAGENT_MAX_UPLOAD_SIZE was ignored, and a larger
+    # one rejected uploads it claimed to allow.
+    from xagent.config import get_max_upload_size_bytes
+
+    limit = min(get_max_upload_size_bytes(), _MAX_DOWNLOAD_BYTES)
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds {limit // (1024 * 1024)} MiB limit.",
+        )
+
+    filename = (file.filename or "").strip()
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        # Off the event loop: inflating and normalizing an archive is pure CPU
+        # over untrusted input, bounded but not free (thousands of members,
+        # tens of MiB). Only this step moves -- it touches no ORM object, so
+        # the request-bound Session stays on its own thread, which is why the
+        # persistence below is deliberately left where it is.
+        files, zip_root = await asyncio.to_thread(
+            functools.partial(
+                _safe_zip_extract, data, bad_zip_status=400, max_bytes=limit
+            )
+        )
+    elif lower.endswith(".md"):
+        files, zip_root = {"SKILL.md": data}, ""
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported upload — provide a .zip skill bundle or a SKILL.md file.",
+        )
+
+    # Validate the bundle before anything reads it — naming included. Deriving
+    # the name parses frontmatter itself, so leaving validation until after
+    # would let an unparsable bundle raise from the naming step instead.
+    # Validation must not depend on which naming branch a request happens to
+    # take; that ordering coupling is what made the override path a bypass.
+    # ``name`` only labels the parse error, so validating before the name is
+    # known loses nothing and keeps the check independent of naming.
+    files = _normalize_skill_files(files, max_bytes=limit)
+
+    skill_name = _derive_upload_skill_name(
+        filename, zip_root, files["SKILL.md"], override=name
+    )
+
+    if scope == "team":
+        from xagent.skills.library import get_skill_write_provider
+
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            scope="team",
+            name=skill_name,
+            files=files,
+            origin="upload",
+        )
+    else:
+        _write_personal_skill(
+            db=db,
+            user=_user,
+            name=skill_name,
+            files=files,
+            origin="upload",
+        )
+
+    mgr = await _get_scoped_manager(request, context, db)
+    skill = await mgr.get_skill(skill_name)
+    if skill is not None and _summary_source(skill) != (
+        "user" if scope == "personal" else scope
+    ):
+        # ``reload`` keys the cache by name with filesystem records loaded
+        # first, so a same-named builtin can stay resident and a bare
+        # ``is None`` test would return 200 carrying that unrelated skill's
+        # content. Treat a mismatch as "not visible yet", not as our write.
+        logger.warning(
+            "Skill Hub: %r read back as a %s skill, not the %s skill just "
+            "written; answering from the validated bundle",
+            skill_name,
+            _summary_source(skill),
+            scope,
+        )
+        skill = None
+    if skill is None:
+        if scope != "personal":
+            # Provider-owned scopes validate inside their own writer, so an
+            # absent record here is that provider's failure to report.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Skill {skill_name!r} was written to the {scope} scope "
+                    "but the provider does not serve it back."
+                ),
+            )
+        # The personal write is durable and was parsed before it landed, so
+        # the request succeeded and the read side is merely behind. No undo:
+        # rolling back here is what made the old name-keyed compensation able
+        # to delete a concurrent attempt's row. See
+        # _personal_summary_from_bundle for why this is not a 5xx.
+        logger.warning(
+            "Skill Hub: uploaded skill %r but the library does not serve it "
+            "yet; answering from the validated bundle",
+            skill_name,
+        )
+        logger.info(
+            "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
+            skill_name,
+            filename,
+            len(data),
+            len(files),
+        )
+        return _personal_summary_from_bundle(name=skill_name, files=files)
+    logger.info(
+        "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
+        skill_name,
+        filename,
+        len(data),
+        len(files),
+    )
+    return _skill_to_summary(skill)
 
 
 # ──────────────────────────────────────────────────────────────────────

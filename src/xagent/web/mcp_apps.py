@@ -731,9 +731,16 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
 
     Unstamped rows predate ``auth.app_id`` and are resolved by the exact name
     they were provisioned under -- the app id for catalog-connect rows, the
-    display name for builtin OAuth rows. Once a row carries ``app_id``, an
-    invalid value must not fall back to a same-named app because that could
-    select another connector's credentials or launch configuration.
+    display name for builtin OAuth rows. Because a bare name cannot say which
+    convention wrote it, such a row resolves only when both namespaces agree
+    on a single owner; anything ambiguous answers ``None`` so callers fail
+    closed. Once a row carries ``app_id``, an invalid value must not fall back
+    to a same-named app because that could select another connector's
+    credentials or launch configuration.
+
+    ``None`` therefore means "cannot prove whose this is", not merely "not
+    found": destructive callers must leave credentials in place rather than
+    treat it as nothing to do.
     """
     auth = getattr(server, "auth", None)
     if isinstance(auth, Mapping) and "app_id" in auth:
@@ -742,6 +749,8 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
             return None
         return get_app_by_id(db, app_id)
     name = str(getattr(server, "name", ""))
+    if not name:
+        return None
     # Both provisioning conventions write ``MCPServer.name``: the catalog
     # connect helpers store the app **id** (``_ensure_catalog_app_server``,
     # ``_ensure_catalog_mcp_oauth_server``) while the builtin OAuth flow stores
@@ -750,7 +759,22 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     # whatever the caller does with the result -- for the disconnect path that
     # meant the user's OAuth credentials survived a successful teardown.
     #
-    # The id is checked first because it is unique, whereas ``name`` is not:
-    # preferring it also keeps a display-name collision from outranking an
-    # exact id match.
-    return get_app_by_id(db, name) or get_app_by_name(db, name)
+    # Both namespaces are therefore enumerated together, hidden rows included,
+    # and the row resolves only when they agree on a single owner. An unstamped
+    # row carries no provenance of its own, so preferring one namespace over
+    # the other would be a guess: ``app_id`` being unique proves that at most
+    # one app holds that id, not that this row was provisioned from it rather
+    # than from another app's (mutable, non-unique) display name. Both readings
+    # are legal, so ambiguity is reported as "cannot resolve" and every caller
+    # fails closed -- deletion keeps the credentials, listing and runtime
+    # decline to name an app -- rather than acting on a coin flip. Only the
+    # stamp settles it, which is what the branch above is for.
+    candidates = (
+        db.query(PublicMCPApp)
+        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
+        .all()
+    )
+    owners = {str(candidate.app_id) for candidate in candidates}
+    if len(owners) != 1:
+        return None
+    return _app_to_dict(candidates[0])

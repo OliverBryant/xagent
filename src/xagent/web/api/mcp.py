@@ -3482,7 +3482,11 @@ async def delete_mcp_server(
             # named after the app id, silently skipping the cleanup below and
             # leaving usable tokens behind after a successful teardown.
             # ``get_app_for_mcp_server`` prefers the row's own ``auth.app_id``
-            # stamp and falls back to id-then-display-name for unstamped rows.
+            # stamp; an unstamped row resolves only when the id and display
+            # name namespaces agree on one owner, and answers ``None`` when
+            # they do not -- which lands on the ``if app_info:`` guard below
+            # and leaves the credentials in place rather than deleting some
+            # other app's.
             app_info = get_app_for_mcp_server(db, server)
             if app_info:
                 provider = app_info.get("provider")

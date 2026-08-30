@@ -40,9 +40,10 @@ import hashlib
 import io
 import logging
 import re
+import struct
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
@@ -58,6 +59,9 @@ from xagent.web.api.skill_hub_registry import (
 )
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.database import get_db
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from _typeshed import WriteableBuffer
 from xagent.web.models.user import User
 from xagent.web.services.skill_runtime import (
     get_skill_runtime_scope,
@@ -355,6 +359,154 @@ _IGNORED_ARCHIVE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 # Inflate archive members in slices so a decompression bomb cannot make the
 # peak footprint a multiple of the size budget.
 _ARCHIVE_CHUNK_BYTES = 1024 * 1024
+
+
+# An archive is refused above this many central-directory entries. A skill
+# bundle is a handful of documents and a few resource folders; the largest
+# real ones sampled sit under a hundred files, so the cap is two orders of
+# magnitude of headroom rather than a tight fit.
+_MAX_ARCHIVE_ENTRIES = 2000
+
+# Central-directory file header: the signature, then a 46-byte fixed part
+# whose last three 16-bit fields (at offset 28) give the lengths of the
+# variable-length name, extra and comment that follow it.
+_CDH_SIGNATURE = b"PK\x01\x02"
+_CDH_FIXED_SIZE = 46
+_CDH_VARIABLE_LENGTHS_OFFSET = 28
+
+
+class _ArchiveTooManyEntries(Exception):
+    """Raised by ``_BoundedZipSource`` mid-construction, once the central
+    directory is known to hold more entries than we will accept."""
+
+
+class _BoundedZipSource(io.RawIOBase):
+    """A seekable read-only view of ``data`` that refuses an archive whose
+    central directory holds more than ``max_entries`` headers.
+
+    ``ZipFile.__init__`` builds a ``ZipInfo`` for every entry in the central
+    directory before any of our code runs, so a cap applied to ``infolist()``
+    bounds what happens *after* construction, not the construction itself. A
+    16 MiB archive of 100,000 padding directories -- comfortably inside the
+    ingress budget -- costs 2.9s and 56 MiB before the first line of ours
+    executes. Handing ``ZipFile`` this object instead refuses it in 0.01s and
+    5 MiB.
+
+    The count is taken from the bytes ``ZipFile`` itself reads, which is what
+    makes this safe to do without a second ZIP parser. CPython locates the
+    end-of-central-directory record (handling comments, self-extracting
+    prefixes and Zip64 for us) and then seeks straight to the directory and
+    reads it; the first read that *starts* on a central-directory signature is
+    therefore the directory itself, and from that offset the headers chain
+    end-to-end. We follow that chain and count, and stop the constructor the
+    moment the count goes over.
+
+    Two properties this relies on, both of which earlier attempts got wrong:
+
+    * **The count accumulates across reads.** A ``BufferedReader`` splits the
+      directory into fixed-size blocks, so a per-read tally saw 1,993 of a
+      2,001-entry directory and let it through. The walk keeps its position in
+      the chain between reads and resumes there, so the boundary is exact.
+    * **Only the real directory anchors it.** The anchor latches on a read
+      that begins on the signature, and thereafter advances by the declared
+      header lengths. Signatures inside member content, inside an archive
+      comment, or inside a self-extracting stub are not on that chain, so a
+      member holding a forged 5,000-header run still counts as one entry.
+
+    Nothing here parses the end record or scans for signatures: locating the
+    directory stays CPython's job, and this only walks the structure it lands
+    on.
+    """
+
+    def __init__(self, data: bytes, *, max_entries: int = _MAX_ARCHIVE_ENTRIES):
+        self._data = data
+        self._pos = 0
+        self._max_entries = max_entries
+        # Offset of the next central-directory header to count, or ``None``
+        # while the directory has not been reached (or has been walked past).
+        self._next_header: Optional[int] = None
+        self._entries = 0
+
+    # -- io.RawIOBase plumbing -------------------------------------------
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            if offset < 0:
+                raise ValueError(f"negative seek value {offset}")
+            target = offset
+        elif whence == io.SEEK_CUR:
+            target = self._pos + offset
+        elif whence == io.SEEK_END:
+            target = len(self._data) + offset
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        # Clamp exactly as ``io.BytesIO`` does. ``zipfile`` seeks a fixed
+        # distance back from the end to find the end record, so on an archive
+        # shorter than that record the target is negative; ``BytesIO`` answers
+        # 0 and ``zipfile`` goes on to reject the archive. Left unclamped, a
+        # negative position indexes ``bytes`` from the *end*, so reads would
+        # quietly return the wrong bytes -- and this object is what decides
+        # where the central directory is.
+        self._pos = max(target, 0)
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            size = len(self._data) - self._pos
+        start = self._pos
+        if (
+            self._next_header is None
+            and self._data[start : start + 4] == _CDH_SIGNATURE
+        ):
+            self._next_header = start
+        end = min(start + size, len(self._data))
+        # Count before slicing: the refusal must not pay for a copy of the
+        # bytes it is refusing.
+        if self._next_header is not None:
+            self._count_headers(end)
+        chunk = self._data[start:end]
+        self._pos = start + len(chunk)
+        return chunk
+
+    def readinto(self, buffer: "WriteableBuffer") -> int:
+        view = memoryview(buffer).cast("B")
+        chunk = self.read(len(view))
+        view[: len(chunk)] = chunk
+        return len(chunk)
+
+    # -- the guard itself -------------------------------------------------
+    def _count_headers(self, limit: int) -> None:
+        """Walk the header chain as far as ``limit``, counting entries."""
+        while self._next_header is not None and (
+            self._next_header + _CDH_FIXED_SIZE <= limit
+        ):
+            offset = self._next_header
+            if self._data[offset : offset + 4] != _CDH_SIGNATURE:
+                # End of the directory (the end record follows it), or bytes
+                # that never were one. Either way there is nothing more to
+                # count, and re-anchoring on a later read would be exactly the
+                # double-count that sank an earlier attempt.
+                self._next_header = None
+                return
+            name_len, extra_len, comment_len = struct.unpack_from(
+                "<HHH", self._data, offset + _CDH_VARIABLE_LENGTHS_OFFSET
+            )
+            self._entries += 1
+            if self._entries > self._max_entries:
+                raise _ArchiveTooManyEntries(
+                    f"central directory holds more than {self._max_entries} entries"
+                )
+            self._next_header = (
+                offset + _CDH_FIXED_SIZE + name_len + extra_len + comment_len
+            )
 
 
 def _is_archive_cruft(path: str) -> bool:
@@ -728,7 +880,24 @@ def _safe_zip_extract(
     total = 0
     raw_files: dict[str, bytes] = {}
     try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        # Not ``io.BytesIO(zip_bytes)``: the constructor materializes a
+        # ``ZipInfo`` per directory entry before returning, and an archive
+        # well inside the ingress budget can hold enough of them to cost
+        # seconds and tens of MiB. ``_BoundedZipSource`` caps that, and the
+        # ``BufferedReader`` is what CPython would wrap a real file in --
+        # keeping the read pattern the same shape the stdlib is tuned for.
+        source = _BoundedZipSource(zip_bytes)
+        zf = zipfile.ZipFile(io.BufferedReader(source))
+        # Second gate, on the count the parser actually produced. The source
+        # above bounds construction from the byte stream; this bounds what we
+        # then do per entry -- a walk plus, for an install, a row per file --
+        # and does not depend on the walk having reached every header. Cheap,
+        # independent, and the one that stays correct if a future CPython
+        # changes how the directory is read.
+        if len(zf.infolist()) > _MAX_ARCHIVE_ENTRIES:
+            raise _ArchiveTooManyEntries(
+                f"archive holds more than {_MAX_ARCHIVE_ENTRIES} entries"
+            )
         for info in zf.infolist():
             if info.is_dir():
                 continue
@@ -776,6 +945,17 @@ def _safe_zip_extract(
             raw_files[path] = content
     except HTTPException:
         raise
+    except _ArchiveTooManyEntries as exc:
+        # Not ``bad_zip_status``: the archive is perfectly readable, it just
+        # carries more than we accept -- a statement about its contents, like
+        # the traversal and size rejections, so 400 whoever supplied it.
+        logger.warning("Skill Hub: archive over entry cap (%s)", exc)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Skill archive contains more than {_MAX_ARCHIVE_ENTRIES} entries."
+            ),
+        ) from exc
     except Exception as exc:
         logger.warning(
             "Skill Hub: unreadable archive (%s)", type(exc).__name__, exc_info=True

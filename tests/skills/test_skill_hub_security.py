@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from unittest import mock
 
 import pytest
 from fastapi import HTTPException
@@ -605,3 +606,324 @@ async def test_team_write_routes_adopt_the_central_provider_invoker(
     assert context.user_id == scope.user_id
     assert context.metadata == scope.metadata
     assert kwargs["scope"] == "team"
+
+
+# ── construction-time entry bound ────────────────────────────────────────────
+
+
+def _entry_zip(
+    count: int, *, comment: bytes = b"", prefix: bytes = b"", name_len: int = 0
+) -> bytes:
+    """An archive of ``count`` empty members, optionally commented/prefixed.
+
+    ``prefix`` stands in for a self-extracting stub: bytes before the local
+    headers that shift every offset in the archive.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(count):
+            name = f"skill/f{i:08d}"
+            zf.writestr(name.ljust(name_len, "x"), b"")
+        zf.comment = comment
+    return prefix + buf.getvalue()
+
+
+class TestArchiveEntryBound:
+    """An over-sized central directory is refused during construction.
+
+    ``ZipFile.__init__`` builds a ``ZipInfo`` per directory entry before any
+    of our code runs, so a cap read off ``infolist()`` bounds only what comes
+    after. These tests assert the mechanism rather than the status code: a
+    pre-construction and a post-construction refusal both answer 400, so a
+    status assertion cannot tell them apart.
+    """
+
+    def test_entry_cap_boundary(self):
+        """Exactly at the cap is accepted; one over is refused.
+
+        The boundary is the test that matters. Counting per read rather than
+        across reads under-counted a 2,001-entry directory as 1,993 because
+        ``BufferedReader`` splits it into blocks — a bug a 20,000-entry case
+        hides completely, since 20,000 trips any cap regardless.
+        """
+        from xagent.web.api.skill_hub import _MAX_ARCHIVE_ENTRIES
+
+        at_cap = _entry_zip(_MAX_ARCHIVE_ENTRIES)
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(at_cap, bad_zip_status=400)
+        # Accepted by the bound — it fails later, on having no SKILL.md.
+        assert "no SKILL.md" in exc.value.detail
+
+        over_cap = _entry_zip(_MAX_ARCHIVE_ENTRIES + 1)
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(over_cap, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "more than" in exc.value.detail
+
+    def test_source_guard_holds_the_boundary_on_its_own(self):
+        """The construction-time bound, with the ``infolist()`` gate removed.
+
+        Both gates answer the same 400 with the same wording, so a test that
+        only calls ``_safe_zip_extract`` cannot see which one fired: weakening
+        the source guard leaves every such test green because the second gate
+        covers for it. Drive the source directly, past ``ZipFile``, and assert
+        the count it actually produced.
+
+        The exact boundary is the assertion that matters. A per-read tally
+        (rather than one accumulated across reads) saw 1,993 headers of a
+        2,001-entry directory, because ``BufferedReader`` splits the directory
+        into fixed-size blocks — invisible to any test that only tries a
+        clearly-hostile count.
+        """
+        from xagent.web.api.skill_hub import (
+            _MAX_ARCHIVE_ENTRIES,
+            _ArchiveTooManyEntries,
+            _BoundedZipSource,
+        )
+
+        source = _BoundedZipSource(_entry_zip(_MAX_ARCHIVE_ENTRIES))
+        zf = zipfile.ZipFile(io.BufferedReader(source))
+        assert len(zf.namelist()) == _MAX_ARCHIVE_ENTRIES
+        # Every header was counted — not a subset that happens to be under.
+        assert source._entries == _MAX_ARCHIVE_ENTRIES
+
+        over = _BoundedZipSource(_entry_zip(_MAX_ARCHIVE_ENTRIES + 1))
+        with pytest.raises(_ArchiveTooManyEntries):
+            zipfile.ZipFile(io.BufferedReader(over))
+        # Refused on the first entry past the cap, not somewhere well beyond.
+        assert over._entries == _MAX_ARCHIVE_ENTRIES + 1
+
+    def test_over_cap_is_a_content_rejection_not_an_unreadable_one(self):
+        """400 regardless of ``bad_zip_status``.
+
+        An archive over the cap parses fine; it just carries more than we
+        accept, which is a statement about its contents like the traversal and
+        size rejections. ``bad_zip_status`` says who supplied an *unreadable*
+        archive, and answering with it here would make a registry-sourced
+        upload a 502 the client cannot act on.
+        """
+        from xagent.web.api.skill_hub import _MAX_ARCHIVE_ENTRIES
+
+        over_cap = _entry_zip(_MAX_ARCHIVE_ENTRIES + 1)
+        for bad_zip_status in (400, 502):
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(over_cap, bad_zip_status=bad_zip_status)
+            assert exc.value.status_code == 400
+            assert "more than" in exc.value.detail
+
+    def test_refusal_happens_before_the_directory_is_materialised(self):
+        """The refusal must beat ``ZipFile``, not follow it.
+
+        Spy on ``ZipInfo`` construction: an archive of 100,000 padding
+        directories costs ~3s and ~56 MiB to materialise, all of it spent
+        before a post-construction cap could look. Far fewer than the whole
+        directory may be built here — the bound trips partway through it.
+        """
+        from xagent.web.api import skill_hub
+        from xagent.web.api.skill_hub import _MAX_ARCHIVE_ENTRIES
+
+        built = 0
+        real_zipinfo = zipfile.ZipInfo
+
+        class CountingZipInfo(real_zipinfo):  # type: ignore[misc, valid-type]
+            def __init__(self, *args, **kwargs):
+                nonlocal built
+                built += 1
+                super().__init__(*args, **kwargs)
+
+        hostile = _entry_zip(50_000)
+        with mock.patch.object(zipfile, "ZipInfo", CountingZipInfo):
+            with pytest.raises(HTTPException) as exc:
+                skill_hub._safe_zip_extract(hostile, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        # A materialise-then-check guard would build all 50,000.
+        assert built <= _MAX_ARCHIVE_ENTRIES + 1, f"built {built} ZipInfo objects"
+
+    def test_hostile_archive_is_refused_cheaply(self):
+        """The whole point is the cost, so bound the cost.
+
+        Unguarded, this archive takes seconds and tens of MiB in the
+        constructor; the ingress size limit does not stop it, because 100,000
+        empty entries compress to well under the budget.
+        """
+        import tracemalloc
+
+        hostile = _entry_zip(100_000)
+        assert len(hostile) < 16 * 1024 * 1024  # passes the ingress size gate
+
+        tracemalloc.start()
+        try:
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(hostile, bad_zip_status=400)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert exc.value.status_code == 400
+        # Unguarded this peaks around 56 MiB; the archive itself is ~10 MiB.
+        assert peak < len(hostile) + 8 * 1024 * 1024, f"peak {peak} bytes"
+
+    @pytest.mark.parametrize(
+        "label,build",
+        [
+            ("plain", lambda n: _entry_zip(n)),
+            ("one-byte comment", lambda n: _entry_zip(n, comment=b"x")),
+            ("64 KiB comment", lambda n: _entry_zip(n, comment=b"y" * 65535)),
+            (
+                "comment holding header signatures",
+                lambda n: _entry_zip(n, comment=b"PK\x01\x02" * 2001 + b"z" * 100),
+            ),
+            ("self-extracting prefix", lambda n: _entry_zip(n, prefix=b"MZ" * 3000)),
+            ("400-character names", lambda n: _entry_zip(n, name_len=400)),
+        ],
+    )
+    def test_bound_holds_across_archive_shapes(self, label, build):
+        """Every shape must land on the same boundary.
+
+        These are the shapes that broke earlier attempts: a comment moves the
+        end record and makes CPython re-read the whole file; a comment may
+        legally contain a central-directory signature; a self-extracting stub
+        shifts every offset. A guard that mis-locates the directory fails
+        *open* on one side of this pair and *closed* on the other, so both
+        sides are asserted.
+        """
+        from xagent.web.api.skill_hub import _MAX_ARCHIVE_ENTRIES
+
+        with pytest.raises(HTTPException) as at_cap:
+            _safe_zip_extract(build(_MAX_ARCHIVE_ENTRIES), bad_zip_status=400)
+        assert "no SKILL.md" in at_cap.value.detail, f"{label} rejected at the cap"
+
+        with pytest.raises(HTTPException) as over:
+            _safe_zip_extract(build(_MAX_ARCHIVE_ENTRIES + 1), bad_zip_status=400)
+        assert "more than" in over.value.detail, f"{label} not bounded"
+
+    def test_zip64_directory_is_bounded(self):
+        """Zip64 must not be a way around the bound.
+
+        Over 65,535 entries the end record is Zip64 and the real values live
+        in a separate record CPython locates by its own rules. An attempt that
+        hand-mirrored that location was 76 bytes off and counted nothing.
+        """
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", allowZip64=True) as zf:
+            for i in range(70_000):
+                zf.writestr(f"f{i:08d}", b"")
+        zip64 = buf.getvalue()
+
+        for label, data in (("plain", zip64), ("with stub", b"MZ" * 3000 + zip64)):
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(data, bad_zip_status=400)
+            assert exc.value.status_code == 400, label
+            assert "more than" in exc.value.detail, label
+
+    def test_member_content_cannot_forge_the_count(self):
+        """A member full of header signatures is still one entry.
+
+        The count follows the chain CPython seeks to, so bytes that merely
+        look like headers — inside a member, a comment or a stub — are not on
+        it. A signature-scanning attempt counted a valid one-entry archive as
+        2,002 and refused it.
+        """
+        forged_header = b"PK\x01\x02" + b"\x00" * 42
+        data = _make_zip(
+            {"SKILL.md": SKILL_MD, "decoy.bin": forged_header * 5000},
+        )
+        files, root = _safe_zip_extract(data, bad_zip_status=400)
+        assert root == ""
+        assert files["SKILL.md"] == SKILL_MD
+        assert files["decoy.bin"] == forged_header * 5000
+
+    def test_a_read_landing_on_forged_bytes_does_not_re_anchor(self):
+        """A member read that *begins* on a header signature must not re-anchor.
+
+        The anchor latches once, on the directory ``ZipFile`` seeks to, and is
+        dropped for good when the chain ends. Re-latching on any later read
+        that happens to start on a signature is the failure that sank an
+        earlier attempt: it double-counts, and refuses valid archives.
+
+        The shape is reachable, not theoretical. ``BufferedReader`` reads in
+        fixed-size blocks, so a member holding a run of forged headers only
+        needs its content shifted until a block boundary lands on one — a
+        padding member a few dozen bytes long does it. Under a re-anchoring
+        guard this three-entry archive counts past 2,000 and is refused.
+        """
+        forged_header = b"PK\x01\x02" + b"\x00" * 42  # declares 0/0/0 lengths
+
+        # Search the alignment rather than hard-coding it: the offset depends
+        # on the block size and on how the writer lays the archive out, and a
+        # stale constant would silently stop exercising the shape.
+        for pad in range(200):
+            data = _make_zip(
+                {
+                    "SKILL.md": SKILL_MD,
+                    "p": b"P" * pad,
+                    "decoy.bin": forged_header * 20_000,
+                }
+            )
+            files, root = _safe_zip_extract(data, bad_zip_status=400)
+            assert root == ""
+            assert files["SKILL.md"] == SKILL_MD
+            assert files["decoy.bin"] == forged_header * 20_000
+
+    def test_seek_matches_bytesio_semantics(self):
+        """The bounded source must behave as the ``BytesIO`` it replaces.
+
+        ``zipfile`` seeks a fixed distance back from the end to find the end
+        record, so an archive shorter than that record seeks past the start.
+        ``BytesIO`` clamps that to 0; an unclamped negative position indexes
+        ``bytes`` from the *end*, so reads return the wrong bytes — and this
+        object is what tells ``zipfile`` where the central directory is.
+        """
+        from xagent.web.api.skill_hub import _BoundedZipSource
+
+        payload = b"0123456789"
+        source = _BoundedZipSource(payload)
+        reference = io.BytesIO(payload)
+
+        for offset, whence in ((-22, io.SEEK_END), (-3, io.SEEK_END), (5, io.SEEK_SET)):
+            assert source.seek(offset, whence) == reference.seek(offset, whence)
+            assert source.read(4) == reference.read(4)
+
+        # Seeking before the start from the current position clamps too.
+        source.seek(0, io.SEEK_SET)
+        reference.seek(0, io.SEEK_SET)
+        assert source.seek(-4, io.SEEK_CUR) == reference.seek(-4, io.SEEK_CUR)
+
+        # An explicitly negative absolute seek is an error, as it is there.
+        with pytest.raises(ValueError):
+            source.seek(-1, io.SEEK_SET)
+
+    def test_short_archive_is_rejected_not_misread(self):
+        """An archive shorter than the end record is refused, not misparsed."""
+        for payload in (b"PK\x05\x06", b"PK", b"", b"\x00" * 8):
+            with pytest.raises(HTTPException) as exc:
+                _safe_zip_extract(payload, bad_zip_status=400)
+            assert exc.value.status_code == 400
+
+    def test_ordinary_archives_are_untouched(self):
+        """The bounded source must be transparent on archives we accept."""
+        data = _make_zip({"my-skill/SKILL.md": SKILL_MD, "my-skill/ref.md": b"hi"})
+        files, root = _safe_zip_extract(data)
+        assert root == "my-skill"
+        assert files == {"SKILL.md": SKILL_MD, "ref.md": b"hi"}
+
+    def test_post_construction_cap_stands_on_its_own(self):
+        """Defence in depth: the ``infolist()`` cap without the source guard.
+
+        The two gates are independent. If a future CPython stops reading the
+        directory in one pass from its own offset, the source guard could
+        under-count; this one bounds the per-entry work regardless, since it
+        reads the count the parser produced.
+        """
+        from xagent.web.api import skill_hub
+
+        class _Passthrough(skill_hub._BoundedZipSource):
+            def _count_headers(self, limit: int) -> None:
+                return None
+
+        with mock.patch.object(skill_hub, "_BoundedZipSource", _Passthrough):
+            with pytest.raises(HTTPException) as exc:
+                skill_hub._safe_zip_extract(
+                    _entry_zip(skill_hub._MAX_ARCHIVE_ENTRIES + 1), bad_zip_status=400
+                )
+        assert exc.value.status_code == 400
+        assert "more than" in exc.value.detail

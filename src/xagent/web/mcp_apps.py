@@ -729,10 +729,11 @@ def ensure_builtin_oauth_server_visibility_for_user(
 def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 
-    Older server rows predate ``auth.app_id`` and are still resolved by their
-    exact catalog name. Once a row carries ``app_id``, an invalid value must not
-    fall back to a same-named app because that could select another connector's
-    credentials or launch configuration.
+    Unstamped rows predate ``auth.app_id`` and are resolved by the exact name
+    they were provisioned under -- the app id for catalog-connect rows, the
+    display name for builtin OAuth rows. Once a row carries ``app_id``, an
+    invalid value must not fall back to a same-named app because that could
+    select another connector's credentials or launch configuration.
     """
     auth = getattr(server, "auth", None)
     if isinstance(auth, Mapping) and "app_id" in auth:
@@ -740,4 +741,16 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
         if not isinstance(app_id, str) or not app_id:
             return None
         return get_app_by_id(db, app_id)
-    return get_app_by_name(db, str(getattr(server, "name", "")))
+    name = str(getattr(server, "name", ""))
+    # Both provisioning conventions write ``MCPServer.name``: the catalog
+    # connect helpers store the app **id** (``_ensure_catalog_app_server``,
+    # ``_ensure_catalog_mcp_oauth_server``) while the builtin OAuth flow stores
+    # the **display name** (``_ensure_user_mcp_server``). Resolving only by
+    # display name leaves every id-named row unresolvable, which silently skips
+    # whatever the caller does with the result -- for the disconnect path that
+    # meant the user's OAuth credentials survived a successful teardown.
+    #
+    # The id is checked first because it is unique, whereas ``name`` is not:
+    # preferring it also keeps a display-name collision from outranking an
+    # exact id match.
+    return get_app_by_id(db, name) or get_app_by_name(db, name)

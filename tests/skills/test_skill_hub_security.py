@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import io
 import struct
 import tracemalloc
@@ -504,10 +503,15 @@ class TestUploadNameOverride:
             == "mine"
         )
 
-    def test_override_is_trimmed(self):
+    @pytest.mark.parametrize("override", ["  mine  ", "   "])
+    def test_override_is_not_silently_trimmed_or_derived(self, override):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=override)
+        assert exc.value.status_code == 400
+
+    def test_empty_override_falls_back_to_zip_root(self):
         assert (
-            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override="  mine  ")
-            == "mine"
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override="") == "root"
         )
 
     def test_no_override_falls_back_to_zip_root(self):
@@ -934,21 +938,52 @@ class TestNoGhostRows:
         assert self._rows(db) == [], "nothing may be written when parsing fails"
 
     @pytest.mark.asyncio
-    async def test_duplicate_name_is_refused_with_409(self, monkeypatch, tmp_path):
-        """The real writer's own conflict branch, unstubbed.
-
-        Every other route test replaces ``_write_personal_skill``, so nothing
-        exercised the duplicate check the upload path relies on to keep a
-        second upload from clobbering an existing skill.
-        """
+    async def test_identical_upload_retry_replays_the_result(
+        self, monkeypatch, tmp_path
+    ):
+        """A lost success response can retry without becoming a false 409."""
         db = self._session(tmp_path)
         assert (
             await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
         ).name == "s"
+        replay = await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        assert replay.name == "s"
+        assert self._rows(db) == ["s"], "a replay must not create another row"
+
+    @pytest.mark.asyncio
+    async def test_same_name_with_different_content_is_still_409(
+        self, monkeypatch, tmp_path
+    ):
+        db = self._session(tmp_path)
+        await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": SKILL_MD + b"\nDifferent instructions.\n"},
+            )
+        assert exc.value.status_code == 409
+        assert self._rows(db) == ["s"], "the first skill must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_same_bundle_from_another_write_path_is_not_an_upload_replay(
+        self, monkeypatch, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from xagent.web.api import skill_hub
+
+        db = self._session(tmp_path)
+        skill_hub._write_personal_skill(
+            db=db,
+            user=SimpleNamespace(id=7),
+            name="s",
+            files={"SKILL.md": SKILL_MD},
+            origin="custom",
+        )
         with pytest.raises(HTTPException) as exc:
             await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
         assert exc.value.status_code == 409
-        assert self._rows(db) == ["s"], "the first skill must survive untouched"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("override", [None, "my-name"])
@@ -1047,25 +1082,10 @@ class TestNoGhostRows:
         assert self._rows(db) == ["agent-builder"], "our own row must survive"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "failure",
-        [
-            pytest.param(RuntimeError("provider unavailable"), id="provider-error"),
-            pytest.param(asyncio.CancelledError(), id="client-disconnect"),
-        ],
-    )
-    async def test_readback_failure_propagates_without_undoing_the_write(
-        self, monkeypatch, tmp_path, failure
+    async def test_personal_success_does_not_depend_on_post_commit_readback(
+        self, monkeypatch, tmp_path
     ):
-        """The write is durable before the read-back awaits run, and those can
-        fail or be cancelled.
-
-        The bundle is validated before the commit, so the durable row is one
-        the skill machinery can read -- it is not a ghost, and undoing it by
-        name is what could delete a concurrent attempt's row. What must hold
-        is that the original exception survives untouched: a cancelled request
-        has to stay cancelled rather than be reported as an ordinary failure.
-        """
+        """A provider failure after commit cannot turn success into a 500."""
         from types import SimpleNamespace
 
         from xagent.skills.library import SkillScopeContext
@@ -1074,22 +1094,22 @@ class TestNoGhostRows:
         db = TestNoGhostRows._session(tmp_path)
 
         async def explode(*args, **kwargs):
-            raise failure
+            raise RuntimeError("post-commit readback must not run")
 
         monkeypatch.setattr(skill_hub, "_get_scoped_manager", explode)
 
-        with pytest.raises(type(failure)):
-            await skill_hub.upload_skill(
-                SimpleNamespace(),
-                file=_make_upload("bundle.zip", _make_zip({"s/SKILL.md": SKILL_MD})),
-                scope="personal",
-                name=None,
-                context=SkillScopeContext(user_id=7, metadata={}),
-                db=db,
-                _user=SimpleNamespace(id=7),
-            )
+        summary = await skill_hub.upload_skill(
+            SimpleNamespace(),
+            file=_make_upload("bundle.zip", _make_zip({"s/SKILL.md": SKILL_MD})),
+            scope="personal",
+            name=None,
+            context=SkillScopeContext(user_id=7, metadata={}),
+            db=db,
+            _user=SimpleNamespace(id=7),
+        )
+        assert summary.name == "s"
         assert TestNoGhostRows._rows(db) == ["s"], (
-            "the validated row is durable and must not be undone by name"
+            "the validated row must remain durable"
         )
 
 

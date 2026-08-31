@@ -24,9 +24,9 @@ machinery (``SkillManager`` + ``SkillParser``):
      a bare ``SKILL.md`` (``POST /upload``). This is the only path that
      takes an archive straight from the client, so it bounds entry count,
      path length and content size before persisting, validates the bundle
-     against the parser *before* naming it, and compensates the write if
-     the skill cannot be read back — including when the request is
-     cancelled mid-flight.
+     against the parser *before* naming it. Personal uploads return directly
+     from those validated bytes after commit, so success does not depend on a
+     fallible post-commit provider readback.
 
 GitHub-URL import was removed in this iteration: we previously
 shipped a ``git clone --depth=1`` path, but ClawHub gives us trusted
@@ -837,13 +837,11 @@ def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
 def _personal_summary_from_bundle(
     *, name: str, files: dict[str, bytes]
 ) -> SkillSummary:
-    """Describe a personal skill that is committed but not visible yet.
+    """Describe a personal skill from the validated bytes that were committed.
 
     The write is durable and was parsed before it landed, so the request
-    succeeded; only the read-side view is behind. Answering 5xx here would be
-    a lie the client cannot act on: a replay re-enters the ``(user, name)``
-    pre-check and gets a deterministic 409, so "retry" is guidance that cannot
-    work, and generic 5xx retry logic would replay a non-idempotent create.
+    succeeded. A replay with the same owner, name and bytes is reconciled to
+    this same result, so transport retry cannot turn success into a false 409.
 
     The bytes re-parsed here are the ones just validated -- the same source
     the manager would have read -- and the result goes through
@@ -855,6 +853,30 @@ def _personal_summary_from_bundle(
     parsed = SkillParser.parse_bundle(name=name, files=files)
     parsed["scope"] = "personal"
     return _skill_to_summary(parsed)
+
+
+def _personal_upload_matches_bundle(
+    *, db: Any, user: User, name: str, files: dict[str, bytes]
+) -> bool:
+    """Whether an upload retry already produced this exact personal skill."""
+    from sqlalchemy.orm import selectinload
+
+    from xagent.web.models.skill import UserSkill
+
+    existing = (
+        db.query(UserSkill)
+        .options(selectinload(UserSkill.files))
+        .filter(
+            UserSkill.user_id == int(user.id),
+            UserSkill.name == name,
+            UserSkill.origin == "upload",
+        )
+        .first()
+    )
+    if existing is None:
+        return False
+    existing_files = {item.path: bytes(item.content) for item in existing.files}
+    return existing_files == files
 
 
 def _summary_from_registry_item(
@@ -1357,8 +1379,8 @@ def _derive_upload_skill_name(
     """
     from xagent.skills.parser import SkillParser
 
-    if override is not None and override.strip():
-        candidate = override.strip()
+    if override is not None and override != "":
+        candidate = override
         # Validate against the rule the message quotes, not a slugifier
         # round-trip. The slugifier strips leading and trailing "-"/"_", so it
         # rejected names like "_foo" and "my_skill_" that _NAME_RE accepts and
@@ -1407,10 +1429,10 @@ async def upload_skill(
     with SKILL.md at its root, possibly nested one directory deep) or a
     bare ``.md`` file used verbatim as SKILL.md.
 
-    The tail follows ``install_skill`` -- persist, re-parse, return the
-    summary. The bundle is validated before the write, so a committed row is
-    one the skill machinery can read and there is nothing to undo afterwards;
-    a read side that is merely behind answers from the validated bundle.
+    The bundle is validated before the write, so a committed personal row is
+    one the skill machinery can read and there is nothing to undo afterwards.
+    Personal uploads answer directly from the validated bundle; provider-owned
+    scopes keep their scoped manager readback contract.
     """
     if scope not in ("personal", "team"):
         raise HTTPException(
@@ -1479,13 +1501,40 @@ async def upload_skill(
             origin="upload",
         )
     else:
-        _write_personal_skill(
-            db=db,
-            user=_user,
-            name=skill_name,
-            files=files,
-            origin="upload",
-        )
+        try:
+            _write_personal_skill(
+                db=db,
+                user=_user,
+                name=skill_name,
+                files=files,
+                origin="upload",
+            )
+        except HTTPException as exc:
+            if exc.status_code != 409 or not _personal_upload_matches_bundle(
+                db=db,
+                user=_user,
+                name=skill_name,
+                files=files,
+            ):
+                raise
+            logger.info(
+                "Skill Hub: replayed upload of personal skill %r from %r",
+                skill_name,
+                filename,
+            )
+        else:
+            logger.info(
+                "Skill Hub: uploaded skill %r from %r (%d bytes, %d file(s))",
+                skill_name,
+                filename,
+                len(data),
+                len(files),
+            )
+        # Personal bundles were parsed before the durable write, so their
+        # authoritative response does not need a fallible manager/provider
+        # readback after commit. Returning the same validated bytes also makes
+        # an identical retry safe when the first response was lost.
+        return _personal_summary_from_bundle(name=skill_name, files=files)
 
     mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(skill_name)

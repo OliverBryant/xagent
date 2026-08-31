@@ -95,19 +95,17 @@ export default function NewSkillPage() {
       form.append("file", file);
       // Let the typed name win over whatever the archive happens to be
       // called; the backend refuses one it would have to rewrite.
-      const typedName = name.trim();
+      const typedName = name;
       if (typedName.length > 0) form.append("name", typedName);
       // No Content-Type header: the browser must set the multipart boundary
       // itself, so passing FormData to apiRequest directly is deliberate.
-      // No transport retry: this POST is durable and keyed by skill name. If
-      // it commits and the response is lost, a replay hits the 409 duplicate
-      // check and the page would report a failure for a skill that exists.
-      // One clear network error beats a false negative on a successful write.
-      const res = await apiRequest(
-        `${apiBase}/api/skill-hub/upload`,
-        { method: "POST", body: form },
-        { maxRetries: 0 },
-      );
+      // The backend reconciles an identical owner/name/content replay, so a
+      // response lost after commit can be retried without turning success
+      // into a duplicate-name failure.
+      const res = await apiRequest(`${apiBase}/api/skill-hub/upload`, {
+        method: "POST",
+        body: form,
+      });
       const parsed = await parseApiResponse(res);
       if (!res.ok) {
         // Shared helper rather than reading `detail` by hand: it also covers
@@ -254,7 +252,6 @@ export default function NewSkillPage() {
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="my-skill"
-            maxLength={NAME_MAX}
             disabled={busy}
             className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-60"
           />

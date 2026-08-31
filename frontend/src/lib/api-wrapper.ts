@@ -36,7 +36,7 @@ function shouldSkipRefresh(url: string): boolean {
     return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => parsed.pathname.endsWith(endpoint))
   } catch { return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => url.includes(endpoint)) }
 }
-async function fetchWithRetry(url: string, options: RequestInit, maxRetries: number = 2): Promise<Response> {
+async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
   let lastError: Error | null = null
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -147,24 +147,11 @@ export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): 
 function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
-/**
- * A request has at most one post-401 replay, bound to an exact immutable credential snapshot.
- *
- * ``maxRetries`` opts a caller out of the transport retry. The default of 2 is
- * safe for idempotent reads, but replaying a durable mutation is not: if the
- * request commits and only the *response* is lost, the retry re-sends it and
- * the second attempt hits the server's duplicate check, so the page reports a
- * failure for a write that actually succeeded. Callers that create something
- * under a unique key pass 0.
- */
-export async function apiRequest(
-  url: string,
-  options: RequestInit = {},
-  { maxRetries }: { maxRetries?: number } = {},
-): Promise<Response> {
+/** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
+export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
   const session = readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
-  const response = await fetchWithRetry(url, withBearer(options, session.accessToken), maxRetries)
+  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {

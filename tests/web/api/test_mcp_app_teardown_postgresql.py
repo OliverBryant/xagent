@@ -9,21 +9,17 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi import HTTPException
-from starlette.requests import Request
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
+from starlette.requests import Request
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
-from xagent.web.models.mcp_oauth import (
-    MCPOAuthClient,
-    MCPOAuthFlowState,
-    MCPOAuthGrant,
-)
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth

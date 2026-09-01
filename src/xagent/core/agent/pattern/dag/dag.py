@@ -1503,6 +1503,8 @@ class DAGPattern(AgentPattern):
         return assessment
 
     def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        language_request = latest_user_text(context, prefer_display=True) or ""
+        output_language = effective_output_language(context)
         latest_messages = [
             {"role": message.role, "content": message.content}
             for message in getattr(context, "messages", [])
@@ -1515,8 +1517,12 @@ class DAGPattern(AgentPattern):
         ]
         payload = {
             "output_language_policy": output_language_directives(
-                effective_output_language(context),
+                output_language,
                 section="completion_assessment",
+                request=language_request,
+            ),
+            "user_authored_language_request": (
+                "" if output_language else language_request
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,

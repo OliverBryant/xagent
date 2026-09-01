@@ -188,7 +188,10 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert "Current user request:" in system_message
     assert "Can you analyze this GitHub project?" in system_message
     assert "Response language rules" in system_message
-    assert "Use the same natural language as the current user request" in system_message
+    assert (
+        "Use the same natural language as the user-authored request above"
+        in system_message
+    )
     assert "Do not let retrieved memories" in system_message
 
 
@@ -712,7 +715,7 @@ def test_dag_step_without_output_language_quotes_the_request_for_language() -> N
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request, quoted for response language only:" in system_content
+    assert "Request-only response language harness:" in system_content
     assert "Crée deux affiches." in system_content
     assert "Response language rules:" in system_content
     assert "Output language:" not in system_content
@@ -744,11 +747,9 @@ def test_dag_step_language_quote_uses_the_typed_message() -> None:
     )
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
-    quote = system_content.split(
-        "Current user request, quoted for response language only:\n"
-    )[1]
+    quote = system_content.split("Request-only response language harness:\n")[1]
 
-    assert quote.startswith(typed)
+    assert typed in quote
     assert "Attached file(s)" not in quote
 
 

@@ -30,7 +30,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
+    request_only_language_harness,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag import dag as dag_module
@@ -5189,7 +5189,7 @@ async def test_polluted_plan_language_is_not_a_hard_policy_for_dag_steps(
         assert "Output language: Simplified Chinese" not in system_content
         assert "Output language:" not in system_content
         assert request in system_content
-        assert response_language_rules() in system_content
+        assert request_only_language_harness(request) in system_content
         step_instruction = [
             message.content
             for message in child.messages

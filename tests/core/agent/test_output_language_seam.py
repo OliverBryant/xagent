@@ -10,6 +10,7 @@ from xagent.core.agent.language import (
     effective_output_language,
     output_language_directives,
     output_language_policy,
+    request_only_language_harness,
     response_language_rules,
 )
 from xagent.core.agent.pattern.dag.dag import DAGPattern
@@ -112,10 +113,12 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
         "plan_payload",
     )
     for section in sections:
-        for label in ("Japanese", ""):
-            assert output_language_directives(
-                label, section=section
-            ) == output_language_policy(label)
+        assert output_language_directives(
+            "Japanese", section=section
+        ) == output_language_policy("Japanese")
+        assert output_language_directives("", section=section) == (
+            request_only_language_harness("")
+        )
 
 
 def test_every_consumer_renders_the_resolved_language() -> None:
@@ -142,8 +145,9 @@ def test_every_consumer_renders_the_resolved_language() -> None:
 
 
 def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
+    request = "Summarize the repository"
     assert (
-        output_language_directives("", section="root_system_context")
+        output_language_directives("", section="root_system_context", request=request)
         in _root_context()._system_context()
     )
     assert (
@@ -153,8 +157,8 @@ def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
     assert output_language_directives(
         "", section="dag_step_instruction"
     ) in _step_instruction(None)
-    assert _completion_policy(None) == output_language_policy("")
-    assert _plan_payload_policy(None) == output_language_policy("")
+    assert _completion_policy(None) == request_only_language_harness(request)
+    assert _plan_payload_policy(None) == request_only_language_harness(request)
 
 
 def test_consumers_normalize_an_aliased_language_label() -> None:

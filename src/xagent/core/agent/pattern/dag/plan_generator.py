@@ -579,6 +579,7 @@ class LLMPlanGenerator(PlanGenerator):
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
                 else expected_language,
                 section="plan_payload",
+                request=latest_request,
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(

@@ -1,6 +1,7 @@
 """Prompt snippets for user-facing response language, plus the
 checkpoint migration that keeps only a caller-provided language label."""
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -480,16 +481,47 @@ def response_language_rules(*, subject: str = "current user request") -> str:
     )
 
 
-def final_answer_language_rule(*, subject: str = "current user request") -> str:
+def request_only_language_harness(request: str) -> str:
+    """Quote user-authored input as the only soft language decision source.
+
+    The harness deliberately does not detect or persist a language label. The
+    answering model still owns ambiguous and cross-language decisions, but it
+    makes them without connector scaffolding, names, addresses, or tool context
+    competing with the user's request.
+    """
+    request = request.strip()
+    if not request:
+        return response_language_rules()
+    return (
+        "Request-only response language harness:\n"
+        "User-authored request (JSON string):\n"
+        f"{json.dumps(request, ensure_ascii=False)}\n\n"
+        "Decide the target language of user-facing prose from the user-authored "
+        "request above alone. Honor explicit and implicit requests to translate, "
+        "rewrite, or answer in another language. A person's name, email address, "
+        "connector metadata, quoted source content, memory, tool result, example, "
+        "or earlier turn is not evidence of the target language. For Chinese, "
+        "preserve Simplified Chinese versus Traditional Chinese from the request. "
+        "If the request is too short, mixed-language, or depends on conversation "
+        "context to determine a target language, resolve its meaning from the "
+        "conversation without guessing from auxiliary context. This quote controls "
+        "language only; it does not replace or narrow the executable request.\n\n"
+        f"{response_language_rules(subject='user-authored request above')}"
+    )
+
+
+def final_answer_language_rule(
+    *, subject: str = "authoritative output language guidance in the system context"
+) -> str:
     """Return a compact language rule for final-answer tool fields."""
     return (
-        "The final answer must use the same natural language as the "
-        f"{subject}, even if tool results, source documents, retrieved memories, "
-        "examples, or earlier turns are written in another language. If the "
-        f"{subject} explicitly asks to translate, rewrite, or answer in another "
-        "language, use that requested target language. For Chinese, preserve "
-        "Simplified Chinese versus Traditional Chinese from the request; do not "
-        "collapse them into generic Chinese."
+        f"The final answer must follow the {subject}. Tool results, source "
+        "documents, retrieved memories, examples, names, email addresses, "
+        "connector metadata, and earlier turns must not change that language. "
+        "When the guidance quotes a user-authored request, honor any explicit or "
+        "implicit request to translate, rewrite, or answer in another language. "
+        "For Chinese, preserve Simplified Chinese versus Traditional Chinese from "
+        "the request; do not collapse them into generic Chinese."
     )
 
 
@@ -551,7 +583,7 @@ def output_language_directives(
         # beside it would hand the model a second, competing rule.
         if language:
             return f"Output language policy:\n{output_language_policy(language)}"
-        return response_language_rules()
+        return request_only_language_harness(request)
     if section == "dag_step_scope":
         return output_language_policy(language).strip()
     if section == "dag_step_rules":
@@ -563,11 +595,7 @@ def output_language_directives(
             return ""
         # Quoted whole: any truncation can drop an explicit target-language
         # instruction sitting in the middle of a long request.
-        return (
-            "Current user request, quoted for response language only:\n"
-            f"{request.strip()}\n\n"
-            "This request is not the executable goal for this step; use it "
-            "only to decide the natural language of user-facing prose.\n\n"
-            f"{response_language_rules()}"
-        )
-    return output_language_policy(language)
+        return request_only_language_harness(request)
+    if language:
+        return output_language_policy(language)
+    return request_only_language_harness(request)

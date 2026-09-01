@@ -17,7 +17,6 @@ from xagent.core.agent.pattern.dag.plan_generator import (
 )
 from xagent.core.agent.pattern.react.react import ReActPattern
 
-
 ENGLISH_REQUEST = "Summarize the latest customer email and draft a concise reply."
 POLLUTED_EXECUTION_REQUEST = (
     f"{ENGLISH_REQUEST}\n\n"

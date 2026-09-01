@@ -12,7 +12,7 @@ import json
 import logging
 import secrets
 import shlex
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
@@ -22,6 +22,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,7 @@ from ..models.mcp_oauth import (
     mcp_oauth_client_registration_lookup_hash,
     mcp_oauth_grant_lookup_hash,
 )
+from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -965,37 +967,59 @@ async def _exchange_mcp_oauth_code(
     return payload
 
 
-async def _revoke_mcp_oauth_grant_externally(
-    *,
-    client: MCPOAuthClient,
-    grant: MCPOAuthGrant,
-) -> None:
-    metadata: dict[str, Any] = (
-        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+@dataclass(frozen=True)
+class _MCPOAuthRevocationSnapshot:
+    grant_id: int
+    metadata: dict[str, Any]
+    client_id: str
+    client_secret: str | None
+    token_endpoint_auth_method: str
+    access_token: str
+    refresh_token: str | None
+
+
+def _mcp_oauth_revocation_snapshot(
+    *, client: MCPOAuthClient, grant: MCPOAuthGrant
+) -> _MCPOAuthRevocationSnapshot:
+    """Capture the encrypted values needed after a teardown commits."""
+    return _MCPOAuthRevocationSnapshot(
+        grant_id=int(grant.id),
+        metadata=(
+            dict(client.metadata_json) if isinstance(client.metadata_json, dict) else {}
+        ),
+        client_id=str(client.client_id),
+        client_secret=(str(client.client_secret) if client.client_secret else None),
+        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
+        access_token=str(grant.access_token),
+        refresh_token=(str(grant.refresh_token) if grant.refresh_token else None),
     )
-    revocation_endpoint = metadata.get("revocation_endpoint")
+
+
+async def _revoke_mcp_oauth_snapshot_externally(
+    snapshot: _MCPOAuthRevocationSnapshot,
+) -> None:
+    revocation_endpoint = snapshot.metadata.get("revocation_endpoint")
     if not isinstance(revocation_endpoint, str) or not revocation_endpoint:
         return
 
     try:
         client_secret = (
-            decrypt_value(str(client.client_secret)) if client.client_secret else ""
+            decrypt_value(snapshot.client_secret) if snapshot.client_secret else ""
         )
-    except Exception as exc:
+    except Exception:
         logger.warning(
             "Skipping MCP OAuth token revocation for grant %s because client secret "
-            "could not be decrypted: %s",
-            grant.id,
-            exc,
+            "could not be decrypted",
+            snapshot.grant_id,
         )
         return
-    auth_method = str(client.token_endpoint_auth_method or "none")
+    auth_method = snapshot.token_endpoint_auth_method
     auth: httpx.Auth | None = None
-    base_data: dict[str, str] = {"client_id": str(client.client_id)}
+    base_data: dict[str, str] = {"client_id": snapshot.client_id}
     if auth_method == "client_secret_post" and client_secret:
         base_data["client_secret"] = client_secret
     elif auth_method == "client_secret_basic" and client_secret:
-        auth = httpx.BasicAuth(str(client.client_id), client_secret)
+        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
     elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
         logger.warning(
             "Skipping MCP OAuth token revocation for unsupported auth method %s",
@@ -1004,8 +1028,8 @@ async def _revoke_mcp_oauth_grant_externally(
         return
 
     encrypted_tokens = (
-        (grant.access_token, "access_token"),
-        (grant.refresh_token, "refresh_token"),
+        (snapshot.access_token, "access_token"),
+        (snapshot.refresh_token, "refresh_token"),
     )
     async with create_mcp_oauth_http_client(
         timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -1015,13 +1039,12 @@ async def _revoke_mcp_oauth_grant_externally(
                 continue
             try:
                 decrypted_token = decrypt_value(str(encrypted_token))
-            except Exception as exc:
+            except Exception:
                 logger.warning(
                     "Skipping MCP OAuth %s revocation for grant %s because token "
-                    "could not be decrypted: %s",
+                    "could not be decrypted",
                     token_type_hint,
-                    grant.id,
-                    exc,
+                    snapshot.grant_id,
                 )
                 continue
             data = {
@@ -1045,14 +1068,23 @@ async def _revoke_mcp_oauth_grant_externally(
                     logger.warning(
                         "MCP OAuth token revocation returned HTTP %s for grant %s",
                         response.status_code,
-                        grant.id,
+                        snapshot.grant_id,
                     )
-            except (MCPOAuthDiscoveryError, httpx.HTTPError) as exc:
+            except (MCPOAuthDiscoveryError, httpx.HTTPError):
                 logger.warning(
-                    "MCP OAuth token revocation failed for grant %s: %s",
-                    grant.id,
-                    exc,
+                    "MCP OAuth token revocation failed for grant %s",
+                    snapshot.grant_id,
                 )
+
+
+async def _revoke_mcp_oauth_grant_externally(
+    *,
+    client: MCPOAuthClient,
+    grant: MCPOAuthGrant,
+) -> None:
+    await _revoke_mcp_oauth_snapshot_externally(
+        _mcp_oauth_revocation_snapshot(client=client, grant=grant)
+    )
 
 
 def _upsert_mcp_oauth_grant(
@@ -3528,6 +3560,304 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
             required = (app.get("launch_config") or {}).get("required_env") or []
             return _env_covers_required(env, required)
     return False
+
+
+def _lock_catalog_for_app_teardown(db: Session) -> None:
+    """Serialize catalog ownership changes for one destructive teardown.
+
+    Locking only the expected catalog row is insufficient for legacy MCP
+    servers whose owner is encoded in ``MCPServer.name``: another catalog row
+    can be inserted or renamed onto that name without touching the expected
+    row. PostgreSQL's table-level SHARE lock excludes those catalog writes for
+    the rest of this transaction. SQLite serializes writes at the database
+    level and does not support this statement, so its unit-test path needs no
+    equivalent SQL.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("LOCK TABLE public_mcp_apps IN SHARE MODE"))
+
+
+def _server_belongs_to_exact_catalog_app(
+    db: Session,
+    *,
+    server: MCPServer,
+    app_id: str,
+) -> bool:
+    """Return whether a locked server has one provable catalog owner."""
+    if str(server.transport or "").lower() != "oauth":
+        # Catalog provisioners name non-builtin and remote-MCP-OAuth rows by
+        # exact app id. Their caller-authored auth blob is not an owner stamp.
+        return str(server.name or "") == app_id
+
+    auth = server.auth
+    if isinstance(auth, Mapping) and "app_id" in auth:
+        return auth.get("app_id") == app_id
+
+    # Legacy builtin OAuth rows can be named by exact app id or mutable display
+    # name. Both namespaces are legal, so every matching row must identify the
+    # same owner. The catalog table lock above makes this set stable until
+    # commit; without it a concurrent rename/reassignment is a phantom.
+    server_name = str(server.name or "")
+    owners = {
+        str(candidate.app_id)
+        for candidate in db.query(PublicMCPApp)
+        .filter(
+            (PublicMCPApp.app_id == server_name) | (PublicMCPApp.name == server_name)
+        )
+        .all()
+    }
+    return owners == {app_id}
+
+
+async def teardown_mcp_app_server(
+    server_id: int,
+    *,
+    app_id: str,
+    expected_catalog_app_id: int,
+    current_user: User,
+    db: Session,
+) -> None:
+    """Atomically disconnect one exact catalog app for one user.
+
+    ``expected_catalog_app_id`` is the immutable primary key observed by the
+    caller's catalog preflight. The exact string ``app_id`` alone cannot
+    distinguish that row from a delete-and-recreate using the same public id.
+    Both values are revalidated under catalog/server locks before any local
+    credential, grant, flow, association, or server row is changed.
+
+    A missing association/server is a 404 idempotency race. A missing,
+    replaced, or ambiguous catalog owner is a 403 fail-closed refusal. Other
+    failures are sanitized as 500. All local deletion is committed once, so a
+    failed final server delete rolls every preceding cleanup back for retry.
+    """
+    revocations: list[_MCPOAuthRevocationSnapshot] = []
+    try:
+        user_id = int(current_user.id)
+        if (
+            not isinstance(app_id, str)
+            or not app_id
+            or app_id != app_id.strip()
+            or isinstance(expected_catalog_app_id, bool)
+            or not isinstance(expected_catalog_app_id, int)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="MCP app teardown identity could not be verified",
+            )
+
+        _lock_catalog_for_app_teardown(db)
+        # The SaaS preflight deliberately uses this same Session and may have
+        # materialized catalog/server rows before a concurrent admin commit.
+        # Row/table locks serialize future writes but do not refresh SQLAlchemy's
+        # identity map, so expire it before the locked revalidation reads.
+        db.expire_all()
+        with db.no_autoflush:
+            expected_app = (
+                db.query(PublicMCPApp)
+                .filter(
+                    PublicMCPApp.id == expected_catalog_app_id,
+                    PublicMCPApp.app_id == app_id,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if expected_app is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+            server = (
+                db.query(MCPServer)
+                .filter(MCPServer.id == server_id)
+                .with_for_update()
+                .one_or_none()
+            )
+            if server is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+
+            user_mcp = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == user_id,
+                    UserMCPServer.mcpserver_id == server_id,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if user_mcp is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="MCP server not found",
+                )
+
+            if not _server_belongs_to_exact_catalog_app(
+                db, server=server, app_id=app_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+
+        if not _check_mcp_permission(
+            user_mcp, getattr(current_user, "is_admin", False), require="delete"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to delete this MCP server",
+            )
+
+        from ..services.connector_team_scope import delete_team_connector
+
+        team_delete = delete_team_connector(db, user_id, "mcp", server_id)
+        if team_delete.blocked_reason:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=team_delete.blocked_reason,
+            )
+        if team_delete.team_owned and not team_delete.authorized:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only a team admin can delete a team MCP server",
+            )
+
+        if str(server.transport or "").lower() == "oauth":
+            # The catalog table is locked and the expected row was revalidated,
+            # so this lookup cannot move to a deleted, renamed, or replacement
+            # owner between the gate and credential deletion.
+            app_info = get_app_for_mcp_server(db, server)
+            if app_info is None or app_info.get("id") != app_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="MCP app teardown owner changed",
+                )
+            provider = app_info.get("provider")
+            providers_to_delete = restrict_to_app_scoped_oauth_grant(
+                app_id, [provider, app_id]
+            )
+            if providers_to_delete:
+                delete_scoped_user_oauth_accounts(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                    providers=providers_to_delete,
+                )
+
+            if provider and provider not in providers_to_delete:
+                other_servers = (
+                    db.query(MCPServer)
+                    .join(
+                        UserMCPServer,
+                        UserMCPServer.mcpserver_id == MCPServer.id,
+                    )
+                    .filter(
+                        UserMCPServer.user_id == user_id,
+                        MCPServer.id != server_id,
+                    )
+                    .all()
+                )
+                normalized_provider = _normalize_app_key(provider)
+                sibling_still_connected = any(
+                    (sibling_app := get_app_for_mcp_server(db, other_server))
+                    and _normalize_app_key(sibling_app.get("provider"))
+                    == normalized_provider
+                    for other_server in other_servers
+                )
+                if not sibling_still_connected:
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=None,
+                        providers=[provider],
+                    )
+
+        for grant in (
+            db.query(MCPOAuthGrant)
+            .filter(
+                MCPOAuthGrant.mcp_server_id == server_id,
+                MCPOAuthGrant.user_id == user_id,
+                MCPOAuthGrant.status == "active",
+            )
+            .with_for_update()
+            .all()
+        ):
+            if isinstance(grant.oauth_client, MCPOAuthClient):
+                revocations.append(
+                    _mcp_oauth_revocation_snapshot(
+                        client=grant.oauth_client, grant=grant
+                    )
+                )
+            db.delete(grant)
+
+        (
+            db.query(MCPOAuthFlowState)
+            .filter(
+                MCPOAuthFlowState.mcp_server_id == server_id,
+                MCPOAuthFlowState.user_id == user_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.delete(user_mcp)
+        db.flush()
+
+        other_users = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == server_id)
+            .with_for_update()
+            .first()
+        )
+        if other_users is None:
+            if team_delete.team_owned and not team_delete.delete_definition:
+                logger.info(
+                    "Kept team-owned MCP server %s after app teardown", server_id
+                )
+            elif _catalog_server_has_platform_key(db, server):
+                logger.info(
+                    "Kept platform-key MCP server %s after app teardown", server_id
+                )
+            else:
+                # Delete the locked identity directly. Database FK cascades
+                # remove MCP OAuth clients (including client_secret), grants,
+                # flows, and associations in this same transaction.
+                db.delete(server)
+
+        db.commit()
+        # Network revocation is deliberately outside the locked transaction.
+        # It is best-effort, just like the generic teardown, while the local
+        # encrypted grant/client material is already durably gone. A provider
+        # timeout therefore cannot hold catalog/server locks or turn a complete
+        # local teardown back into a retryable partial commit.
+        for revocation in revocations:
+            try:
+                await _revoke_mcp_oauth_snapshot_externally(revocation)
+            except Exception:
+                logger.warning(
+                    "MCP OAuth token revocation failed after teardown for grant %s",
+                    revocation.grant_id,
+                )
+        logger.info(
+            "Completed app-scoped MCP teardown for app %r, server %s, user %s",
+            app_id,
+            server_id,
+            user_id,
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.error(
+            "App-scoped MCP teardown failed for app %r, server %s",
+            app_id,
+            server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete MCP server",
+        ) from None
 
 
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)

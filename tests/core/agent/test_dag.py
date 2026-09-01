@@ -623,14 +623,18 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
     completion_messages = llm.stream_calls[1]["messages"]
     assert (
-        "same natural language as the output language policy"
+        "The final answer must follow the output language policy"
         in completion_messages[0]["content"]
     )
     completion_payload = json.loads(completion_messages[-1]["content"])
-    assert "output_language_policy" in completion_payload
+    request = "Answer through DAG"
+    assert completion_payload["user_authored_language_request"] == request
+    assert completion_payload["output_language_policy"] == (
+        request_only_language_harness(request)
+    )
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "connector metadata" in answer_schema["description"]
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
@@ -1065,7 +1069,7 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert "Overall user goal is background context only" in messages[0]["content"]
     assert "Output language policy" in messages[0]["content"]
     assert (
-        "Current user request, quoted for response language only:"
+        request_only_language_harness("Extract highlights and generate two posters.")
         in messages[0]["content"]
     )
     assert "Extract highlights and generate two posters." in messages[0]["content"]
@@ -5289,7 +5293,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
         if message.metadata.get("kind") == "dag_step_instruction"
     )
     assert "Output language: Simplified Chinese" not in instruction
-    assert "Use the same natural language as the current user request" in instruction
+    assert request_only_language_harness("") in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

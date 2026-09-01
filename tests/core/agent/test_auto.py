@@ -857,10 +857,11 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-        "same natural language as the current user request"
+        "authoritative output language guidance in the system context"
         in tool_schema["description"]
     )
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "connector metadata" in answer_schema["description"]
+    assert request_only_language_harness("hi") in llm.calls[0]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio

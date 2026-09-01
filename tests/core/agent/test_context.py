@@ -698,9 +698,7 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert "Output language: English" in system_content
     # A caller-pinned language is authoritative; the soft request quote would
     # contradict it.
-    assert "Current user request, quoted for response language only:" not in (
-        system_content
-    )
+    assert "Request-only response language harness:" not in system_content
     assert "Create two posters." not in system_content
     assert "Only execute the current DAG step" in system_content
     assert [message["role"] for message in result].count("system") == 1

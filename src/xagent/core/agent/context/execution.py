@@ -42,6 +42,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    display_message_override,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
@@ -518,22 +519,24 @@ class ExecutionContext:
     def _current_user_request_text(self, *, prefer_display: bool = False) -> str:
         """Return the current request text.
 
-        ``prefer_display`` yields the user-typed message instead of the
-        execution prompt, whose appended file-reference block is fixed English
-        and would otherwise decide the language of a short foreign request.
+        ``prefer_display`` yields a present string ``display_message``, including
+        an intentionally empty one, instead of the execution prompt. Missing and
+        legacy non-string values fall back to content. This keeps appended file
+        or connector context from deciding the response language.
         """
         for message in reversed(self.messages):
             if message.hidden or message.role != "user":
                 continue
-            if message.metadata.get("response_to_waiting_for_user"):
+            metadata = message.metadata if isinstance(message.metadata, dict) else {}
+            if metadata.get("response_to_waiting_for_user"):
                 continue
             # A DAG child context copies the root messages and then appends step
             # scaffolding; only the root request may anchor the response language.
-            if message.metadata.get("dag_step_id"):
+            if metadata.get("dag_step_id"):
                 continue
             if prefer_display:
-                display = str(message.metadata.get("display_message") or "").strip()
-                if display:
+                display = display_message_override(metadata)
+                if display is not None:
                     return display
             content = str(message.content or "").strip()
             if content:

@@ -110,23 +110,35 @@ def build_skill_context(skill: dict[str, Any]) -> str:
     return f"## Available Skill: {name}\n\n{content}".strip()
 
 
+def display_message_override(metadata: Any) -> str | None:
+    """Return a supported display-message override, including an empty one.
+
+    Missing keys and legacy non-string values keep the execution-content
+    fallback. A present string is authoritative after trimming, so file-only
+    turns with an intentionally blank display message do not expose augmented
+    connector or attachment text as user-authored language evidence.
+    """
+    if not isinstance(metadata, dict) or "display_message" not in metadata:
+        return None
+    display = metadata["display_message"]
+    if not isinstance(display, str):
+        return None
+    return display.strip()
+
+
 def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:
     """Return the latest user turn's text.
 
-    ``prefer_display`` returns what the user actually typed instead of the
-    runtime-augmented execution prompt; language anchors must use it, work
-    anchors must not.
+    ``prefer_display`` returns a present string ``display_message`` (including
+    an intentionally empty one) instead of the runtime-augmented execution
+    prompt. Missing and legacy non-string values fall back to content. Language
+    anchors must prefer display text; work anchors must not.
     """
     for message in reversed(getattr(context, "messages", []) or []):
         if getattr(message, "role", None) == "user":
             if prefer_display:
-                metadata = getattr(message, "metadata", None)
-                display = (
-                    metadata.get("display_message")
-                    if isinstance(metadata, dict)
-                    else None
-                )
-                if isinstance(display, str) and display.strip():
+                display = display_message_override(getattr(message, "metadata", None))
+                if display is not None:
                     return display
             return str(getattr(message, "content", "") or "")
     task = context.metadata.get("task") if hasattr(context, "metadata") else None

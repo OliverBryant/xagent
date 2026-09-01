@@ -11,7 +11,6 @@ from xagent.core.agent.language import (
     output_language_directives,
     output_language_policy,
     request_only_language_harness,
-    response_language_rules,
 )
 from xagent.core.agent.pattern.dag.dag import DAGPattern
 from xagent.core.agent.pattern.dag.plan_generator import (
@@ -91,10 +90,9 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     assert output_language_directives("Japanese", section="root_system_context") == (
         f"Output language policy:\n{output_language_policy('Japanese')}"
     )
-    assert (
-        output_language_directives("", section="root_system_context")
-        == response_language_rules()
-    )
+    assert output_language_directives(
+        "", section="root_system_context"
+    ) == request_only_language_harness("")
     assert (
         output_language_directives("Japanese", section="dag_step_scope")
         == output_language_policy("Japanese").strip()
@@ -116,9 +114,15 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
         assert output_language_directives(
             "Japanese", section=section
         ) == output_language_policy("Japanese")
-        assert output_language_directives("", section=section) == (
-            request_only_language_harness("")
-        )
+    assert output_language_directives(
+        "", section="dag_step_instruction"
+    ) == request_only_language_harness("")
+    assert "`user_authored_language_request` field" in output_language_directives(
+        "", section="completion_assessment"
+    )
+    assert "`latest_user_request` field" in output_language_directives(
+        "", section="plan_payload"
+    )
 
 
 def test_every_consumer_renders_the_resolved_language() -> None:
@@ -157,8 +161,10 @@ def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
     assert output_language_directives(
         "", section="dag_step_instruction"
     ) in _step_instruction(None)
-    assert _completion_policy(None) == request_only_language_harness(request)
-    assert _plan_payload_policy(None) == request_only_language_harness(request)
+    assert "`user_authored_language_request` field" in _completion_policy(None)
+    assert request not in _completion_policy(None)
+    assert "`latest_user_request` field" in _plan_payload_policy(None)
+    assert request not in _plan_payload_policy(None)
 
 
 def test_consumers_normalize_an_aliased_language_label() -> None:

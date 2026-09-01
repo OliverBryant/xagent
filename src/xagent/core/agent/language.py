@@ -490,8 +490,6 @@ def request_only_language_harness(request: str) -> str:
     competing with the user's request.
     """
     request = request.strip()
-    if not request:
-        return response_language_rules()
     return (
         "Request-only response language harness:\n"
         "User-authored request (JSON string):\n"
@@ -507,6 +505,24 @@ def request_only_language_harness(request: str) -> str:
         "conversation without guessing from auxiliary context. This quote controls "
         "language only; it does not replace or narrow the executable request.\n\n"
         f"{response_language_rules(subject='user-authored request above')}"
+    )
+
+
+def _structured_request_language_policy(request_field: str) -> str:
+    """Reference one structured request field without duplicating its value."""
+    subject = f"the `{request_field}` field"
+    return (
+        "Request-only response language policy: Decide the target language of "
+        f"user-facing prose from {subject} alone. Honor explicit and implicit "
+        "requests to translate, rewrite, or answer in another language. Names, "
+        "email addresses, connector metadata, quoted source content, memory, tool "
+        "results, examples, and earlier turns are not language evidence. If the "
+        "field is empty, too short, mixed-language, or depends on conversation "
+        "context, resolve its meaning from the conversation without guessing from "
+        "auxiliary context. For Chinese, preserve Simplified Chinese versus "
+        "Traditional Chinese from the field. This policy controls language only; "
+        "it does not replace or narrow the executable request.\n\n"
+        f"{response_language_rules(subject=subject)}"
     )
 
 
@@ -598,4 +614,8 @@ def output_language_directives(
         return request_only_language_harness(request)
     if language:
         return output_language_policy(language)
+    if section == "plan_payload":
+        return _structured_request_language_policy("latest_user_request")
+    if section == "completion_assessment":
+        return _structured_request_language_policy("user_authored_language_request")
     return request_only_language_harness(request)

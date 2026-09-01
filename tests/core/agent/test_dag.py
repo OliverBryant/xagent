@@ -629,9 +629,11 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     completion_payload = json.loads(completion_messages[-1]["content"])
     request = "Answer through DAG"
     assert completion_payload["user_authored_language_request"] == request
-    assert completion_payload["output_language_policy"] == (
-        request_only_language_harness(request)
+    assert (
+        "`user_authored_language_request` field"
+        in completion_payload["output_language_policy"]
     )
+    assert request not in completion_payload["output_language_policy"]
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
     assert "connector metadata" in answer_schema["description"]

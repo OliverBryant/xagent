@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -199,6 +200,7 @@ async def test_builtin_oauth_teardown_deletes_exact_credential_and_last_server(
         server_id,
         app_id="calendar",
         expected_catalog_app_id=app_pk,
+        expected_provider_name="custom-calendar",
         current_user=user,
         db=db,
     )
@@ -234,6 +236,7 @@ async def test_remote_oauth_last_user_cascades_client_secret_grant_and_flow(
         server_id,
         app_id="remote-notes",
         expected_catalog_app_id=app_pk,
+        expected_provider_name=None,
         current_user=user,
         db=db,
     )
@@ -267,6 +270,7 @@ async def test_final_server_delete_failure_rolls_back_every_cleanup_for_retry(
                 server_id,
                 app_id="remote-notes",
                 expected_catalog_app_id=app_pk,
+                expected_provider_name=None,
                 current_user=user,
                 db=db,
             )
@@ -288,6 +292,7 @@ async def test_final_server_delete_failure_rolls_back_every_cleanup_for_retry(
             server_id,
             app_id="remote-notes",
             expected_catalog_app_id=app_pk,
+            expected_provider_name=None,
             current_user=user,
             db=db,
         )
@@ -349,6 +354,7 @@ async def test_recreated_catalog_owner_fails_closed_before_cleanup(db: Session) 
             server_id,
             app_id="legacy-mail",
             expected_catalog_app_id=expected_pk,
+            expected_provider_name="legacy-provider",
             current_user=user,
             db=db,
         )
@@ -357,3 +363,175 @@ async def test_recreated_catalog_owner_fails_closed_before_cleanup(db: Session) 
     assert db.get(MCPServer, server_id) is not None
     assert db.query(UserMCPServer).count() == 1
     assert db.query(UserOAuth).filter_by(provider="legacy-provider").count() == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_drift_fails_closed_before_cleanup(db: Session) -> None:
+    user = _user(db)
+    app = _app(
+        db,
+        app_id="calendar",
+        name="Calendar",
+        transport="oauth",
+        provider="original-provider",
+    )
+    server = MCPServer(
+        name="Calendar",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "calendar", "provider": "original-provider"},
+    )
+    db.add(server)
+    db.flush()
+    _associate(db, user=user, server=server)
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="original-provider",
+                access_token=encrypt_value("original-secret"),
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="replacement-provider",
+                access_token=encrypt_value("replacement-secret"),
+            ),
+        ]
+    )
+    db.commit()
+    app_pk, server_id = int(app.id), int(server.id)
+
+    app.provider_name = "replacement-provider"
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await mcp_api.teardown_mcp_app_server(
+            server_id,
+            app_id="calendar",
+            expected_catalog_app_id=app_pk,
+            expected_provider_name="original-provider",
+            current_user=user,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert db.get(MCPServer, server_id) is not None
+    assert db.query(UserMCPServer).count() == 1
+    assert {row.provider for row in db.query(UserOAuth).all()} == {
+        "original-provider",
+        "replacement-provider",
+    }
+
+
+@pytest.mark.asyncio
+async def test_multi_user_teardown_deletes_all_current_user_grant_statuses(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _user(db)
+    other_user = _user(db, "other-account")
+    app, server, client = _remote_oauth_state(db, user=user)
+    app_pk, server_id = int(app.id), int(server.id)
+    _associate(db, user=other_user, server=server)
+    db.add_all(
+        [
+            MCPOAuthGrant(
+                mcp_server_id=server_id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"xagent:user:{user.id}",
+                issuer="https://auth.example",
+                resource="https://mcp.example/mcp",
+                scope="notes.revoked",
+                access_token=encrypt_value("revoked-access-token"),
+                refresh_token=encrypt_value("revoked-refresh-token"),
+                status="revoked",
+            ),
+            MCPOAuthGrant(
+                mcp_server_id=server_id,
+                user_id=user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"xagent:user:{user.id}",
+                issuer="https://auth.example",
+                resource="https://mcp.example/mcp",
+                scope="notes.inactive",
+                access_token=encrypt_value("inactive-access-token"),
+                refresh_token=encrypt_value("inactive-refresh-token"),
+                status="inactive",
+            ),
+            MCPOAuthGrant(
+                mcp_server_id=server_id,
+                user_id=other_user.id,
+                mcp_oauth_client_id=client.id,
+                resource_owner_key=f"xagent:user:{other_user.id}",
+                issuer="https://auth.example",
+                resource="https://mcp.example/mcp",
+                scope="notes.read",
+                access_token=encrypt_value("other-access-token"),
+                refresh_token=encrypt_value("other-refresh-token"),
+                status="active",
+            ),
+        ]
+    )
+    db.commit()
+    active_grant_id = int(
+        db.query(MCPOAuthGrant.id).filter_by(user_id=user.id, status="active").scalar()
+    )
+    revoked_grant_ids: list[int] = []
+
+    async def observe_revoke(snapshot) -> None:
+        revoked_grant_ids.append(snapshot.grant_id)
+
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_snapshot_externally", observe_revoke
+    )
+
+    await mcp_api.teardown_mcp_app_server(
+        server_id,
+        app_id="remote-notes",
+        expected_catalog_app_id=app_pk,
+        expected_provider_name=None,
+        current_user=user,
+        db=db,
+    )
+
+    assert revoked_grant_ids == [active_grant_id]
+    assert db.get(MCPServer, server_id) is not None
+    assert db.get(MCPOAuthClient, int(client.id)) is not None
+    assert db.query(MCPOAuthGrant).filter_by(user_id=user.id).count() == 0
+    assert db.query(MCPOAuthGrant).filter_by(user_id=other_user.id).count() == 1
+    assert db.query(MCPOAuthFlowState).filter_by(user_id=user.id).count() == 0
+    assert db.query(UserMCPServer).filter_by(user_id=user.id).count() == 0
+    assert db.query(UserMCPServer).filter_by(user_id=other_user.id).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_unexpected_teardown_failure_logs_no_exception_detail(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user = _user(db)
+    db.commit()
+    secret_detail = "raw upstream detail access_token=audit-secret"
+
+    def fail_lock(_db: Session) -> None:
+        raise RuntimeError(secret_detail)
+
+    monkeypatch.setattr(mcp_api, "_lock_catalog_for_app_teardown", fail_lock)
+    with caplog.at_level(logging.ERROR, logger=mcp_api.logger.name):
+        with pytest.raises(HTTPException) as exc_info:
+            await mcp_api.teardown_mcp_app_server(
+                42,
+                app_id="safe-app-id",
+                expected_catalog_app_id=7,
+                expected_provider_name=None,
+                current_user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "Failed to delete MCP server"
+    assert "safe-app-id" in caplog.text
+    assert "server 42" in caplog.text
+    assert secret_detail not in caplog.text
+    assert "audit-secret" not in caplog.text

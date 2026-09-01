@@ -3577,21 +3577,22 @@ def _lock_catalog_for_app_teardown(db: Session) -> None:
         db.execute(text("LOCK TABLE public_mcp_apps IN SHARE MODE"))
 
 
-def _server_belongs_to_exact_catalog_app(
+def _locked_catalog_app_for_server(
     db: Session,
     *,
     server: MCPServer,
-    app_id: str,
-) -> bool:
-    """Return whether a locked server has one provable catalog owner."""
+    expected_app: PublicMCPApp,
+) -> PublicMCPApp | None:
+    """Return the locked catalog row when the server has that exact owner."""
+    app_id = str(expected_app.app_id)
     if str(server.transport or "").lower() != "oauth":
         # Catalog provisioners name non-builtin and remote-MCP-OAuth rows by
         # exact app id. Their caller-authored auth blob is not an owner stamp.
-        return str(server.name or "") == app_id
+        return expected_app if str(server.name or "") == app_id else None
 
     auth = server.auth
     if isinstance(auth, Mapping) and "app_id" in auth:
-        return auth.get("app_id") == app_id
+        return expected_app if auth.get("app_id") == app_id else None
 
     # Legacy builtin OAuth rows can be named by exact app id or mutable display
     # name. Both namespaces are legal, so every matching row must identify the
@@ -3606,7 +3607,7 @@ def _server_belongs_to_exact_catalog_app(
         )
         .all()
     }
-    return owners == {app_id}
+    return expected_app if owners == {app_id} else None
 
 
 async def teardown_mcp_app_server(
@@ -3614,6 +3615,7 @@ async def teardown_mcp_app_server(
     *,
     app_id: str,
     expected_catalog_app_id: int,
+    expected_provider_name: str | None,
     current_user: User,
     db: Session,
 ) -> None:
@@ -3622,7 +3624,9 @@ async def teardown_mcp_app_server(
     ``expected_catalog_app_id`` is the immutable primary key observed by the
     caller's catalog preflight. The exact string ``app_id`` alone cannot
     distinguish that row from a delete-and-recreate using the same public id.
-    Both values are revalidated under catalog/server locks before any local
+    The caller must also pin the catalog row's exact ``provider_name`` because
+    that mutable value selects which user credential is deleted. All three
+    values are revalidated under catalog/server locks before any local
     credential, grant, flow, association, or server row is changed.
 
     A missing association/server is a 404 idempotency race. A missing,
@@ -3639,6 +3643,10 @@ async def teardown_mcp_app_server(
             or app_id != app_id.strip()
             or isinstance(expected_catalog_app_id, bool)
             or not isinstance(expected_catalog_app_id, int)
+            or (
+                expected_provider_name is not None
+                and not isinstance(expected_provider_name, str)
+            )
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -3657,6 +3665,7 @@ async def teardown_mcp_app_server(
                 .filter(
                     PublicMCPApp.id == expected_catalog_app_id,
                     PublicMCPApp.app_id == app_id,
+                    PublicMCPApp.provider_name == expected_provider_name,
                 )
                 .with_for_update()
                 .one_or_none()
@@ -3694,9 +3703,10 @@ async def teardown_mcp_app_server(
                     detail="MCP server not found",
                 )
 
-            if not _server_belongs_to_exact_catalog_app(
-                db, server=server, app_id=app_id
-            ):
+            validated_app = _locked_catalog_app_for_server(
+                db, server=server, expected_app=expected_app
+            )
+            if validated_app is None:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="MCP app teardown owner changed",
@@ -3725,16 +3735,10 @@ async def teardown_mcp_app_server(
             )
 
         if str(server.transport or "").lower() == "oauth":
-            # The catalog table is locked and the expected row was revalidated,
-            # so this lookup cannot move to a deleted, renamed, or replacement
-            # owner between the gate and credential deletion.
-            app_info = get_app_for_mcp_server(db, server)
-            if app_info is None or app_info.get("id") != app_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="MCP app teardown owner changed",
-                )
-            provider = app_info.get("provider")
+            # Use the row revalidated under the catalog/server locks above.
+            # Calling the generic resolver again would re-read mutable catalog
+            # state and could select a provider different from the preflight.
+            provider = validated_app.provider_name
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
                 app_id, [provider, app_id]
             )
@@ -3779,12 +3783,13 @@ async def teardown_mcp_app_server(
             .filter(
                 MCPOAuthGrant.mcp_server_id == server_id,
                 MCPOAuthGrant.user_id == user_id,
-                MCPOAuthGrant.status == "active",
             )
             .with_for_update()
             .all()
         ):
-            if isinstance(grant.oauth_client, MCPOAuthClient):
+            if str(grant.status) == "active" and isinstance(
+                grant.oauth_client, MCPOAuthClient
+            ):
                 revocations.append(
                     _mcp_oauth_revocation_snapshot(
                         client=grant.oauth_client, grant=grant

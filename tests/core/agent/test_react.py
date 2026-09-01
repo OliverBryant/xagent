@@ -23,7 +23,7 @@ from xagent.core.agent import (
     ToolCallRecord,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
-from xagent.core.agent.language import request_only_language_harness
+from xagent.core.agent.language import output_language_directives
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
@@ -4052,7 +4052,9 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         in final_answer_schema["description"]
     )
     assert "connector metadata" in final_answer_schema["description"]
-    assert request_only_language_harness("Say hi") in system_prompt
+    assert (
+        output_language_directives("", section="root_existing_request") in system_prompt
+    )
     assert (
         "Call this tool alone: never place it in the same response as any "
         "other tool call" in final_answer_schema["description"]

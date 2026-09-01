@@ -113,10 +113,11 @@ def build_skill_context(skill: dict[str, Any]) -> str:
 def display_message_override(metadata: Any) -> str | None:
     """Return a supported display-message override, including an empty one.
 
-    Missing keys and legacy non-string values keep the execution-content
-    fallback. A present string is authoritative after trimming, so file-only
-    turns with an intentionally blank display message do not expose augmented
-    connector or attachment text as user-authored language evidence.
+    Missing keys and non-string values in directly constructed or restored
+    contexts keep the execution-content fallback. The production runner
+    normalizes a present non-string value to an authoritative empty string before
+    this helper. Any present string is authoritative after trimming, so file-only
+    turns do not expose augmented connector or attachment text as language evidence.
     """
     if not isinstance(metadata, dict) or "display_message" not in metadata:
         return None
@@ -131,8 +132,9 @@ def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:
 
     ``prefer_display`` returns a present string ``display_message`` (including
     an intentionally empty one) instead of the runtime-augmented execution
-    prompt. Missing and legacy non-string values fall back to content. Language
-    anchors must prefer display text; work anchors must not.
+    prompt. Missing values, plus non-string values in direct/restored contexts,
+    fall back to content. Language anchors must prefer display text; work anchors
+    must not.
     """
     for message in reversed(getattr(context, "messages", []) or []):
         if getattr(message, "role", None) == "user":

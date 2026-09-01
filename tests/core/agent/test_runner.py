@@ -19,6 +19,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.enrichment import latest_user_text
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -1643,6 +1644,29 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     )
     assert user_event["data"]["message"] == "Read file"
     assert user_event["data"]["turn_id"] == turn_id
+
+
+@pytest.mark.parametrize("display_message", [None, 17], ids=["null", "non-string"])
+def test_runner_normalizes_unsupported_display_values_to_authoritative_empty(
+    tmp_path: Path,
+    display_message: object,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[FakePattern({"success": True})]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(
+        execution_id="exec-display-normalization",
+        metadata={"request_context": {"display_message": display_message}},
+    )
+
+    metadata = runner._initial_user_message_metadata(context)
+    context.add_user_message(
+        "Connector context: responder en español.", metadata=metadata
+    )
+
+    assert metadata["display_message"] == ""
+    assert latest_user_text(context, prefer_display=True) == ""
 
 
 @pytest.mark.asyncio

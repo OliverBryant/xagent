@@ -1521,8 +1521,10 @@ class DAGPattern(AgentPattern):
                 section="completion_assessment",
                 request=language_request,
             ),
-            "user_authored_language_request": (
-                "" if output_language else language_request
+            **(
+                {}
+                if output_language
+                else {"user_authored_language_request": language_request}
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,

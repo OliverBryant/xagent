@@ -549,10 +549,15 @@ class ExecutionContext:
         current_task = self._current_user_request_text()
         output_language = effective_output_language(self)
         if current_task and not dag_step_id:
+            language_request = self._current_user_request_text(prefer_display=True)
             language_directives = output_language_directives(
                 output_language,
-                section="root_system_context",
-                request=self._current_user_request_text(prefer_display=True),
+                section=(
+                    "root_existing_request"
+                    if not output_language and language_request == current_task
+                    else "root_system_context"
+                ),
+                request=language_request,
             )
             parts.append(
                 "Current user request:\n"

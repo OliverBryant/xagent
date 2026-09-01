@@ -189,7 +189,7 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert "Can you analyze this GitHub project?" in system_message
     assert "Response language rules" in system_message
     assert (
-        "Use the same natural language as the user-authored request above"
+        "Use the same natural language as the current user request above"
         in system_message
     )
     assert "Do not let retrieved memories" in system_message
@@ -745,9 +745,9 @@ def test_dag_step_language_quote_uses_the_typed_message() -> None:
     )
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
-    quote = system_content.split("Request-only response language harness:\n")[1]
+    quote = system_content.split("User-authored request (JSON string):\n", 1)[1]
 
-    assert typed in quote
+    assert quote.startswith(json.dumps(typed, ensure_ascii=False))
     assert "Attached file(s)" not in quote
 
 

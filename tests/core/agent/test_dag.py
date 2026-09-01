@@ -5202,6 +5202,9 @@ async def test_polluted_plan_language_is_not_a_hard_policy_for_dag_steps(
             if message.metadata.get("kind") == "dag_step_instruction"
         ][0]
         assert "Output language: Simplified Chinese" not in step_instruction
+        assert "authoritative request-language guidance" in step_instruction
+        assert request_only_language_harness("") not in step_instruction
+        assert request not in step_instruction
     completion_payload = json.loads(llm.seen_messages[-1][-1]["content"])
     completion_policy = completion_payload["output_language_policy"]
     assert "Output language: Simplified Chinese" not in completion_policy
@@ -5252,13 +5255,21 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     step = PlanStep(id="write", task="Write the summary")
     pattern = DAGPattern(lambda **_: build_plan(step))
     pattern.plan = build_plan(step)
+    request = "Summarize the release notes."
 
     legacy_root = ExecutionContext(execution_id="dag-restored-language-legacy")
     legacy_root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    legacy_root.add_user_message(request)
     stale_instruction = pattern._step_instruction(root_context=legacy_root, step=step)
     assert "Output language: Simplified Chinese" in stale_instruction
 
-    child_context = ExecutionContext(execution_id="dag-restored-language:write")
+    child_context = legacy_root.create_child_context(
+        metadata={
+            "dag_step_id": "write",
+            "dag_step_name": step.task,
+            "dag_step_description": step.task,
+        }
+    )
     child_context.add_user_message(
         stale_instruction,
         metadata={"kind": "dag_step_instruction", "dag_step_id": "write"},
@@ -5279,7 +5290,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     monkeypatch.setattr(dag_module, "ReActPattern", CapturingReActPattern)
 
     root_context = ExecutionContext(execution_id="dag-restored-language")
-    root_context.add_user_message("Summarize the release notes.")
+    root_context.add_user_message(request)
     await pattern._execute_step_impl(
         step=step,
         root_context=root_context,
@@ -5295,7 +5306,9 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
         if message.metadata.get("kind") == "dag_step_instruction"
     )
     assert "Output language: Simplified Chinese" not in instruction
-    assert request_only_language_harness("") in instruction
+    assert "authoritative request-language guidance" in instruction
+    assert request_only_language_harness("") not in instruction
+    assert request not in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

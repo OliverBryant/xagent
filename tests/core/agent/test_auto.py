@@ -25,7 +25,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    request_only_language_harness,
+    output_language_directives,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -861,7 +861,10 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
         in tool_schema["description"]
     )
     assert "connector metadata" in answer_schema["description"]
-    assert request_only_language_harness("hi") in llm.calls[0]["messages"][0]["content"]
+    assert (
+        output_language_directives("", section="root_existing_request")
+        in llm.calls[0]["messages"][0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -2295,10 +2298,7 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert "Output language policy:" not in child_system
     assert "Summarize the quarterly revenue trend in one paragraph." in child_system
     assert (
-        request_only_language_harness(
-            "Summarize the quarterly revenue trend in one paragraph."
-        )
-        in child_system
+        output_language_directives("", section="root_existing_request") in child_system
     )
 
 
@@ -2325,15 +2325,18 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert result["success"] is True
     assert result["output"] == "La capitale de l'Italie est Rome."
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    target_rule = "honor any explicit or implicit request to translate"
+    target_rule = "Honor any explicit or implicit request to translate"
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert target_rule in tool_schema["description"]
     assert (
         target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
     )
     system_content = context.get_messages_for_llm()[0]["content"]
-    assert request in system_content
-    assert request_only_language_harness(request) in system_content
+    assert system_content.count(request) == 1
+    assert (
+        output_language_directives("", section="root_existing_request")
+        in system_content
+    )
 
 
 class RoutedDecisionLLM:

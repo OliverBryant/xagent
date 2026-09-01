@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from xagent.core.utils.encryption import encrypt_value
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import mcp as mcp_api
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -535,3 +539,204 @@ async def test_unexpected_teardown_failure_logs_no_exception_detail(
     assert "server 42" in caplog.text
     assert secret_detail not in caplog.text
     assert "audit-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_sqlite_teardown_rejects_without_discarding_caller_writes(
+    db: Session,
+) -> None:
+    user = _user(db)
+    app = _app(
+        db,
+        app_id="calendar",
+        name="Calendar",
+        transport="oauth",
+        provider="calendar-provider",
+    )
+    server = MCPServer(
+        name="Calendar",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "calendar", "provider": "calendar-provider"},
+    )
+    db.add(server)
+    db.flush()
+    _associate(db, user=user, server=server)
+    db.commit()
+    db.refresh(user)
+    app_pk, server_id = int(app.id), int(server.id)
+    pending = UserOAuth(
+        user_id=user.id,
+        provider="unrelated-pending-write",
+        access_token=encrypt_value("must-remain-pending"),
+    )
+    db.add(pending)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await mcp_api.teardown_mcp_app_server(
+            server_id,
+            app_id="calendar",
+            expected_catalog_app_id=app_pk,
+            expected_provider_name="calendar-provider",
+            current_user=user,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert pending in db.new
+    with db.no_autoflush:
+        assert db.get(MCPServer, server_id) is not None
+        assert db.query(UserMCPServer).filter_by(mcpserver_id=server_id).count() == 1
+
+
+@pytest.mark.parametrize("mutation", ["provider-drift", "delete-recreate"])
+def test_sqlite_catalog_mutation_waits_for_teardown_write_fence(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'teardown-race.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=10_000)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    with factory() as seed_db:
+        user = _user(seed_db)
+        app = _app(
+            seed_db,
+            app_id="calendar",
+            name="Calendar",
+            transport="oauth",
+            provider="original-provider",
+        )
+        _app(seed_db, app_id="pk-keeper", name="PK Keeper", transport="stdio")
+        server = MCPServer(
+            name="Calendar",
+            managed="external",
+            transport="oauth",
+            auth={"app_id": "calendar", "provider": "original-provider"},
+        )
+        seed_db.add(server)
+        seed_db.flush()
+        _associate(seed_db, user=user, server=server)
+        seed_db.add_all(
+            [
+                UserOAuth(
+                    user_id=user.id,
+                    provider="original-provider",
+                    access_token=encrypt_value("delete-me"),
+                ),
+                UserOAuth(
+                    user_id=user.id,
+                    provider="replacement-provider",
+                    access_token=encrypt_value("keep-me"),
+                ),
+            ]
+        )
+        seed_db.commit()
+        user_id, app_pk, server_id = int(user.id), int(app.id), int(server.id)
+
+    identity_checked = threading.Event()
+    release_teardown = threading.Event()
+    mutation_sent = threading.Event()
+    mutation_finished = threading.Event()
+    mutation_thread_id: list[int] = []
+    real_gate = mcp_api._locked_catalog_app_for_server
+
+    def gated_identity(*args, **kwargs):
+        result = real_gate(*args, **kwargs)
+        identity_checked.set()
+        assert release_teardown.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(mcp_api, "_locked_catalog_app_for_server", gated_identity)
+
+    expected_prefix = (
+        "UPDATE public_mcp_apps"
+        if mutation == "provider-drift"
+        else "DELETE FROM public_mcp_apps"
+    )
+
+    def observe_mutation(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if (
+            mutation_thread_id
+            and threading.get_ident() == mutation_thread_id[0]
+            and statement.lstrip().startswith(expected_prefix)
+        ):
+            mutation_sent.set()
+
+    event.listen(engine, "before_cursor_execute", observe_mutation)
+
+    def teardown() -> None:
+        with factory() as teardown_db:
+            current_user = teardown_db.get(User, user_id)
+            assert current_user is not None
+            asyncio.run(
+                mcp_api.teardown_mcp_app_server(
+                    server_id,
+                    app_id="calendar",
+                    expected_catalog_app_id=app_pk,
+                    expected_provider_name="original-provider",
+                    current_user=current_user,
+                    db=teardown_db,
+                )
+            )
+
+    def mutate_catalog() -> None:
+        mutation_thread_id.append(threading.get_ident())
+        try:
+            with factory() as mutation_db:
+                expected = mutation_db.get(PublicMCPApp, app_pk)
+                assert expected is not None
+                if mutation == "provider-drift":
+                    expected.provider_name = "replacement-provider"
+                    mutation_db.commit()
+                else:
+                    mutation_db.delete(expected)
+                    mutation_db.commit()
+                    mutation_db.add(
+                        PublicMCPApp(
+                            app_id="calendar",
+                            name="Calendar Replacement",
+                            transport="oauth",
+                            provider_name="replacement-provider",
+                            oauth_scopes=[],
+                            launch_config={},
+                            is_visible_in_connector=True,
+                        )
+                    )
+                    mutation_db.commit()
+        finally:
+            mutation_finished.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            teardown_future = executor.submit(teardown)
+            assert identity_checked.wait(timeout=10)
+            mutation_future = executor.submit(mutate_catalog)
+            assert mutation_sent.wait(timeout=10)
+            assert not mutation_finished.wait(timeout=0.25)
+            release_teardown.set()
+            teardown_future.result(timeout=10)
+            mutation_future.result(timeout=10)
+    finally:
+        release_teardown.set()
+        event.remove(engine, "before_cursor_execute", observe_mutation)
+
+    with factory() as verify_db:
+        assert verify_db.get(MCPServer, server_id) is None
+        assert (
+            verify_db.query(UserOAuth).filter_by(provider="original-provider").count()
+            == 0
+        )
+        assert (
+            verify_db.query(UserOAuth)
+            .filter_by(provider="replacement-provider")
+            .count()
+            == 1
+        )
+    engine.dispose()

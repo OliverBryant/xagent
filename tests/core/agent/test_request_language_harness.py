@@ -249,7 +249,7 @@ def test_new_independent_request_replaces_the_persisted_provenance() -> None:
     context = _polluted_context()
     assert top_level_user_request(context).language_text == ENGLISH_REQUEST
 
-    follow_up = "Ahora responde en español."
+    follow_up = "Switch to Spanish now."
     context.add_user_message(
         f"{follow_up}\n[Connector context in English]",
         metadata={"display_message": follow_up},

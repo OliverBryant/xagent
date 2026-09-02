@@ -13,7 +13,6 @@ later lifecycle fences distinguish each replacement from its predecessor.
 
 from __future__ import annotations
 
-import uuid
 from typing import Sequence, Union
 
 import sqlalchemy as sa
@@ -88,28 +87,13 @@ def _add_and_backfill(
 
     table = sa.table(
         table_name,
-        sa.column("id", sa.Integer()),
         sa.column(column_name, generation_type),
     )
-    row_ids = list(
-        bind.scalars(sa.select(table.c.id).where(table.c[column_name].is_(None)))
+    bind.execute(
+        sa.update(table)
+        .where(table.c[column_name].is_(None))
+        .values({column_name: server_default})
     )
-    generated: set[uuid.UUID] = set()
-    backfill_rows: list[dict[str, object]] = []
-    for row_id in row_ids:
-        generation = uuid.uuid4()
-        while generation in generated:
-            generation = uuid.uuid4()
-        generated.add(generation)
-        backfill_rows.append({"_row_id": row_id, "_generation": generation})
-
-    if backfill_rows:
-        bind.execute(
-            sa.update(table)
-            .where(table.c.id == sa.bindparam("_row_id"))
-            .values({column_name: sa.bindparam("_generation")}),
-            backfill_rows,
-        )
 
     with op.batch_alter_table(table_name) as batch_op:
         batch_op.alter_column(

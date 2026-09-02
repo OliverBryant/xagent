@@ -74,12 +74,40 @@ def _assert_generation_schema(connection: sa.Connection) -> None:
     ):
         columns = {item["name"]: item for item in inspector.get_columns(table)}
         assert columns[column]["nullable"] is False
+        assert columns[column]["default"] is not None
         uniques = {
             item["name"]: item for item in inspector.get_unique_constraints(table)
         }
         assert uniques[unique_name]["column_names"] == [column]
         values = _generations(connection, table, column)
         assert len(values) == len(set(values)) == 2
+
+
+def _assert_database_defaults(connection: sa.Connection) -> None:
+    connection.execute(
+        sa.text(
+            "INSERT INTO public_mcp_apps (id, app_id) VALUES (3, 'database-default')"
+        )
+    )
+    connection.execute(
+        sa.text(
+            "INSERT INTO user_mcpservers (id, user_id, mcpserver_id) VALUES (3, 12, 20)"
+        )
+    )
+    for table, column in (
+        ("public_mcp_apps", "generation"),
+        ("user_mcpservers", "lifecycle_generation"),
+    ):
+        generated = uuid.UUID(
+            str(
+                connection.scalar(
+                    sa.text(
+                        f"SELECT {column} FROM {table} WHERE id = 3"  # noqa: S608
+                    )
+                )
+            )
+        )
+        assert generated.version == 4
 
 
 def _assert_constraints(connection: sa.Connection) -> None:
@@ -139,6 +167,7 @@ def _upgrade_cycle(engine: sa.Engine) -> None:
         assert first_associations.isdisjoint(
             _generations(connection, "user_mcpservers", "lifecycle_generation")
         )
+        _assert_database_defaults(connection)
 
     with engine.connect() as connection:
         _assert_constraints(connection)

@@ -5,9 +5,12 @@ import uuid
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy import create_engine
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.schema import CreateColumn
 
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -140,6 +143,67 @@ def test_regular_updates_preserve_generations() -> None:
 
         assert app.generation == catalog_generation
         assert association.lifecycle_generation == association_generation
+
+
+def test_fresh_schema_raw_inserts_receive_database_generations() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        user, server = _user_and_server(db)
+        db.commit()
+        user_id = user.id
+        server_id = server.id
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport) "
+                "VALUES ('raw-catalog', 'Raw catalog', 'oauth')"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO user_mcpservers "
+                "(user_id, mcpserver_id, is_owner, can_edit, can_delete, "
+                "is_shared, is_active, is_default) "
+                "VALUES (:user_id, :server_id, 0, 0, 0, 0, 1, 0)"
+            ),
+            {"user_id": user_id, "server_id": server_id},
+        )
+        catalog_generation = uuid.UUID(
+            str(
+                connection.scalar(
+                    sa.text(
+                        "SELECT generation FROM public_mcp_apps "
+                        "WHERE app_id = 'raw-catalog'"
+                    )
+                )
+            )
+        )
+        association_generation = uuid.UUID(
+            str(
+                connection.scalar(
+                    sa.text(
+                        "SELECT lifecycle_generation FROM user_mcpservers "
+                        "WHERE user_id = :user_id AND mcpserver_id = :server_id"
+                    ),
+                    {"user_id": user_id, "server_id": server_id},
+                )
+            )
+        )
+
+    assert catalog_generation.version == 4
+    assert association_generation.version == 4
+    assert catalog_generation != association_generation
+
+
+@pytest.mark.parametrize(
+    "column",
+    [PublicMCPApp.generation, UserMCPServer.lifecycle_generation],
+)
+def test_postgresql_fresh_schema_uses_database_uuid_default(column) -> None:
+    ddl = str(CreateColumn(column).compile(dialect=postgresql.dialect()))
+    assert "DEFAULT gen_random_uuid()" in ddl
 
 
 def test_production_association_creation_paths_share_the_model_default() -> None:

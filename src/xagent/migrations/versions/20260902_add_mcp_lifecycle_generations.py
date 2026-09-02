@@ -32,6 +32,13 @@ ASSOCIATION_TABLE = "user_mcpservers"
 ASSOCIATION_COLUMN = "lifecycle_generation"
 ASSOCIATION_UNIQUE = "uq_user_mcpservers_lifecycle_generation"
 ASSOCIATION_NONEMPTY = "ck_user_mcpservers_lifecycle_generation_nonempty"
+SQLITE_UUID_V4_DEFAULT = sa.text(
+    "(lower(hex(randomblob(4))) || lower(hex(randomblob(2))) || "
+    "'4' || substr(lower(hex(randomblob(2))), 2) || "
+    "substr('89ab', (random() & 3) + 1, 1) || "
+    "substr(lower(hex(randomblob(2))), 2) || lower(hex(randomblob(6))))"
+)
+POSTGRESQL_UUID_V4_DEFAULT = sa.text("gen_random_uuid()")
 
 
 def _table_exists(table_name: str) -> bool:
@@ -45,18 +52,48 @@ def _add_and_backfill(
     nonempty_name: str,
 ) -> None:
     generation_type = sa.Uuid(as_uuid=True)
-    op.add_column(
-        table_name,
-        sa.Column(column_name, generation_type, nullable=True),
-    )
+    bind = op.get_bind()
+    dialect = bind.dialect.name
+    if dialect == "postgresql":
+        server_default = POSTGRESQL_UUID_V4_DEFAULT
+    elif dialect == "sqlite":
+        server_default = SQLITE_UUID_V4_DEFAULT
+    else:
+        raise RuntimeError(f"unsupported MCP generation dialect: {dialect}")
+
+    inspector = sa.inspect(bind)
+    columns = {item["name"]: item for item in inspector.get_columns(table_name)}
+    unique_names = {
+        item["name"] for item in inspector.get_unique_constraints(table_name)
+    }
+    check_names = {item["name"] for item in inspector.get_check_constraints(table_name)}
+    if column_name in columns:
+        column = columns[column_name]
+        if (
+            column["nullable"] is False
+            and column["default"] is not None
+            and unique_name in unique_names
+            and nonempty_name in check_names
+        ):
+            return
+    else:
+        op.add_column(
+            table_name,
+            sa.Column(
+                column_name,
+                generation_type,
+                nullable=True,
+            ),
+        )
 
     table = sa.table(
         table_name,
         sa.column("id", sa.Integer()),
         sa.column(column_name, generation_type),
     )
-    bind = op.get_bind()
-    row_ids = list(bind.scalars(sa.select(table.c.id)))
+    row_ids = list(
+        bind.scalars(sa.select(table.c.id).where(table.c[column_name].is_(None)))
+    )
     generated: set[uuid.UUID] = set()
     backfill_rows: list[dict[str, object]] = []
     for row_id in row_ids:
@@ -79,12 +116,15 @@ def _add_and_backfill(
             column_name,
             existing_type=generation_type,
             nullable=False,
+            server_default=server_default,
         )
-        batch_op.create_unique_constraint(unique_name, [column_name])
-        batch_op.create_check_constraint(
-            nonempty_name,
-            f"CAST({column_name} AS VARCHAR) <> ''",
-        )
+        if unique_name not in unique_names:
+            batch_op.create_unique_constraint(unique_name, [column_name])
+        if nonempty_name not in check_names:
+            batch_op.create_check_constraint(
+                nonempty_name,
+                f"CAST({column_name} AS VARCHAR) <> ''",
+            )
 
 
 def upgrade() -> None:

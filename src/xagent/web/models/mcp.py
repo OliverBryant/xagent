@@ -21,6 +21,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from ...core.tools.core.mcp.model import create_mcp_server_table
+from .generation import RandomUUID
 
 if TYPE_CHECKING:
     from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text
@@ -109,6 +110,7 @@ class UserMCPServer(Base):  # type: ignore
     lifecycle_generation = Column(
         Uuid,
         default=uuid.uuid4,
+        server_default=RandomUUID(),
         nullable=False,
     )
     user_id = Column(

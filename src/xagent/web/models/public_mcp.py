@@ -21,6 +21,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from .database import Base
+from .generation import RandomUUID
 
 
 class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
@@ -39,6 +40,7 @@ class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
     generation: Mapped[UUID] = mapped_column(
         Uuid,
         default=uuid4,
+        server_default=RandomUUID(),
         nullable=False,
     )
     app_id: Mapped[str] = mapped_column(

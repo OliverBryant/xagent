@@ -19,6 +19,7 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.enrichment import memory_input_text
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
@@ -1636,6 +1637,7 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert first_user.content == execution_message
     assert first_user.metadata["display_message"] == "Read file"
     assert first_user.metadata["files"] == files
+    assert memory_input_text(result["context"]) == "Read file"
     turn_id = first_user.metadata.get("turn_id")
     assert isinstance(turn_id, str) and turn_id
     user_event = next(

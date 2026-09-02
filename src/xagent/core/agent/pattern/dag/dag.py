@@ -16,6 +16,7 @@ from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
     latest_user_text,
+    memory_input_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
@@ -466,7 +467,7 @@ class DAGPattern(AgentPattern):
             self.status = "planning"
         try:
             if self.plan is None:
-                task_text = latest_user_text(context)
+                task_text = memory_input_text(context)
                 await enrich_context_with_memory(
                     context=context,
                     query=task_text,

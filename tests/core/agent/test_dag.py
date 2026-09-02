@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -240,10 +241,17 @@ class MemoryNote:
 class FakeMemoryStore:
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
+        self.added: list[Any] = []
 
     def search(self, **kwargs: Any) -> list[MemoryNote]:
         self.searches.append(kwargs)
+        if kwargs.get("query") == "User prefers concise summaries.":
+            return []
         return [MemoryNote()]
+
+    def add(self, note: Any) -> Any:
+        self.added.append(note)
+        return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
 
 
 class FakeSkillManager:
@@ -4059,12 +4067,33 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
     generator = LLMPlanGenerator()
     pattern = DAGPattern(generator)
     context = ExecutionContext(execution_id="dag-enriched")
-    context.add_user_message("Plan this")
+    context.add_user_message(
+        "Plan this\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Plan this"},
+    )
     memory_store = FakeMemoryStore()
     skill_manager = FakeSkillManager()
     llm = SequenceLLM(
         [
             plan_tool_response([{"id": "only", "task": "Only step"}]),
+            {
+                "content": "Remembering a reusable preference.",
+                "tool_calls": [
+                    {
+                        "id": "call_store_memory",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User prefers concise summaries.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
             {"content": "step done", "done": True},
         ]
     )
@@ -4082,7 +4111,15 @@ async def test_dag_pattern_enriches_plan_prompt_with_memory() -> None:
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "dag_plan_execute_memory",
         "general",
+        "react_memory",
     ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Plan this",
+        "Plan this",
+        "User prefers concise summaries.",
+    ]
+    assert memory_store.added[0].metadata["task"] == "Plan this"
+    assert "/private/runtime/input.txt" not in memory_store.added[0].metadata["task"]
     prompt_payload = json.loads(llm.call_kwargs[0]["messages"][1]["content"])
     assert (
         "Split this project using the historical DAG pattern."

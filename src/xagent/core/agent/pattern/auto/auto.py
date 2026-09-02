@@ -17,7 +17,7 @@ from ...context.enrichment import (
     SELECTED_SKILL_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
     enrich_context_with_memory,
-    latest_user_text,
+    memory_input_text,
 )
 from ...context.skill_tool import (
     LOAD_SKILL_TOOL_NAME,
@@ -490,7 +490,7 @@ class AutoPattern(AgentPattern):
         final_answer_stream: FinalAnswerStreamSession | None = None
         if self.decision is None:
             self.status = "deciding"
-            task_text = latest_user_text(context)
+            task_text = memory_input_text(context)
             await enrich_context_with_memory(
                 context=context,
                 query=task_text,

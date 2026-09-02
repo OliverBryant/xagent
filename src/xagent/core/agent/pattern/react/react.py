@@ -78,6 +78,7 @@ from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
+    memory_input_text,
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
@@ -506,6 +507,7 @@ class ReActPattern(AgentPattern):
 
         try:
             task_text = self._task_text(context)
+            memory_text = memory_input_text(context, execution_text=task_text)
             self._memory_store = kwargs.get("memory_store")
             # DAG steps skip the automatic retrieval: the root run already
             # retrieved for the whole task, and steps can search_memory on
@@ -513,7 +515,7 @@ class ReActPattern(AgentPattern):
             if not context.metadata.get("dag_step_id"):
                 await enrich_context_with_memory(
                     context=context,
-                    query=task_text,
+                    query=memory_text,
                     category="react_memory",
                     memory_store=self._memory_store,
                     runtime=runtime,
@@ -522,7 +524,7 @@ class ReActPattern(AgentPattern):
             context_tools = await self._with_context_tools(
                 tools=tools,
                 context=context,
-                task_text=task_text,
+                task_text=memory_text,
                 runtime=runtime,
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),

@@ -280,6 +280,24 @@ async def test_search_memory_rejects_empty_query_and_emits_trace() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_memory_reports_backend_failure() -> None:
+    class BrokenSearchStore(CrudMemoryStore):
+        def search(self, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("backend unavailable")
+
+    tracer = TraceEventRecorder()
+    tool = SearchMemoryTool(
+        memory_store=BrokenSearchStore(), runtime=FakeRuntime(tracer=tracer)
+    )
+
+    result = await tool.execute(query="preferences")
+
+    assert result == {"success": False, "error": "Failed to search memories."}
+    assert tracer.events[-1]["data"]["success"] is False
+    assert tracer.events[-1]["data"]["found"] is False
+
+
+@pytest.mark.asyncio
 async def test_update_memory_replaces_content() -> None:
     store = CrudMemoryStore({"mem-1": _note("mem-1", "Old fact.")})
     tool = UpdateMemoryTool(memory_store=store, task="current task")

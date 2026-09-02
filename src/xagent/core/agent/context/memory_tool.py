@@ -267,7 +267,24 @@ class SearchMemoryTool:
                 data={"query": query[:200], "source": SEARCH_MEMORY_TOOL_NAME},
             )
 
-        memories = await asyncio.to_thread(self._search, query, limit)
+        try:
+            memories = await asyncio.to_thread(self._search, query, limit)
+        except Exception:
+            logger.exception("search_memory failed")
+            if tracer is not None and task_id:
+                await trace_memory_retrieve_end(
+                    tracer,
+                    task_id=task_id,
+                    step_id=step_id,
+                    data={
+                        "query": query[:200],
+                        "memories_count": 0,
+                        "found": False,
+                        "success": False,
+                        "source": SEARCH_MEMORY_TOOL_NAME,
+                    },
+                )
+            return {"success": False, "error": "Failed to search memories."}
 
         if tracer is not None and task_id:
             await trace_memory_retrieve_end(
@@ -285,11 +302,7 @@ class SearchMemoryTool:
         return {"success": True, "memories": memories, "count": len(memories)}
 
     def _search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        try:
-            results = self.memory_store.search(query=query, k=limit)
-        except Exception:
-            logger.exception("search_memory failed")
-            return []
+        results = self.memory_store.search(query=query, k=limit)
         memories = []
         for note in results or []:
             memories.append(

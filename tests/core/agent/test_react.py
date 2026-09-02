@@ -4000,7 +4000,10 @@ async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
     skill_manager = FakeSkillManager()
     pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.")
-    context.add_user_message("Do the thing")
+    context.add_user_message(
+        "Do the thing\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Do the thing"},
+    )
 
     result = await pattern.run(
         context=context,
@@ -4015,6 +4018,10 @@ async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
     assert [search["filters"]["category"] for search in memory_store.searches] == [
         "react_memory",
         "general",
+    ]
+    assert [search["query"] for search in memory_store.searches] == [
+        "Do the thing",
+        "Do the thing",
     ]
     first_system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Use the stored project preference." in first_system_prompt
@@ -5344,12 +5351,16 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
     )
     pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext()
-    context.add_user_message("Ask, then calculate")
+    context.add_user_message(
+        "Ask, then calculate\n\nAttached file: /private/runtime/input.txt",
+        metadata={"display_message": "Ask, then calculate"},
+    )
 
     first = await pattern.run(context=context, tools=[], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    context.add_user_message("B")
+    rebuilt_context = ExecutionContext.from_dict(context.to_dict())
+    rebuilt_context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=3)
     resumed_pattern.load_state(pattern.get_state())
     resumed_llm = FakeLLM(
@@ -5376,7 +5387,7 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
     memory_store = MemoryToolStore()
 
     resumed = await resumed_pattern.run(
-        context=context,
+        context=rebuilt_context,
         tools=[],
         llm=resumed_llm,
         memory_store=memory_store,
@@ -6176,6 +6187,8 @@ class MemoryToolStore:
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
         self.added: list[Any] = []
+        self.notes: dict[str, Any] = {}
+        self.updated: list[Any] = []
 
     def search(self, **kwargs: Any) -> list[Any]:
         self.searches.append(kwargs)
@@ -6184,6 +6197,17 @@ class MemoryToolStore:
     def add(self, note: Any) -> Any:
         self.added.append(note)
         return SimpleNamespace(success=True, memory_id=f"mem-{len(self.added)}")
+
+    def get(self, memory_id: str) -> Any:
+        note = self.notes.get(memory_id)
+        if note is None:
+            return SimpleNamespace(success=False, content=None)
+        return SimpleNamespace(success=True, content=note)
+
+    def update(self, note: Any) -> Any:
+        self.updated.append(note)
+        self.notes[note.id] = note
+        return SimpleNamespace(success=True, memory_id=note.id)
 
 
 def _tool_names_from_llm_call(call: dict[str, Any]) -> list[str]:
@@ -6252,6 +6276,56 @@ async def test_react_pattern_exposes_store_memory_tool_with_memory_store() -> No
     # consumed by the ReAct loop itself.
     assert llm.responses == []
     assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_update_memory_uses_clean_task_metadata() -> None:
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "Correcting stale memory.",
+                "tool_calls": [
+                    {
+                        "id": "call_update_memory",
+                        "function": {
+                            "name": "update_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "memory_id": "mem-existing",
+                                    "content": "Use the current release channel.",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Done.", "done": True},
+        ]
+    )
+    memory_store = MemoryToolStore()
+    memory_store.notes["mem-existing"] = SimpleNamespace(
+        id="mem-existing",
+        content="Use the legacy release channel.",
+        metadata={"source": "test"},
+    )
+    pattern = ReActPattern(max_iterations=3)
+    typed = "Update the release notes"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext()
+    context.add_user_message(augmented, metadata={"display_message": typed})
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True
+    assert len(memory_store.updated) == 1
+    assert memory_store.updated[0].metadata["updated_by_task"] == typed
+    assert augmented not in memory_store.updated[0].metadata.values()
 
 
 @pytest.mark.asyncio

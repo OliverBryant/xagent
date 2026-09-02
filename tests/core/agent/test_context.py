@@ -20,6 +20,7 @@ from xagent.core.agent.context.enrichment import (
     _current_user_id,
     _lookup_relevant_memories_with_context,
     enrich_context_with_memory,
+    memory_input_text,
 )
 from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.language import (
@@ -60,6 +61,87 @@ def test_create_context() -> None:
     assert ctx.workspace_state["files"] == 2
     assert ctx.memory_session_id == "mem-1"
     assert ctx.memory_snapshot == {"summary": "hello"}
+
+
+def test_memory_input_prefers_display_message_after_context_rebuild() -> None:
+    typed = "Summarize the attachment"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext(execution_id="memory-input")
+    context.add_user_message(
+        augmented,
+        metadata={"display_message": typed},
+    )
+
+    rebuilt = ExecutionContext.from_dict(context.to_dict())
+
+    assert memory_input_text(rebuilt) == typed
+    assert memory_input_text(rebuilt, execution_text=augmented) == typed
+
+
+def test_memory_input_preserves_legacy_content_fallback() -> None:
+    context = ExecutionContext(execution_id="legacy-memory-input")
+    context.add_user_message("Legacy execution text")
+
+    assert memory_input_text(context) == "Legacy execution text"
+    assert (
+        memory_input_text(context, execution_text="Legacy execution text")
+        == "Legacy execution text"
+    )
+
+
+def test_memory_input_uses_original_display_for_frozen_react_task() -> None:
+    original = "Inspect the report"
+    augmented = f"{original}\n\nAttached file: /private/runtime/report.pdf"
+    context = ExecutionContext(execution_id="resumed-memory-input")
+    context.add_user_message(augmented, metadata={"display_message": original})
+    context.add_user_message("Continue with the second option")
+
+    assert memory_input_text(context) == "Continue with the second option"
+    assert memory_input_text(context, execution_text=augmented) == original
+
+
+@pytest.mark.parametrize("display_message", [None, "", 42, {"text": "visible"}])
+def test_memory_input_ignores_unusable_display_metadata(
+    display_message: object,
+) -> None:
+    context = ExecutionContext(execution_id="invalid-display-memory-input")
+    context.add_user_message(
+        "Execution text fallback",
+        metadata={"display_message": display_message},
+    )
+
+    assert memory_input_text(context) == "Execution text fallback"
+
+
+def test_dag_memory_input_ignores_internal_step_messages() -> None:
+    typed = "Plan the release"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    root = ExecutionContext(execution_id="dag-memory-input")
+    root.add_user_message(augmented, metadata={"display_message": typed})
+    child = root.create_child_context(metadata={"dag_step_id": "draft"})
+    child.add_user_message(
+        "Only execute this internal step.",
+        metadata={"dag_step_id": "draft", "kind": "dag_step_instruction"},
+    )
+
+    assert memory_input_text(child) == typed
+    assert (
+        memory_input_text(child, execution_text="Only execute this internal step.")
+        == typed
+    )
+
+
+def test_dag_memory_input_preserves_legacy_step_fallback() -> None:
+    root = ExecutionContext(execution_id="legacy-dag-memory-input")
+    root.add_user_message("Legacy root execution text")
+    child = root.create_child_context(metadata={"dag_step_id": "draft"})
+    step_instruction = "Only execute this legacy internal step."
+    child.add_user_message(
+        step_instruction,
+        metadata={"dag_step_id": "draft", "kind": "dag_step_instruction"},
+    )
+
+    assert memory_input_text(child, execution_text=step_instruction) == step_instruction
 
 
 def test_sanitize_tool_result_for_context_hides_image_path_when_artifact_exists() -> (

@@ -56,7 +56,11 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
-from ..dynamic_memory_store import get_memory_store
+from ..dynamic_memory_store import (
+    MEMORY_BACKEND_UNAVAILABLE_REASON,
+    MemoryBackendUnavailableError,
+    get_memory_store,
+)
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
@@ -354,12 +358,35 @@ def resolve_agent_service_memory_policy(
     use_in_memory = (is_preview and not enabled) or (
         override is not None and not override.available
     )
-    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    backend_unavailable = False
+    if use_in_memory:
+        memory = InMemoryMemoryStore()
+    else:
+        requirements = (
+            {
+                "require_persistence": override.require_persistence,
+                "require_vector_search": override.require_vector_search,
+            }
+            if override is not None
+            and (override.require_persistence or override.require_vector_search)
+            else {}
+        )
+        try:
+            memory = get_memory_store(**requirements)
+        except MemoryBackendUnavailableError:
+            memory = InMemoryMemoryStore()
+            enabled = False
+            backend_unavailable = True
+    available = True if override is None else override.available
+    availability_reason = None if override is None else override.reason
+    if backend_unavailable:
+        available = False
+        availability_reason = MEMORY_BACKEND_UNAVAILABLE_REASON
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
-        memory_available=True if override is None else override.available,
-        memory_availability_reason=None if override is None else override.reason,
+        memory_available=available,
+        memory_availability_reason=availability_reason,
     )
 
 

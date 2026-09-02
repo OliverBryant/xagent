@@ -7,7 +7,8 @@ from typing import Optional, Union
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.model.embedding import DashScopeEmbedding
+from ..core.model import EmbeddingModelConfig
+from ..core.model.embedding import create_embedding_adapter
 from ..core.storage.manager import get_storage_root
 from .models.database import get_db
 from .models.model import Model as DBModel
@@ -16,6 +17,13 @@ from .services.db_runtime import is_database_pool_timeout
 from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
 
 logger = logging.getLogger(__name__)
+
+MEMORY_BACKEND_UNAVAILABLE_REASON = "required_memory_backend_unavailable"
+
+
+class MemoryBackendUnavailableError(RuntimeError):
+    """Raised when an opt-in memory backend capability cannot be provided."""
+
 
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
@@ -54,6 +62,7 @@ class DynamicMemoryStoreManager:
         # endpoint rotation on the same model take effect without a restart.
         self._last_embedding_model_fingerprint: Optional[tuple] = None
         self._is_lancedb: bool = False
+        self._model_lookup_failed = False
 
         # Initialize with in-memory store (will be replaced with LanceDB when embedding model is configured)
         self._initialize_in_memory_store()
@@ -142,65 +151,78 @@ class DynamicMemoryStoreManager:
         except Exception as e:
             if is_database_pool_timeout(e):
                 raise
+            self._model_lookup_failed = True
             logger.error(f"Error checking for embedding model: {e}")
             return None
 
     def _create_lancedb_store(
-        self, embedding_model: DBModel
+        self, embedding_model: Optional[DBModel]
     ) -> UserIsolatedMemoryStore:
         """Create LanceDB store with the given embedding model."""
-        try:
-            # Check legacy location (project root) first for backward compatibility
-            legacy_dir = os.path.join(
-                os.path.dirname(
-                    os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-                ),
-                "memory_store",
+        # Check legacy location (project root) first for backward compatibility
+        legacy_dir = os.path.join(
+            os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            ),
+            "memory_store",
+        )
+        if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
+            logger.info(f"Using legacy memory store location: {legacy_dir}")
+            db_dir = legacy_dir
+        else:
+            new_dir = get_storage_root() / "memory_store"
+            os.makedirs(new_dir, exist_ok=True)
+            db_dir = str(new_dir)
+
+        embedding_adapter = None
+        if embedding_model is not None:
+            embedding_adapter = create_embedding_adapter(
+                EmbeddingModelConfig(
+                    id=str(embedding_model.model_id),
+                    model_name=embedding_model.model_name,
+                    model_provider=embedding_model.model_provider,
+                    api_key=str(embedding_model.api_key),
+                    base_url=embedding_model.base_url,
+                    dimension=embedding_model.dimension,
+                )
             )
-            if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
-                logger.info(f"Using legacy memory store location: {legacy_dir}")
-                db_dir = legacy_dir
-            else:
-                # Use new default location
-                new_dir = get_storage_root() / "memory_store"
-                os.makedirs(new_dir, exist_ok=True)
-                db_dir = str(new_dir)
+        lancedb_store = LanceDBMemoryStore(
+            db_dir=db_dir,
+            embedding_model=embedding_adapter,
+            similarity_threshold=self._similarity_threshold or 1.5,
+        )
+        logger.info("Created LanceDB memory store")
+        return UserIsolatedMemoryStore(lancedb_store)
 
-            if embedding_model.model_provider == "dashscope":
-                lancedb_store = LanceDBMemoryStore(
-                    db_dir=db_dir,
-                    embedding_model=DashScopeEmbedding(
-                        api_key=str(embedding_model.api_key),
-                        dimension=int(embedding_model.dimension or 1024),
-                    ),
-                    similarity_threshold=self._similarity_threshold or 1.5,
-                )
-                logger.info("Created LanceDB store with DashScope embedding model")
-                return UserIsolatedMemoryStore(lancedb_store)
-            else:
-                # Fallback to in-memory if embedding type not supported
-                logger.warning(
-                    f"Unsupported embedding model type: {embedding_model.model_provider}"
-                )
-                self._initialize_in_memory_store()
-                return self._memory_store  # type: ignore[return-value]
-        except Exception as e:
-            logger.error(f"Error creating LanceDB store: {e}")
-            # Fallback to in-memory store
-            self._initialize_in_memory_store()
-            return self._memory_store  # type: ignore[return-value]
-
-    def _check_and_update_store(self) -> None:
+    def _check_and_update_store(
+        self,
+        *,
+        require_persistence: bool = False,
+        require_vector_search: bool = False,
+    ) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
         with self._lock:
-            embedding_model = self._get_embedding_model_from_db()
+            strict = require_persistence or require_vector_search
+            self._model_lookup_failed = False
+            try:
+                embedding_model = self._get_embedding_model_from_db()
+            except Exception as exc:
+                if strict:
+                    raise MemoryBackendUnavailableError(
+                        MEMORY_BACKEND_UNAVAILABLE_REASON
+                    ) from exc
+                raise
+            if strict and self._model_lookup_failed:
+                raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
             current_model_id = embedding_model.id if embedding_model else None
             current_fingerprint = _embedding_model_fingerprint(embedding_model)
 
             # Check if we need to update the store
             should_update = False
 
-            if embedding_model and not self._is_lancedb:
+            if embedding_model and (
+                not self._is_lancedb or self._last_embedding_model_fingerprint is None
+            ):
                 # We have an embedding model but using in-memory store
                 should_update = True
                 logger.info("Embedding model detected, upgrading to LanceDB store")
@@ -215,32 +237,56 @@ class DynamicMemoryStoreManager:
                 logger.info(
                     "Embedding model configuration changed, updating LanceDB store"
                 )
-            elif not embedding_model and self._is_lancedb:
+            elif not embedding_model and self._is_lancedb and not require_persistence:
                 # No embedding model available but using LanceDB (shouldn't happen normally)
                 should_update = True
                 logger.info(
                     "No embedding model available, falling back to in-memory store"
                 )
 
+            elif not embedding_model and require_persistence and not self._is_lancedb:
+                should_update = True
+
+            if require_vector_search and embedding_model is None:
+                raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
+
             if should_update:
-                if embedding_model:
-                    self._memory_store = self._create_lancedb_store(embedding_model)
+                if embedding_model or require_persistence:
+                    try:
+                        memory_store = self._create_lancedb_store(embedding_model)
+                    except Exception as exc:
+                        logger.exception("Error creating LanceDB memory store")
+                        self._initialize_in_memory_store()
+                        if strict:
+                            raise MemoryBackendUnavailableError(
+                                MEMORY_BACKEND_UNAVAILABLE_REASON
+                            ) from exc
+                        return
+                    self._memory_store = memory_store
                     self._is_lancedb = True
-                    self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
+                    self._last_embedding_model_id = current_model_id
                     self._last_embedding_model_fingerprint = current_fingerprint
                     logger.info("Switched to LanceDB memory store")
                 else:
                     self._initialize_in_memory_store()
                     logger.info("Switched to in-memory memory store")
 
-    def get_memory_store(self) -> MemoryStoreType:
+    def get_memory_store(
+        self,
+        *,
+        require_persistence: bool = False,
+        require_vector_search: bool = False,
+    ) -> MemoryStoreType:
         """
         Get the current memory store, initializing or updating as necessary.
 
         Returns:
             Current memory store instance
         """
-        self._check_and_update_store()
+        self._check_and_update_store(
+            require_persistence=require_persistence,
+            require_vector_search=require_vector_search,
+        )
         return self._memory_store  # type: ignore[return-value]
 
     def force_reinitialize(self) -> None:
@@ -287,7 +333,10 @@ class DynamicMemoryStoreManager:
                 "is_lancedb": self._is_lancedb,
                 "embedding_model_id": self._last_embedding_model_id,
                 "similarity_threshold": self._similarity_threshold,
-                "supports_vector_search": self._is_lancedb,
+                "supports_vector_search": (
+                    self._is_lancedb
+                    and self._last_embedding_model_fingerprint is not None
+                ),
             }
 
 
@@ -310,10 +359,17 @@ def get_memory_store_manager(
     return _dynamic_manager
 
 
-def get_memory_store() -> MemoryStoreType:
+def get_memory_store(
+    *,
+    require_persistence: bool = False,
+    require_vector_search: bool = False,
+) -> MemoryStoreType:
     """Get the current memory store (for backward compatibility)."""
     manager = get_memory_store_manager()
-    return manager.get_memory_store()
+    return manager.get_memory_store(
+        require_persistence=require_persistence,
+        require_vector_search=require_vector_search,
+    )
 
 
 def force_reinitialize_memory_store() -> None:

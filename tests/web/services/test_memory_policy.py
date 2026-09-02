@@ -9,6 +9,10 @@ import pytest
 
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web.api import chat as chat_api
+from xagent.web.dynamic_memory_store import (
+    MEMORY_BACKEND_UNAVAILABLE_REASON,
+    MemoryBackendUnavailableError,
+)
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
     MemoryPolicyDecision,
@@ -104,6 +108,62 @@ def test_trusted_resolver_can_enable_preview_memory(
     )
 
 
+@pytest.mark.parametrize(
+    ("require_persistence", "require_vector_search"),
+    [(True, False), (False, True), (True, True)],
+    ids=("persistence", "vector-search", "both"),
+)
+def test_trusted_resolver_forwards_backend_requirements_independently(
+    monkeypatch: pytest.MonkeyPatch,
+    require_persistence: bool,
+    require_vector_search: bool,
+) -> None:
+    dynamic_store = Mock(name="dynamic-memory-store")
+    get_memory_store = Mock(return_value=dynamic_store)
+    monkeypatch.setattr(chat_api, "get_memory_store", get_memory_store)
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            require_persistence=require_persistence,
+            require_vector_search=require_vector_search,
+        )
+    )
+
+    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory is dynamic_store
+    assert policy.memory_enabled is True
+    get_memory_store.assert_called_once_with(
+        require_persistence=require_persistence,
+        require_vector_search=require_vector_search,
+    )
+
+
+def test_required_backend_failure_is_reported_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_api,
+        "get_memory_store",
+        Mock(side_effect=MemoryBackendUnavailableError("unavailable")),
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            require_persistence=True,
+        )
+    )
+
+    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.memory_availability_reason == MEMORY_BACKEND_UNAVAILABLE_REASON
+
+
 def test_trusted_resolver_can_disable_otherwise_enabled_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,6 +232,11 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
         MemoryPolicyDecision(enabled=False, available=False),
         MemoryPolicyDecision(enabled=True, available=True, reason=""),
         MemoryPolicyDecision(enabled=1, available=True),  # type: ignore[arg-type]
+        MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            require_persistence=1,  # type: ignore[arg-type]
+        ),
     ],
     ids=(
         "wrong-type",
@@ -179,6 +244,7 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
         "unavailable-without-reason",
         "empty-reason",
         "non-bool-flag",
+        "non-bool-requirement",
     ),
 )
 def test_invalid_resolver_decision_fails_closed(

@@ -20,6 +20,7 @@ from xagent.web.api.websocket import (
     handle_build_preview_execution,
 )
 from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+from xagent.web.services import memory_policy as memory_policy_module
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -333,7 +334,11 @@ async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
 
     monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
     memory_manager = DynamicMemoryStoreManager()
-    monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
+    monkeypatch.setattr(
+        memory_policy_module,
+        "get_memory_store",
+        memory_manager.get_memory_store,
+    )
 
     held_connection = engine.connect()
     stop_ticker = asyncio.Event()

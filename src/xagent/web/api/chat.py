@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
 
@@ -28,8 +27,6 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
     scope_fingerprint,
 )
-from ...core.memory.base import MemoryStore
-from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -56,7 +53,6 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
-from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
@@ -107,6 +103,10 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
+from ..services.memory_policy import (
+    AgentServiceMemoryPolicy,
+    resolve_agent_service_memory_policy,
+)
 from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
@@ -306,32 +306,6 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
         or 0
     )
     return int(max_trace_event_id), int(max_chat_message_id)
-
-
-@dataclass(frozen=True)
-class AgentServiceMemoryPolicy:
-    memory: MemoryStore
-    memory_enabled: bool
-
-
-def resolve_agent_service_memory_policy(
-    *,
-    task: Optional[Any] = None,
-    agent_config: Optional[Mapping[str, Any]] = None,
-) -> AgentServiceMemoryPolicy:
-    """Resolve the memory store and enablement for an AgentService runtime."""
-    config = agent_config
-    if config is None:
-        task_config = getattr(task, "agent_config", None)
-        config = task_config if isinstance(task_config, Mapping) else {}
-
-    if config.get("is_preview") is True:
-        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
-
-    if task is not None and task.agent_id:
-        return AgentServiceMemoryPolicy(get_memory_store(), False)
-
-    return AgentServiceMemoryPolicy(get_memory_store(), True)
 
 
 async def resolve_agent_service_memory_policy_async(

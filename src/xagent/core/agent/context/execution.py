@@ -42,7 +42,7 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
-    display_message_override,
+    top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
@@ -524,45 +524,29 @@ class ExecutionContext:
         legacy non-string values fall back to content. This keeps appended file
         or connector context from deciding the response language.
         """
-        for message in reversed(self.messages):
-            if message.hidden or message.role != "user":
-                continue
-            metadata = message.metadata if isinstance(message.metadata, dict) else {}
-            if metadata.get("response_to_waiting_for_user"):
-                continue
-            # A DAG child context copies the root messages and then appends step
-            # scaffolding; only the root request may anchor the response language.
-            if metadata.get("dag_step_id"):
-                continue
-            if prefer_display:
-                display = display_message_override(metadata)
-                if display is not None:
-                    return display
-            content = str(message.content or "").strip()
-            if content:
-                return content
-        return str(self.metadata.get("task") or "").strip()
+        request = top_level_user_request(self)
+        return request.language_text if prefer_display else request.execution_text
 
     def _system_context(self) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = self._current_user_request_text()
+        request = top_level_user_request(self)
+        current_task = request.execution_text
         output_language = effective_output_language(self)
-        if current_task and not dag_step_id:
-            language_request = self._current_user_request_text(prefer_display=True)
+        if not dag_step_id and (current_task or request.display_state != "missing"):
+            language_request = request.language_text
             language_directives = output_language_directives(
                 output_language,
                 section=(
                     "root_existing_request"
-                    if not output_language and language_request == current_task
+                    if request.display_state == "missing"
                     else "root_system_context"
                 ),
                 request=language_request,
             )
             parts.append(
-                "Current user request:\n"
-                f"{current_task}\n\n"
-                "Conversation focus rules: answer the current user request above. "
+                "Conversation focus rules: answer the latest independent user "
+                "request in the conversation. "
                 "Earlier user and assistant messages are context only; use them to "
                 "resolve references and preserve continuity, but do not re-answer "
                 "previous requests or repeat previous final answers unless the "
@@ -635,7 +619,11 @@ class ExecutionContext:
             request_anchor = output_language_directives(
                 output_language,
                 section="dag_step_request_anchor",
-                request=self._current_user_request_text(prefer_display=True),
+                request=(
+                    request.language_text
+                    if request.display_state != "missing"
+                    else None
+                ),
             )
             if request_anchor:
                 parts.append(request_anchor)
@@ -1526,6 +1514,17 @@ class ExecutionContext:
         return self._get_total_tokens()
 
     def _get_total_tokens(self) -> int:
+        rendered_estimate = self._estimate_message_tokens(self.messages) + max(
+            1,
+            len(
+                "\n\n".join(
+                    part
+                    for part in (self.system_prompt, self._system_context())
+                    if part
+                )
+            )
+            // 4,
+        )
         if self.llm_calls:
             latest_call = self.llm_calls[-1]
             if latest_call.input_tokens > 0:
@@ -1543,8 +1542,11 @@ class ExecutionContext:
                     delta_chars = self._message_content_chars(
                         self.messages[prompt_message_count:]
                     )
-                    return latest_call.input_tokens + max(0, delta_chars // 4)
-        return self._estimate_message_tokens(self.messages)
+                    return max(
+                        rendered_estimate,
+                        latest_call.input_tokens + max(0, delta_chars // 4),
+                    )
+        return rendered_estimate
 
     def _estimate_message_tokens(self, messages: list[Message]) -> int:
         return sum(

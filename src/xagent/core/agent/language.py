@@ -507,7 +507,9 @@ def _soft_request_language_guidance(
         "Honor explicit and implicit requests to translate, rewrite, or answer in "
         "another language. Names, email addresses, connector metadata, quoted "
         "source content, memory, tool results, examples, and earlier turns are not "
-        "language evidence. "
+        "language evidence. An answer to a pending agent question does not replace "
+        "the independent request as language evidence unless that answer explicitly "
+        "asks to translate, rewrite, or continue the response in another language. "
         f"If {empty_subject} is empty, too short, mixed-language, or depends on "
         "conversation context, resolve its meaning from the conversation without "
         "guessing from auxiliary context. For Chinese, preserve Simplified Chinese "
@@ -527,10 +529,10 @@ def _structured_request_language_policy(request_field: str) -> str:
 
 
 def _root_request_language_policy() -> str:
-    """Reference the root request already rendered immediately above."""
+    """Reference the root request already present as a user message."""
     return (
         "Request-only response language policy: "
-        f"{_soft_request_language_guidance(subject='current user request above', empty_subject='request', boundary='policy')}"
+        f"{_soft_request_language_guidance(subject='latest independent user message in the conversation', empty_subject='request', boundary='policy')}"
     )
 
 
@@ -613,7 +615,7 @@ def output_language_directives(
     language: str | None,
     *,
     section: OutputLanguageSection,
-    request: str = "",
+    request: str | None = None,
 ) -> str:
     """Return the language instructions one prompt section must emit.
 
@@ -625,7 +627,7 @@ def output_language_directives(
         # beside it would hand the model a second, competing rule.
         if language:
             return f"Output language policy:\n{output_language_policy(language)}"
-        return request_only_language_harness(request)
+        return request_only_language_harness(request or "")
     if section == "root_existing_request":
         if language:
             return f"Output language policy:\n{output_language_policy(language)}"
@@ -637,8 +639,10 @@ def output_language_directives(
     if section == "dag_step_request_anchor":
         # A step context never carries the request itself, so quote it here -- but
         # only when no pinned language already answers the same question.
-        if language or not request:
+        if language:
             return ""
+        if request is None:
+            return _root_request_language_policy()
         # Quoted whole: any truncation can drop an explicit target-language
         # instruction sitting in the middle of a long request.
         return request_only_language_harness(request)
@@ -650,4 +654,4 @@ def output_language_directives(
         return _structured_request_language_policy("latest_user_request")
     if section == "completion_assessment":
         return _structured_request_language_policy("user_authored_language_request")
-    return request_only_language_harness(request)
+    return request_only_language_harness(request or "")

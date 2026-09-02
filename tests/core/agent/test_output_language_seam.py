@@ -93,8 +93,9 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     assert output_language_directives(
         "", section="root_system_context"
     ) == request_only_language_harness("")
-    assert "current user request above" in output_language_directives(
-        "", section="root_existing_request"
+    assert (
+        "latest independent user message in the conversation"
+        in output_language_directives("", section="root_existing_request")
     )
     assert (
         output_language_directives("Japanese", section="dag_step_scope")
@@ -103,6 +104,12 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     assert (
         output_language_directives("", section="dag_step_scope")
         == output_language_policy("").strip()
+    )
+    assert "latest independent user message" in output_language_directives(
+        "", section="dag_step_request_anchor", request=None
+    )
+    assert request_only_language_harness("") == output_language_directives(
+        "", section="dag_step_request_anchor", request=""
     )
     assert (
         output_language_directives("Japanese", section="dag_step_rules")

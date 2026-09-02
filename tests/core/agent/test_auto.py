@@ -2292,11 +2292,15 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert result["success"] is True
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     assert child.kwargs is not None
-    child_system = child.kwargs["context"].get_messages_for_llm()[0]["content"]
+    child_messages = child.kwargs["context"].get_messages_for_llm()
+    child_system = child_messages[0]["content"]
     assert "请始终使用中文回答。" in child_system
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
-    assert "Summarize the quarterly revenue trend in one paragraph." in child_system
+    assert "Summarize the quarterly revenue trend in one paragraph." not in child_system
+    assert child_messages[-1]["content"] == (
+        "Summarize the quarterly revenue trend in one paragraph."
+    )
     assert (
         output_language_directives("", section="root_existing_request") in child_system
     )
@@ -2331,8 +2335,10 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert (
         target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
     )
-    system_content = context.get_messages_for_llm()[0]["content"]
-    assert system_content.count(request) == 1
+    messages = context.get_messages_for_llm()
+    system_content = messages[0]["content"]
+    assert system_content.count(request) == 0
+    assert sum(message["content"].count(request) for message in messages) == 1
     assert (
         output_language_directives("", section="root_existing_request")
         in system_content

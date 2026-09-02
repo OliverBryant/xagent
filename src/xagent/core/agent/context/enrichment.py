@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 from ...agent.trace import (
     trace_memory_retrieve_end,
@@ -19,6 +20,19 @@ SKILL_CONTEXT_METADATA_KEY = "selected_skill_context"
 # True only when generate_image is registered and edit_image is not; a deployment
 # with no image tools at all leaves it False.
 IMAGE_EDIT_UNAVAILABLE_METADATA_KEY = "image_edit_unavailable"
+
+
+DisplayMessageState = Literal["missing", "empty", "text"]
+
+
+@dataclass(frozen=True)
+class TopLevelUserRequest:
+    """One executable request and its presentation-only language boundary."""
+
+    execution_text: str
+    language_text: str
+    display_state: DisplayMessageState
+    has_pending_response: bool = False
 
 
 async def enrich_context_with_memory(
@@ -125,6 +139,76 @@ def display_message_override(metadata: Any) -> str | None:
     if not isinstance(display, str):
         return None
     return display.strip()
+
+
+def top_level_user_request(context: Any) -> TopLevelUserRequest:
+    """Return the latest independent request, excluding DAG and wait scaffolding.
+
+    A present display string is authoritative for language even when empty.
+    Answers to pending agent questions remain conversational context, but they do
+    not replace the independent request. Prompt policy may still honor an explicit
+    language-change instruction in such an answer.
+    """
+    has_pending_response = False
+    for message in reversed(getattr(context, "messages", []) or []):
+        if getattr(message, "role", None) != "user" or getattr(
+            message, "hidden", False
+        ):
+            continue
+        metadata = getattr(message, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("response_to_waiting_for_user"):
+            has_pending_response = True
+            continue
+        if metadata.get("dag_step_id"):
+            continue
+
+        execution_text = str(getattr(message, "content", "") or "").strip()
+        display_text = display_message_override(metadata)
+        if display_text is None:
+            if not execution_text:
+                continue
+            return TopLevelUserRequest(
+                execution_text=execution_text,
+                language_text=execution_text,
+                display_state="missing",
+                has_pending_response=has_pending_response,
+            )
+        return TopLevelUserRequest(
+            execution_text=execution_text,
+            language_text=display_text,
+            display_state="text" if display_text else "empty",
+            has_pending_response=has_pending_response,
+        )
+
+    task = (
+        context.metadata.get("task")
+        if isinstance(getattr(context, "metadata", None), dict)
+        else None
+    )
+    task_text = str(task or "").strip()
+    return TopLevelUserRequest(
+        execution_text=task_text,
+        language_text=task_text,
+        display_state="missing",
+        has_pending_response=has_pending_response,
+    )
+
+
+def language_prompt_message(message: Any) -> dict[str, Any]:
+    """Serialize one prompt payload message without duplicating its content."""
+    payload = {
+        "role": getattr(message, "role", None),
+        "content": getattr(message, "content", None),
+    }
+    metadata = getattr(message, "metadata", None)
+    if (
+        payload["role"] == "user"
+        and isinstance(metadata, dict)
+        and metadata.get("response_to_waiting_for_user")
+    ):
+        payload["user_message_context"] = "pending_agent_question_response"
+    return payload
 
 
 def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:

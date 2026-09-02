@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...context.enrichment import latest_user_text
+from ...context.enrichment import language_prompt_message, top_level_user_request
 from ...language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
@@ -561,10 +561,10 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
-        latest_request = latest_user_text(request.context, prefer_display=True) or ""
+        latest_request = top_level_user_request(request.context).language_text
         expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
-            {"role": message.role, "content": message.content}
+            language_prompt_message(message)
             for message in request.context.messages
             if getattr(message, "role", None) in {"user", "assistant", "tool"}
         ]
@@ -688,7 +688,7 @@ class LLMPlanGenerator(PlanGenerator):
         Script comparison cannot tell a biased plan from a request that legitimately
         asks for another language, so it may only nudge once, never reject a plan.
         """
-        request = latest_user_text(context, prefer_display=True) or ""
+        request = top_level_user_request(context).language_text
         for step in plan.steps:
             mismatch = detect_prose_script_mismatch(
                 request, LLMPlanGenerator._step_prose(step)

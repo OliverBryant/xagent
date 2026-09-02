@@ -30,6 +30,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
+    output_language_directives,
     request_only_language_harness,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
@@ -454,6 +455,14 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
         "kind": "dag_waiting_user_response",
         "forwarded_from_root": True,
         "dag_step_id": "confirm",
+        "response_to_waiting_for_user": {
+            "question": "Choose A or B",
+            "message_type": "question",
+        },
+    }
+    assert root_context.messages[-1].metadata["response_to_waiting_for_user"] == {
+        "question": "Choose A or B",
+        "message_type": "question",
     }
 
 
@@ -1071,10 +1080,10 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert "Overall user goal is background context only" in messages[0]["content"]
     assert "Output language policy" in messages[0]["content"]
     assert (
-        request_only_language_harness("Extract highlights and generate two posters.")
+        output_language_directives("", section="root_existing_request")
         in messages[0]["content"]
     )
-    assert "Extract highlights and generate two posters." in messages[0]["content"]
+    assert "Extract highlights and generate two posters." not in messages[0]["content"]
     assert "Extract highlights and generate two posters." not in messages[-1]["content"]
     assert "Current step id: extract" in messages[0]["content"]
     assert "Detailed step boundary rules" in messages[0]["content"]
@@ -5191,11 +5200,13 @@ async def test_polluted_plan_language_is_not_a_hard_policy_for_dag_steps(
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     assert sorted(captured) == ["compare", "write"]
     for child in captured.values():
-        system_content = child.get_messages_for_llm()[0]["content"]
+        messages = child.get_messages_for_llm()
+        system_content = messages[0]["content"]
         assert "Output language: Simplified Chinese" not in system_content
         assert "Output language:" not in system_content
-        assert request in system_content
-        assert request_only_language_harness(request) in system_content
+        assert request not in system_content
+        assert sum(message["content"].count(request) for message in messages) == 1
+        assert "latest independent user message" in system_content
         step_instruction = [
             message.content
             for message in child.messages

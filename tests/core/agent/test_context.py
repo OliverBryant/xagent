@@ -185,11 +185,13 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
 
     system_message = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request:" in system_message
-    assert "Can you analyze this GitHub project?" in system_message
+    assert "Current user request:" not in system_message
+    assert ctx.get_messages_for_llm()[-1]["content"] == (
+        "Can you analyze this GitHub project?"
+    )
     assert "Response language rules" in system_message
     assert (
-        "Use the same natural language as the current user request above"
+        "Use the same natural language as the latest independent user message"
         in system_message
     )
     assert "Do not let retrieved memories" in system_message
@@ -322,11 +324,13 @@ def test_system_context_uses_latest_user_message_as_current_request() -> None:
     ctx.add_assistant_message("Sure, here is the analysis.")
     ctx.add_user_message("请继续用中文总结")
 
-    system_message = ctx.get_messages_for_llm()[0]["content"]
+    messages = ctx.get_messages_for_llm()
+    system_message = messages[0]["content"]
 
-    assert "Current user request:\n请继续用中文总结" in system_message
-    assert "Current user request:\nCan you analyze this GitHub project?" not in (
-        system_message
+    assert "latest independent user message" in system_message
+    assert system_message.count("请继续用中文总结") == 0
+    assert (
+        sum(message["content"].count("请继续用中文总结") for message in messages) == 1
     )
 
 
@@ -348,8 +352,10 @@ def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> 
     system_message = messages[0]["content"]
     waiting_answer_message = messages[-1]["content"]
 
-    assert "Current user request:\nBook a trip" in system_message
-    assert "Current user request:\n北京" not in system_message
+    assert "latest independent user message" in system_message
+    assert "Book a trip" not in system_message
+    assert "北京" not in system_message
+    assert messages[1]["content"] == "Book a trip"
     assert "answer to a pending agent question" in waiting_answer_message
     assert "User answer: 北京" in waiting_answer_message
 
@@ -676,8 +682,8 @@ def test_get_messages_for_llm_injects_current_request_focus() -> None:
     result = ctx.get_messages_for_llm()
 
     system_content = result[0]["content"]
-    assert "Current user request:" in system_content
-    assert "Compare Mistral, OpenAI, and Anthropic ARR." in system_content
+    assert "Current user request:" not in system_content
+    assert result[-1]["content"] == "Compare Mistral, OpenAI, and Anthropic ARR."
     assert "Earlier user and assistant messages are context only" in system_content
     assert "do not re-answer previous requests" in system_content
 
@@ -704,17 +710,19 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert [message["role"] for message in result].count("system") == 1
 
 
-def test_dag_step_without_output_language_quotes_the_request_for_language() -> None:
+def test_dag_step_without_output_language_references_the_existing_request() -> None:
     ctx = ExecutionContext()
     ctx.metadata["task"] = "Crée deux affiches."
     ctx.metadata["dag_step_id"] = "step-1"
     ctx.metadata["dag_step_name"] = "Extract release notes"
     ctx.add_user_message("Crée deux affiches.")
 
-    system_content = ctx.get_messages_for_llm()[0]["content"]
+    messages = ctx.get_messages_for_llm()
+    system_content = messages[0]["content"]
 
-    assert "Request-only response language harness:" in system_content
-    assert "Crée deux affiches." in system_content
+    assert "latest independent user message" in system_content
+    assert "Crée deux affiches." not in system_content
+    assert messages[-1]["content"] == "Crée deux affiches."
     assert "Response language rules:" in system_content
     assert "Output language:" not in system_content
 
@@ -726,9 +734,11 @@ def test_dag_step_language_quote_keeps_a_mid_request_directive() -> None:
     ctx.metadata["dag_step_name"] = "Extract release notes"
     ctx.add_user_message(request)
 
-    system_content = ctx.get_messages_for_llm()[0]["content"]
+    messages = ctx.get_messages_for_llm()
+    system_content = messages[0]["content"]
 
-    assert request in system_content
+    assert request not in system_content
+    assert messages[-1]["content"] == request
     assert "middle truncated" not in system_content
 
 
@@ -1560,11 +1570,11 @@ def test_compact_disabled() -> None:
 def test_token_estimate_uses_latest_prompt_usage_plus_append_delta() -> None:
     ctx = ExecutionContext()
     ctx.add_user_message("a" * 20)
-    ctx.record_llm_usage(input_tokens=100, output_tokens=10)
+    ctx.record_llm_usage(input_tokens=10_000, output_tokens=10)
     ctx.add_assistant_message("b" * 16)
     ctx.add_user_message("c" * 8)
 
-    assert ctx._get_total_tokens() == 106
+    assert ctx._get_total_tokens() == 10_006
 
 
 def test_token_estimate_falls_back_when_history_is_rewritten() -> None:
@@ -1573,7 +1583,11 @@ def test_token_estimate_falls_back_when_history_is_rewritten() -> None:
     ctx.record_llm_usage(input_tokens=100, output_tokens=10)
     ctx.messages[0] = Message.role_user("rewritten")
 
-    assert ctx._get_total_tokens() == max(1, len("rewritten") // 4)
+    expected = ctx._estimate_message_tokens(ctx.messages) + max(
+        1,
+        len("\n\n".join((ctx._system_context(),))) // 4,
+    )
+    assert ctx._get_total_tokens() == expected
 
 
 def test_serialization_roundtrip() -> None:

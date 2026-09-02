@@ -25,6 +25,17 @@ from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
+from xagent.web.services.memory_policy import (
+    TrustedMemoryPolicyDecision,
+    set_trusted_memory_policy_resolver,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_trusted_memory_policy_resolver():
+    set_trusted_memory_policy_resolver(None)
+    yield
+    set_trusted_memory_policy_resolver(None)
 
 
 class _BlockingPreviewWebSocket:
@@ -305,6 +316,166 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
 
     assert isinstance(policy.memory, InMemoryMemoryStore)
     assert policy.memory_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "expected_enabled"),
+    [
+        (None, True),
+        (42, False),
+    ],
+)
+def test_default_memory_policy_for_regular_and_published_agents(
+    monkeypatch,
+    agent_id,
+    expected_enabled,
+):
+    memory = object()
+    monkeypatch.setattr(chat_api, "get_memory_store", lambda: memory)
+    task = SimpleNamespace(
+        id=7,
+        user_id=8,
+        agent_id=agent_id,
+        agent_config={},
+    )
+
+    policy = resolve_agent_service_memory_policy(task=task)
+
+    assert policy.memory is memory
+    assert policy.memory_enabled is expected_enabled
+    assert policy.memory_available is True
+    assert policy.reason is None
+
+
+def test_trusted_memory_policy_can_enable_published_agent(monkeypatch):
+    memory = object()
+    monkeypatch.setattr(chat_api, "get_memory_store", lambda: memory)
+    task = SimpleNamespace(
+        id=7,
+        user_id=8,
+        agent_id=42,
+        agent_config={},
+    )
+    requests = []
+
+    def resolve(request):
+        requests.append(request)
+        return TrustedMemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            reason="service_memory_available",
+        )
+
+    set_trusted_memory_policy_resolver(resolve)
+
+    policy = resolve_agent_service_memory_policy(task=task)
+
+    assert policy.memory is memory
+    assert policy.memory_enabled is True
+    assert policy.memory_available is True
+    assert policy.reason == "service_memory_available"
+    assert requests == [
+        chat_api.TrustedMemoryPolicyRequest(
+            task_id=7,
+            user_id=8,
+            agent_id=42,
+            is_preview=False,
+            default_enabled=False,
+        )
+    ]
+
+
+def test_trusted_memory_policy_can_disable_default_memory(monkeypatch):
+    memory = object()
+    monkeypatch.setattr(chat_api, "get_memory_store", lambda: memory)
+    task = SimpleNamespace(
+        id=7,
+        user_id=8,
+        agent_id=None,
+        agent_config={},
+    )
+    set_trusted_memory_policy_resolver(
+        lambda request: TrustedMemoryPolicyDecision(
+            enabled=False,
+            available=True,
+            reason="disabled_by_service_policy",
+        )
+    )
+
+    policy = resolve_agent_service_memory_policy(task=task)
+
+    assert policy.memory is memory
+    assert policy.memory_enabled is False
+    assert policy.memory_available is True
+    assert policy.reason == "disabled_by_service_policy"
+
+
+@pytest.mark.parametrize(
+    ("resolver", "expected_reason"),
+    [
+        (lambda request: None, "invalid_decision"),
+        (
+            lambda request: TrustedMemoryPolicyDecision(
+                enabled=True,
+                available=False,
+            ),
+            "invalid_decision",
+        ),
+        (
+            lambda request: TrustedMemoryPolicyDecision(
+                enabled=1,
+                available=True,
+            ),
+            "invalid_decision",
+        ),
+    ],
+)
+def test_invalid_trusted_memory_policy_decision_fails_closed(
+    monkeypatch,
+    resolver,
+    expected_reason,
+):
+    memory = object()
+    monkeypatch.setattr(chat_api, "get_memory_store", lambda: memory)
+    set_trusted_memory_policy_resolver(resolver)
+
+    policy = resolve_agent_service_memory_policy(
+        task=SimpleNamespace(
+            id=7,
+            user_id=8,
+            agent_id=None,
+            agent_config={},
+        )
+    )
+
+    assert policy.memory is memory
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.reason == expected_reason
+
+
+def test_trusted_memory_policy_resolver_failure_fails_closed(monkeypatch):
+    memory = object()
+    monkeypatch.setattr(chat_api, "get_memory_store", lambda: memory)
+
+    def fail(request):
+        raise RuntimeError("resolver unavailable")
+
+    set_trusted_memory_policy_resolver(fail)
+
+    policy = resolve_agent_service_memory_policy(
+        task=SimpleNamespace(
+            id=7,
+            user_id=8,
+            agent_id=None,
+            agent_config={},
+        )
+    )
+
+    assert policy.memory is memory
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.reason == "resolver_error"
 
 
 @pytest.mark.asyncio

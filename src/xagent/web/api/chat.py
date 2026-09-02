@@ -107,6 +107,10 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import resolve_llms_from_names
 from ..services.managed_file_ref import ensure_uploaded_file_local_path
+from ..services.memory_policy import (
+    TrustedMemoryPolicyRequest,
+    resolve_trusted_memory_policy,
+)
 from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
@@ -312,6 +316,8 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
     memory_enabled: bool
+    memory_available: bool = True
+    reason: str | None = None
 
 
 def resolve_agent_service_memory_policy(
@@ -325,13 +331,37 @@ def resolve_agent_service_memory_policy(
         task_config = getattr(task, "agent_config", None)
         config = task_config if isinstance(task_config, Mapping) else {}
 
-    if config.get("is_preview") is True:
-        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
+    is_preview = config.get("is_preview") is True
+    if is_preview:
+        default_policy = AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
+    elif task is not None and task.agent_id:
+        default_policy = AgentServiceMemoryPolicy(get_memory_store(), False)
+    else:
+        default_policy = AgentServiceMemoryPolicy(get_memory_store(), True)
 
-    if task is not None and task.agent_id:
-        return AgentServiceMemoryPolicy(get_memory_store(), False)
+    decision = resolve_trusted_memory_policy(
+        TrustedMemoryPolicyRequest(
+            task_id=_optional_task_id(task, "id"),
+            user_id=_optional_task_id(task, "user_id"),
+            agent_id=_optional_task_id(task, "agent_id"),
+            is_preview=is_preview,
+            default_enabled=default_policy.memory_enabled,
+        )
+    )
+    if decision is None:
+        return default_policy
 
-    return AgentServiceMemoryPolicy(get_memory_store(), True)
+    return AgentServiceMemoryPolicy(
+        memory=default_policy.memory,
+        memory_enabled=decision.enabled and decision.available,
+        memory_available=decision.available,
+        reason=decision.reason,
+    )
+
+
+def _optional_task_id(task: Optional[Any], attribute: str) -> int | None:
+    value = getattr(task, attribute, None)
+    return value if type(value) is int else None
 
 
 async def resolve_agent_service_memory_policy_async(

@@ -1907,6 +1907,19 @@ async def test_inject_user_message_raises_corrupt_on_contextless_checkpoint() ->
         )
 
 
+def _assert_unpinned_restored_request_prompt(context: ExecutionContext) -> None:
+    request = "Summarize the release notes in one paragraph."
+    provider_messages = context.get_messages_for_llm()
+    system_content = provider_messages[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert request not in system_content
+    assert "latest independent user message" in system_content
+    assert sum(message["content"].count(request) for message in provider_messages) == 1
+    assert any(
+        message == {"role": "user", "content": request} for message in provider_messages
+    )
+
+
 @pytest.mark.asyncio
 async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> None:
     checkpoint_context = ExecutionContext(execution_id="exec-legacy-router-language")
@@ -1944,9 +1957,7 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
-    assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    _assert_unpinned_restored_request_prompt(result["context"])
 
 
 @pytest.mark.asyncio
@@ -1986,9 +1997,7 @@ async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
-    assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    _assert_unpinned_restored_request_prompt(result["context"])
 
 
 @pytest.mark.asyncio

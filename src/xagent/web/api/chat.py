@@ -359,6 +359,7 @@ def resolve_agent_service_memory_policy(
         override is not None and not override.available
     )
     backend_unavailable = False
+    memory: MemoryStore
     if use_in_memory:
         memory = InMemoryMemoryStore()
     else:

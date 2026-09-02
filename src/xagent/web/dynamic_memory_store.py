@@ -3,7 +3,7 @@
 import logging
 import os
 import threading
-from typing import Optional, Union
+from typing import Optional, Union, cast
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
@@ -214,7 +214,9 @@ class DynamicMemoryStoreManager:
                 raise
             if strict and self._model_lookup_failed:
                 raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
-            current_model_id = embedding_model.id if embedding_model else None
+            current_model_id = (
+                cast(int, embedding_model.id) if embedding_model else None
+            )
             current_fingerprint = _embedding_model_fingerprint(embedding_model)
 
             # Check if we need to update the store

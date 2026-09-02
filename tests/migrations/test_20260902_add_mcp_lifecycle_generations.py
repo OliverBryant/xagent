@@ -139,7 +139,7 @@ def _assert_constraints(connection: sa.Connection) -> None:
 def _upgrade_cycle(engine: sa.Engine) -> None:
     config = create_alembic_config(engine)
     config.set_main_option("script_location", str(MIGRATIONS_DIR))
-    with engine.begin() as connection:
+    with engine.connect() as connection:
         _create_legacy_schema(connection)
         config.attributes["connection"] = connection
         command.upgrade(config, REVISION)
@@ -168,6 +168,7 @@ def _upgrade_cycle(engine: sa.Engine) -> None:
             _generations(connection, "user_mcpservers", "lifecycle_generation")
         )
         _assert_database_defaults(connection)
+        connection.commit()
 
     with engine.connect() as connection:
         _assert_constraints(connection)

@@ -23,6 +23,7 @@ IMAGE_EDIT_UNAVAILABLE_METADATA_KEY = "image_edit_unavailable"
 
 
 DisplayMessageState = Literal["missing", "empty", "text"]
+TOP_LEVEL_USER_REQUEST_METADATA_KEY = "_xagent_top_level_user_request"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,40 @@ class TopLevelUserRequest:
     language_text: str
     display_state: DisplayMessageState
     has_pending_response: bool = False
+
+
+def _stored_top_level_user_request(context: Any) -> TopLevelUserRequest | None:
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    payload = metadata.get(TOP_LEVEL_USER_REQUEST_METADATA_KEY)
+    if not isinstance(payload, dict):
+        return None
+    execution_text = payload.get("execution_text")
+    language_text = payload.get("language_text")
+    display_state = payload.get("display_state")
+    if (
+        not isinstance(execution_text, str)
+        or not isinstance(language_text, str)
+        or display_state not in {"missing", "empty", "text"}
+    ):
+        return None
+    return TopLevelUserRequest(
+        execution_text=execution_text,
+        language_text=language_text,
+        display_state=display_state,
+    )
+
+
+def _persist_top_level_user_request(context: Any, request: TopLevelUserRequest) -> None:
+    metadata = getattr(context, "metadata", None)
+    if not isinstance(metadata, dict):
+        return
+    metadata[TOP_LEVEL_USER_REQUEST_METADATA_KEY] = {
+        "execution_text": request.execution_text,
+        "language_text": request.language_text,
+        "display_state": request.display_state,
+    }
 
 
 async def enrich_context_with_memory(
@@ -168,16 +203,29 @@ def top_level_user_request(context: Any) -> TopLevelUserRequest:
         if display_text is None:
             if not execution_text:
                 continue
-            return TopLevelUserRequest(
+            request = TopLevelUserRequest(
                 execution_text=execution_text,
                 language_text=execution_text,
                 display_state="missing",
                 has_pending_response=has_pending_response,
             )
-        return TopLevelUserRequest(
+            _persist_top_level_user_request(context, request)
+            return request
+        request = TopLevelUserRequest(
             execution_text=execution_text,
             language_text=display_text,
             display_state="text" if display_text else "empty",
+            has_pending_response=has_pending_response,
+        )
+        _persist_top_level_user_request(context, request)
+        return request
+
+    stored = _stored_top_level_user_request(context)
+    if stored is not None:
+        return TopLevelUserRequest(
+            execution_text=stored.execution_text,
+            language_text=stored.language_text,
+            display_state=stored.display_state,
             has_pending_response=has_pending_response,
         )
 
@@ -187,12 +235,14 @@ def top_level_user_request(context: Any) -> TopLevelUserRequest:
         else None
     )
     task_text = str(task or "").strip()
-    return TopLevelUserRequest(
+    request = TopLevelUserRequest(
         execution_text=task_text,
         language_text=task_text,
         display_state="missing",
         has_pending_response=has_pending_response,
     )
+    _persist_top_level_user_request(context, request)
+    return request
 
 
 def language_prompt_message(message: Any) -> dict[str, Any]:

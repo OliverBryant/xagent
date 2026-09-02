@@ -907,6 +907,9 @@ class ExecutionContext:
         include_system_prompt: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> "ExecutionContext":
+        # Child compaction may discard the copied root message, so snapshot its
+        # clean request provenance before metadata is cloned.
+        top_level_user_request(self)
         child_metadata = dict(self.metadata)
         if metadata:
             child_metadata.update(metadata)
@@ -1076,6 +1079,7 @@ class ExecutionContext:
                 strategy="none",
             )
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._compact(llm)
@@ -1092,6 +1096,7 @@ class ExecutionContext:
         if not self.compact_config.enabled:
             return None
 
+        top_level_user_request(self)
         total_tokens = self._get_total_tokens()
         if total_tokens <= self.compact_config.threshold:
             return None
@@ -1168,6 +1173,7 @@ class ExecutionContext:
         llm: Any = None,
         original_tokens: int | None = None,
     ) -> CompactResult:
+        top_level_user_request(self)
         original_count = len(self.messages)
         summary = (
             ""

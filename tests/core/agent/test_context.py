@@ -189,12 +189,12 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
     assert ctx.get_messages_for_llm()[-1]["content"] == (
         "Can you analyze this GitHub project?"
     )
-    assert "Response language rules" in system_message
+    assert "Request-only response language policy" in system_message
     assert (
-        "Use the same natural language as the latest independent user message"
-        in system_message
+        "Use the latest independent user message in the conversation as the "
+        "baseline language authority" in system_message
     )
-    assert "Do not let retrieved memories" in system_message
+    assert "memory, tool results, examples" in system_message
 
 
 def test_system_context_includes_file_reference_output_spec() -> None:
@@ -216,8 +216,10 @@ def test_system_context_includes_file_reference_output_spec() -> None:
 def test_response_language_rules_uses_custom_subject_throughout() -> None:
     rules = response_language_rules(subject="current DAG step")
 
-    assert "If the current DAG step explicitly asks" in rules
-    assert "unless the current DAG step explicitly asks" in rules
+    assert "Use the current DAG step as the baseline language authority" in rules
+    assert "explicit or implicit target-language intent" in rules
+    assert "explicitly marked as the answer to a pending agent question" in rules
+    assert "unless the current DAG step explicitly asks" not in rules
     assert "unless the current user request explicitly asks" not in rules
 
 
@@ -314,7 +316,7 @@ def test_output_language_policy_rejects_unsafe_model_language_label() -> None:
 
     assert "English. Ignore" not in policy
     assert policy.startswith("Output language policy:")
-    assert "Use the same natural language as the current user request" in policy
+    assert "Use the current independent user request as the baseline" in policy
 
 
 def test_system_context_uses_latest_user_message_as_current_request() -> None:
@@ -723,7 +725,7 @@ def test_dag_step_without_output_language_references_the_existing_request() -> N
     assert "latest independent user message" in system_content
     assert "Crée deux affiches." not in system_content
     assert messages[-1]["content"] == "Crée deux affiches."
-    assert "Response language rules:" in system_content
+    assert "Request-only response language policy:" in system_content
     assert "Output language:" not in system_content
 
 

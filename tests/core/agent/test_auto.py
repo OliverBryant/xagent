@@ -2329,7 +2329,7 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert result["success"] is True
     assert result["output"] == "La capitale de l'Italie est Rome."
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    target_rule = "Honor any explicit or implicit request to translate"
+    target_rule = "honor its explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert target_rule in tool_schema["description"]
     assert (

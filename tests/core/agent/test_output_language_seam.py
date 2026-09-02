@@ -138,12 +138,12 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
     completion_policy = output_language_directives("", section="completion_assessment")
     plan_policy = output_language_directives("", section="plan_payload")
     assert (
-        "Use the same natural language as the `user_authored_language_request` "
-        "field for all user-facing prose." in completion_policy
+        "Use the `user_authored_language_request` field as the baseline language "
+        "authority for all user-facing prose" in completion_policy
     )
     assert (
-        "Use the same natural language as the `latest_user_request` field for all "
-        "user-facing prose." in plan_policy
+        "Use the `latest_user_request` field as the baseline language authority "
+        "for all user-facing prose" in plan_policy
     )
     assert "the the `" not in completion_policy + plan_policy
 

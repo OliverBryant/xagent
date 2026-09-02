@@ -5,8 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from xagent.core.agent.context import ExecutionContext
+from xagent.core.agent.context import CompactConfig, ExecutionContext
 from xagent.core.agent.context.enrichment import (
+    TOP_LEVEL_USER_REQUEST_METADATA_KEY,
     latest_user_text,
     top_level_user_request,
 )
@@ -14,13 +15,16 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     final_answer_language_rule,
     output_language_directives,
+    output_language_policy,
     request_only_language_harness,
 )
 from xagent.core.agent.pattern.auto.auto import AutoPattern
 from xagent.core.agent.pattern.dag.dag import DAGPattern
 from xagent.core.agent.pattern.dag.plan_generator import (
+    ExecutionPlan,
     LLMPlanGenerator,
     PlanGenerationRequest,
+    PlanStep,
 )
 from xagent.core.agent.pattern.react.react import ReActPattern
 
@@ -91,9 +95,63 @@ def test_request_language_harness_preserves_soft_authority_invariants() -> None:
     harness = request_only_language_harness("Summarize this request.")
 
     assert "Request-only response language harness" in harness
-    assert "explicit and implicit requests" in harness
+    assert "explicit or implicit target-language intent" in harness
+    assert "explicitly marked as the answer to a pending agent question" in harness
     assert "empty, too short, mixed-language, or depends on conversation" in harness
     assert "Output language:" not in harness
+
+
+def test_every_unpinned_surface_uses_one_noncontradictory_language_policy() -> None:
+    context = _polluted_context()
+    root, plan_payload, completion_payload = _language_surfaces(context)
+    missing_display = ExecutionContext(execution_id="missing-display-policy")
+    missing_display.add_user_message(ENGLISH_REQUEST)
+    final_rule = final_answer_language_rule()
+    canonical_surfaces = [
+        root,
+        missing_display._system_context(),
+        str(plan_payload["output_language_policy"]),
+        str(completion_payload["output_language_policy"]),
+        output_language_policy(),
+        final_rule,
+    ]
+    forbidden = (
+        "unless the current user request explicitly asks for that language change",
+        "unless the user-authored request above explicitly asks",
+        "unless the `latest_user_request` field explicitly asks",
+        "unless the `user_authored_language_request` field explicitly asks",
+    )
+
+    for surface in canonical_surfaces:
+        assert "explicit or implicit target-language intent" in surface
+        assert "explicitly marked as the answer to a pending agent question" in surface
+        assert all(clause not in surface for clause in forbidden)
+
+    planner_description = LLMPlanGenerator()._plan_tool_schema()["function"][
+        "parameters"
+    ]["properties"]["response_language"]["description"]
+    assert "explicit or implicit target-language intent" in planner_description
+    assert "pending_agent_question_response" in planner_description
+    retry_context = ExecutionContext(execution_id="language-retry-policy")
+    retry_context.add_user_message("请用中文总结。")
+    retry = LLMPlanGenerator._request_language_reminder(
+        retry_context,
+        ExecutionPlan(steps=[PlanStep(id="summary", task="Write an English summary")]),
+    )
+    assert retry is not None
+    assert "explicit or implicit target-language intent" in retry
+    assert "explicitly marked as a pending agent question response" in retry
+    assert "from that request alone" not in retry
+    assert (
+        AutoPattern()
+        ._decision_tool_schema()["function"]["description"]
+        .endswith(final_rule)
+    )
+    assert (
+        ReActPattern()
+        ._final_answer_tool_schema()["function"]["description"]
+        .endswith(final_rule)
+    )
 
 
 def test_root_language_harness_uses_only_the_user_authored_request() -> None:
@@ -185,6 +243,25 @@ def test_dag_language_consumers_receive_the_same_user_authored_request() -> None
     )
     assert ENGLISH_REQUEST not in completion_payload["output_language_policy"]
     assert "Gerard Santos" not in completion_payload["output_language_policy"]
+
+
+def test_new_independent_request_replaces_the_persisted_provenance() -> None:
+    context = _polluted_context()
+    assert top_level_user_request(context).language_text == ENGLISH_REQUEST
+
+    follow_up = "Ahora responde en español."
+    context.add_user_message(
+        f"{follow_up}\n[Connector context in English]",
+        metadata={"display_message": follow_up},
+    )
+
+    request = top_level_user_request(context)
+    assert request.language_text == follow_up
+    assert context.metadata[TOP_LEVEL_USER_REQUEST_METADATA_KEY] == {
+        "execution_text": f"{follow_up}\n[Connector context in English]",
+        "language_text": follow_up,
+        "display_state": "text",
+    }
 
 
 def test_structured_language_payloads_include_a_large_request_exactly_once() -> None:
@@ -297,6 +374,70 @@ def test_dag_step_preserves_authoritative_blank_display_anchor(
     )
 
 
+@pytest.mark.parametrize(
+    ("display_message", "language_text", "display_state"),
+    [
+        pytest.param(ENGLISH_REQUEST, ENGLISH_REQUEST, "text", id="clean-display"),
+        pytest.param("", "", "empty", id="blank-display"),
+        pytest.param("  \n\t", "", "empty", id="whitespace-display"),
+    ],
+)
+@pytest.mark.parametrize("compaction", ["fresh", "summary", "truncate"])
+@pytest.mark.parametrize("cold_restore", [False, True], ids=["live", "restored"])
+def test_dag_request_provenance_survives_compaction_and_restore(
+    display_message: str,
+    language_text: str,
+    display_state: str,
+    compaction: str,
+    cold_restore: bool,
+) -> None:
+    root = ExecutionContext(
+        execution_id="dag-provenance-root",
+        metadata={"task": POLLUTED_EXECUTION_REQUEST},
+    )
+    root.add_user_message(
+        POLLUTED_EXECUTION_REQUEST,
+        metadata={"display_message": display_message},
+    )
+    child = root.create_child_context(
+        execution_id="dag-provenance-step",
+        metadata={"dag_step_id": "draft", "dag_step_name": "Redactar respuesta"},
+    )
+    child.add_user_message(
+        "DAG step instruction in Spanish",
+        metadata={"dag_step_id": "draft", "kind": "dag_step_instruction"},
+    )
+
+    if compaction == "summary":
+        child.compact_with_llm_response({"content": "Resumen español del trabajo"})
+    elif compaction == "truncate":
+        child.compact_config = CompactConfig(
+            enabled=True,
+            threshold=1,
+            max_messages=1,
+        )
+        assert child.compact_if_needed().compacted
+    if cold_restore:
+        child = ExecutionContext.from_dict(child.to_dict())
+
+    request = top_level_user_request(child)
+    snapshot = child.metadata[TOP_LEVEL_USER_REQUEST_METADATA_KEY]
+    system_context = child._system_context()
+
+    assert request.execution_text == POLLUTED_EXECUTION_REQUEST
+    assert request.language_text == language_text
+    assert request.display_state == display_state
+    assert snapshot == {
+        "execution_text": POLLUTED_EXECUTION_REQUEST,
+        "language_text": language_text,
+        "display_state": display_state,
+    }
+    assert request_only_language_harness(language_text) in system_context
+    assert (
+        request_only_language_harness(POLLUTED_EXECUTION_REQUEST) not in system_context
+    )
+
+
 def _waiting_dag_context(answer: str) -> tuple[DAGPattern, ExecutionContext]:
     root = ExecutionContext(execution_id="dag-language-wait")
     root.add_user_message(
@@ -367,7 +508,15 @@ def test_dag_wait_response_keeps_top_level_language_boundary(
         item for item in completion["messages"] if item.get("content") == answer
     )
     assert answer_payload["user_message_context"] == "pending_agent_question_response"
-    assert "unless that answer explicitly asks" in completion["output_language_policy"]
+    policies = [
+        root._system_context(),
+        str(plan_payload["output_language_policy"]),
+        str(completion["output_language_policy"]),
+    ]
+    for policy in policies:
+        assert "explicitly marked as the answer to a pending agent question" in policy
+        assert "only when the marked answer explicitly asks" in policy
+        assert "unless the user-authored request above explicitly asks" not in policy
 
 
 def test_large_split_request_has_canonical_provider_copies_and_budget() -> None:
@@ -403,6 +552,8 @@ def test_caller_pinned_language_remains_the_only_hard_authority() -> None:
     )
     assert "Output language: French" in completion_payload["output_language_policy"]
     assert "user_authored_language_request" not in completion_payload
+    assert "sole hard authority" in output_language_policy("French")
+    assert "user-requested language changes" not in output_language_policy("French")
 
 
 def test_final_answer_schemas_follow_the_shared_language_guidance() -> None:

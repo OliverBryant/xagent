@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -492,6 +493,19 @@ def _mcp_oauth_callback_error_redirect(
     raw_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
+    return _mcp_oauth_callback_error_redirect_for_path(
+        raw_redirect_after,
+        error_code=error_code,
+        message=message,
+    )
+
+
+def _mcp_oauth_callback_error_redirect_for_path(
+    raw_redirect_after: str | None,
+    *,
+    error_code: str,
+    message: str,
+) -> RedirectResponse:
     redirect_path = _redirect_after_with_params(
         raw_redirect_after,
         (
@@ -776,6 +790,206 @@ def _upsert_mcp_oauth_client(
         return client
 
 
+class _SQLiteOAuthPersistenceTransactionError(RuntimeError):
+    """The caller has SQLite writes that the persistence fence cannot reset."""
+
+
+def _begin_sqlite_oauth_persistence(db: Session) -> None:
+    """Acquire SQLite write intent before lifecycle identity is re-read."""
+    if db.new or db.dirty or db.deleted:
+        raise _SQLiteOAuthPersistenceTransactionError(
+            "SQLite OAuth persistence requires a read-only preflight"
+        )
+
+    connection = db.connection()
+    driver_connection = connection.connection.driver_connection
+    if bool(getattr(driver_connection, "in_transaction", False)):
+        raise _SQLiteOAuthPersistenceTransactionError(
+            "SQLite OAuth persistence requires an owned transaction"
+        )
+
+    # SQLAlchemy has logically autobegun for the read-only preflight even
+    # though pysqlite has not emitted BEGIN. End that logical transaction,
+    # then reserve SQLite's single writer before the identity reads.
+    db.rollback()
+    connection = db.connection()
+    driver_connection = connection.connection.driver_connection
+    if bool(getattr(driver_connection, "in_transaction", False)):
+        raise RuntimeError("SQLite OAuth persistence could not reset preflight")
+    connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+@dataclass(frozen=True)
+class _MCPOAuthAssociationIdentity:
+    server_id: int
+    user_id: int
+    lifecycle_generation: UUID
+
+
+@dataclass(frozen=True)
+class _MCPOAuthFlowIdentity:
+    id: int
+    state: str
+    server_id: int
+    user_id: int
+    client_id: int
+    association_lifecycle_generation: UUID
+
+
+def _mcp_oauth_flow_identity(flow_state: MCPOAuthFlowState) -> _MCPOAuthFlowIdentity:
+    generation = flow_state.association_lifecycle_generation
+    if not isinstance(generation, UUID):
+        raise RuntimeError("MCP OAuth flow has no association lifecycle generation")
+    return _MCPOAuthFlowIdentity(
+        id=int(flow_state.id),
+        state=str(flow_state.state),
+        server_id=int(flow_state.mcp_server_id),
+        user_id=int(flow_state.user_id),
+        client_id=int(flow_state.mcp_oauth_client_id),
+        association_lifecycle_generation=generation,
+    )
+
+
+def _lock_active_mcp_oauth_lifecycle(
+    db: Session,
+    *,
+    association_identity: _MCPOAuthAssociationIdentity,
+    flow_identity: _MCPOAuthFlowIdentity | None = None,
+) -> tuple[MCPServer, UserMCPServer, MCPOAuthFlowState | None] | None:
+    """Lock the exact association lifecycle before final OAuth persistence."""
+    if db.get_bind().dialect.name == "sqlite":
+        _begin_sqlite_oauth_persistence(db)
+    db.expire_all()
+
+    server = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == association_identity.server_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if server is None:
+        return None
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == association_identity.user_id,
+            UserMCPServer.mcpserver_id == association_identity.server_id,
+            UserMCPServer.lifecycle_generation
+            == association_identity.lifecycle_generation,
+            UserMCPServer.is_active.is_(True),
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if association is None:
+        return None
+
+    flow_state: MCPOAuthFlowState | None = None
+    if flow_identity is not None:
+        if (
+            flow_identity.server_id != association_identity.server_id
+            or flow_identity.user_id != association_identity.user_id
+            or flow_identity.association_lifecycle_generation
+            != association_identity.lifecycle_generation
+        ):
+            return None
+        flow_state = (
+            db.query(MCPOAuthFlowState)
+            .filter(
+                MCPOAuthFlowState.id == flow_identity.id,
+                MCPOAuthFlowState.state == flow_identity.state,
+                MCPOAuthFlowState.mcp_server_id == flow_identity.server_id,
+                MCPOAuthFlowState.user_id == flow_identity.user_id,
+                MCPOAuthFlowState.mcp_oauth_client_id == flow_identity.client_id,
+                MCPOAuthFlowState.association_lifecycle_generation
+                == flow_identity.association_lifecycle_generation,
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+        if flow_state is None:
+            return None
+    return server, association, flow_state
+
+
+def _persist_mcp_oauth_connect_flow(
+    db: Session,
+    *,
+    association_identity: _MCPOAuthAssociationIdentity,
+    discovery: Any,
+    client_id: str,
+    client_secret: str | None,
+    token_endpoint_auth_method: str,
+    redirect_uri: str,
+    registration_lookup_hash: str | None,
+    resource_owner_key: str,
+    selected_issuer: str,
+    selected_resource: str,
+    selected_scope: str,
+    redirect_after: str | None,
+) -> tuple[str, str, str] | None:
+    """Persist a client and flow only for the preflight association generation."""
+    lifecycle = _lock_active_mcp_oauth_lifecycle(
+        db,
+        association_identity=association_identity,
+    )
+    if lifecycle is None:
+        db.rollback()
+        return None
+
+    try:
+        oauth_client = _upsert_mcp_oauth_client(
+            db,
+            server_id=association_identity.server_id,
+            discovery=discovery,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_endpoint_auth_method=token_endpoint_auth_method,
+            redirect_uri=redirect_uri,
+            registration_lookup_hash=registration_lookup_hash,
+        )
+
+        stale_flow_state_ids = (
+            db.query(MCPOAuthFlowState.id)
+            .filter(
+                MCPOAuthFlowState.expires_at
+                < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
+            )
+            .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
+            .scalar_subquery()
+        )
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.id.in_(stale_flow_state_ids)
+        ).delete(synchronize_session=False)
+
+        state_value = secrets.token_urlsafe(32)
+        code_verifier = secrets.token_urlsafe(64)
+        db.add(
+            MCPOAuthFlowState(
+                state=state_value,
+                mcp_server_id=association_identity.server_id,
+                user_id=association_identity.user_id,
+                association_lifecycle_generation=(
+                    association_identity.lifecycle_generation
+                ),
+                mcp_oauth_client_id=oauth_client.id,
+                resource_owner_key=resource_owner_key,
+                issuer=selected_issuer,
+                resource=selected_resource,
+                scope=selected_scope,
+                code_verifier=encrypt_value(code_verifier),
+                redirect_after=_safe_mcp_oauth_redirect_after(redirect_after),
+                expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
+            )
+        )
+        persisted_client_id = str(oauth_client.client_id)
+        db.commit()
+        return persisted_client_id, state_value, code_verifier
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
     return MCPOAuthGrantResponse(
         id=cast(int, grant.id),
@@ -835,12 +1049,19 @@ def _mcp_oauth_flow_state_error(
         return "state_already_consumed", "OAuth state consumed"
     if _as_aware_utc(flow_state.expires_at) <= _utc_now():
         return "expired_state", "OAuth state expired"
+    association_generation = flow_state.association_lifecycle_generation
+    if association_generation is None:
+        return (
+            "invalid_state",
+            "OAuth state is not bound to an MCP server connection lifecycle",
+        )
     if (
         db.query(UserMCPServer)
         .filter(
             UserMCPServer.user_id == flow_state.user_id,
             UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
-            UserMCPServer.is_active,
+            UserMCPServer.lifecycle_generation == association_generation,
+            UserMCPServer.is_active.is_(True),
         )
         .first()
         is None
@@ -860,6 +1081,12 @@ def _claim_mcp_oauth_flow_state(
         db.query(MCPOAuthFlowState)
         .filter(
             MCPOAuthFlowState.id == flow_state.id,
+            MCPOAuthFlowState.state == flow_state.state,
+            MCPOAuthFlowState.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthFlowState.user_id == flow_state.user_id,
+            MCPOAuthFlowState.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
+            MCPOAuthFlowState.association_lifecycle_generation
+            == flow_state.association_lifecycle_generation,
             MCPOAuthFlowState.consumed_at.is_(None),
             MCPOAuthFlowState.expires_at > claimed_at,
         )
@@ -872,7 +1099,6 @@ def _claim_mcp_oauth_flow_state(
         db.rollback()
         return "state_already_consumed", "OAuth state consumed"
     db.commit()
-    db.refresh(flow_state)
     return None
 
 
@@ -963,6 +1189,135 @@ async def _exchange_mcp_oauth_code(
             },
         )
     return payload
+
+
+@dataclass(frozen=True)
+class _MCPOAuthIssuedTokenSnapshot:
+    flow_id: int
+    revocation_endpoint: str | None
+    client_id: str
+    encrypted_client_secret: str | None
+    token_endpoint_auth_method: str
+    access_token: str
+    refresh_token: str | None
+
+
+def _mcp_oauth_issued_token_snapshot(
+    *,
+    client: MCPOAuthClient,
+    flow_id: int,
+    token_data: dict[str, Any],
+) -> _MCPOAuthIssuedTokenSnapshot:
+    metadata = client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    revocation_endpoint = metadata.get("revocation_endpoint")
+    refresh_token = token_data.get("refresh_token")
+    return _MCPOAuthIssuedTokenSnapshot(
+        flow_id=flow_id,
+        revocation_endpoint=(
+            revocation_endpoint
+            if isinstance(revocation_endpoint, str) and revocation_endpoint
+            else None
+        ),
+        client_id=str(client.client_id),
+        encrypted_client_secret=(
+            str(client.client_secret) if client.client_secret else None
+        ),
+        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
+        access_token=str(token_data["access_token"]),
+        refresh_token=str(refresh_token) if refresh_token else None,
+    )
+
+
+async def _revoke_mcp_oauth_issued_token_externally(
+    snapshot: _MCPOAuthIssuedTokenSnapshot,
+) -> None:
+    """Best-effort revoke a token whose final local persistence failed."""
+    if snapshot.revocation_endpoint is None:
+        return
+    try:
+        client_secret = (
+            decrypt_value(snapshot.encrypted_client_secret)
+            if snapshot.encrypted_client_secret
+            else ""
+        )
+    except Exception:
+        logger.warning(
+            "Skipping issued MCP OAuth token revocation for flow %s because "
+            "client credentials are unavailable",
+            snapshot.flow_id,
+        )
+        return
+
+    auth: httpx.Auth | None = None
+    data_base: dict[str, str] = {"client_id": snapshot.client_id}
+    if snapshot.token_endpoint_auth_method == "client_secret_post" and client_secret:
+        data_base["client_secret"] = client_secret
+    elif snapshot.token_endpoint_auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
+    elif snapshot.token_endpoint_auth_method not in {
+        "none",
+        "client_secret_post",
+        "client_secret_basic",
+    }:
+        logger.warning(
+            "Skipping issued MCP OAuth token revocation for flow %s because "
+            "the client authentication method is unsupported",
+            snapshot.flow_id,
+        )
+        return
+
+    try:
+        async with create_mcp_oauth_http_client(
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ) as http_client:
+            for token, token_type_hint in (
+                (snapshot.access_token, "access_token"),
+                (snapshot.refresh_token, "refresh_token"),
+            ):
+                if token is None:
+                    continue
+                request_kwargs: dict[str, Any] = {
+                    "data": {
+                        **data_base,
+                        "token": token,
+                        "token_type_hint": token_type_hint,
+                    },
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                }
+                if auth is not None:
+                    request_kwargs["auth"] = auth
+                try:
+                    response = await oauth_post(
+                        snapshot.revocation_endpoint,
+                        client=http_client,
+                        **request_kwargs,
+                    )
+                    if response.status_code >= 400:
+                        logger.warning(
+                            "Issued MCP OAuth token revocation returned HTTP %s "
+                            "for flow %s",
+                            response.status_code,
+                            snapshot.flow_id,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Issued MCP OAuth token revocation failed for flow %s",
+                        snapshot.flow_id,
+                    )
+    except Exception:
+        logger.warning(
+            "Issued MCP OAuth token revocation could not start for flow %s",
+            snapshot.flow_id,
+        )
+
+
+async def _rollback_and_revoke_mcp_oauth_issued_token(
+    db: Session,
+    snapshot: _MCPOAuthIssuedTokenSnapshot,
+) -> None:
+    """Release database locks before any compensating provider request."""
+    db.rollback()
+    await _revoke_mcp_oauth_issued_token_externally(snapshot)
 
 
 async def _revoke_mcp_oauth_grant_externally(
@@ -4334,6 +4689,9 @@ async def mcp_oauth_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Invalid OAuth state"},
         )
+    callback_redirect_after = (
+        str(flow_state.redirect_after) if flow_state.redirect_after else None
+    )
     try:
         _validate_mcp_oauth_state_cookie(request, state_value)
     except HTTPException as exc:
@@ -4370,6 +4728,20 @@ async def mcp_oauth_callback(
         )
 
     try:
+        flow_identity = _mcp_oauth_flow_identity(flow_state)
+    except RuntimeError:
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
+            error_code="invalid_state",
+            message="OAuth state is not bound to an MCP server connection lifecycle",
+        )
+    association_identity = _MCPOAuthAssociationIdentity(
+        server_id=flow_identity.server_id,
+        user_id=flow_identity.user_id,
+        lifecycle_generation=flow_identity.association_lifecycle_generation,
+    )
+
+    try:
         _validate_mcp_oauth_callback_issuer(
             request=request,
             client=client,
@@ -4387,6 +4759,12 @@ async def mcp_oauth_callback(
                 or "Authorization response issuer did not match flow state"
             ),
         )
+    code_verifier = decrypt_value(str(flow_state.code_verifier))
+    resource = str(flow_state.resource)
+    # The claim commit expires ORM instances. Keep the provider-facing client
+    # snapshot detached so a concurrent server deletion cannot make token
+    # exchange or compensation reload stale ORM state.
+    db.expunge(client)
     claim_error = _claim_mcp_oauth_flow_state(db, flow_state)
     if claim_error is not None:
         error_code, message = claim_error
@@ -4409,30 +4787,61 @@ async def mcp_oauth_callback(
             error_code="invalid_state",
             message="Missing authorization code",
         )
+    issued_token: _MCPOAuthIssuedTokenSnapshot | None = None
     try:
         token_data = await _exchange_mcp_oauth_code(
             client=client,
             code=code,
-            code_verifier=decrypt_value(str(flow_state.code_verifier)),
-            resource=str(flow_state.resource),
+            code_verifier=code_verifier,
+            resource=resource,
         )
-        _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+        issued_token = _mcp_oauth_issued_token_snapshot(
+            client=client,
+            flow_id=flow_identity.id,
+            token_data=token_data,
+        )
+        lifecycle = _lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+            flow_identity=flow_identity,
+        )
+        if lifecycle is None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+            return _mcp_oauth_callback_error_redirect_for_path(
+                callback_redirect_after,
+                error_code="invalid_state",
+                message="MCP server connection changed during OAuth authorization",
+            )
+        locked_flow_state = lifecycle[2]
+        if locked_flow_state is None:
+            raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
+        _upsert_mcp_oauth_grant(
+            db,
+            flow_state=locked_flow_state,
+            token_data=token_data,
+        )
         db.commit()
     except HTTPException as exc:
-        db.rollback()
+        if issued_token is not None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+        else:
+            db.rollback()
         detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
         error_code = str(detail.get("code") or "token_exchange_failed")
         message = str(detail.get("message") or "MCP OAuth authorization failed")
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
     except Exception:
-        db.rollback()
-        logger.exception("MCP OAuth callback failed after state claim")
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        if issued_token is not None:
+            await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
+        else:
+            db.rollback()
+        logger.error("MCP OAuth callback failed after state claim")
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="token_exchange_failed",
             message="MCP OAuth authorization failed",
         )
@@ -4444,7 +4853,7 @@ async def mcp_oauth_callback(
     response = RedirectResponse(
         _mcp_oauth_redirect_after_url(
             _redirect_after_with_params(
-                str(flow_state.redirect_after) if flow_state.redirect_after else None,
+                callback_redirect_after,
                 (("mcp_oauth_success", "1"),),
             )
         )
@@ -4482,8 +4891,22 @@ async def connect_mcp_oauth(
 ) -> RedirectResponse | JSONResponse:
     """Start MCP OAuth Authorization Code + PKCE for the current user."""
     user_id = cast(int, current_user.id)
-    _, server = _get_user_mcp_server_or_404(
+    association, server = _get_user_mcp_server_or_404(
         db, user_id=user_id, server_id=server_id, require_active=True
+    )
+    association_generation = association.lifecycle_generation
+    if not isinstance(association_generation, UUID):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "oauth_lifecycle_changed",
+                "message": "MCP server connection lifecycle is unavailable",
+            },
+        )
+    association_identity = _MCPOAuthAssociationIdentity(
+        server_id=server_id,
+        user_id=user_id,
+        lifecycle_generation=association_generation,
     )
     auth_config = _get_mcp_oauth_config(server)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config)
@@ -4540,6 +4963,9 @@ async def connect_mcp_oauth(
                 registered_client.token_endpoint_auth_method
             )
         else:
+            # Dynamic registration is provider I/O too; release the client
+            # lookup transaction before awaiting it.
+            db.rollback()
             try:
                 registration = await register_mcp_oauth_public_client(
                     discovery.authorization_server,
@@ -4563,70 +4989,34 @@ async def connect_mcp_oauth(
         str(discovery.resource), field_name="resource"
     )
 
-    oauth_client = _upsert_mcp_oauth_client(
+    persisted = _persist_mcp_oauth_connect_flow(
         db,
-        server_id=server_id,
+        association_identity=association_identity,
         discovery=discovery,
         client_id=client_id,
         client_secret=client_secret,
         token_endpoint_auth_method=token_endpoint_auth_method,
         redirect_uri=redirect_uri,
         registration_lookup_hash=registration_lookup_hash,
-    )
-
-    # Sweep this table's dead rows before adding another, mirroring the Slack
-    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
-    # double-submitted authorization leaves a row that is permanently unusable
-    # once it expires (the claim query requires consumed_at IS NULL and
-    # expires_at > now), but nothing deleted it: the only other deletes are the
-    # per-user purge on disconnect and the FK cascade on server deletion, so
-    # the table grew without bound. Deliberately global rather than scoped to
-    # this user/server — a user who never reconnects would otherwise keep their
-    # rows forever, which is the leak this is meant to close. Filtering on
-    # expires_at alone (an indexed column) also covers consumed rows, since
-    # every row expires within MCP_OAUTH_STATE_TTL of being created.
-    #
-    # Bounded per request. The index narrows the scan but does not cap the work,
-    # and this table is precisely the one that has never been swept — the first
-    # connect after this ships meets whatever backlog has accumulated, inside a
-    # user-facing transaction. Draining a fixed batch per connect keeps that
-    # transaction short; the remainder is already dead, so later connects
-    # clearing it costs nothing. Deleting by a bounded id subquery rather than
-    # an IN list of fetched ids keeps it to one statement and clear of any
-    # bound-parameter limit.
-    stale_flow_state_ids = (
-        db.query(MCPOAuthFlowState.id)
-        .filter(
-            MCPOAuthFlowState.expires_at < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
-        )
-        .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
-        .scalar_subquery()
-    )
-    db.query(MCPOAuthFlowState).filter(
-        MCPOAuthFlowState.id.in_(stale_flow_state_ids)
-    ).delete(synchronize_session=False)
-
-    state_value = secrets.token_urlsafe(32)
-    code_verifier = secrets.token_urlsafe(64)
-    flow_state = MCPOAuthFlowState(
-        state=state_value,
-        mcp_server_id=server_id,
-        user_id=user_id,
-        mcp_oauth_client_id=oauth_client.id,
         resource_owner_key=resource_owner_key,
-        issuer=selected_issuer,
-        resource=selected_resource,
-        scope=selected_scope,
-        code_verifier=encrypt_value(code_verifier),
-        redirect_after=_safe_mcp_oauth_redirect_after(request_data.redirect_after),
-        expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
+        selected_issuer=selected_issuer,
+        selected_resource=selected_resource,
+        selected_scope=selected_scope,
+        redirect_after=request_data.redirect_after,
     )
-    db.add(flow_state)
-    db.commit()
+    if persisted is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "oauth_lifecycle_changed",
+                "message": "MCP server connection changed during OAuth setup",
+            },
+        )
+    persisted_client_id, state_value, code_verifier = persisted
 
     params = {
         "response_type": "code",
-        "client_id": str(oauth_client.client_id),
+        "client_id": persisted_client_id,
         "redirect_uri": redirect_uri,
         "state": state_value,
         "code_challenge": _pkce_code_challenge(code_verifier),

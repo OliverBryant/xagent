@@ -1,0 +1,253 @@
+"""PostgreSQL release gate for MCP OAuth producer lifecycle fencing."""
+
+from __future__ import annotations
+
+import threading
+from datetime import timedelta
+
+import pytest
+from sqlalchemy.orm import sessionmaker
+
+from tests.shared.postgres_disposable import disposable_database_factory
+from xagent.core.utils.encryption import encrypt_value
+from xagent.web.api import mcp as mcp_api
+from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.user import User
+
+pytestmark = pytest.mark.postgresql
+
+
+@pytest.fixture()
+def postgresql_engine():
+    with disposable_database_factory("xagent_mcp_oauth_lifecycle") as make:
+        engine = make("producer_fence")
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                User.__table__,
+                MCPServer.__table__,
+                UserMCPServer.__table__,
+                MCPOAuthClient.__table__,
+                MCPOAuthGrant.__table__,
+                MCPOAuthFlowState.__table__,
+            ],
+        )
+        yield engine
+
+
+def _seed_lifecycle(factory):
+    with factory() as db:
+        user = User(username="postgres-oauth-alice", password_hash="x")
+        other_user = User(username="postgres-oauth-bob", password_hash="x")
+        server = MCPServer.from_config(
+            {
+                "name": "postgres-oauth-records",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            }
+        )
+        db.add_all([user, other_user, server])
+        db.flush()
+        association = UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+        other_association = UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+        client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="postgres-client",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+        db.add_all([association, other_association, client])
+        db.flush()
+        flow = MCPOAuthFlowState(
+            state="postgres-flow-state",
+            mcp_server_id=server.id,
+            user_id=user.id,
+            association_lifecycle_generation=association.lifecycle_generation,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            code_verifier=encrypt_value("postgres-verifier"),
+            expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+            consumed_at=mcp_api._utc_now(),
+        )
+        db.add(flow)
+        db.commit()
+        return {
+            "user_id": int(user.id),
+            "other_user_id": int(other_user.id),
+            "server_id": int(server.id),
+            "client_id": int(client.id),
+            "flow_id": int(flow.id),
+            "generation": association.lifecycle_generation,
+        }
+
+
+def _identities(seed):
+    association_identity = mcp_api._MCPOAuthAssociationIdentity(
+        server_id=seed["server_id"],
+        user_id=seed["user_id"],
+        lifecycle_generation=seed["generation"],
+    )
+    flow_identity = mcp_api._MCPOAuthFlowIdentity(
+        id=seed["flow_id"],
+        state="postgres-flow-state",
+        server_id=seed["server_id"],
+        user_id=seed["user_id"],
+        client_id=seed["client_id"],
+        association_lifecycle_generation=seed["generation"],
+    )
+    return association_identity, flow_identity
+
+
+def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
+    postgresql_engine,
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory)
+    association_identity, flow_identity = _identities(seed)
+
+    with factory() as disconnect_db:
+        disconnect_db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.id == seed["flow_id"]
+        ).delete(synchronize_session=False)
+        disconnect_db.query(UserMCPServer).filter(
+            UserMCPServer.user_id == seed["user_id"],
+            UserMCPServer.mcpserver_id == seed["server_id"],
+        ).delete(synchronize_session=False)
+        disconnect_db.commit()
+        replacement_association = UserMCPServer(
+            user_id=seed["user_id"],
+            mcpserver_id=seed["server_id"],
+            is_owner=False,
+            is_active=True,
+        )
+        disconnect_db.add(replacement_association)
+        disconnect_db.flush()
+        replacement_flow = MCPOAuthFlowState(
+            state="postgres-flow-state",
+            mcp_server_id=seed["server_id"],
+            user_id=seed["user_id"],
+            association_lifecycle_generation=(
+                replacement_association.lifecycle_generation
+            ),
+            mcp_oauth_client_id=seed["client_id"],
+            resource_owner_key="replacement-owner",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            code_verifier=encrypt_value("replacement-verifier"),
+            expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+        )
+        disconnect_db.add(replacement_flow)
+        disconnect_db.commit()
+        replacement_flow_id = int(replacement_flow.id)
+        assert replacement_association.lifecycle_generation != seed["generation"]
+
+    with factory() as producer_db:
+        assert (
+            mcp_api._lock_active_mcp_oauth_lifecycle(
+                producer_db,
+                association_identity=association_identity,
+                flow_identity=flow_identity,
+            )
+            is None
+        )
+        producer_db.rollback()
+
+    with factory() as verify_db:
+        assert verify_db.query(MCPOAuthGrant).count() == 0
+        assert verify_db.query(MCPOAuthFlowState).one().id == replacement_flow_id
+        assert (
+            verify_db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == seed["server_id"])
+            .count()
+            == 2
+        )
+
+
+def test_producer_first_holds_lifecycle_locks_until_grant_commit(
+    postgresql_engine,
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory)
+    association_identity, flow_identity = _identities(seed)
+    disconnect_started = threading.Event()
+    disconnect_finished = threading.Event()
+    disconnect_errors: list[BaseException] = []
+
+    def disconnect() -> None:
+        try:
+            with factory() as disconnect_db:
+                disconnect_started.set()
+                disconnect_db.query(MCPOAuthGrant).filter(
+                    MCPOAuthGrant.mcp_server_id == seed["server_id"],
+                    MCPOAuthGrant.user_id == seed["user_id"],
+                ).delete(synchronize_session=False)
+                disconnect_db.query(MCPOAuthFlowState).filter(
+                    MCPOAuthFlowState.id == seed["flow_id"]
+                ).delete(synchronize_session=False)
+                disconnect_db.query(UserMCPServer).filter(
+                    UserMCPServer.user_id == seed["user_id"],
+                    UserMCPServer.mcpserver_id == seed["server_id"],
+                ).delete(synchronize_session=False)
+                disconnect_db.commit()
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            disconnect_errors.append(exc)
+        finally:
+            disconnect_finished.set()
+
+    with factory() as producer_db:
+        lifecycle = mcp_api._lock_active_mcp_oauth_lifecycle(
+            producer_db,
+            association_identity=association_identity,
+            flow_identity=flow_identity,
+        )
+        assert lifecycle is not None
+        locked_flow = lifecycle[2]
+        assert locked_flow is not None
+        disconnect_thread = threading.Thread(target=disconnect)
+        disconnect_thread.start()
+        assert disconnect_started.wait(timeout=2)
+        assert not disconnect_finished.wait(timeout=0.2)
+        mcp_api._upsert_mcp_oauth_grant(
+            producer_db,
+            flow_state=locked_flow,
+            token_data={
+                "access_token": "postgres-issued-token",
+                "token_type": "Bearer",
+                "scope": "records.read",
+            },
+        )
+        producer_db.commit()
+
+    disconnect_thread.join(timeout=5)
+    assert disconnect_finished.is_set()
+    assert disconnect_errors == []
+    with factory() as verify_db:
+        assert verify_db.query(MCPOAuthGrant).count() == 0
+        assert verify_db.query(MCPOAuthFlowState).count() == 0
+        assert (
+            verify_db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == seed["server_id"])
+            .count()
+            == 1
+        )

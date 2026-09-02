@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -9,6 +11,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
@@ -58,6 +61,8 @@ def db_session(tmp_path):
     engine = create_engine(
         f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
     )
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar() == "wal"
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     db = SessionLocal()
@@ -197,6 +202,17 @@ def _add_oauth_client(
     return client
 
 
+def _association_generation(db, user: User, server: MCPServer):
+    return (
+        db.query(UserMCPServer.lifecycle_generation)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .scalar()
+    )
+
+
 def _add_callback_client_and_state(
     db,
     user: User,
@@ -207,10 +223,12 @@ def _add_callback_client_and_state(
 ) -> tuple[MCPServer, MCPOAuthClient, MCPOAuthFlowState]:
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(db, server, metadata_json=metadata_json)
+    association_generation = _association_generation(db, user, server)
     flow_state = MCPOAuthFlowState(
         state=state,
         mcp_server_id=server.id,
         user_id=user.id,
+        association_lifecycle_generation=association_generation,
         mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
@@ -654,6 +672,172 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
     assert flow_state.mcp_oauth_client_id == client.id
+    assert flow_state.association_lifecycle_generation == _association_generation(
+        db, user, server
+    )
+
+
+@pytest.mark.asyncio
+async def test_connect_rejects_delete_and_recreate_during_provider_io(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    original_generation = _association_generation(db, user, server)
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def replace_association_during_discovery(*args, **kwargs):
+        other_db = SessionLocal()
+        try:
+            other_db.query(UserMCPServer).filter(
+                UserMCPServer.user_id == user.id,
+                UserMCPServer.mcpserver_id == server.id,
+            ).delete(synchronize_session=False)
+            other_db.commit()
+            other_db.add(
+                UserMCPServer(
+                    user_id=user.id,
+                    mcpserver_id=server.id,
+                    is_owner=False,
+                    is_active=True,
+                )
+            )
+            other_db.commit()
+        finally:
+            other_db.close()
+        return _discovery()
+
+    monkeypatch.setattr(
+        mcp_api, "discover_mcp_oauth_metadata", replace_association_during_discovery
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/mcp"),
+            user,
+            db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "oauth_lifecycle_changed"
+    db.expire_all()
+    replacement_generation = _association_generation(db, user, server)
+    assert replacement_generation != original_generation
+    assert db.query(MCPOAuthClient).count() == 0
+    assert db.query(MCPOAuthFlowState).count() == 0
+    assert (
+        db.query(UserMCPServer).filter(UserMCPServer.mcpserver_id == server.id).count()
+        == 2
+    )
+
+
+def test_connect_producer_first_blocks_disconnect_until_flow_commit(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    association_identity = mcp_api._MCPOAuthAssociationIdentity(
+        server_id=server.id,
+        user_id=user.id,
+        lifecycle_generation=_association_generation(db, user, server),
+    )
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    disconnect_started = threading.Event()
+    disconnect_finished = threading.Event()
+    disconnect_errors: list[BaseException] = []
+
+    def disconnect() -> None:
+        other_db = SessionLocal()
+        try:
+            disconnect_started.set()
+            other_db.query(MCPOAuthFlowState).filter(
+                MCPOAuthFlowState.mcp_server_id == server.id,
+                MCPOAuthFlowState.user_id == user.id,
+            ).delete(synchronize_session=False)
+            other_db.query(UserMCPServer).filter(
+                UserMCPServer.mcpserver_id == server.id,
+                UserMCPServer.user_id == user.id,
+            ).delete(synchronize_session=False)
+            other_db.commit()
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            disconnect_errors.append(exc)
+        finally:
+            other_db.close()
+            disconnect_finished.set()
+
+    original_upsert = mcp_api._upsert_mcp_oauth_client
+    disconnect_thread: threading.Thread | None = None
+
+    def gated_upsert(*args, **kwargs):
+        nonlocal disconnect_thread
+        disconnect_thread = threading.Thread(target=disconnect)
+        disconnect_thread.start()
+        assert disconnect_started.wait(timeout=2)
+        time.sleep(0.1)
+        assert not disconnect_finished.is_set()
+        return original_upsert(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_client", gated_upsert)
+    persisted = mcp_api._persist_mcp_oauth_connect_flow(
+        db,
+        association_identity=association_identity,
+        discovery=_discovery(),
+        client_id="client-123",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        registration_lookup_hash=None,
+        resource_owner_key=f"xagent:user:{user.id}",
+        selected_issuer="https://auth.example.com",
+        selected_resource="https://mcp.example.com/mcp",
+        selected_scope="records.read",
+        redirect_after="/mcp",
+    )
+    assert persisted is not None
+    assert disconnect_thread is not None
+    disconnect_thread.join(timeout=2)
+
+    assert disconnect_finished.is_set()
+    assert disconnect_errors == []
+    db.expire_all()
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one_or_none()
+        is None
+    )
+    assert db.query(MCPOAuthFlowState).count() == 0
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == other_user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+        is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -2207,10 +2391,19 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         client_secret=mcp_api.encrypt_value("client-secret"),
         token_endpoint_auth_method="client_secret_post",
     )
+    association_generation = (
+        db.query(UserMCPServer.lifecycle_generation)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .scalar()
+    )
     flow_state = MCPOAuthFlowState(
         state="state-123",
         mcp_server_id=server.id,
         user_id=user.id,
+        association_lifecycle_generation=association_generation,
         mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
@@ -2267,6 +2460,296 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     assert decrypt_value(grant.access_token) == "plain-access-token"
     assert decrypt_value(grant.refresh_token) == "plain-refresh-token"
     assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_replacement_lifecycle_and_flow_after_token_issue(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server, client, original_flow = _add_callback_client_and_state(
+        db,
+        user,
+        state="replacement-lifecycle-state",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    server_id = int(server.id)
+    user_id = int(user.id)
+    client_id = int(client.id)
+    original_generation = original_flow.association_lifecycle_generation
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    replacement: dict[str, object] = {}
+
+    async def replace_lifecycle_during_exchange(**kwargs):
+        other_db = SessionLocal()
+        try:
+            other_db.query(MCPOAuthFlowState).filter(
+                MCPOAuthFlowState.id == original_flow.id
+            ).delete(synchronize_session=False)
+            other_db.query(UserMCPServer).filter(
+                UserMCPServer.user_id == user_id,
+                UserMCPServer.mcpserver_id == server_id,
+            ).delete(synchronize_session=False)
+            other_db.commit()
+            replacement_association = UserMCPServer(
+                user_id=user_id,
+                mcpserver_id=server_id,
+                is_owner=False,
+                is_active=True,
+            )
+            other_db.add(replacement_association)
+            other_db.flush()
+            replacement_flow = MCPOAuthFlowState(
+                state="replacement-lifecycle-state",
+                mcp_server_id=server_id,
+                user_id=user_id,
+                association_lifecycle_generation=(
+                    replacement_association.lifecycle_generation
+                ),
+                mcp_oauth_client_id=client_id,
+                resource_owner_key="replacement-owner",
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("replacement-verifier"),
+                redirect_after="/replacement",
+                expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+            )
+            other_db.add(replacement_flow)
+            other_db.commit()
+            replacement["generation"] = replacement_association.lifecycle_generation
+            replacement["flow_id"] = replacement_flow.id
+        finally:
+            other_db.close()
+        return {
+            "access_token": "issued-access-token",
+            "refresh_token": "issued-refresh-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    revoked: list[mcp_api._MCPOAuthIssuedTokenSnapshot] = []
+
+    async def record_revoke(snapshot):
+        revoked.append(snapshot)
+
+    monkeypatch.setattr(
+        mcp_api, "_exchange_mcp_oauth_code", replace_lifecycle_during_exchange
+    )
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revoke
+    )
+
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=replacement-lifecycle-state"
+        ),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
+    assert replacement["generation"] != original_generation
+    assert len(revoked) == 1
+    assert revoked[0].access_token == "issued-access-token"
+    db.expire_all()
+    assert db.query(MCPOAuthGrant).count() == 0
+    replacement_flow = db.query(MCPOAuthFlowState).one()
+    assert replacement_flow.id == replacement["flow_id"]
+    assert replacement_flow.redirect_after == "/replacement"
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_replacement_flow_in_same_lifecycle(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server, client, original_flow = _add_callback_client_and_state(
+        db,
+        user,
+        state="replacement-flow-state",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    sentinel = MCPOAuthFlowState(
+        state="replacement-flow-sentinel",
+        mcp_server_id=server.id,
+        user_id=user.id,
+        association_lifecycle_generation=original_flow.association_lifecycle_generation,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key="sentinel-owner",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=encrypt_value("sentinel-verifier"),
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+    )
+    db.add(sentinel)
+    db.commit()
+    original_flow_id = int(original_flow.id)
+    server_id = int(server.id)
+    user_id = int(user.id)
+    client_id = int(client.id)
+    lifecycle_generation = original_flow.association_lifecycle_generation
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    replacement_flow_id: list[int] = []
+
+    async def replace_flow_during_exchange(**kwargs):
+        other_db = SessionLocal()
+        try:
+            other_db.query(MCPOAuthFlowState).filter(
+                MCPOAuthFlowState.id == original_flow_id
+            ).delete(synchronize_session=False)
+            other_db.commit()
+            replacement_flow = MCPOAuthFlowState(
+                state="replacement-flow-state",
+                mcp_server_id=server_id,
+                user_id=user_id,
+                association_lifecycle_generation=lifecycle_generation,
+                mcp_oauth_client_id=client_id,
+                resource_owner_key="replacement-owner",
+                issuer="https://auth.example.com",
+                resource="https://mcp.example.com/mcp",
+                scope="records.read",
+                code_verifier=encrypt_value("replacement-verifier"),
+                redirect_after="/replacement",
+                expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+            )
+            other_db.add(replacement_flow)
+            other_db.commit()
+            replacement_flow_id.append(int(replacement_flow.id))
+        finally:
+            other_db.close()
+        return {
+            "access_token": "issued-access-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    revoked: list[mcp_api._MCPOAuthIssuedTokenSnapshot] = []
+
+    async def record_revoke(snapshot):
+        revoked.append(snapshot)
+
+    monkeypatch.setattr(
+        mcp_api, "_exchange_mcp_oauth_code", replace_flow_during_exchange
+    )
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revoke
+    )
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=replacement-flow-state"),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
+    assert replacement_flow_id[0] != original_flow_id
+    assert len(revoked) == 1
+    db.expire_all()
+    assert db.query(MCPOAuthGrant).count() == 0
+    replacement_flow = (
+        db.query(MCPOAuthFlowState)
+        .filter(MCPOAuthFlowState.state == "replacement-flow-state")
+        .one()
+    )
+    assert replacement_flow.id == replacement_flow_id[0]
+    assert replacement_flow.consumed_at is None
+
+
+@pytest.mark.asyncio
+async def test_callback_rolls_back_before_revoke_and_sanitizes_failure_log(
+    db_session, monkeypatch, caplog
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="persistence-failure-state",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    ordering: list[str] = []
+
+    @event.listens_for(db, "after_rollback")
+    def record_rollback(session):
+        ordering.append("rollback")
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "issued-secret-access-token",
+            "refresh_token": "issued-secret-refresh-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    def fail_persistence(*args, **kwargs):
+        raise RuntimeError("raw persistence detail issued-secret-access-token")
+
+    async def record_revoke(snapshot):
+        assert not db.in_transaction()
+        ordering.append("revoke")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+    monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_grant", fail_persistence)
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revoke
+    )
+
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=persistence-failure-state"
+        ),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["token_exchange_failed"]
+    assert ordering[-2:] == ["rollback", "revoke"]
+    assert "issued-secret-access-token" not in caplog.text
+    assert "issued-secret-refresh-token" not in caplog.text
+    assert "raw persistence detail" not in caplog.text
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_issued_token_compensation_revokes_access_and_refresh(monkeypatch):
+    requests: list[dict[str, list[str]]] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(200)
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+    await mcp_api._revoke_mcp_oauth_issued_token_externally(
+        mcp_api._MCPOAuthIssuedTokenSnapshot(
+            flow_id=7,
+            revocation_endpoint="https://auth.example.com/revoke",
+            client_id="public-client",
+            encrypted_client_secret=None,
+            token_endpoint_auth_method="none",
+            access_token="issued-access-token",
+            refresh_token="issued-refresh-token",
+        )
+    )
+
+    assert [request["token"] for request in requests] == [
+        ["issued-access-token"],
+        ["issued-refresh-token"],
+    ]
+    assert [request["token_type_hint"] for request in requests] == [
+        ["access_token"],
+        ["refresh_token"],
+    ]
 
 
 @pytest.mark.asyncio
@@ -2393,6 +2876,30 @@ async def test_callback_rejects_state_without_browser_session_cookie(
 
 
 @pytest.mark.asyncio
+async def test_callback_rejects_legacy_state_without_lifecycle_generation(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _, _, flow_state = _add_callback_client_and_state(
+        db, user, state="legacy-unbound-state"
+    )
+    flow_state.association_lifecycle_generation = None
+    db.commit()
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("an unbound pre-migration flow must fail before token exchange")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=legacy-unbound-state"),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
 async def test_callback_uses_flow_bound_client_when_same_issuer_has_multiple_clients(
     db_session, monkeypatch
 ):
@@ -2400,10 +2907,19 @@ async def test_callback_uses_flow_bound_client_when_same_issuer_has_multiple_cli
     server = _add_mcp_oauth_server(db, user)
     _add_oauth_client(db, server, client_id="stale-client")
     bound_client = _add_oauth_client(db, server, client_id="bound-client")
+    association_generation = (
+        db.query(UserMCPServer.lifecycle_generation)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .scalar()
+    )
     flow_state = MCPOAuthFlowState(
         state="client-bound-state",
         mcp_server_id=server.id,
         user_id=user.id,
+        association_lifecycle_generation=association_generation,
         mcp_oauth_client_id=bound_client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
@@ -2834,6 +3350,7 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
             state="bad-token-state",
             mcp_server_id=server.id,
             user_id=user.id,
+            association_lifecycle_generation=_association_generation(db, user, server),
             mcp_oauth_client_id=client.id,
             resource_owner_key="resource-owner-a",
             issuer="https://auth.example.com",

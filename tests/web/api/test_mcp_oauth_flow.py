@@ -45,8 +45,8 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_hash
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
-from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services import connector_team_scope
+from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,

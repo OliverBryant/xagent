@@ -454,10 +454,6 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
         "kind": "dag_waiting_user_response",
         "forwarded_from_root": True,
         "dag_step_id": "confirm",
-        "response_to_waiting_for_user": {
-            "question": "Choose A or B",
-            "message_type": "question",
-        },
     }
 
 

@@ -229,7 +229,7 @@ def top_level_user_request(context: Any) -> TopLevelUserRequest:
             continue
         metadata = getattr(message, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
-        if pending_user_response(message) is not None:
+        if metadata.get("response_to_waiting_for_user"):
             has_pending_response = True
             continue
         if metadata.get("dag_step_id"):

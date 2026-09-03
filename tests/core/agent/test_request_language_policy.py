@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -66,16 +65,58 @@ def test_pending_response_serializer_exposes_only_allowlisted_exact_fields() -> 
 
 
 @pytest.mark.parametrize(
-    "marker",
-    [True, False, "legacy", 1, None, {}, {"question": " \n"}],
+    "metadata",
+    [
+        None,
+        {"response_to_waiting_for_user": True},
+        {"response_to_waiting_for_user": False},
+        {"response_to_waiting_for_user": "legacy"},
+        {"response_to_waiting_for_user": 1},
+        {"response_to_waiting_for_user": None},
+        {"response_to_waiting_for_user": {}},
+        {"response_to_waiting_for_user": {"question": " \n"}},
+        {"response_to_waiting_for_user": {"question": 7}},
+    ],
 )
-def test_pending_response_malformed_or_blank_marker_degrades_safely(
+def test_pending_response_rejects_malformed_or_blank_marker(
+    metadata: dict[str, Any] | None,
+) -> None:
+    context = ExecutionContext()
+    message = context.add_user_message("Spanish", metadata=metadata)
+    assert pending_user_response(message) is None
+
+
+def test_pending_response_defaults_invalid_message_type_without_leaking_it() -> None:
+    response = pending_user_response(
+        _marked_message(
+            "Spanish",
+            {"question": "Which output language?", "message_type": ["internal"]},
+        )
+    )
+
+    assert response == PendingUserResponse(
+        answer="Spanish",
+        question="Which output language?",
+        message_type="question",
+    )
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [True, "legacy", {"question": " \n"}, {"question": 7}],
+)
+def test_strict_parser_does_not_change_layer_a_marker_compatibility(
     marker: Any,
 ) -> None:
-    message = _marked_message("Spanish", marker)
+    context = ExecutionContext()
+    context.add_user_message("Draft the email.")
+    message = context.add_user_message(
+        "Spanish",
+        metadata={"response_to_waiting_for_user": marker},
+    )
+
     assert pending_user_response(message) is None
-    context = SimpleNamespace(messages=[message], metadata={})
-    assert top_level_user_request(context).language_text == "Spanish"
+    assert top_level_user_request(context).language_text == "Draft the email."
 
 
 def test_language_question_and_terse_selection_are_preserved_for_policy() -> None:
@@ -98,13 +139,18 @@ def test_language_question_and_terse_selection_are_preserved_for_policy() -> Non
     assert "answer is an unambiguous selection" in harness
 
 
-def test_explicit_answer_override_and_city_negative_control_share_one_policy() -> None:
+def test_caller_pin_and_explicit_answer_override_share_one_policy() -> None:
     policy = canonical_unpinned_request_language_policy()
 
     assert "request_context.output_language is the sole hard language authority" in (
         policy
     )
     assert "answer explicitly asks to translate, rewrite, or continue" in policy
+
+
+def test_city_question_and_language_name_are_not_a_language_override() -> None:
+    policy = canonical_unpinned_request_language_policy()
+
     assert '"Which city should the email mention?" followed by "Spanish"' in policy
     assert "remains ordinary conversation context" in policy
 
@@ -121,7 +167,7 @@ def test_harness_preserves_large_request_and_answer_exactly_once() -> None:
     assert harness.count("Which language?") == 1
 
 
-def test_new_policy_is_not_active_in_existing_consumers() -> None:
+def test_request_language_harness_is_not_active_in_root_consumers() -> None:
     context = ExecutionContext()
     context.add_user_message("Draft the email.")
 
@@ -131,7 +177,7 @@ def test_new_policy_is_not_active_in_existing_consumers() -> None:
     )
 
 
-def test_dag_marker_is_propagated_symmetrically_without_internal_fields() -> None:
+def test_request_language_representation_is_not_active_in_dag_forwarding() -> None:
     root = ExecutionContext()
     root.add_user_message("Draft the email.")
     child = root.create_child_context(execution_id="step")
@@ -154,12 +200,6 @@ def test_dag_marker_is_propagated_symmetrically_without_internal_fields() -> Non
     root.add_user_message("Spanish")
 
     assert pattern._forward_user_response_to_waiting_step(root)
-    expected = {
-        "question": "Which output language?",
-        "message_type": "question",
-    }
-    assert root.messages[-1].metadata["response_to_waiting_for_user"] == expected
+    assert "response_to_waiting_for_user" not in root.messages[-1].metadata
     restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["draft"])
-    assert (
-        restored_child.messages[-1].metadata["response_to_waiting_for_user"] == expected
-    )
+    assert "response_to_waiting_for_user" not in restored_child.messages[-1].metadata

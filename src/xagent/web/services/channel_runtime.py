@@ -718,6 +718,7 @@ def _prepare_channel_task_sync(
     mcp_runtime_authorization_policy_required: bool = False,
     mcp_runtime_authorization_policy_identity: str | None = None,
     task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
+    resume_run_id: str | None = None,
 ) -> _ChannelTaskClaimSnapshot | None:
     if not isinstance(task_mode, ChannelTaskMode):
         raise ValueError("Unsupported channel task mode")
@@ -910,6 +911,19 @@ def _prepare_channel_task_sync(
                     agent_id=agent_id,
                 )
 
+            # A resume has to land in the *same* run the waiting checkpoint
+            # was written under. `new_run=True` mints a fresh run id and nulls
+            # both checkpoint pointer columns (acquire_task_lease_no_commit),
+            # which leaves the pending question unreadable in the new run's
+            # partition -- the agent then replans from scratch instead of
+            # handing the answer back to the tool call that asked. Claiming
+            # with the caller's own run id keeps the pointers, which is what
+            # the websocket resume path already relies on.
+            #
+            # Only ever the run id the caller *read off the waiting task*: this
+            # is a resume of an existing run, so a caller that cannot name that
+            # run has nothing to resume and must take the fresh-run path.
+            resuming = resume_run_id is not None
             lease = acquire_task_lease_no_commit(
                 db,
                 task_id,
@@ -918,7 +932,8 @@ def _prepare_channel_task_sync(
                     if task_mode is ChannelTaskMode.ACTOR_INTERACTION
                     else None
                 ),
-                new_run=True,
+                expected_run_id=resume_run_id,
+                new_run=not resuming,
                 claim_predicates=claim_predicates,
             )
             if lease is None:
@@ -974,12 +989,19 @@ async def prepare_channel_task(
     mcp_runtime_authorization_policy_required: bool = False,
     mcp_runtime_authorization_policy_identity: str | None = None,
     task_mode: ChannelTaskMode = ChannelTaskMode.DEFAULT,
+    resume_run_id: str | None = None,
 ) -> ClaimedChannelTask | None:
     """Authorize, resolve or create, and claim one channel run atomically.
 
     The trusted actor path sets both ``new_task_is_visible=False`` and
     ``mcp_runtime_authorization_policy_required=True``. That marker is written
     in the creation transaction before the returned lease can be executed.
+
+    ``resume_run_id`` claims an existing run instead of starting a new one, so
+    the run's checkpoint pointers survive the claim and a waiting execution can
+    actually be resumed. Pass the run id read off the waiting task; omitting it
+    keeps the default fresh-run claim, which is what every non-resume turn
+    wants.
     """
 
     worker = asyncio.create_task(
@@ -1000,6 +1022,7 @@ async def prepare_channel_task(
                 mcp_runtime_authorization_policy_identity
             ),
             task_mode=task_mode,
+            resume_run_id=resume_run_id,
         )
     )
     snapshot, cancellation = await await_task_settlement(worker)

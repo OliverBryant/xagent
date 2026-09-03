@@ -334,6 +334,120 @@ async def test_actor_interaction_reuses_exact_waiting_task(
 
 
 @pytest.mark.asyncio
+async def test_actor_interaction_resume_claim_keeps_run_and_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """``resume_run_id`` claims the waiting run instead of replacing it.
+
+    The default claim mints a new run id and nulls the checkpoint pointers
+    (pinned by ``test_actor_interaction_reuses_exact_waiting_task``), which
+    leaves the waiting checkpoint unreadable in the new run's partition. A
+    resume has to land in the same run, or there is nothing to resume.
+    """
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
+    monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    task_id = await _create_waiting_actor_task(
+        SessionLocal,
+        channel_id=channel_id,
+        agent_id=agent_id,
+    )
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        waiting_run_id = task.run_id
+        assert waiting_run_id is not None
+        task.last_checkpoint_event_id = "waiting-checkpoint"
+        task.last_checkpoint_trace_event_id = 4242
+        db.commit()
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=task_id,
+        text="approve",
+        channel_name="Trusted direct channel",
+        expected_owner_user_id=user_id,
+        agent_id=agent_id,
+        new_task_is_visible=False,
+        mcp_runtime_authorization_policy_required=True,
+        task_mode=channel_runtime.ChannelTaskMode.ACTOR_INTERACTION,
+        resume_run_id=waiting_run_id,
+    )
+
+    assert prepared is not None
+    assert prepared.task_id == task_id
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        # The run the checkpoint was written under, still current.
+        assert task.run_id == waiting_run_id
+        assert task.last_checkpoint_event_id == "waiting-checkpoint"
+        assert task.last_checkpoint_trace_event_id == 4242
+    assert await prepared.managed_lease.finalize_result(status=TaskStatus.FAILED)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resume_claim_refuses_a_run_id_that_is_not_the_waiting_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mock_workspace_db,
+) -> None:
+    """A stale or guessed run id must not claim the task.
+
+    The run id names which execution is being resumed. If a mismatched id
+    still claimed, a caller holding a stale id would resume a run that has
+    since moved on -- and take the waiting task's lease while doing it.
+    """
+    del mock_workspace_db
+    engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
+    agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
+    monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    task_id = await _create_waiting_actor_task(
+        SessionLocal,
+        channel_id=channel_id,
+        agent_id=agent_id,
+    )
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        waiting_run_id = task.run_id
+        task.last_checkpoint_event_id = "waiting-checkpoint"
+        db.commit()
+
+    prepared = await prepare_channel_task(
+        channel_id=channel_id,
+        external_user_id="telegram-user",
+        active_task_id=task_id,
+        text="approve",
+        channel_name="Trusted direct channel",
+        expected_owner_user_id=user_id,
+        agent_id=agent_id,
+        new_task_is_visible=False,
+        mcp_runtime_authorization_policy_required=True,
+        task_mode=channel_runtime.ChannelTaskMode.ACTOR_INTERACTION,
+        resume_run_id="not-the-waiting-run",
+    )
+
+    assert prepared is None
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        # Untouched: still waiting, still on its own run, checkpoint intact.
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.run_id == waiting_run_id
+        assert task.last_checkpoint_event_id == "waiting-checkpoint"
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_actor_interaction_rejects_live_waiting_lease(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

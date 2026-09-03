@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260902_oauth_flow_generation"
-down_revision: Union[str, None] = "20260902_mcp_generations"
+down_revision: Union[str, None] = "20260901_seed_chartmogul_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

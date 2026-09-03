@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -15,6 +17,7 @@ from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
+from xagent.web.services import connector_team_scope
 
 pytestmark = pytest.mark.postgresql
 
@@ -119,21 +122,74 @@ def _identities(seed):
 
 
 def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
-    postgresql_engine,
+    postgresql_engine, monkeypatch
 ) -> None:
     factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
     seed = _seed_lifecycle(factory)
     association_identity, flow_identity = _identities(seed)
 
+    teardown_locked = threading.Event()
+    allow_teardown = threading.Event()
+    producer_started = threading.Event()
+    producer_finished = threading.Event()
+    disconnect_errors: list[BaseException] = []
+    producer_results: list[object] = []
+
+    def gated_team_delete(*args):
+        teardown_locked.set()
+        assert allow_teardown.wait(timeout=5)
+        return SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        )
+
+    monkeypatch.setattr(
+        connector_team_scope, "delete_team_connector", gated_team_delete
+    )
+
+    def disconnect() -> None:
+        try:
+            with factory() as disconnect_db:
+                asyncio.run(
+                    mcp_api.delete_mcp_server(
+                        seed["server_id"],
+                        current_user=disconnect_db.get(User, seed["user_id"]),
+                        db=disconnect_db,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            disconnect_errors.append(exc)
+
+    def producer() -> None:
+        with factory() as producer_db:
+            producer_started.set()
+            producer_results.append(
+                mcp_api._lock_active_mcp_oauth_lifecycle(
+                    producer_db,
+                    association_identity=association_identity,
+                    flow_identity=flow_identity,
+                )
+            )
+            producer_db.rollback()
+        producer_finished.set()
+
+    disconnect_thread = threading.Thread(target=disconnect)
+    disconnect_thread.start()
+    assert teardown_locked.wait(timeout=5)
+    producer_thread = threading.Thread(target=producer)
+    producer_thread.start()
+    assert producer_started.wait(timeout=2)
+    assert not producer_finished.wait(timeout=0.2)
+    allow_teardown.set()
+    disconnect_thread.join(timeout=5)
+    producer_thread.join(timeout=5)
+    assert disconnect_errors == []
+    assert producer_finished.is_set()
+    assert producer_results == [None]
+
     with factory() as disconnect_db:
-        disconnect_db.query(MCPOAuthFlowState).filter(
-            MCPOAuthFlowState.id == seed["flow_id"]
-        ).delete(synchronize_session=False)
-        disconnect_db.query(UserMCPServer).filter(
-            UserMCPServer.user_id == seed["user_id"],
-            UserMCPServer.mcpserver_id == seed["server_id"],
-        ).delete(synchronize_session=False)
-        disconnect_db.commit()
         replacement_association = UserMCPServer(
             user_id=seed["user_id"],
             mcpserver_id=seed["server_id"],
@@ -185,37 +241,38 @@ def test_disconnect_first_replacement_cannot_receive_stale_callback_grant(
 
 
 def test_producer_first_holds_lifecycle_locks_until_grant_commit(
-    postgresql_engine,
+    postgresql_engine, monkeypatch
 ) -> None:
     factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
     seed = _seed_lifecycle(factory)
     association_identity, flow_identity = _identities(seed)
     disconnect_started = threading.Event()
+    disconnect_lock_attempted = threading.Event()
     disconnect_finished = threading.Event()
     disconnect_errors: list[BaseException] = []
+
+    monkeypatch.setattr(
+        connector_team_scope,
+        "delete_team_connector",
+        lambda *args: SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        ),
+    )
 
     def disconnect() -> None:
         try:
             with factory() as disconnect_db:
                 disconnect_started.set()
-                # The teardown consumer specified by #2033 follows the same
-                # global lock order as the producer fence. Model that contract
-                # here without changing the generic DELETE route in this PR.
-                disconnect_db.query(MCPServer).filter(
-                    MCPServer.id == seed["server_id"]
-                ).with_for_update().one()
-                disconnect_db.query(MCPOAuthGrant).filter(
-                    MCPOAuthGrant.mcp_server_id == seed["server_id"],
-                    MCPOAuthGrant.user_id == seed["user_id"],
-                ).delete(synchronize_session=False)
-                disconnect_db.query(MCPOAuthFlowState).filter(
-                    MCPOAuthFlowState.id == seed["flow_id"]
-                ).delete(synchronize_session=False)
-                disconnect_db.query(UserMCPServer).filter(
-                    UserMCPServer.user_id == seed["user_id"],
-                    UserMCPServer.mcpserver_id == seed["server_id"],
-                ).delete(synchronize_session=False)
-                disconnect_db.commit()
+                asyncio.run(
+                    mcp_api.delete_mcp_server(
+                        seed["server_id"],
+                        current_user=disconnect_db.get(User, seed["user_id"]),
+                        db=disconnect_db,
+                    )
+                )
         except BaseException as exc:  # pragma: no cover - assertion reports it
             disconnect_errors.append(exc)
         finally:
@@ -230,9 +287,21 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         assert lifecycle is not None
         locked_flow = lifecycle[2]
         assert locked_flow is not None
+        original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
+
+        def record_disconnect_lock_attempt(*args, **kwargs):
+            disconnect_lock_attempted.set()
+            return original_lock(*args, **kwargs)
+
+        monkeypatch.setattr(
+            mcp_api,
+            "_lock_active_mcp_oauth_lifecycle",
+            record_disconnect_lock_attempt,
+        )
         disconnect_thread = threading.Thread(target=disconnect)
         disconnect_thread.start()
         assert disconnect_started.wait(timeout=2)
+        assert disconnect_lock_attempted.wait(timeout=2)
         assert not disconnect_finished.wait(timeout=0.2)
         mcp_api._upsert_mcp_oauth_grant(
             producer_db,

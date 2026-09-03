@@ -855,6 +855,7 @@ def _lock_active_mcp_oauth_lifecycle(
     *,
     association_identity: _MCPOAuthAssociationIdentity,
     flow_identity: _MCPOAuthFlowIdentity | None = None,
+    association_must_be_active: bool = True,
 ) -> tuple[MCPServer, UserMCPServer, MCPOAuthFlowState | None] | None:
     """Lock the exact association lifecycle before final OAuth persistence."""
     if db.get_bind().dialect.name == "sqlite":
@@ -869,18 +870,14 @@ def _lock_active_mcp_oauth_lifecycle(
     )
     if server is None:
         return None
-    association = (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.user_id == association_identity.user_id,
-            UserMCPServer.mcpserver_id == association_identity.server_id,
-            UserMCPServer.lifecycle_generation
-            == association_identity.lifecycle_generation,
-            UserMCPServer.is_active.is_(True),
-        )
-        .with_for_update()
-        .one_or_none()
+    association_query = db.query(UserMCPServer).filter(
+        UserMCPServer.user_id == association_identity.user_id,
+        UserMCPServer.mcpserver_id == association_identity.server_id,
+        UserMCPServer.lifecycle_generation == association_identity.lifecycle_generation,
     )
+    if association_must_be_active:
+        association_query = association_query.filter(UserMCPServer.is_active.is_(True))
+    association = association_query.with_for_update().one_or_none()
     if association is None:
         return None
 
@@ -1322,94 +1319,149 @@ async def _rollback_and_revoke_mcp_oauth_issued_token(
     await _revoke_mcp_oauth_issued_token_externally(snapshot)
 
 
+@dataclass(frozen=True)
+class _MCPOAuthGrantRevocationSnapshot:
+    grant_id: int
+    revocation_endpoint: str | None
+    client_id: str
+    encrypted_client_secret: str | None
+    token_endpoint_auth_method: str
+    encrypted_access_token: str | None
+    encrypted_refresh_token: str | None
+
+
+def _mcp_oauth_grant_revocation_snapshot(
+    *, client: MCPOAuthClient, grant: MCPOAuthGrant
+) -> _MCPOAuthGrantRevocationSnapshot:
+    metadata: dict[str, Any] = (
+        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    )
+    revocation_endpoint = metadata.get("revocation_endpoint")
+    return _MCPOAuthGrantRevocationSnapshot(
+        grant_id=int(grant.id),
+        revocation_endpoint=(
+            revocation_endpoint
+            if isinstance(revocation_endpoint, str) and revocation_endpoint
+            else None
+        ),
+        client_id=str(client.client_id),
+        encrypted_client_secret=(
+            str(client.client_secret) if client.client_secret else None
+        ),
+        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
+        encrypted_access_token=(
+            str(grant.access_token) if grant.access_token else None
+        ),
+        encrypted_refresh_token=(
+            str(grant.refresh_token) if grant.refresh_token else None
+        ),
+    )
+
+
+async def _revoke_mcp_oauth_grant_snapshot_externally(
+    snapshot: _MCPOAuthGrantRevocationSnapshot,
+) -> None:
+    """Best-effort revoke a detached grant snapshot without ORM access."""
+    if snapshot.revocation_endpoint is None:
+        return
+
+    try:
+        client_secret = (
+            decrypt_value(snapshot.encrypted_client_secret)
+            if snapshot.encrypted_client_secret
+            else ""
+        )
+    except Exception as exc:
+        logger.warning(
+            "Skipping MCP OAuth token revocation for grant %s "
+            "(stage=decrypt_client_secret, exception_type=%s)",
+            snapshot.grant_id,
+            type(exc).__name__,
+        )
+        return
+    auth_method = snapshot.token_endpoint_auth_method
+    auth: httpx.Auth | None = None
+    base_data: dict[str, str] = {"client_id": snapshot.client_id}
+    if auth_method == "client_secret_post" and client_secret:
+        base_data["client_secret"] = client_secret
+    elif auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
+    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
+        logger.warning(
+            "Skipping MCP OAuth token revocation for grant %s "
+            "(stage=validate_auth_method)",
+            snapshot.grant_id,
+        )
+        return
+
+    try:
+        async with create_mcp_oauth_http_client(
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ) as http_client:
+            for encrypted_token, token_type_hint in (
+                (snapshot.encrypted_access_token, "access_token"),
+                (snapshot.encrypted_refresh_token, "refresh_token"),
+            ):
+                if not encrypted_token:
+                    continue
+                try:
+                    decrypted_token = decrypt_value(encrypted_token)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping MCP OAuth token revocation for grant %s "
+                        "(stage=decrypt_%s, exception_type=%s)",
+                        snapshot.grant_id,
+                        token_type_hint,
+                        type(exc).__name__,
+                    )
+                    continue
+                request_kwargs: dict[str, Any] = {
+                    "data": {
+                        **base_data,
+                        "token": decrypted_token,
+                        "token_type_hint": token_type_hint,
+                    },
+                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                }
+                if auth is not None:
+                    request_kwargs["auth"] = auth
+                try:
+                    response = await oauth_post(
+                        snapshot.revocation_endpoint,
+                        client=http_client,
+                        **request_kwargs,
+                    )
+                    if response.status_code >= 400:
+                        logger.warning(
+                            "MCP OAuth token revocation returned HTTP %s for grant %s",
+                            response.status_code,
+                            snapshot.grant_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "MCP OAuth token revocation failed for grant %s "
+                        "(stage=revoke_%s, exception_type=%s)",
+                        snapshot.grant_id,
+                        token_type_hint,
+                        type(exc).__name__,
+                    )
+    except Exception as exc:
+        logger.warning(
+            "MCP OAuth token revocation could not start for grant %s "
+            "(stage=create_client, exception_type=%s)",
+            snapshot.grant_id,
+            type(exc).__name__,
+        )
+
+
 async def _revoke_mcp_oauth_grant_externally(
     *,
     client: MCPOAuthClient,
     grant: MCPOAuthGrant,
 ) -> None:
-    metadata: dict[str, Any] = (
-        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    await _revoke_mcp_oauth_grant_snapshot_externally(
+        _mcp_oauth_grant_revocation_snapshot(client=client, grant=grant)
     )
-    revocation_endpoint = metadata.get("revocation_endpoint")
-    if not isinstance(revocation_endpoint, str) or not revocation_endpoint:
-        return
-
-    try:
-        client_secret = (
-            decrypt_value(str(client.client_secret)) if client.client_secret else ""
-        )
-    except Exception as exc:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for grant %s because client secret "
-            "could not be decrypted: %s",
-            grant.id,
-            exc,
-        )
-        return
-    auth_method = str(client.token_endpoint_auth_method or "none")
-    auth: httpx.Auth | None = None
-    base_data: dict[str, str] = {"client_id": str(client.client_id)}
-    if auth_method == "client_secret_post" and client_secret:
-        base_data["client_secret"] = client_secret
-    elif auth_method == "client_secret_basic" and client_secret:
-        auth = httpx.BasicAuth(str(client.client_id), client_secret)
-    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for unsupported auth method %s",
-            auth_method,
-        )
-        return
-
-    encrypted_tokens = (
-        (grant.access_token, "access_token"),
-        (grant.refresh_token, "refresh_token"),
-    )
-    async with create_mcp_oauth_http_client(
-        timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
-    ) as http_client:
-        for encrypted_token, token_type_hint in encrypted_tokens:
-            if not encrypted_token:
-                continue
-            try:
-                decrypted_token = decrypt_value(str(encrypted_token))
-            except Exception as exc:
-                logger.warning(
-                    "Skipping MCP OAuth %s revocation for grant %s because token "
-                    "could not be decrypted: %s",
-                    token_type_hint,
-                    grant.id,
-                    exc,
-                )
-                continue
-            data = {
-                **base_data,
-                "token": decrypted_token,
-                "token_type_hint": token_type_hint,
-            }
-            request_kwargs: dict[str, Any] = {
-                "data": data,
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-            }
-            if auth is not None:
-                request_kwargs["auth"] = auth
-            try:
-                response = await oauth_post(
-                    revocation_endpoint,
-                    client=http_client,
-                    **request_kwargs,
-                )
-                if response.status_code >= 400:
-                    logger.warning(
-                        "MCP OAuth token revocation returned HTTP %s for grant %s",
-                        response.status_code,
-                        grant.id,
-                    )
-            except (MCPOAuthDiscoveryError, httpx.HTTPError) as exc:
-                logger.warning(
-                    "MCP OAuth token revocation failed for grant %s: %s",
-                    grant.id,
-                    exc,
-                )
 
 
 def _upsert_mcp_oauth_grant(
@@ -4132,6 +4184,27 @@ async def delete_mcp_server(
             )
 
         user_mcp, server = result
+        association_identity = _MCPOAuthAssociationIdentity(
+            server_id=int(server.id),
+            user_id=int(user_id),
+            lifecycle_generation=user_mcp.lifecycle_generation,
+        )
+        association_was_active = bool(user_mcp.is_active)
+
+        # Serialize teardown with OAuth producers before enumerating artifacts.
+        # The exact generation prevents a stale DELETE from touching a replacement
+        # association created for the same user and shared server.
+        lifecycle = _lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+            association_must_be_active=association_was_active,
+        )
+        if lifecycle is None:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+            )
+        server, user_mcp, _ = lifecycle
 
         # Deleting cascades to the shared config once no associations remain;
         # gate it on ownership, consistent with the update handler.
@@ -4143,7 +4216,7 @@ async def delete_mcp_server(
                 detail="You do not have permission to delete this MCP server",
             )
 
-        server_name = server.name
+        server_name = str(server.name)
 
         from ..services.connector_team_scope import delete_team_connector
 
@@ -4230,15 +4303,16 @@ async def delete_mcp_server(
                             providers=[provider],
                         )
 
-        # Revoke and purge this user's MCP OAuth grants for the server. On a
+        # Snapshot and purge this user's MCP OAuth grants for the server. On a
         # shared (multi-user) row the server outlives this disconnect, so
         # without this the grant's refresh token would stay usable — and its
         # row would stay stored — until the LAST user disconnects and the
-        # cascade finally removes it. Best-effort external revocation first
-        # (now awaitable, unlike the previous local-only status flip), then a
-        # hard delete rather than a "revoked" status flip: a revoked grant
+        # cascade finally removes it. The provider-facing revocation happens
+        # only after the local commit releases lifecycle locks. Use a hard
+        # delete rather than a "revoked" status flip: a revoked grant
         # row is otherwise never swept, accumulating indefinitely as an
         # inert but secret-bearing row (F10).
+        grant_revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
         for grant in (
             db.query(MCPOAuthGrant)
             .filter(
@@ -4249,8 +4323,10 @@ async def delete_mcp_server(
             .all()
         ):
             if isinstance(grant.oauth_client, MCPOAuthClient):
-                await _revoke_mcp_oauth_grant_externally(
-                    client=grant.oauth_client, grant=grant
+                grant_revocations.append(
+                    _mcp_oauth_grant_revocation_snapshot(
+                        client=grant.oauth_client, grant=grant
+                    )
                 )
             db.delete(grant)
 
@@ -4266,6 +4342,9 @@ async def delete_mcp_server(
         # Remove user-server association
         db.delete(user_mcp)
         db.commit()
+
+        for snapshot in grant_revocations:
+            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
 
         # Check if any other users are using this server
         other_users = (
@@ -4296,10 +4375,13 @@ async def delete_mcp_server(
             logger.info(f"Removed user {user_id} access to MCP server '{server_name}'")
 
     except HTTPException:
-        raise
-    except Exception as e:
         db.rollback()
-        logger.error(f"Failed to delete MCP server: {e}")
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            "Failed to delete MCP server (exception_type=%s)", type(exc).__name__
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete MCP server",
@@ -4790,6 +4872,7 @@ async def mcp_oauth_callback(
             message="Missing authorization code",
         )
     issued_token: _MCPOAuthIssuedTokenSnapshot | None = None
+    failure_stage = "token_exchange"
     try:
         token_data = await _exchange_mcp_oauth_code(
             client=client,
@@ -4797,11 +4880,13 @@ async def mcp_oauth_callback(
             code_verifier=code_verifier,
             resource=resource,
         )
+        failure_stage = "snapshot_issued_token"
         issued_token = _mcp_oauth_issued_token_snapshot(
             client=client,
             flow_id=flow_identity.id,
             token_data=token_data,
         )
+        failure_stage = "lock_lifecycle"
         lifecycle = _lock_active_mcp_oauth_lifecycle(
             db,
             association_identity=association_identity,
@@ -4817,11 +4902,13 @@ async def mcp_oauth_callback(
         locked_flow_state = lifecycle[2]
         if locked_flow_state is None:
             raise RuntimeError("MCP OAuth lifecycle lock did not return the flow")
+        failure_stage = "persist_grant"
         _upsert_mcp_oauth_grant(
             db,
             flow_state=locked_flow_state,
             token_data=token_data,
         )
+        failure_stage = "commit_grant"
         db.commit()
     except HTTPException as exc:
         if issued_token is not None:
@@ -4836,12 +4923,16 @@ async def mcp_oauth_callback(
             error_code=error_code,
             message=message,
         )
-    except Exception:
+    except Exception as exc:
         if issued_token is not None:
             await _rollback_and_revoke_mcp_oauth_issued_token(db, issued_token)
         else:
             db.rollback()
-        logger.error("MCP OAuth callback failed after state claim")
+        logger.error(
+            "MCP OAuth callback failed after state claim (stage=%s, exception_type=%s)",
+            failure_stage,
+            type(exc).__name__,
+        )
         return _mcp_oauth_callback_error_redirect_for_path(
             callback_redirect_after,
             error_code="token_exchange_failed",

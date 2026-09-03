@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -10,8 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
-from sqlalchemy import event
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
@@ -46,6 +46,7 @@ from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_has
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services import connector_team_scope
 from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
@@ -769,15 +770,13 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
         other_db = SessionLocal()
         try:
             disconnect_started.set()
-            other_db.query(MCPOAuthFlowState).filter(
-                MCPOAuthFlowState.mcp_server_id == server.id,
-                MCPOAuthFlowState.user_id == user.id,
-            ).delete(synchronize_session=False)
-            other_db.query(UserMCPServer).filter(
-                UserMCPServer.mcpserver_id == server.id,
-                UserMCPServer.user_id == user.id,
-            ).delete(synchronize_session=False)
-            other_db.commit()
+            asyncio.run(
+                delete_mcp_server(
+                    server.id,
+                    current_user=other_db.get(User, user.id),
+                    db=other_db,
+                )
+            )
         except BaseException as exc:  # pragma: no cover - assertion reports it
             disconnect_errors.append(exc)
         finally:
@@ -797,6 +796,16 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
         return original_upsert(*args, **kwargs)
 
     monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_client", gated_upsert)
+    monkeypatch.setattr(
+        connector_team_scope,
+        "delete_team_connector",
+        lambda *args: SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        ),
+    )
     persisted = mcp_api._persist_mcp_oauth_connect_flow(
         db,
         association_identity=association_identity,
@@ -837,6 +846,314 @@ def test_connect_producer_first_blocks_disconnect_until_flow_commit(
         )
         .one()
         is not None
+    )
+
+
+def test_callback_producer_first_blocks_real_disconnect_until_grant_commit(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    client = _add_oauth_client(db, server)
+    generation = _association_generation(db, user, server)
+    flow = MCPOAuthFlowState(
+        state="sqlite-producer-first",
+        mcp_server_id=server.id,
+        user_id=user.id,
+        association_lifecycle_generation=generation,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=encrypt_value("sqlite-verifier"),
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+        consumed_at=mcp_api._utc_now(),
+    )
+    db.add(flow)
+    db.commit()
+    association_identity = mcp_api._MCPOAuthAssociationIdentity(
+        server_id=server.id,
+        user_id=user.id,
+        lifecycle_generation=generation,
+    )
+    flow_identity = mcp_api._mcp_oauth_flow_identity(flow)
+    lifecycle = mcp_api._lock_active_mcp_oauth_lifecycle(
+        db,
+        association_identity=association_identity,
+        flow_identity=flow_identity,
+    )
+    assert lifecycle is not None and lifecycle[2] is not None
+
+    monkeypatch.setattr(
+        connector_team_scope,
+        "delete_team_connector",
+        lambda *args: SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        ),
+    )
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    disconnect_started = threading.Event()
+    disconnect_lock_attempted = threading.Event()
+    disconnect_finished = threading.Event()
+    disconnect_errors: list[BaseException] = []
+
+    def disconnect() -> None:
+        with SessionLocal() as disconnect_db:
+            try:
+                disconnect_started.set()
+                asyncio.run(
+                    delete_mcp_server(
+                        server.id,
+                        current_user=disconnect_db.get(User, user.id),
+                        db=disconnect_db,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - assertion reports it
+                disconnect_errors.append(exc)
+            finally:
+                disconnect_finished.set()
+
+    disconnect_thread = threading.Thread(target=disconnect)
+    original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
+
+    def record_disconnect_lock_attempt(*args, **kwargs):
+        disconnect_lock_attempted.set()
+        return original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mcp_api,
+        "_lock_active_mcp_oauth_lifecycle",
+        record_disconnect_lock_attempt,
+    )
+    disconnect_thread.start()
+    assert disconnect_started.wait(timeout=2)
+    assert disconnect_lock_attempted.wait(timeout=2)
+    assert not disconnect_finished.wait(timeout=0.2)
+    mcp_api._upsert_mcp_oauth_grant(
+        db,
+        flow_state=lifecycle[2],
+        token_data={
+            "access_token": "sqlite-issued-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        },
+    )
+    db.commit()
+
+    disconnect_thread.join(timeout=5)
+    assert disconnect_finished.is_set()
+    assert disconnect_errors == []
+    db.expire_all()
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert db.query(MCPOAuthFlowState).count() == 0
+    assert (
+        db.query(UserMCPServer).filter(UserMCPServer.mcpserver_id == server.id).count()
+        == 1
+    )
+
+
+def test_real_disconnect_first_rejects_stale_callback_and_preserves_replacement(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    client = _add_oauth_client(db, server)
+    original_generation = _association_generation(db, user, server)
+    flow = MCPOAuthFlowState(
+        state="sqlite-teardown-first",
+        mcp_server_id=server.id,
+        user_id=user.id,
+        association_lifecycle_generation=original_generation,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=encrypt_value("sqlite-verifier"),
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+        consumed_at=mcp_api._utc_now(),
+    )
+    db.add(flow)
+    db.commit()
+    association_identity = mcp_api._MCPOAuthAssociationIdentity(
+        server_id=server.id,
+        user_id=user.id,
+        lifecycle_generation=original_generation,
+    )
+    flow_identity = mcp_api._mcp_oauth_flow_identity(flow)
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    teardown_locked = threading.Event()
+    allow_teardown = threading.Event()
+    producer_started = threading.Event()
+    producer_finished = threading.Event()
+    producer_results: list[object] = []
+    errors: list[BaseException] = []
+
+    def gated_team_delete(*args):
+        teardown_locked.set()
+        assert allow_teardown.wait(timeout=5)
+        return SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        )
+
+    monkeypatch.setattr(
+        connector_team_scope, "delete_team_connector", gated_team_delete
+    )
+
+    def disconnect() -> None:
+        with SessionLocal() as disconnect_db:
+            try:
+                asyncio.run(
+                    delete_mcp_server(
+                        server.id,
+                        current_user=disconnect_db.get(User, user.id),
+                        db=disconnect_db,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+    def producer() -> None:
+        with SessionLocal() as producer_db:
+            try:
+                producer_started.set()
+                producer_results.append(
+                    mcp_api._lock_active_mcp_oauth_lifecycle(
+                        producer_db,
+                        association_identity=association_identity,
+                        flow_identity=flow_identity,
+                    )
+                )
+                producer_db.rollback()
+            except BaseException as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+            finally:
+                producer_finished.set()
+
+    disconnect_thread = threading.Thread(target=disconnect)
+    disconnect_thread.start()
+    assert teardown_locked.wait(timeout=2)
+    producer_thread = threading.Thread(target=producer)
+    producer_thread.start()
+    assert producer_started.wait(timeout=2)
+    assert not producer_finished.wait(timeout=0.2)
+    allow_teardown.set()
+    disconnect_thread.join(timeout=5)
+    producer_thread.join(timeout=5)
+    assert errors == []
+    assert producer_finished.is_set()
+    assert producer_results == [None]
+
+    db.expire_all()
+    replacement = UserMCPServer(
+        user_id=user.id,
+        mcpserver_id=server.id,
+        is_owner=False,
+        is_active=True,
+    )
+    db.add(replacement)
+    db.commit()
+    assert replacement.lifecycle_generation != original_generation
+    assert (
+        mcp_api._lock_active_mcp_oauth_lifecycle(
+            db,
+            association_identity=association_identity,
+            flow_identity=flow_identity,
+        )
+        is None
+    )
+    db.rollback()
+    assert db.query(MCPOAuthGrant).count() == 0
+    assert db.query(MCPOAuthFlowState).count() == 0
+    assert (
+        db.query(UserMCPServer).filter(UserMCPServer.mcpserver_id == server.id).count()
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_real_disconnect_cannot_delete_replacement_association(
+    db_session, monkeypatch
+):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    original_generation = _association_generation(db, user, server)
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
+    replacement_generation: list[object] = []
+
+    def replace_before_lock(*args, **kwargs):
+        with SessionLocal() as replacement_db:
+            replacement_db.query(UserMCPServer).filter(
+                UserMCPServer.user_id == user.id,
+                UserMCPServer.mcpserver_id == server.id,
+                UserMCPServer.lifecycle_generation == original_generation,
+            ).delete(synchronize_session=False)
+            replacement = UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                is_active=True,
+            )
+            replacement_db.add(replacement)
+            replacement_db.commit()
+            replacement_generation.append(replacement.lifecycle_generation)
+        return original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(
+        mcp_api, "_lock_active_mcp_oauth_lifecycle", replace_before_lock
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert exc_info.value.status_code == 404
+    assert replacement_generation[0] != original_generation
+    db.expire_all()
+    replacement = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assert replacement.lifecycle_generation == replacement_generation[0]
+    assert (
+        db.query(UserMCPServer).filter(UserMCPServer.mcpserver_id == server.id).count()
+        == 2
     )
 
 
@@ -2714,6 +3031,8 @@ async def test_callback_rolls_back_before_revoke_and_sanitizes_failure_log(
     assert "issued-secret-access-token" not in caplog.text
     assert "issued-secret-refresh-token" not in caplog.text
     assert "raw persistence detail" not in caplog.text
+    assert "stage=persist_grant" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -3547,6 +3866,7 @@ async def test_delete_mcp_server_revokes_external_tokens_when_endpoint_is_advert
     real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
+        assert not db.in_transaction()
         requests.append(parse_qs(request.content.decode()))
         return httpx.Response(200)
 
@@ -3603,8 +3923,53 @@ async def test_delete_mcp_server_purges_the_users_own_flow_state_rows(db_session
 
 
 @pytest.mark.asyncio
+async def test_delete_mcp_server_preserves_inactive_association_semantics(db_session):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_active = False
+    db.add(
+        UserMCPServer(
+            user_id=other_user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    await delete_mcp_server(server.id, current_user=user, db=db)
+
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one_or_none()
+        is None
+    )
+    assert (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == other_user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+        is not None
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
-    db_session, monkeypatch
+    db_session, monkeypatch, caplog
 ):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -3632,7 +3997,7 @@ async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
 
     def fail_target_token_decrypt(value: str) -> str:
         if value == "not-encrypted-token":
-            raise ValueError("cannot decrypt token")
+            raise ValueError("cannot decrypt raw-sensitive-provider-detail")
         return real_decrypt_value(value)
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3649,6 +4014,9 @@ async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
     db.refresh(grant)
     assert grant.status == "revoked"
     assert grant.revoked_at is not None
+    assert "raw-sensitive-provider-detail" not in caplog.text
+    assert "stage=decrypt_access_token" in caplog.text
+    assert "exception_type=ValueError" in caplog.text
 
 
 @pytest.mark.asyncio

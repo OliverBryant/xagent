@@ -68,7 +68,10 @@ def test_default_memory_policy_is_unchanged_without_resolver(
         get_memory_store.assert_not_called()
     else:
         assert policy.memory is dynamic_store
-        get_memory_store.assert_called_once_with()
+        get_memory_store.assert_called_once_with(
+            require_persistence=False,
+            require_vector_search=False,
+        )
 
 
 def test_trusted_resolver_can_enable_preview_memory(
@@ -137,7 +140,7 @@ def test_trusted_resolver_forwards_backend_requirements_independently(
     )
 
 
-def test_required_backend_failure_propagates_to_task_setup(
+def test_required_backend_failure_propagates_to_setup_failure_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -155,27 +158,6 @@ def test_required_backend_failure_propagates_to_task_setup(
 
     with pytest.raises(MemoryBackendUnavailableError):
         chat_api.resolve_agent_service_memory_policy(task=_task())
-
-
-@pytest.mark.asyncio
-async def test_required_backend_failure_propagates_through_async_setup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        chat_api,
-        "get_memory_store",
-        Mock(side_effect=MemoryBackendUnavailableError("unavailable")),
-    )
-    set_trusted_memory_policy_resolver(
-        lambda _request: MemoryPolicyDecision(
-            enabled=True,
-            available=True,
-            require_vector_search=True,
-        )
-    )
-
-    with pytest.raises(MemoryBackendUnavailableError):
-        await chat_api.resolve_agent_service_memory_policy_async(task=_task())
 
 
 def test_trusted_resolver_can_disable_otherwise_enabled_memory(
@@ -251,6 +233,17 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
             available=True,
             require_persistence=1,  # type: ignore[arg-type]
         ),
+        MemoryPolicyDecision(
+            enabled=False,
+            available=True,
+            require_persistence=True,
+        ),
+        MemoryPolicyDecision(
+            enabled=False,
+            available=False,
+            reason="unavailable",
+            require_vector_search=True,
+        ),
     ],
     ids=(
         "wrong-type",
@@ -259,6 +252,8 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
         "empty-reason",
         "non-bool-flag",
         "non-bool-requirement",
+        "disabled-with-requirement",
+        "unavailable-with-requirement",
     ),
 )
 def test_invalid_resolver_decision_fails_closed(

@@ -358,15 +358,14 @@ def resolve_agent_service_memory_policy(
     if use_in_memory:
         memory = InMemoryMemoryStore()
     else:
-        requirements = (
-            {
-                "require_persistence": override.require_persistence,
-                "require_vector_search": override.require_vector_search,
-            }
-            if override is not None
-            and (override.require_persistence or override.require_vector_search)
-            else {}
-        )
+        requirements = {
+            "require_persistence": bool(
+                override is not None and override.require_persistence
+            ),
+            "require_vector_search": bool(
+                override is not None and override.require_vector_search
+            ),
+        }
         memory = get_memory_store(**requirements)
     available = True if override is None else override.available
     availability_reason = None if override is None else override.reason

@@ -83,6 +83,10 @@ def _validate_decision(decision: object) -> None:
         raise TypeError("memory backend requirement flags must be bool")
     if decision.enabled and not decision.available:
         raise ValueError("unavailable memory cannot be enabled")
+    if (decision.require_persistence or decision.require_vector_search) and not (
+        decision.enabled and decision.available
+    ):
+        raise ValueError("memory backend requirements need enabled, available memory")
     if decision.reason is not None and (
         not isinstance(decision.reason, str) or not decision.reason.strip()
     ):

@@ -163,7 +163,9 @@ async def list_tools_in_sandbox(
         for item in tool_data:
             raw = None
             if isinstance(item, dict):
-                payload = {k: v for k, v in item.items() if k != SANDBOX_RAW_ANNOTATIONS_KEY}
+                payload = {
+                    k: v for k, v in item.items() if k != SANDBOX_RAW_ANNOTATIONS_KEY
+                }
                 candidate = item.get(SANDBOX_RAW_ANNOTATIONS_KEY)
                 raw = candidate if isinstance(candidate, dict) else None
             else:

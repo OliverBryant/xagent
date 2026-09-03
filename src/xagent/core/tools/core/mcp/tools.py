@@ -83,7 +83,7 @@ class _RawListToolsResult(BaseModel):
     the SDK's own validation untouched; ``_tools_with_raw_annotations`` then
     reads it twice. ``extra="allow"`` and the model-level capture together
     mean a field this model does not name can never make a listing
-    unparseable here when the SDK itself accepted it.
+    unparsable here when the SDK itself accepted it.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -114,9 +114,7 @@ def raw_annotations_for(tool: MCPTool) -> dict[str, Any] | None:
     return captured if isinstance(captured, dict) else None
 
 
-def attach_raw_annotations(
-    tool: MCPTool, raw: dict[str, Any] | None
-) -> MCPTool:
+def attach_raw_annotations(tool: MCPTool, raw: dict[str, Any] | None) -> MCPTool:
     """Carry one tool's wire annotations alongside the SDK's parsed model.
 
     Set with ``object.__setattr__`` because ``Tool`` is a Pydantic model that

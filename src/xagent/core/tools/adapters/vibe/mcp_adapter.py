@@ -12,7 +12,7 @@ import math
 import os
 import re
 import weakref
-from collections.abc import Coroutine, Iterator, Mapping
+from collections.abc import Coroutine, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from typing import (

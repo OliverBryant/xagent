@@ -19,6 +19,7 @@ from ..core.storage.manager import get_storage_root
 from .models.database import get_db
 from .models.model import Model as DBModel
 from .models.user import UserDefaultModel
+from .services.db_runtime import is_database_pool_timeout
 from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,8 @@ class DynamicMemoryStoreManager:
         try:
             model = self._get_embedding_model_from_db()
         except Exception as exc:
+            if is_database_pool_timeout(exc):
+                raise
             logger.error("Error checking for embedding model: %s", exc)
             return _ModelLookupResult(_ModelLookupStatus.FAILED, error=exc)
         if model is None:

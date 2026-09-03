@@ -30,7 +30,5 @@ def downgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     if "models" not in inspector.get_table_names():
         return
-    if "managed_by" in {
-        column["name"] for column in inspector.get_columns("models")
-    }:
+    if "managed_by" in {column["name"] for column in inspector.get_columns("models")}:
         op.drop_column("models", "managed_by")

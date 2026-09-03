@@ -6,9 +6,12 @@ import asyncio
 import threading
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 from sqlalchemy.orm import sessionmaker
+from starlette.requests import Request
 
 from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.core.utils.encryption import encrypt_value
@@ -40,7 +43,7 @@ def postgresql_engine():
         yield engine
 
 
-def _seed_lifecycle(factory):
+def _seed_lifecycle(factory, *, flow_consumed: bool = True):
     with factory() as db:
         user = User(username="postgres-oauth-alice", password_hash="x")
         other_user = User(username="postgres-oauth-bob", password_hash="x")
@@ -90,7 +93,7 @@ def _seed_lifecycle(factory):
             scope="records.read",
             code_verifier=encrypt_value("postgres-verifier"),
             expires_at=mcp_api._utc_now() + timedelta(minutes=10),
-            consumed_at=mcp_api._utc_now(),
+            consumed_at=mcp_api._utc_now() if flow_consumed else None,
         )
         db.add(flow)
         db.commit()
@@ -102,6 +105,24 @@ def _seed_lifecycle(factory):
             "flow_id": int(flow.id),
             "generation": association.lifecycle_generation,
         }
+
+
+def _callback_request(state: str) -> Request:
+    path = f"/api/mcp/oauth/callback?code=auth-code&state={state}"
+    parsed = urlparse(path)
+    cookie = (
+        f"{mcp_api.MCP_OAUTH_STATE_COOKIE}="
+        f"{mcp_api._mcp_oauth_state_cookie_value(state)}"
+    )
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": parsed.path,
+            "query_string": parsed.query.encode(),
+            "headers": [(b"cookie", cookie.encode())],
+        }
+    )
 
 
 def _identities(seed):
@@ -317,6 +338,116 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
     disconnect_thread.join(timeout=5)
     assert disconnect_finished.is_set()
     assert disconnect_errors == []
+    with factory() as verify_db:
+        assert verify_db.query(MCPOAuthGrant).count() == 0
+        assert verify_db.query(MCPOAuthFlowState).count() == 0
+        assert (
+            verify_db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == seed["server_id"])
+            .count()
+            == 1
+        )
+
+
+def test_real_callback_producer_blocks_disconnect_until_grant_commit(
+    postgresql_engine, monkeypatch
+) -> None:
+    factory = sessionmaker(bind=postgresql_engine, autoflush=False, autocommit=False)
+    seed = _seed_lifecycle(factory, flow_consumed=False)
+    producer_at_upsert = threading.Event()
+    allow_producer_commit = threading.Event()
+    disconnect_lock_attempted = threading.Event()
+    disconnect_finished = threading.Event()
+    callback_results: list[Any] = []
+    callback_errors: list[BaseException] = []
+    disconnect_errors: list[BaseException] = []
+
+    async def exchange_code(**kwargs):
+        return {
+            "access_token": "postgres-callback-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    original_upsert = mcp_api._upsert_mcp_oauth_grant
+
+    def gated_upsert(*args, **kwargs):
+        producer_at_upsert.set()
+        assert allow_producer_commit.wait(timeout=5)
+        return original_upsert(*args, **kwargs)
+
+    original_lock = mcp_api._lock_active_mcp_oauth_lifecycle
+
+    def record_disconnect_lock_attempt(*args, **kwargs):
+        if threading.current_thread().name == "postgres-real-disconnect":
+            disconnect_lock_attempted.set()
+        return original_lock(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_code)
+    monkeypatch.setattr(mcp_api, "_upsert_mcp_oauth_grant", gated_upsert)
+    monkeypatch.setattr(
+        mcp_api,
+        "_lock_active_mcp_oauth_lifecycle",
+        record_disconnect_lock_attempt,
+    )
+    monkeypatch.setattr(
+        connector_team_scope,
+        "delete_team_connector",
+        lambda *args: SimpleNamespace(
+            blocked_reason=None,
+            team_owned=False,
+            authorized=False,
+            delete_definition=False,
+        ),
+    )
+
+    def callback() -> None:
+        try:
+            with factory() as callback_db:
+                callback_results.append(
+                    asyncio.run(
+                        mcp_api.mcp_oauth_callback(
+                            _callback_request("postgres-flow-state"), callback_db
+                        )
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            callback_errors.append(exc)
+
+    def disconnect() -> None:
+        try:
+            with factory() as disconnect_db:
+                asyncio.run(
+                    mcp_api.delete_mcp_server(
+                        seed["server_id"],
+                        current_user=disconnect_db.get(User, seed["user_id"]),
+                        db=disconnect_db,
+                    )
+                )
+        except BaseException as exc:  # pragma: no cover - assertion reports it
+            disconnect_errors.append(exc)
+        finally:
+            disconnect_finished.set()
+
+    callback_thread = threading.Thread(target=callback, name="postgres-real-callback")
+    callback_thread.start()
+    assert producer_at_upsert.wait(timeout=5)
+    disconnect_thread = threading.Thread(
+        target=disconnect, name="postgres-real-disconnect"
+    )
+    disconnect_thread.start()
+    assert disconnect_lock_attempted.wait(timeout=5)
+    assert not disconnect_finished.wait(timeout=0.2)
+    allow_producer_commit.set()
+    callback_thread.join(timeout=5)
+    disconnect_thread.join(timeout=5)
+
+    assert not callback_thread.is_alive()
+    assert not disconnect_thread.is_alive()
+    assert callback_errors == []
+    assert disconnect_errors == []
+    assert len(callback_results) == 1
+    assert callback_results[0].status_code == 307
     with factory() as verify_db:
         assert verify_db.query(MCPOAuthGrant).count() == 0
         assert verify_db.query(MCPOAuthFlowState).count() == 0

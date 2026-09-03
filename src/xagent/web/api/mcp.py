@@ -857,7 +857,7 @@ def _lock_active_mcp_oauth_lifecycle(
     flow_identity: _MCPOAuthFlowIdentity | None = None,
     association_must_be_active: bool = True,
 ) -> tuple[MCPServer, UserMCPServer, MCPOAuthFlowState | None] | None:
-    """Lock the exact association lifecycle before final OAuth persistence."""
+    """Lock server, exact association generation, then exact flow if supplied."""
     if db.get_bind().dialect.name == "sqlite":
         _begin_sqlite_oauth_persistence(db)
     db.expire_all()
@@ -909,6 +909,35 @@ def _lock_active_mcp_oauth_lifecycle(
     return server, association, flow_state
 
 
+def _sweep_expired_mcp_oauth_flow_states(db: Session) -> None:
+    """Delete one bounded batch of dead flow states outside lifecycle locks."""
+    # Sweep this table's dead rows before adding another, mirroring the Slack
+    # OAuth flow-state ledger in channel.py. Every abandoned, denied or
+    # double-submitted authorization leaves a row that is permanently unusable
+    # once it expires (the claim query requires consumed_at IS NULL and
+    # expires_at > now), but nothing else removes it until a disconnect or a
+    # server cascade. Deliberately global so users who never reconnect do not
+    # retain rows forever, and bounded so one user-facing request does not drain
+    # an unbounded historical backlog.
+    try:
+        stale_flow_state_ids = (
+            db.query(MCPOAuthFlowState.id)
+            .filter(
+                MCPOAuthFlowState.expires_at
+                < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
+            )
+            .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
+            .scalar_subquery()
+        )
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.id.in_(stale_flow_state_ids)
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def _persist_mcp_oauth_connect_flow(
     db: Session,
     *,
@@ -926,6 +955,10 @@ def _persist_mcp_oauth_connect_flow(
     redirect_after: str | None,
 ) -> tuple[str, str, str] | None:
     """Persist a client and flow only for the preflight association generation."""
+    # This global maintenance write is independent of the new flow. Commit it
+    # before taking per-lifecycle row locks so unrelated expired rows cannot
+    # widen the server -> association critical section.
+    _sweep_expired_mcp_oauth_flow_states(db)
     lifecycle = _lock_active_mcp_oauth_lifecycle(
         db,
         association_identity=association_identity,
@@ -945,19 +978,6 @@ def _persist_mcp_oauth_connect_flow(
             redirect_uri=redirect_uri,
             registration_lookup_hash=registration_lookup_hash,
         )
-
-        stale_flow_state_ids = (
-            db.query(MCPOAuthFlowState.id)
-            .filter(
-                MCPOAuthFlowState.expires_at
-                < _utc_now() - MCP_OAUTH_FLOW_STATE_RETENTION
-            )
-            .limit(MCP_OAUTH_FLOW_STATE_SWEEP_BATCH)
-            .scalar_subquery()
-        )
-        db.query(MCPOAuthFlowState).filter(
-            MCPOAuthFlowState.id.in_(stale_flow_state_ids)
-        ).delete(synchronize_session=False)
 
         state_value = secrets.token_urlsafe(32)
         code_verifier = secrets.token_urlsafe(64)
@@ -4167,7 +4187,6 @@ async def delete_mcp_server(
 ) -> None:
     """Delete an MCP server."""
     try:
-        manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
         # Check user has access to this server
@@ -4189,15 +4208,13 @@ async def delete_mcp_server(
             user_id=int(user_id),
             lifecycle_generation=user_mcp.lifecycle_generation,
         )
-        association_was_active = bool(user_mcp.is_active)
-
         # Serialize teardown with OAuth producers before enumerating artifacts.
         # The exact generation prevents a stale DELETE from touching a replacement
         # association created for the same user and shared server.
         lifecycle = _lock_active_mcp_oauth_lifecycle(
             db,
             association_identity=association_identity,
-            association_must_be_active=association_was_active,
+            association_must_be_active=False,
         )
         if lifecycle is None:
             db.rollback()
@@ -4341,36 +4358,43 @@ async def delete_mcp_server(
 
         # Remove user-server association
         db.delete(user_mcp)
-        db.commit()
+        db.flush()
 
-        for snapshot in grant_revocations:
-            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
-
-        # Check if any other users are using this server
+        # Decide shared-row retention while the server lifecycle lock is still
+        # held. A post-commit check followed by a second delete transaction can
+        # erase a replacement association committed between those operations.
         other_users = (
             db.query(UserMCPServer)
             .filter(UserMCPServer.mcpserver_id == server_id)
             .first()
         )
-
-        # Only remove from manager and delete if no other users
+        server_deleted = False
+        retained_team_server = False
+        retained_platform_server = False
         if not other_users:
-            if team_delete.team_owned and not team_delete.delete_definition:
-                logger.info(
-                    f"Kept shared MCP server '{server_name}' after team disconnect"
-                )
-                return
-            if _catalog_server_has_platform_key(db, server):
-                # Keep the shared catalog row: it holds the admin's platform
-                # fallback key and is reused by future connects. Deleting it would
-                # silently wipe the platform key with no signal to the admin.
-                logger.info(
-                    f"Kept shared catalog server '{server_name}' after last user "
-                    "disconnect (preserves platform fallback key)"
-                )
-            else:
-                manager.remove_server(server_name)
-                logger.info(f"Deleted MCP server '{server_name}'")
+            retained_team_server = bool(
+                team_delete.team_owned and not team_delete.delete_definition
+            )
+            if not retained_team_server:
+                retained_platform_server = _catalog_server_has_platform_key(db, server)
+            if not retained_team_server and not retained_platform_server:
+                db.delete(server)
+                server_deleted = True
+
+        db.commit()
+
+        for snapshot in grant_revocations:
+            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
+
+        if retained_team_server:
+            logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")
+        elif retained_platform_server:
+            logger.info(
+                f"Kept shared catalog server '{server_name}' after last user "
+                "disconnect (preserves platform fallback key)"
+            )
+        elif server_deleted:
+            logger.info(f"Deleted MCP server '{server_name}'")
         else:
             logger.info(f"Removed user {user_id} access to MCP server '{server_name}'")
 
@@ -4793,8 +4817,8 @@ async def mcp_oauth_callback(
     state_error = _mcp_oauth_flow_state_error(db, flow_state)
     if state_error is not None:
         error_code, message = state_error
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
@@ -4852,22 +4876,22 @@ async def mcp_oauth_callback(
     claim_error = _claim_mcp_oauth_flow_state(db, flow_state)
     if claim_error is not None:
         error_code, message = claim_error
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code=error_code,
             message=message,
         )
     if error:
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="token_exchange_failed",
             message=oauth_error_message(
                 {"error": error}, "MCP OAuth authorization failed"
             ),
         )
     if not code:
-        return _mcp_oauth_callback_error_redirect(
-            flow_state,
+        return _mcp_oauth_callback_error_redirect_for_path(
+            callback_redirect_after,
             error_code="invalid_state",
             message="Missing authorization code",
         )

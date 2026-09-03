@@ -40,8 +40,9 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
     PlanLanguageMismatchError,
 )
+from xagent.core.memory.core import MemoryNote as StoredMemoryNote
+from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.types import ChunkType, StreamChunk
-from xagent.core.memory.core import MemoryNote as StoredMemoryNote, MemoryResponse
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"

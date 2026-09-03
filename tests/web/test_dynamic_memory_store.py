@@ -12,8 +12,11 @@ from xagent.web.dynamic_memory_store import (
     DynamicMemoryStoreManager,
     MemoryBackendUnavailableError,
 )
-from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
-from xagent.web.user_isolated_memory import UserContext, current_user_id
+from xagent.web.user_isolated_memory import (
+    UserContext,
+    UserIsolatedMemoryStore,
+    current_user_id,
+)
 
 
 class FakeLanceStore:

@@ -8,7 +8,6 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.web.api.chat import AgentServiceManager
-from xagent.web.user_isolated_memory import current_user_id
 from xagent.web.models.task import (
     DAGExecution,
     DAGExecutionPhase,
@@ -23,6 +22,7 @@ from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
     _TaskFields,
 )
+from xagent.web.user_isolated_memory import current_user_id
 
 
 def _build_reconstruction_snapshot(

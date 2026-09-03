@@ -349,7 +349,7 @@ class DynamicMemoryStoreManager:
             return UserIsolatedMemoryStore(
                 store._base_store, require_vector_search=True
             )
-        return store  # type: ignore[return-value]
+        return store
 
     def force_reinitialize(self) -> None:
         """Force reinitialization of the memory store."""

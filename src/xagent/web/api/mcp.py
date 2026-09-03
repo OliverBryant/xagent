@@ -1208,7 +1208,9 @@ def _mcp_oauth_issued_token_snapshot(
     flow_id: int,
     token_data: dict[str, Any],
 ) -> _MCPOAuthIssuedTokenSnapshot:
-    metadata = client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    metadata: dict[str, Any] = (
+        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    )
     revocation_endpoint = metadata.get("revocation_endpoint")
     refresh_token = token_data.get("refresh_token")
     return _MCPOAuthIssuedTokenSnapshot(

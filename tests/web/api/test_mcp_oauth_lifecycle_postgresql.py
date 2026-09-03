@@ -198,6 +198,12 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         try:
             with factory() as disconnect_db:
                 disconnect_started.set()
+                # The teardown consumer specified by #2033 follows the same
+                # global lock order as the producer fence. Model that contract
+                # here without changing the generic DELETE route in this PR.
+                disconnect_db.query(MCPServer).filter(
+                    MCPServer.id == seed["server_id"]
+                ).with_for_update().one()
                 disconnect_db.query(MCPOAuthGrant).filter(
                     MCPOAuthGrant.mcp_server_id == seed["server_id"],
                     MCPOAuthGrant.user_id == seed["user_id"],

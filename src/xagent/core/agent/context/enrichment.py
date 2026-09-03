@@ -183,10 +183,24 @@ def display_message_override(metadata: Any) -> str | None:
     return display.strip()
 
 
-def top_level_user_request(context: Any) -> TopLevelUserRequest:
-    """Return and persist the latest independent top-level user request."""
+def top_level_user_request(
+    context: Any,
+    *,
+    user_message_limit: int | None = None,
+) -> TopLevelUserRequest:
+    """Return and persist the latest independent top-level user request.
+
+    ``user_message_limit`` freezes selection to a checkpointed prefix when a
+    later waiting response has already been appended to the root context.
+    """
     has_pending_response = False
-    for message in reversed(getattr(context, "messages", []) or []):
+    messages = list(getattr(context, "messages", []) or [])
+    if user_message_limit is not None:
+        user_messages = [
+            message for message in messages if getattr(message, "role", None) == "user"
+        ]
+        messages = user_messages[: max(0, user_message_limit)]
+    for message in reversed(messages):
         if getattr(message, "role", None) != "user" or getattr(
             message, "hidden", False
         ):

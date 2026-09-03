@@ -553,27 +553,13 @@ class ExecutionContext:
         ``user_message_limit`` restricts selection to a previously checkpointed
         user-message window so later waiting responses cannot become the task.
         """
-        messages = self.messages
-        if user_message_limit is not None:
-            user_messages = [message for message in messages if message.role == "user"]
-            messages = user_messages[: max(0, user_message_limit)]
-        for message in reversed(messages):
-            if message.hidden or message.role != "user":
-                continue
-            if message.metadata.get("response_to_waiting_for_user"):
-                continue
-            # A DAG child context copies the root messages and then appends step
-            # scaffolding; only the root request may anchor the response language.
-            if message.metadata.get("dag_step_id"):
-                continue
-            if prefer_display:
-                display = message.metadata.get("display_message")
-                if isinstance(display, str) and display.strip():
-                    return display.strip()
-            content = str(message.content or "").strip()
-            if content:
-                return content
-        return str(self.metadata.get("task") or "").strip()
+        request = top_level_user_request(
+            self,
+            user_message_limit=user_message_limit,
+        )
+        if prefer_display and request.display_state == "text":
+            return request.language_text
+        return request.execution_text
 
     def _system_context(self) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]

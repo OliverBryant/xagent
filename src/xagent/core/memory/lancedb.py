@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, cast
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -210,7 +210,7 @@ class LanceDBMemoryStore(MemoryStore):
             if isinstance(result, list) and result:
                 vector = result[0] if isinstance(result[0], list) else result
                 if vector and all(isinstance(value, (int, float)) for value in vector):
-                    return [float(value) for value in vector]
+                    return [float(value) for value in cast(list[float], vector)]
         except MemoryBackendUnavailableError:
             raise
         except Exception as exc:

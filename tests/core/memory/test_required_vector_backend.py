@@ -5,10 +5,7 @@ import pytest
 
 from xagent.core.memory.base import MemoryBackendUnavailableError
 from xagent.core.memory.core import MemoryNote
-from xagent.core.memory.lancedb import (
-    LanceDBMemoryStore,
-    _VECTOR_SPACE_METADATA_KEY,
-)
+from xagent.core.memory.lancedb import _VECTOR_SPACE_METADATA_KEY, LanceDBMemoryStore
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 from .conftest import ConstantEmbedding

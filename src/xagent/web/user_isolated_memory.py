@@ -1,7 +1,7 @@
 """User-isolated memory store for web application."""
 
 import contextvars
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, cast
 
 from xagent.core.execution_scope import (
     ExecutionScope,
@@ -167,7 +167,11 @@ class UserIsolatedMemoryStore(MemoryStore):
         note.metadata.update(memory_dimension_metadata(get_execution_scope()))
 
         if self._require_vector_search:
-            return self._base_store.add_required_vector(note)  # type: ignore[attr-defined]
+            strict_add = cast(
+                Callable[[MemoryNote], MemoryResponse],
+                getattr(self._base_store, "add_required_vector"),
+            )
+            return strict_add(note)
         return self._base_store.add(note)
 
     def get(self, note_id: str) -> MemoryResponse:

@@ -18,6 +18,7 @@ from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 from sqlalchemy import or_
+from sqlalchemy.orm import Session
 
 from ...config import get_default_task_execution_mode
 from ...core.file_storage.keys import build_task_output_storage_key
@@ -113,6 +114,16 @@ class _ChannelTaskClaimSnapshot:
     is_new_task: bool
     lease: TaskLease
     requested_agent_missing: bool = False
+    # The status this claim took the task away from, for a claim that is
+    # resuming an existing run rather than starting a new one. None for every
+    # fresh claim.
+    #
+    # Deliberately not derived from ``is_new_task``: an actor interaction that
+    # passes no resume run id also reuses an existing row, so that flag cannot
+    # tell "resuming a waiting run" from "re-claiming a row for a new run".
+    # Compensation reads this to decide whether an abandoned claim should be
+    # put back where it was or failed -- see ``_compensate_channel_task_claim_sync``.
+    resumed_from_status: TaskStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -924,6 +935,13 @@ def _prepare_channel_task_sync(
             # is a resume of an existing run, so a caller that cannot name that
             # run has nothing to resume and must take the fresh-run path.
             resuming = resume_run_id is not None
+            # Read before the claim, which flips the row to RUNNING: after it,
+            # the status this claim interrupted is no longer on the row to
+            # read. Only captured for a resume -- a fresh claim compensates as
+            # FAILED and has nothing to restore.
+            resumed_from_status = (
+                _resumable_prior_status(db, task_id) if resuming else None
+            )
             lease = acquire_task_lease_no_commit(
                 db,
                 task_id,
@@ -970,6 +988,7 @@ def _prepare_channel_task_sync(
                 is_new_task=is_new_task,
                 lease=lease,
                 requested_agent_missing=requested_agent_missing,
+                resumed_from_status=resumed_from_status,
             )
         except Exception:
             db.rollback()
@@ -1075,17 +1094,45 @@ async def prepare_channel_task(
     )
 
 
+def _resumable_prior_status(db: Session, task_id: int) -> TaskStatus | None:
+    """Return the status a resume claim should restore, or None.
+
+    Only WAITING_FOR_USER is restorable. Any other status means the row was
+    not parked on a question when this claim reached it -- there is no
+    pending interaction to hand back to, so an abandoned claim there is an
+    ordinary failed turn rather than a resume to undo.
+    """
+    row = db.query(Task.status).filter(Task.id == task_id).first()
+    if row is None:
+        return None
+    status = row[0]
+    return status if status is TaskStatus.WAITING_FOR_USER else None
+
+
 def _compensate_channel_task_claim_sync(
     snapshot: _ChannelTaskClaimSnapshot,
 ) -> bool:
-    """Settle the exact committed claim or leave its lease to TTL recovery."""
+    """Settle the exact committed claim or leave its lease to TTL recovery.
+
+    A fresh claim that is abandoned before execution is a turn that never
+    ran, and FAILED is the honest record of it.
+
+    A resumed claim is not: the task was parked on a question, and the answer
+    was never injected, so nothing about the pending interaction has changed.
+    Failing it there would be destructive rather than merely inaccurate --
+    the loader and the next claim both require WAITING_FOR_USER, so a task
+    failed here can never be resumed again and the approval it was waiting on
+    becomes permanently unanswerable, checkpoint and all. Put it back where
+    the claim found it instead, which is what every other resume path
+    (websocket, A2A, V1) does on the same cancellation.
+    """
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         return finalize_managed_task_lease_result(
             db,
             snapshot.lease,
-            status=TaskStatus.FAILED,
+            status=snapshot.resumed_from_status or TaskStatus.FAILED,
         )
 
 

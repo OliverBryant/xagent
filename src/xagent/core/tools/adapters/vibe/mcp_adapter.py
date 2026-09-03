@@ -12,7 +12,7 @@ import math
 import os
 import re
 import weakref
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, create_model
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
-from ...core.mcp.tools import load_mcp_tools
+from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -105,6 +105,53 @@ class MCPWriteHint(Enum):
     READ_ONLY = "read_only"
     DESTRUCTIVE = "destructive"
     UNDECLARED = "undeclared"
+
+
+# The annotation keys this classifier reads, spelled as the MCP wire schema
+# spells them (camelCase is the protocol's, not this codebase's).
+_READ_ONLY_HINT = "readOnlyHint"
+_DESTRUCTIVE_HINT = "destructiveHint"
+
+
+def classify_write_hint(raw_annotations: object) -> MCPWriteHint:
+    """Classify a tool's *raw* wire annotations into a write hint.
+
+    Takes the annotation mapping as it arrived on the wire, before the mcp
+    SDK's models see it. That is deliberate and it is the whole reason this
+    function exists: ``ToolAnnotations`` declares ``bool | None`` under
+    non-strict Pydantic validation, so by the time a parsed object is in
+    hand, ``1`` and ``"true"`` have already become an indistinguishable
+    Python ``True``. Classifying after that boundary cannot tell a server
+    that promised ``true`` from one that sent a coercible non-boolean, which
+    would turn "only an exact boolean counts" into a promise this code does
+    not keep.
+
+    Fail-closed in both directions that matter:
+
+    * A declared ``destructiveHint`` outranks a simultaneous ``readOnlyHint``.
+      The schema marks the two independent with no mutual exclusion, so a peer
+      can send both, and the safe reading of a contradiction is the one that
+      keeps a human in front of the action.
+    * Everything else -- absent, ``None``, ``false``, a non-boolean, or an
+      annotations value that is not even a mapping -- is ``UNDECLARED``,
+      which a consumer must treat as a write.
+
+    None of this makes the result trustworthy: annotations come from a server
+    the client does not control, and the spec says outright that a client
+    "should never make tool use decisions based on ToolAnnotations received
+    from untrusted servers". What this buys is that a *malformed* or
+    *contradictory* claim can never read as the permissive one.
+    """
+    if not isinstance(raw_annotations, Mapping):
+        return MCPWriteHint.UNDECLARED
+    # ``is True`` against the raw value, which is the only place it means what
+    # it says. Checked destructive-first so a both-true peer lands on the
+    # safe side.
+    if raw_annotations.get(_DESTRUCTIVE_HINT) is True:
+        return MCPWriteHint.DESTRUCTIVE
+    if raw_annotations.get(_READ_ONLY_HINT) is True:
+        return MCPWriteHint.READ_ONLY
+    return MCPWriteHint.UNDECLARED
 
 
 @dataclass(frozen=True)
@@ -808,6 +855,7 @@ class MCPToolAdapter(AbstractBaseTool):
         source_server: Optional[str] = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
+        raw_annotations: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -826,8 +874,16 @@ class MCPToolAdapter(AbstractBaseTool):
                 after interruption.
             concurrent_tools: Optional allowlist of raw MCP tool names. Empty
                 means every tool from an opted-in server is safe.
+            raw_annotations: The tool's ``annotations`` object exactly as it
+                arrived on the wire, before the mcp SDK's non-strict models
+                coerced it. Required for an honest ``write_hint``: once
+                parsed, ``1`` and ``"true"`` are indistinguishable from a
+                real ``true``. Omitted means no wire evidence reached this
+                adapter, which classifies as ``UNDECLARED`` -- never as a
+                read-only promise.
         """
         self.mcp_tool = mcp_tool
+        self._raw_annotations = raw_annotations
         self.connection = connection
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
@@ -896,34 +952,20 @@ class MCPToolAdapter(AbstractBaseTool):
     def write_hint(self) -> "MCPWriteHint":
         """What the server's own annotations claim about this tool's writes.
 
-        Read straight from the MCP spec's ``readOnlyHint`` /
-        ``destructiveHint`` tool annotations, which nothing in this package
-        consumed before. They are the only machine-readable signal a
-        connector author has for "this call changes the world", so a caller
-        that must decide whether to gate an action has to start here.
+        Classified from the raw wire annotations captured at load time, not
+        from the parsed ``ToolAnnotations`` object -- see
+        ``classify_write_hint`` for why the distinction is the point rather
+        than a detail. An adapter built without that evidence reports
+        ``UNDECLARED``, which a consumer must treat as a write.
 
-        Deliberately *not* trusted as a security fact. The spec says so in
-        as many words -- annotations are hints, and a client "should never
-        make tool use decisions based on ToolAnnotations received from
-        untrusted servers" -- and the shape below is built so the unsafe
-        reading is never the accidental one: anything absent, malformed, or
-        not exactly ``True`` reads as :data:`MCPWriteHint.UNDECLARED`, which
-        a gate is expected to treat the same as a declared write. A server
-        that lies in the permissive direction is the case this cannot fix
-        (it is upstream of every consumer); a server that says nothing at
-        all is the case this must not silently wave through, and does not.
+        Not a trust boundary. The spec says annotations are hints and a
+        client "should never make tool use decisions based on
+        ToolAnnotations received from untrusted servers". A server that lies
+        in the permissive direction is upstream of anything this can check;
+        what is guaranteed here is only that malformed or self-contradictory
+        input never reads as the permissive answer.
         """
-        annotations = getattr(self.mcp_tool, "annotations", None)
-        if annotations is None:
-            return MCPWriteHint.UNDECLARED
-        # ``is True`` rather than truthiness: these arrive as ``bool | None``
-        # from a remote peer, and a JSON string or number surviving into one
-        # of them must not read as a promise about writes.
-        if getattr(annotations, "readOnlyHint", None) is True:
-            return MCPWriteHint.READ_ONLY
-        if getattr(annotations, "destructiveHint", None) is True:
-            return MCPWriteHint.DESTRUCTIVE
-        return MCPWriteHint.UNDECLARED
+        return classify_write_hint(self._raw_annotations)
 
     @property
     def tags(self) -> List[str]:
@@ -1699,6 +1741,10 @@ def _build_mcp_tool_adapter(
         source_server=normalize_mcp_server_name(server_name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
+        # Read off the tool the loader produced -- both the direct and the
+        # sandboxed loader attach it, so one builder serves both paths and
+        # neither can quietly lose the evidence the other keeps.
+        raw_annotations=raw_annotations_for(mcp_tool),
     )
 
 

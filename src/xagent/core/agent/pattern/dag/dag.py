@@ -1886,11 +1886,30 @@ class DAGPattern(AgentPattern):
 
         child_context = type(root_context).from_dict(active_context)
         self._refresh_restored_step_runtime_metadata(child_context, root_context)
+        state = self.active_step_pattern_states.get(step_id)
+        waiting_request = (
+            state.get("waiting_for_user_request") if isinstance(state, dict) else {}
+        )
+        waiting_request = waiting_request if isinstance(waiting_request, dict) else {}
         for message in root_user_messages[self.planned_user_message_count :]:
+            marker = {
+                "question": waiting_request.get("message", ""),
+                "message_type": waiting_request.get("message_type", "question"),
+            }
+            metadata = {
+                **getattr(message, "metadata", {}),
+                "response_to_waiting_for_user": marker,
+            }
+            root_index = next(
+                index
+                for index, root_message in enumerate(root_context.messages)
+                if root_message is message
+            )
+            root_context.messages[root_index] = replace(message, metadata=metadata)
             child_context.add_user_message(
                 message.content,
                 metadata={
-                    **getattr(message, "metadata", {}),
+                    **metadata,
                     "kind": "dag_waiting_user_response",
                     "forwarded_from_root": True,
                     "dag_step_id": step_id,

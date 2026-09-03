@@ -87,6 +87,26 @@ def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
     return _MCP_LOAD_FAILURE_MESSAGES[phase]
 
 
+class MCPWriteHint(Enum):
+    """What a server's tool annotations claim about a tool's side effects.
+
+    Three states rather than a boolean, because "the server told us this is
+    read-only" and "the server told us nothing" are different facts and only
+    the first one is a claim. Collapsing them into ``is_read_only: bool``
+    would make silence indistinguishable from a promise -- and silence is
+    the common case, since annotations are optional and most connectors
+    omit them.
+
+    A consumer deciding whether an action needs a human in front of it
+    should treat everything except :data:`READ_ONLY` as a write. See
+    ``MCPToolAdapter.write_hint`` for why none of this is a trust boundary.
+    """
+
+    READ_ONLY = "read_only"
+    DESTRUCTIVE = "destructive"
+    UNDECLARED = "undeclared"
+
+
 @dataclass(frozen=True)
 class MCPServerLoadFailure:
     """Safe MCP load failure data that excludes raw exception details."""
@@ -871,6 +891,39 @@ class MCPToolAdapter(AbstractBaseTool):
     def description(self) -> str:
         """Get tool description from MCP tool."""
         return self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
+
+    @property
+    def write_hint(self) -> "MCPWriteHint":
+        """What the server's own annotations claim about this tool's writes.
+
+        Read straight from the MCP spec's ``readOnlyHint`` /
+        ``destructiveHint`` tool annotations, which nothing in this package
+        consumed before. They are the only machine-readable signal a
+        connector author has for "this call changes the world", so a caller
+        that must decide whether to gate an action has to start here.
+
+        Deliberately *not* trusted as a security fact. The spec says so in
+        as many words -- annotations are hints, and a client "should never
+        make tool use decisions based on ToolAnnotations received from
+        untrusted servers" -- and the shape below is built so the unsafe
+        reading is never the accidental one: anything absent, malformed, or
+        not exactly ``True`` reads as :data:`MCPWriteHint.UNDECLARED`, which
+        a gate is expected to treat the same as a declared write. A server
+        that lies in the permissive direction is the case this cannot fix
+        (it is upstream of every consumer); a server that says nothing at
+        all is the case this must not silently wave through, and does not.
+        """
+        annotations = getattr(self.mcp_tool, "annotations", None)
+        if annotations is None:
+            return MCPWriteHint.UNDECLARED
+        # ``is True`` rather than truthiness: these arrive as ``bool | None``
+        # from a remote peer, and a JSON string or number surviving into one
+        # of them must not read as a promise about writes.
+        if getattr(annotations, "readOnlyHint", None) is True:
+            return MCPWriteHint.READ_ONLY
+        if getattr(annotations, "destructiveHint", None) is True:
+            return MCPWriteHint.DESTRUCTIVE
+        return MCPWriteHint.UNDECLARED
 
     @property
     def tags(self) -> List[str]:

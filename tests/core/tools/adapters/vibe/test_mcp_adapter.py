@@ -23,6 +23,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPServerLoadFailure,
     MCPToolAdapter,
+    MCPWriteHint,
     _build_mcp_tool_adapter,
     _compact_json,
     _exception_indicates_http_401,
@@ -2911,3 +2912,83 @@ def test_description_length_boundary(length, truncated):
         assert description == "a" * (_FIELD_TEXT_MAX_CHARS - 1) + "…"
     else:
         assert description == raw
+
+
+def _annotated_tool(**annotations: Any) -> SimpleNamespace:
+    """An MCP tool carrying exactly the annotation fields given."""
+    tool = _mcp_tool()
+    tool.annotations = SimpleNamespace(**annotations)
+    return tool
+
+
+def _adapter_for(tool: SimpleNamespace) -> MCPToolAdapter:
+    return _build_mcp_tool_adapter("srv", SimpleNamespace(), tool)
+
+
+@pytest.mark.parametrize(
+    "annotations,expected",
+    [
+        ({"readOnlyHint": True}, MCPWriteHint.READ_ONLY),
+        ({"readOnlyHint": True, "destructiveHint": True}, MCPWriteHint.READ_ONLY),
+        ({"destructiveHint": True}, MCPWriteHint.DESTRUCTIVE),
+        ({"readOnlyHint": False, "destructiveHint": True}, MCPWriteHint.DESTRUCTIVE),
+        ({"readOnlyHint": False}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": False, "destructiveHint": False}, MCPWriteHint.UNDECLARED),
+        ({"readOnlyHint": None, "destructiveHint": None}, MCPWriteHint.UNDECLARED),
+        ({"title": "Echo"}, MCPWriteHint.UNDECLARED),
+    ],
+)
+def test_write_hint_reads_the_spec_annotations(annotations, expected):
+    """readOnlyHint wins over destructiveHint; neither set is UNDECLARED."""
+    assert _adapter_for(_annotated_tool(**annotations)).write_hint is expected
+
+
+def test_write_hint_without_any_annotations_is_undeclared():
+    """The common case -- a connector that annotates nothing -- is not a promise."""
+    tool = _mcp_tool()
+    assert not hasattr(tool, "annotations")
+
+    assert _adapter_for(tool).write_hint is MCPWriteHint.UNDECLARED
+    assert _adapter_for(_annotated_tool()).write_hint is MCPWriteHint.UNDECLARED
+
+
+@pytest.mark.parametrize("planted", ["true", "false", 1, 0, [], {}, "readOnly"])
+def test_non_boolean_hints_never_read_as_a_read_only_promise(planted):
+    """A remote peer's non-boolean value must not pass for ``True``.
+
+    ``readOnlyHint`` is typed ``bool | None``, but it arrives over the wire
+    from a server this client does not control. Truthiness would let the
+    string "false" -- or any non-empty string -- claim the tool is read-only
+    and skip whatever gate a consumer puts behind this.
+    """
+    hint = _adapter_for(_annotated_tool(readOnlyHint=planted)).write_hint
+
+    assert hint is not MCPWriteHint.READ_ONLY
+    assert hint is MCPWriteHint.UNDECLARED
+
+
+def test_non_boolean_destructive_hint_does_not_claim_destructive():
+    """Symmetric to the read-only case: only ``True`` is a declaration."""
+    assert (
+        _adapter_for(_annotated_tool(destructiveHint="true")).write_hint
+        is MCPWriteHint.UNDECLARED
+    )
+
+
+def test_annotations_explicitly_none_is_undeclared():
+    """``annotations=None`` is what the SDK gives for an unannotated tool."""
+    assert _adapter_for(_annotated_tool_none()).write_hint is MCPWriteHint.UNDECLARED
+
+
+def _annotated_tool_none() -> SimpleNamespace:
+    tool = _mcp_tool()
+    tool.annotations = None
+    return tool
+
+
+def test_only_read_only_is_a_safe_reading():
+    """The enum's contract: everything except READ_ONLY means "treat as write"."""
+    assert {h for h in MCPWriteHint if h is not MCPWriteHint.READ_ONLY} == {
+        MCPWriteHint.DESTRUCTIVE,
+        MCPWriteHint.UNDECLARED,
+    }

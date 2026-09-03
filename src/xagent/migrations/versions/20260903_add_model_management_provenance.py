@@ -17,8 +17,20 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("models", sa.Column("managed_by", sa.String(50), nullable=True))
+    inspector = sa.inspect(op.get_bind())
+    if "models" not in inspector.get_table_names():
+        return
+    if "managed_by" not in {
+        column["name"] for column in inspector.get_columns("models")
+    }:
+        op.add_column("models", sa.Column("managed_by", sa.String(50), nullable=True))
 
 
 def downgrade() -> None:
-    op.drop_column("models", "managed_by")
+    inspector = sa.inspect(op.get_bind())
+    if "models" not in inspector.get_table_names():
+        return
+    if "managed_by" in {
+        column["name"] for column in inspector.get_columns("models")
+    }:
+        op.drop_column("models", "managed_by")

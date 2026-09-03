@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
@@ -22,7 +23,6 @@ from xagent.web.services.llm_utils import (
     PlatformModelIdentityError,
     PlatformModelStore,
 )
-from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 
 # Create temporary directory for database
 

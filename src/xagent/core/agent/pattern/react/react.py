@@ -78,7 +78,6 @@ from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
-    memory_input_text,
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
@@ -1735,11 +1734,15 @@ class ReActPattern(AgentPattern):
     def _memory_text(self, context: Any, *, execution_text: str) -> str:
         if self.memory_input_text:
             return self.memory_input_text
-        self.memory_input_text = memory_input_text(
-            context,
-            execution_text=execution_text,
+        self.memory_input_text = (
+            context.current_user_request_text(prefer_display=True) or execution_text
         )
         return self.memory_input_text
+
+    def seed_memory_input(self, memory_text: str) -> None:
+        """Provide DAG-owned provenance without replacing restored state."""
+        if self.memory_input_text is None:
+            self.memory_input_text = str(memory_text or "") or None
 
     def _mark_latest_user_message_as_waiting_response(
         self,

@@ -265,56 +265,6 @@ def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:
     return str(task or "")
 
 
-def memory_input_text(context: Any, *, execution_text: str | None = None) -> str:
-    """Return clean user-facing text for memory recall and provenance.
-
-    Runtime user messages may contain execution-only augmentation such as file
-    references. Their ``display_message`` metadata carries the corresponding
-    user-facing text. DAG child contexts also append internal user-role step
-    messages, so those are excluded when locating the root request.
-
-    ``execution_text`` lets a resumed ReAct run keep memory provenance attached
-    to its original task rather than a later clarification response. Legacy
-    contexts without display metadata retain their previous content fallback.
-    """
-
-    messages = list(getattr(context, "messages", []) or [])
-    dag_step_id = (
-        context.metadata.get("dag_step_id")
-        if isinstance(getattr(context, "metadata", None), dict)
-        else None
-    )
-    candidates: list[Any] = []
-    for message in reversed(messages):
-        if getattr(message, "role", None) != "user":
-            continue
-        metadata = getattr(message, "metadata", None)
-        metadata = metadata if isinstance(metadata, dict) else {}
-        if dag_step_id and metadata.get("dag_step_id"):
-            continue
-        content = str(getattr(message, "content", "") or "")
-        if execution_text is not None and not dag_step_id and content != execution_text:
-            continue
-        candidates.append(message)
-
-    if not candidates and execution_text is not None:
-        return memory_input_text(context)
-    if candidates:
-        message = candidates[0]
-        metadata = getattr(message, "metadata", None)
-        display = (
-            metadata.get("display_message") if isinstance(metadata, dict) else None
-        )
-        if isinstance(display, str) and display.strip():
-            return display
-        if dag_step_id and execution_text is not None:
-            return execution_text
-        return str(getattr(message, "content", "") or "")
-
-    task = context.metadata.get("task") if hasattr(context, "metadata") else None
-    return str(task or "")
-
-
 def _runtime_attr(runtime: Any | None, name: str) -> Any | None:
     if runtime is None:
         return None
@@ -376,7 +326,10 @@ def _lookup_relevant_memories_with_context(
             similarity_threshold=similarity_threshold,
         )
     except Exception:
-        logger.exception("Failed to retrieve memories")
+        logger.exception(
+            "Failed to retrieve memories%s",
+            " with user context" if user_id is not None else "",
+        )
         return []
 
 

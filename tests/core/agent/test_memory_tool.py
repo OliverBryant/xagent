@@ -279,6 +279,7 @@ async def test_search_memory_rejects_empty_query_and_emits_trace() -> None:
         "task_start_memory_retrieve",
         "task_end_memory_retrieve",
     ]
+    assert tracer.events[-1]["data"]["success"] is True
 
 
 @pytest.mark.asyncio

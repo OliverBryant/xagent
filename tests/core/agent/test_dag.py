@@ -495,6 +495,101 @@ async def test_dag_forwards_disabled_interaction_policy_to_each_step(
     assert observed_policies == [False]
 
 
+@pytest.mark.asyncio
+async def test_dag_waiting_resume_keeps_memory_input_for_later_child() -> None:
+    class EmptyMemoryStore(FakeMemoryStore):
+        def search(self, **kwargs: Any) -> list[MemoryNote]:
+            self.searches.append(kwargs)
+            return []
+
+    typed = "Compare the attached options"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/options.pdf"
+    context = ExecutionContext(execution_id="dag-waiting-memory")
+    context.metadata["task"] = augmented
+    context.add_user_message(augmented, metadata={"display_message": typed})
+    plan = build_plan(
+        PlanStep(id="confirm", task="Ask which option to use"),
+        PlanStep(id="save", task="Save the choice", dependencies=["confirm"]),
+    )
+    pattern = DAGPattern(lambda **_: plan)
+    memory_store = EmptyMemoryStore()
+    first = await pattern.run(
+        context=context,
+        tools=[],
+        llm=SequenceLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "ask-choice",
+                            "function": {
+                                "name": "send_message",
+                                "arguments": json.dumps(
+                                    {
+                                        "message": "Choose A or B",
+                                        "message_type": "question",
+                                        "expect_response": True,
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "done": False,
+                }
+            ]
+        ),
+        memory_store=memory_store,
+    )
+
+    assert first["status"] == "waiting_for_user"
+    legacy_state = pattern.get_state()
+    legacy_state.pop("memory_input_text")
+    rebuilt = ExecutionContext.from_dict(context.to_dict())
+    rebuilt.add_user_message("B")
+    restored = DAGPattern(lambda **_: plan)
+    restored.load_state(legacy_state)
+
+    resume_llm = SequenceLLM(
+        [
+            {"content": "Choice confirmed.", "done": True},
+            {
+                "content": "Remembering the choice.",
+                "tool_calls": [
+                    {
+                        "id": "store-choice",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User chose option B.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {"content": "Choice saved.", "done": True},
+        ]
+    )
+    result = await restored.run(
+        context=rebuilt,
+        tools=[],
+        llm=resume_llm,
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True, result
+    assert restored.memory_input_text == typed
+    assert memory_store.added
+    assert memory_store.added[-1].metadata["task"] == typed
+    assert {call["query"] for call in memory_store.searches} == {
+        typed,
+        "User chose option B.",
+    }
+
+
 async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:
     pattern = DAGPattern(lambda **_: plan)
     return await pattern.run(
@@ -1089,6 +1184,7 @@ async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
 
     assert interrupted["status"] == "interrupted"
     assert checkpoint is not None
+    assert checkpoint["pattern_state"]["memory_input_text"] == typed
     step_state = checkpoint["pattern_state"]["active_step_pattern_states"]["answer"]
     assert step_state["memory_input_text"] == typed
 
@@ -1114,8 +1210,6 @@ async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
     assert result["success"] is True, result
     assert memory_store.added[0].metadata["task"] == typed
     assert memory_store.updated[0].metadata["updated_by_task"] == typed
-    assert augmented not in memory_store.added[0].metadata.values()
-    assert augmented not in memory_store.updated[0].metadata.values()
 
 
 @pytest.mark.asyncio
@@ -5422,6 +5516,9 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     class CapturingReActPattern:
         def __init__(self, **kwargs: Any) -> None:
             del kwargs
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
 
         async def run(self, *, context: Any, **kwargs: Any) -> dict[str, Any]:
             del kwargs

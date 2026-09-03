@@ -875,9 +875,6 @@ class LanceDBMemoryStore(MemoryStore):
 
             return results[:k]
 
-        except Exception:
-            logger.exception("Failed to search memories for query %r", query[:50])
-            raise
         finally:
             _safe_close_table(table)
 
@@ -897,14 +894,10 @@ class LanceDBMemoryStore(MemoryStore):
         so list_all and search cannot diverge (#909). Results are sorted
         newest-first to match InMemoryStore.list_all.
         """
-        try:
-            notes = self.search(query="", k=10000, filters=filters or None)
-            # Mirror InMemoryStore: newest first.
-            notes.sort(key=lambda n: n.timestamp, reverse=True)
-            return notes
-        except Exception as e:
-            logger.error(f"Failed to list all memories: {e}")
-            return []
+        notes = self.search(query="", k=10000, filters=filters or None)
+        # Mirror InMemoryStore: newest first.
+        notes.sort(key=lambda n: n.timestamp, reverse=True)
+        return notes
 
     def get_stats(self) -> dict[str, Any]:
         """Get statistics about the memory store."""

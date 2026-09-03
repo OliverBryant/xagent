@@ -5362,7 +5362,9 @@ async def test_react_pattern_resume_binds_original_task_to_store_memory() -> Non
     rebuilt_context = ExecutionContext.from_dict(context.to_dict())
     rebuilt_context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=3)
-    resumed_pattern.load_state(pattern.get_state())
+    legacy_state = pattern.get_state()
+    legacy_state.pop("memory_input_text")
+    resumed_pattern.load_state(legacy_state)
     resumed_llm = FakeLLM(
         responses=[
             {

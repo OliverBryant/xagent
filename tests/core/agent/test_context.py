@@ -503,6 +503,32 @@ def test_memory_enrichment_uses_web_user_context(
     assert current_user_id.get() is None
 
 
+def test_memory_enrichment_without_user_context_fails_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_lookup(*_: object, **__: object) -> list[dict[str, str]]:
+        raise RuntimeError("memory backend unavailable")
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "lookup_relevant_memories",
+        fail_lookup,
+    )
+
+    memories = _lookup_relevant_memories_with_context(
+        memory_store=object(),
+        query="query",
+        category="general",
+        include_general=True,
+        limit=5,
+        similarity_threshold=None,
+        user_id=None,
+    )
+
+    assert memories == []
+    assert current_user_id.get() is None
+
+
 @pytest.mark.asyncio
 async def test_enrich_context_with_memory_caches_and_builds_context(
     monkeypatch: pytest.MonkeyPatch,

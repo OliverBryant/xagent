@@ -1000,6 +1000,7 @@ class DAGPattern(AgentPattern):
             finalize_after_tool_result=False,
             user_interaction_enabled=self.user_interaction_enabled,
         )
+        react_pattern.memory_input_text = memory_input_text(root_context)
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:
             react_pattern.load_state(active_pattern_state)

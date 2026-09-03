@@ -448,6 +448,7 @@ class ReActPattern(AgentPattern):
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.pending_tool_interaction_responses: list[dict[str, str]] = []
         self.task_text: str | None = None
+        self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
 
@@ -507,7 +508,7 @@ class ReActPattern(AgentPattern):
 
         try:
             task_text = self._task_text(context)
-            memory_text = memory_input_text(context, execution_text=task_text)
+            memory_text = self._memory_text(context, execution_text=task_text)
             self._memory_store = kwargs.get("memory_store")
             # DAG steps skip the automatic retrieval: the root run already
             # retrieved for the whole task, and steps can search_memory on
@@ -1585,6 +1586,7 @@ class ReActPattern(AgentPattern):
                 self.pending_tool_interaction_responses
             ),
             "task_text": self.task_text,
+            "memory_input_text": self.memory_input_text,
             "last_response": self.last_response,
             "pending_tool_calls": self.pending_tool_calls,
             "pending_tool_call_content": self.pending_tool_call_content,
@@ -1654,6 +1656,9 @@ class ReActPattern(AgentPattern):
         ]
         stored_task_text = state.get("task_text")
         self.task_text = str(stored_task_text) if stored_task_text else None
+        stored_memory_input = state.get("memory_input_text")
+        if stored_memory_input:
+            self.memory_input_text = str(stored_memory_input)
         self.last_response = state.get("last_response")
         self.pending_tool_calls = list(state.get("pending_tool_calls", []))
         self.pending_tool_call_content = dict(
@@ -1726,6 +1731,15 @@ class ReActPattern(AgentPattern):
             return self.task_text
         self.task_text = latest_user_text(context)
         return self.task_text
+
+    def _memory_text(self, context: Any, *, execution_text: str) -> str:
+        if self.memory_input_text:
+            return self.memory_input_text
+        self.memory_input_text = memory_input_text(
+            context,
+            execution_text=execution_text,
+        )
+        return self.memory_input_text
 
     def _mark_latest_user_message_as_waiting_response(
         self,

@@ -41,6 +41,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PlanLanguageMismatchError,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.memory.core import MemoryNote as StoredMemoryNote, MemoryResponse
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
@@ -995,6 +996,125 @@ async def test_dag_pattern_passes_compact_llm_to_step_react_compaction() -> None
         "compacted dag step context" in message["content"]
         for message in llm.seen_messages[0]
     )
+
+
+@pytest.mark.asyncio
+async def test_dag_compaction_resume_preserves_clean_memory_metadata() -> None:
+    class CrudMemoryStore:
+        def __init__(self) -> None:
+            self.notes = {
+                "existing": StoredMemoryNote(
+                    id="existing",
+                    content="Old preference",
+                    metadata={},
+                )
+            }
+            self.added: list[StoredMemoryNote] = []
+            self.updated: list[StoredMemoryNote] = []
+
+        def search(self, **_: Any) -> list[StoredMemoryNote]:
+            return []
+
+        def add(self, note: StoredMemoryNote) -> MemoryResponse:
+            self.added.append(note)
+            return MemoryResponse(success=True, memory_id="added")
+
+        def get(self, note_id: str) -> MemoryResponse:
+            return MemoryResponse(success=True, content=self.notes[note_id])
+
+        def update(self, note: StoredMemoryNote) -> MemoryResponse:
+            self.updated.append(note)
+            return MemoryResponse(success=True, memory_id=note.id)
+
+    typed = "Prepare the report"
+    augmented = f"{typed}\n\nAttached file: /private/runtime/input.txt"
+    context = ExecutionContext(execution_id="dag-memory-provenance")
+    context.metadata["task"] = augmented
+    context.compact_config.threshold = 1
+    context.add_user_message(augmented, metadata={"display_message": typed})
+    runtime = PatternRuntime(execution_id=context.execution_id)
+    runtime.interrupt_checker = lambda: any(
+        checkpoint["label"] == "dag_after_llm" for checkpoint in runtime.checkpoints
+    )
+    pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="answer", task="Draft the report"))
+    )
+    first_llm = SequenceLLM(
+        [
+            {
+                "content": "Persist memory changes.",
+                "tool_calls": [
+                    {
+                        "id": "store",
+                        "function": {
+                            "name": "store_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "content": "User prefers brief reports.",
+                                    "kind": "user_preference",
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "update",
+                        "function": {
+                            "name": "update_memory",
+                            "arguments": json.dumps(
+                                {
+                                    "memory_id": "existing",
+                                    "content": "User prefers concise reports.",
+                                }
+                            ),
+                        },
+                    },
+                ],
+                "done": False,
+            }
+        ]
+    )
+    compact_llm = SequenceLLM([{"content": "Compacted DAG child"}])
+    memory_store = CrudMemoryStore()
+
+    interrupted = await pattern.run(
+        context=context,
+        tools=[],
+        llm=first_llm,
+        compact_llm=compact_llm,
+        memory_store=memory_store,
+        runtime=runtime,
+    )
+    checkpoint = runtime.last_checkpoint
+
+    assert interrupted["status"] == "interrupted"
+    assert checkpoint is not None
+    step_state = checkpoint["pattern_state"]["active_step_pattern_states"]["answer"]
+    assert step_state["memory_input_text"] == typed
+
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message(
+        "Internal resumed step",
+        metadata={"dag_step_id": "answer"},
+    )
+    restored_context.compact_with_llm_response({"content": "Rebuilt root"})
+    restored = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="answer", task="Draft the report"))
+    )
+    restored.load_state(checkpoint["pattern_state"])
+
+    result = await restored.run(
+        context=restored_context,
+        tools=[],
+        llm=SequenceLLM([{"content": "Done.", "done": True}]),
+        compact_llm=SequenceLLM([{"content": "Compacted resumed child"}]),
+        memory_store=memory_store,
+    )
+
+    assert result["success"] is True, result
+    assert memory_store.added[0].metadata["task"] == typed
+    assert memory_store.updated[0].metadata["updated_by_task"] == typed
+    assert augmented not in memory_store.added[0].metadata.values()
+    assert augmented not in memory_store.updated[0].metadata.values()
 
 
 @pytest.mark.asyncio

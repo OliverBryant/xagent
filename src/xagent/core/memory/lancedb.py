@@ -875,9 +875,9 @@ class LanceDBMemoryStore(MemoryStore):
 
             return results[:k]
 
-        except Exception as e:
-            logger.error(f"Failed to search memories with query '{query[:50]}...': {e}")
-            return []
+        except Exception:
+            logger.exception("Failed to search memories for query %r", query[:50])
+            raise
         finally:
             _safe_close_table(table)
 

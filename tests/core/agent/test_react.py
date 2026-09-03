@@ -6055,6 +6055,7 @@ def test_react_pattern_state_roundtrip() -> None:
     pattern.status = "acting"
     pattern.current_iteration = 2
     pattern.task_text = "Original task"
+    pattern.memory_input_text = "Clean original task"
     pattern.pending_tool_calls = [{"id": "call_1", "name": "calculator", "args": {}}]
     pattern._record_tool_call(
         {"id": "call_1", "name": "calculator", "args": {"expression": "1+1"}},
@@ -6070,8 +6071,19 @@ def test_react_pattern_state_roundtrip() -> None:
     assert restored.max_iterations == 5
     assert restored.repeated_tool_decision_after_consecutive_work_tool_calls == 7
     assert restored.task_text == "Original task"
+    assert restored.memory_input_text == "Clean original task"
     assert restored.reasoning_mode == ReActReasoningMode.TOOL_CALLING
     assert restored.tool_ledger["call_1"].result == {"result": 2}
+
+
+def test_react_pattern_loads_legacy_state_without_overwriting_memory_input() -> None:
+    restored = ReActPattern()
+    restored.memory_input_text = "Clean task from the rebuilt root context"
+
+    restored.load_state({"task_text": "Augmented execution task"})
+
+    assert restored.task_text == "Augmented execution task"
+    assert restored.memory_input_text == "Clean task from the rebuilt root context"
 
 
 def test_react_pattern_state_roundtrip_preserves_disabled_decision_thresholds() -> None:

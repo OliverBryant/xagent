@@ -12,6 +12,10 @@ from .scope_columns import (
 )
 
 
+class MemoryBackendUnavailableError(RuntimeError):
+    """A caller-required memory backend capability is unavailable."""
+
+
 def comparable_timestamp(value: Any) -> Any:
     """Normalize a datetime for cross-comparison in date-range filters.
 

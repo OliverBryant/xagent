@@ -42,7 +42,9 @@ class UserIsolatedMemoryStore(MemoryStore):
     remains the only access-control key.
     """
 
-    def __init__(self, base_store: MemoryStore) -> None:
+    def __init__(
+        self, base_store: MemoryStore, *, require_vector_search: bool = False
+    ) -> None:
         """
         Initialize with a base memory store for actual storage.
 
@@ -50,6 +52,7 @@ class UserIsolatedMemoryStore(MemoryStore):
             base_store: The underlying memory store for storage operations
         """
         self._base_store = base_store
+        self._require_vector_search = require_vector_search
 
     def _get_current_user_id(self) -> Optional[int]:
         """Get the current user ID from context."""
@@ -163,6 +166,8 @@ class UserIsolatedMemoryStore(MemoryStore):
         # filter on them (no-op when unscoped or dimension-less).
         note.metadata.update(memory_dimension_metadata(get_execution_scope()))
 
+        if self._require_vector_search:
+            return self._base_store.add_required_vector(note)  # type: ignore[attr-defined]
         return self._base_store.add(note)
 
     def get(self, note_id: str) -> MemoryResponse:
@@ -283,7 +288,12 @@ class UserIsolatedMemoryStore(MemoryStore):
         # the store (prefilter on the vector path), not post-filtered here.
         filtered_filters = self._add_user_filter(filters)
 
-        return self._base_store.search(
+        method = (
+            self._base_store.search_required_vector  # type: ignore[attr-defined]
+            if self._require_vector_search
+            else self._base_store.search
+        )
+        return method(
             query=query,
             k=k,
             filters=filtered_filters,

@@ -28,7 +28,7 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
     scope_fingerprint,
 )
-from ...core.memory.base import MemoryStore
+from ...core.memory.base import MemoryBackendUnavailableError, MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
@@ -56,11 +56,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.tools.core.knowledge_base_scope import KnowledgeBaseScopeError
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
-from ..dynamic_memory_store import (
-    MEMORY_BACKEND_UNAVAILABLE_REASON,
-    MemoryBackendUnavailableError,
-    get_memory_store,
-)
+from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
@@ -358,7 +354,6 @@ def resolve_agent_service_memory_policy(
     use_in_memory = (is_preview and not enabled) or (
         override is not None and not override.available
     )
-    backend_unavailable = False
     memory: MemoryStore
     if use_in_memory:
         memory = InMemoryMemoryStore()
@@ -372,17 +367,9 @@ def resolve_agent_service_memory_policy(
             and (override.require_persistence or override.require_vector_search)
             else {}
         )
-        try:
-            memory = get_memory_store(**requirements)
-        except MemoryBackendUnavailableError:
-            memory = InMemoryMemoryStore()
-            enabled = False
-            backend_unavailable = True
+        memory = get_memory_store(**requirements)
     available = True if override is None else override.available
     availability_reason = None if override is None else override.reason
-    if backend_unavailable:
-        available = False
-        availability_reason = MEMORY_BACKEND_UNAVAILABLE_REASON
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
@@ -2639,6 +2626,7 @@ class AgentServiceManager:
                             return self._agents[task_id]
                     except (
                         HTTPException,
+                        MemoryBackendUnavailableError,
                         TaskOwnerMismatchError,
                         _AgentRuntimeSessionBoundaryError,
                     ):
@@ -4034,10 +4022,11 @@ class AgentServiceManager:
                 if agent_config
                 else None
             )
-            memory_policy = await resolve_agent_service_memory_policy_async(
-                task=task,
-                agent_config=agent_config,
-            )
+            with UserContext(user_id):
+                memory_policy = await resolve_agent_service_memory_policy_async(
+                    task=task,
+                    agent_config=agent_config,
+                )
             allowed_external_dirs = _build_allowed_external_dirs(
                 user_id,
                 scope=scope,

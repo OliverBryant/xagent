@@ -18,6 +18,14 @@ from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 class FakeLanceStore:
     def __init__(self, model: Any) -> None:
         self.model = model
+        self.vector_checks = 0
+        self.text_checks = 0
+
+    def ensure_required_vector_search(self) -> None:
+        self.vector_checks += 1
+
+    def ensure_text_persistence(self) -> None:
+        self.text_checks += 1
 
 
 def _manager_with_fake_db(monkeypatch, model_holder: dict) -> DynamicMemoryStoreManager:
@@ -30,6 +38,7 @@ def _manager_with_fake_db(monkeypatch, model_holder: dict) -> DynamicMemoryStore
         "_create_lancedb_store",
         lambda model: FakeLanceStore(model),
     )
+    monkeypatch.setattr(memory_store_module, "LanceDBMemoryStore", FakeLanceStore)
     return manager
 
 
@@ -91,6 +100,7 @@ def test_persistence_can_be_required_without_vector_search(monkeypatch) -> None:
     persistent_store = FakeLanceStore(None)
     create_store = Mock(return_value=persistent_store)
     monkeypatch.setattr(manager, "_create_lancedb_store", create_store)
+    monkeypatch.setattr(memory_store_module, "LanceDBMemoryStore", FakeLanceStore)
 
     assert manager.get_memory_store(require_persistence=True) is persistent_store
     create_store.assert_called_once_with(None)
@@ -114,8 +124,9 @@ def test_vector_search_requirement_succeeds_with_embedding_model(monkeypatch) ->
 
     store = manager.get_memory_store(require_vector_search=True)
 
-    assert isinstance(store, FakeLanceStore)
-    assert store.model is model
+    assert isinstance(store, UserIsolatedMemoryStore)
+    assert store._base_store.model is model
+    assert store._base_store.vector_checks == 1
     assert manager.get_store_info()["supports_vector_search"] is True
 
 
@@ -140,7 +151,7 @@ def test_strict_creation_failure_is_reported_but_default_falls_back(
     assert isinstance(store._base_store, InMemoryMemoryStore)
 
 
-def test_strict_model_lookup_exception_fails_closed(monkeypatch) -> None:
+def test_persistence_ignores_optional_model_lookup_failure(monkeypatch) -> None:
     manager = DynamicMemoryStoreManager()
     monkeypatch.setattr(
         manager,
@@ -148,12 +159,17 @@ def test_strict_model_lookup_exception_fails_closed(monkeypatch) -> None:
         Mock(side_effect=RuntimeError("model store down")),
     )
 
-    with pytest.raises(MemoryBackendUnavailableError) as exc_info:
-        manager.get_memory_store(require_persistence=True)
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    persistent_store = FakeLanceStore(None)
+    monkeypatch.setattr(
+        manager, "_create_lancedb_store", lambda _model: persistent_store
+    )
+    monkeypatch.setattr(memory_store_module, "LanceDBMemoryStore", FakeLanceStore)
+
+    assert manager.get_memory_store(require_persistence=True) is persistent_store
+    assert persistent_store.text_checks == 1
 
 
-def test_swallowed_model_database_failure_still_fails_closed_in_strict_mode(
+def test_swallowed_model_database_failure_allows_persistence_only(
     monkeypatch,
 ) -> None:
     manager = DynamicMemoryStoreManager()
@@ -164,8 +180,53 @@ def test_swallowed_model_database_failure_still_fails_closed_in_strict_mode(
 
     monkeypatch.setattr(memory_store_module, "get_db", broken_db)
 
-    with pytest.raises(MemoryBackendUnavailableError):
-        manager.get_memory_store(require_persistence=True)
+    persistent_store = FakeLanceStore(None)
+    monkeypatch.setattr(
+        manager, "_create_lancedb_store", lambda _model: persistent_store
+    )
+    monkeypatch.setattr(memory_store_module, "LanceDBMemoryStore", FakeLanceStore)
+
+    assert manager.get_memory_store(require_persistence=True) is persistent_store
+
+
+def test_persistence_clears_stale_model_after_same_user_removal(monkeypatch) -> None:
+    holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
+    manager = _manager_with_fake_db(monkeypatch, holder)
+    first = manager.get_memory_store(require_vector_search=True)._base_store
+
+    holder["model"] = None
+    second = manager.get_memory_store(require_persistence=True)
+
+    assert second is not first
+    assert second.model is None
+    assert second.text_checks == 1
+    assert manager.get_store_info()["supports_vector_search"] is False
+
+
+def test_persistence_clears_stale_model_across_users(monkeypatch) -> None:
+    models = {1: _model(2, "2026-07-17 10:00:00", "key"), 2: None}
+    manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(
+        manager,
+        "_get_embedding_model_from_db",
+        lambda: models[memory_store_module.current_user_id.get()],
+    )
+    monkeypatch.setattr(manager, "_create_lancedb_store", FakeLanceStore)
+    monkeypatch.setattr(memory_store_module, "LanceDBMemoryStore", FakeLanceStore)
+
+    token = memory_store_module.current_user_id.set(1)
+    try:
+        first = manager.get_memory_store(require_vector_search=True)._base_store
+    finally:
+        memory_store_module.current_user_id.reset(token)
+    token = memory_store_module.current_user_id.set(2)
+    try:
+        second = manager.get_memory_store(require_persistence=True)
+    finally:
+        memory_store_module.current_user_id.reset(token)
+
+    assert second is not first
+    assert second.model is None
 
 
 def test_database_embedding_configuration_is_propagated(monkeypatch, tmp_path) -> None:
@@ -187,5 +248,10 @@ def test_database_embedding_configuration_is_propagated(monkeypatch, tmp_path) -
     assert config.api_key == "secret"
     assert config.base_url == "https://embedding.example/v1"
     assert config.dimension == 1024
+    identity = lancedb_store.call_args.kwargs["vector_space_identity"]
+    assert '"base_url":"https://embedding.example/v1"' in identity
+    assert '"dimension":1024' in identity
+    assert '"model":"text-embedding-v4"' in identity
+    assert '"provider":"dashscope"' in identity
     assert isinstance(wrapped, UserIsolatedMemoryStore)
     assert wrapped._base_store is lancedb_store.return_value

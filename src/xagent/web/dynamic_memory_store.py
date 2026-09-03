@@ -1,10 +1,12 @@
 """Dynamic memory store manager for web application."""
 
+import json
 import logging
 import os
 import threading
 from typing import Optional, Union, cast
 
+from ..core.memory.base import MemoryBackendUnavailableError
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
 from ..core.model import EmbeddingModelConfig
@@ -19,10 +21,6 @@ from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
 logger = logging.getLogger(__name__)
 
 MEMORY_BACKEND_UNAVAILABLE_REASON = "required_memory_backend_unavailable"
-
-
-class MemoryBackendUnavailableError(RuntimeError):
-    """Raised when an opt-in memory backend capability cannot be provided."""
 
 
 # Type alias for our memory store types that includes user isolation
@@ -41,6 +39,21 @@ def _embedding_model_fingerprint(model: Optional[DBModel]) -> Optional[tuple]:
     if model is None:
         return None
     return (model.id, str(model.updated_at))
+
+
+def _embedding_vector_space_identity(model: DBModel) -> str:
+    """Stable identity of the vector space produced by a database model."""
+
+    return json.dumps(
+        {
+            "base_url": model.base_url,
+            "dimension": model.dimension,
+            "model": model.model_name,
+            "provider": str(model.model_provider).strip().lower(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class DynamicMemoryStoreManager:
@@ -189,6 +202,11 @@ class DynamicMemoryStoreManager:
         lancedb_store = LanceDBMemoryStore(
             db_dir=db_dir,
             embedding_model=embedding_adapter,
+            vector_space_identity=(
+                _embedding_vector_space_identity(embedding_model)
+                if embedding_model is not None
+                else None
+            ),
             similarity_threshold=self._similarity_threshold or 1.5,
         )
         logger.info("Created LanceDB memory store")
@@ -202,17 +220,18 @@ class DynamicMemoryStoreManager:
     ) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
         with self._lock:
-            strict = require_persistence or require_vector_search
             self._model_lookup_failed = False
             try:
                 embedding_model = self._get_embedding_model_from_db()
             except Exception as exc:
-                if strict:
+                if require_vector_search:
                     raise MemoryBackendUnavailableError(
                         MEMORY_BACKEND_UNAVAILABLE_REASON
                     ) from exc
-                raise
-            if strict and self._model_lookup_failed:
+                if not require_persistence:
+                    raise
+                embedding_model = None
+            if require_vector_search and self._model_lookup_failed:
                 raise MemoryBackendUnavailableError(MEMORY_BACKEND_UNAVAILABLE_REASON)
             current_model_id = (
                 cast(int, embedding_model.id) if embedding_model else None
@@ -246,7 +265,14 @@ class DynamicMemoryStoreManager:
                     "No embedding model available, falling back to in-memory store"
                 )
 
-            elif not embedding_model and require_persistence and not self._is_lancedb:
+            elif (
+                not embedding_model
+                and require_persistence
+                and (
+                    not self._is_lancedb
+                    or self._last_embedding_model_fingerprint is not None
+                )
+            ):
                 should_update = True
 
             if require_vector_search and embedding_model is None:
@@ -258,11 +284,11 @@ class DynamicMemoryStoreManager:
                         memory_store = self._create_lancedb_store(embedding_model)
                     except Exception as exc:
                         logger.exception("Error creating LanceDB memory store")
-                        self._initialize_in_memory_store()
-                        if strict:
+                        if require_persistence or require_vector_search:
                             raise MemoryBackendUnavailableError(
                                 MEMORY_BACKEND_UNAVAILABLE_REASON
                             ) from exc
+                        self._initialize_in_memory_store()
                         return
                     self._memory_store = memory_store
                     self._is_lancedb = True
@@ -272,6 +298,27 @@ class DynamicMemoryStoreManager:
                 else:
                     self._initialize_in_memory_store()
                     logger.info("Switched to in-memory memory store")
+
+            base_store = (
+                self._memory_store._base_store
+                if isinstance(self._memory_store, UserIsolatedMemoryStore)
+                else self._memory_store
+            )
+            try:
+                if require_vector_search:
+                    if not isinstance(base_store, LanceDBMemoryStore):
+                        raise RuntimeError("LanceDB store is not available")
+                    base_store.ensure_required_vector_search()
+                elif require_persistence and embedding_model is None:
+                    if not isinstance(base_store, LanceDBMemoryStore):
+                        raise RuntimeError("LanceDB store is not available")
+                    base_store.ensure_text_persistence()
+            except MemoryBackendUnavailableError:
+                raise
+            except Exception as exc:
+                raise MemoryBackendUnavailableError(
+                    MEMORY_BACKEND_UNAVAILABLE_REASON
+                ) from exc
 
     def get_memory_store(
         self,
@@ -285,11 +332,19 @@ class DynamicMemoryStoreManager:
         Returns:
             Current memory store instance
         """
-        self._check_and_update_store(
-            require_persistence=require_persistence,
-            require_vector_search=require_vector_search,
-        )
-        return self._memory_store  # type: ignore[return-value]
+        with self._lock:
+            self._check_and_update_store(
+                require_persistence=require_persistence,
+                require_vector_search=require_vector_search,
+            )
+            if require_vector_search:
+                base_store = (
+                    self._memory_store._base_store
+                    if isinstance(self._memory_store, UserIsolatedMemoryStore)
+                    else cast(MemoryStoreType, self._memory_store)
+                )
+                return UserIsolatedMemoryStore(base_store, require_vector_search=True)
+            return self._memory_store  # type: ignore[return-value]
 
     def force_reinitialize(self) -> None:
         """Force reinitialization of the memory store."""

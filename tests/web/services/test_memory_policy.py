@@ -9,10 +9,7 @@ import pytest
 
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web.api import chat as chat_api
-from xagent.web.dynamic_memory_store import (
-    MEMORY_BACKEND_UNAVAILABLE_REASON,
-    MemoryBackendUnavailableError,
-)
+from xagent.web.dynamic_memory_store import MemoryBackendUnavailableError
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
     MemoryPolicyDecision,
@@ -140,7 +137,7 @@ def test_trusted_resolver_forwards_backend_requirements_independently(
     )
 
 
-def test_required_backend_failure_is_reported_and_fails_closed(
+def test_required_backend_failure_propagates_to_task_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -156,12 +153,29 @@ def test_required_backend_failure_is_reported_and_fails_closed(
         )
     )
 
-    policy = chat_api.resolve_agent_service_memory_policy(task=_task())
+    with pytest.raises(MemoryBackendUnavailableError):
+        chat_api.resolve_agent_service_memory_policy(task=_task())
 
-    assert isinstance(policy.memory, InMemoryMemoryStore)
-    assert policy.memory_enabled is False
-    assert policy.memory_available is False
-    assert policy.memory_availability_reason == MEMORY_BACKEND_UNAVAILABLE_REASON
+
+@pytest.mark.asyncio
+async def test_required_backend_failure_propagates_through_async_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_api,
+        "get_memory_store",
+        Mock(side_effect=MemoryBackendUnavailableError("unavailable")),
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            require_vector_search=True,
+        )
+    )
+
+    with pytest.raises(MemoryBackendUnavailableError):
+        await chat_api.resolve_agent_service_memory_policy_async(task=_task())
 
 
 def test_trusted_resolver_can_disable_otherwise_enabled_memory(

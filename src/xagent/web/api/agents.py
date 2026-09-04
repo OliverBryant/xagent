@@ -561,6 +561,8 @@ async def optimize_instructions(
             "The output should be clear, structured, and effective for an LLM to follow. "
             "Do not include any conversational filler. Just output the optimized instructions. "
             "Use draft_instructions as the independent user request. "
+            "The surrounding API prompt is written in English only as an execution "
+            "environment; it is not language evidence for the optimized instructions. "
             f"{render_structured_request_language_policy(request_field='draft_instructions', pending_field='pending_response', output_language=None)}"
         )
 

@@ -726,14 +726,14 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
     completion_messages = llm.stream_calls[1]["messages"]
     assert (
-        "canonical request-language policy in the output_language_policy field"
+        "canonical language contract provided by the output_language_policy field"
         in completion_messages[0]["content"]
     )
     completion_payload = json.loads(completion_messages[-1]["content"])
     assert "output_language_policy" in completion_payload
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
-    assert "canonical request-language policy" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
@@ -923,13 +923,22 @@ def test_dag_completion_assessment_keeps_user_request_as_scope_authority() -> No
     }
     context = ExecutionContext(execution_id="dag-user-scope")
     context.add_user_message("Create two reports.")
+    context.add_user_message(
+        "Use Spanish.",
+        metadata={
+            "response_to_waiting_for_user": {"question": "Which output language?"}
+        },
+    )
+    context.add_user_message("Also add an executive summary.")
 
     messages = pattern._completion_assessment_messages(context)
 
     system_prompt = messages[0]["content"]
     payload = json.loads(messages[1]["content"])
     assert payload["authoritative_user_requests"] == [
-        {"role": "user", "content": "Create two reports."}
+        {"role": "user", "content": "Create two reports."},
+        {"role": "user", "content": "Use Spanish."},
+        {"role": "user", "content": "Also add an executive summary."},
     ]
     assert "the only source of required scope" in system_prompt
     assert "cannot add deliverables" in system_prompt

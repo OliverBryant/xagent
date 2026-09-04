@@ -31,7 +31,12 @@ from xagent.core.agent.language import (
     response_language_rules,
 )
 from xagent.core.agent.utils.context_builder import ContextBuilder
-from xagent.core.context_ref import CONTEXT_REFS_KEY, SUPERSEDES_SCOPE_KEY
+from xagent.core.context_ref import (
+    CONTEXT_REFS_KEY,
+    SUPERSEDES_SCOPE_KEY,
+    ContextReference,
+    ImageDetail,
+)
 from xagent.core.model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
@@ -1679,6 +1684,63 @@ def test_token_estimate_falls_back_when_history_is_rewritten() -> None:
     assert ctx._get_total_tokens() == max(1, len("rewritten") // 4)
 
 
+def test_provider_estimate_drives_compaction_with_dynamic_system_prompt() -> None:
+    ctx = ExecutionContext(system_prompt="S" * 3_600)
+    ctx.add_user_message("x")
+    rendered = ctx.get_messages_for_llm()
+    rendered_tokens = ctx.estimate_context_tokens(rendered)
+    assert rendered_tokens > ctx._get_total_tokens() + 800
+
+    ctx.compact_config.threshold = rendered_tokens - 1
+    request = ctx.build_llm_compact_request_if_needed()
+
+    assert request is not None
+    assert request["original_tokens"] == rendered_tokens
+
+
+def test_provider_estimate_counts_context_refs_and_tool_call_arguments() -> None:
+    reference = ContextReference(
+        file_ref={
+            "file_id": "image-1",
+            "filename": "frame.png",
+            "mime_type": "image/png",
+        },
+        detail=ImageDetail.LOW,
+    )
+    ctx = ExecutionContext()
+    with_ref = [
+        {
+            "role": "user",
+            "content": "inspect",
+            CONTEXT_REFS_KEY: [reference.durable_dict()],
+        }
+    ]
+    without_ref = [{"role": "user", "content": "inspect"}]
+    assert ctx.estimate_context_tokens(with_ref) >= (
+        ctx.estimate_context_tokens(without_ref) + reference.estimated_tokens()
+    )
+
+    long_call = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "write_file", "arguments": "x" * 1_000}}
+            ],
+        }
+    ]
+    short_call = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "write_file", "arguments": ""}}],
+        }
+    ]
+    assert ctx.estimate_context_tokens(long_call) > (
+        ctx.estimate_context_tokens(short_call) + 200
+    )
+
+
 def test_serialization_roundtrip() -> None:
     ctx = ExecutionContext()
     ctx.execution_id = "task-x"
@@ -1997,6 +2059,15 @@ def _context_over_threshold(threshold: int) -> ExecutionContext:
     ctx = ExecutionContext()
     ctx.compact_config.threshold = threshold
     ctx.add_user_message("current request")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    )
     # Token estimation is chars//4, so this clears the threshold and makes the
     # request materialize.
     ctx.add_tool_result(

@@ -56,6 +56,7 @@ async def test_optimize_instructions_preserves_draft_language(
     assert "draft_instructions" in system_prompt
     assert "explicit or implicit target-language intent" in system_prompt
     assert "Simplified Chinese versus Traditional Chinese" in system_prompt
+    assert "surrounding API prompt is written in English only" in system_prompt
 
 
 @pytest.mark.asyncio

@@ -78,7 +78,7 @@ from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
-    pending_user_response,
+    pending_user_response_lifecycle,
     pending_user_response_marker,
 )
 from ...context.memory_tool import build_memory_tools
@@ -1754,13 +1754,13 @@ class ReActPattern(AgentPattern):
         if not isinstance(messages, list):
             return None
 
-        for index in range(len(messages) - 1, after_message_count - 1, -1):
+        for index in range(after_message_count, len(messages)):
             message = messages[index]
             if getattr(message, "role", None) != "user":
                 continue
             metadata = getattr(message, "metadata", None)
             metadata = dict(metadata) if isinstance(metadata, dict) else {}
-            if pending_user_response(message) is not None:
+            if pending_user_response_lifecycle(message) is not None:
                 return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
             marker = pending_user_response_marker(waiting_request)

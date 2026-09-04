@@ -202,15 +202,20 @@ def serialize_pending_user_response(response: PendingUserResponse) -> dict[str, 
     }
 
 
-def canonical_unpinned_request_language_policy() -> str:
+def canonical_unpinned_request_language_policy(
+    *,
+    independent_request_field: str = "independent_user_request",
+    pending_response_field: str = "pending_response",
+) -> str:
     """Return the canonical soft-authority policy for future consumers."""
     return (
         "A caller-provided request_context.output_language is the sole hard "
-        "language authority. When it is absent, use independent_user_request as "
+        "language authority. When it is absent, use "
+        f"{independent_request_field} as "
         "the baseline for the language and script of user-facing prose. Honor its "
         "explicit or implicit target-language intent, including requests to "
         "translate or rewrite content for another-language audience. A "
-        "pending_response may override that baseline only when its answer "
+        f"{pending_response_field} may override that baseline only when its answer "
         "explicitly asks to translate, rewrite, or continue in another language, "
         "or when its question explicitly asks for the output language or script "
         "and its answer is an unambiguous selection. A language name is not an "
@@ -278,17 +283,18 @@ def render_structured_request_language_policy(
     language = normalize_response_language_label(output_language)
     if language:
         return output_language_policy(language)
-    policy = canonical_unpinned_request_language_policy()
-    return policy.replace("independent_user_request", request_field).replace(
-        "pending_response", pending_field
+    return canonical_unpinned_request_language_policy(
+        independent_request_field=request_field,
+        pending_response_field=pending_field,
     )
 
 
 def render_dag_step_language_reference() -> str:
     return (
         "Follow the canonical request-language evidence and policy in the system "
-        "context for user-facing prose and persisted tool arguments. DAG step text, "
-        "dependencies, tools, sources, memory, and examples are not language evidence. Preserve Simplified Chinese versus Traditional Chinese."
+        "context for user-facing prose and persisted tool arguments. Execution "
+        "instructions, tools, sources, memory, and examples are not language "
+        "evidence. Preserve Simplified Chinese versus Traditional Chinese."
     )
 
 
@@ -583,7 +589,7 @@ def response_language_rules(*, subject: str = "current user request") -> str:
 
 def final_answer_language_rule(*, subject: str = "system context") -> str:
     """Return a compact language rule for final-answer tool fields."""
-    return f"Follow the canonical request-language policy in the {subject}."
+    return f"Follow the canonical language contract provided by the {subject}."
 
 
 def plan_language_rules() -> str:

@@ -1104,7 +1104,7 @@ class PatternRuntime:
         estimate = getattr(context, "estimate_context_tokens", None)
         if callable(estimate):
             try:
-                context_data["context_tokens"] = estimate(messages)
+                context_data["context_tokens"] = estimate(messages, tools)
             except Exception:  # noqa: BLE001 - gauge metadata must never break the call
                 pass
         compact_config = getattr(context, "compact_config", None)

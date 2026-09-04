@@ -129,6 +129,7 @@ def test_every_consumer_renders_the_resolved_language() -> None:
     assert render_dag_step_language_reference() in _step_instruction("Japanese")
     assert "Output language: Japanese" in _completion_policy("Japanese")
     assert "Output language: Japanese" in _plan_payload_policy("Japanese")
+    assert "Output language: Japanese" in step_system
 
 
 def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
@@ -171,3 +172,49 @@ def test_unusable_language_metadata_never_reaches_a_prompt() -> None:
         # A rejected label leaves the root context with the soft rules only,
         # not with a redundant second copy of the fallback policy.
         assert rendered[0].count("Output language policy:") == 0
+
+
+def test_root_reference_and_structured_fields_do_not_duplicate_request() -> None:
+    request = "Summarize this repository"
+    context = ExecutionContext()
+    context.add_user_message(request)
+
+    root_system = context._system_context()
+    plan_payload = json.loads(
+        LLMPlanGenerator()._build_prompt(
+            PlanGenerationRequest(
+                context=context,
+                execution_id="root-reference",
+                available_tool_names=[],
+            )
+        )
+    )
+
+    assert root_system.count(request) == 1
+    assert '"independent_user_request_reference": "Current user request above"' in (
+        root_system
+    )
+    assert plan_payload["latest_user_request"] == request
+    assert request not in plan_payload["output_language_policy"]
+
+
+def test_blank_pending_question_is_not_planner_language_evidence() -> None:
+    context = ExecutionContext()
+    context.add_user_message("Draft the email.")
+    context.add_user_message(
+        "Spanish",
+        metadata={"response_to_waiting_for_user": {"question": ""}},
+    )
+    payload = json.loads(
+        LLMPlanGenerator()._build_prompt(
+            PlanGenerationRequest(
+                context=context,
+                execution_id="blank-pending",
+                available_tool_names=[],
+            )
+        )
+    )
+
+    assert payload["latest_user_request"] == "Draft the email."
+    assert payload["pending_response"] is None
+    assert payload["messages"][-1]["content"] == "Spanish"

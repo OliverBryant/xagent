@@ -72,15 +72,28 @@ def pending_user_response(message: Any) -> PendingUserResponse | None:
     return PendingUserResponse(answer, question, message_type)
 
 
+def pending_user_response_lifecycle(message: Any) -> dict[str, Any] | None:
+    """Return the durable marker for a real waiting-response lifecycle.
+
+    Unlike :func:`pending_user_response`, lifecycle identity does not require a
+    usable question. The strict parser remains the gate for language evidence.
+    """
+    if getattr(message, "role", None) != "user":
+        return None
+    metadata = getattr(message, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    marker = metadata.get("response_to_waiting_for_user")
+    if not isinstance(marker, dict) or not isinstance(marker.get("question"), str):
+        return None
+    return marker
+
+
 def latest_pending_user_response(context: Any) -> PendingUserResponse | None:
     for message in reversed(getattr(context, "messages", []) or []):
         response = pending_user_response(message)
         if response is not None:
             return response
-        metadata = getattr(message, "metadata", None)
-        metadata = metadata if isinstance(metadata, dict) else {}
-        if getattr(message, "role", None) == "user" and not metadata.get("dag_step_id"):
-            return None
     return None
 
 
@@ -88,15 +101,10 @@ def pending_user_response_marker(waiting_request: Any) -> dict[str, Any] | None:
     if not isinstance(waiting_request, dict):
         return None
     question = waiting_request.get("message")
-    if not isinstance(question, str) or not question.strip():
-        return None
+    question = question if isinstance(question, str) else ""
     return {
-        "tool_name": waiting_request.get("tool_name"),
-        "tool_call_id": waiting_request.get("tool_call_id"),
         "question": question,
         "message_type": waiting_request.get("message_type", "question"),
-        "interactions": waiting_request.get("interactions"),
-        "requests": waiting_request.get("requests"),
     }
 
 

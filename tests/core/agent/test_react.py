@@ -4176,7 +4176,7 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         if schema["function"]["name"] == "final_answer"
     )["function"]
     assert (
-        "canonical request-language policy in the system context"
+        "canonical language contract provided by the system context"
         in final_answer_schema["description"]
     )
     assert (
@@ -4198,7 +4198,7 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "generic Chinese" in response_language_schema["description"]
     answer_schema = final_answer_schema["parameters"]["properties"]["answer"]
     assert "response_language" in answer_schema["description"]
-    assert "canonical request-language policy" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
     assert "exact markdown_link" in answer_schema["description"]
     assert "get_workspace_output_files" not in answer_schema["description"]
@@ -6707,7 +6707,10 @@ async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
         if message.role == "user" and message.content == "Use 42"
     )
     waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
-    assert waiting_metadata["requests"][0]["tool_name"] == "clarification_gate"
+    assert waiting_metadata == {
+        "question": "Which value should be used?",
+        "message_type": "question",
+    }
 
 
 @pytest.mark.asyncio

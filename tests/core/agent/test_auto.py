@@ -863,10 +863,10 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-        "canonical request-language policy in the system context"
+            "canonical language contract provided by the system context"
         in tool_schema["description"]
     )
-    assert "canonical request-language policy" in answer_schema["description"]
+    assert "canonical language contract" in answer_schema["description"]
 
 
 @pytest.mark.asyncio
@@ -2327,7 +2327,7 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     target_rule = "explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
-    assert "canonical request-language policy" in tool_schema["description"]
+    assert "canonical language contract" in tool_schema["description"]
     system_content = context.get_messages_for_llm()[0]["content"]
     assert request in system_content
     assert target_rule in system_content

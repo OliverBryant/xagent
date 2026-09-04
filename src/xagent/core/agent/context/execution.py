@@ -30,6 +30,7 @@ from ..language import (
     render_dag_step_language_reference,
     render_request_language_harness,
     render_root_request_language_harness,
+    serialize_pending_user_response,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -46,6 +47,7 @@ from .enrichment import (
     SKILL_CONTEXT_METADATA_KEY,
     latest_pending_user_response,
     pending_user_response,
+    pending_user_response_lifecycle,
     top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
@@ -111,6 +113,37 @@ COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
 # Wire name: request_context keys reach metadata verbatim, so renaming this
 # breaks the clients that populate it.
 CLOCK_TIMEZONE_METADATA_KEY = "timezone"
+
+
+def estimate_provider_prompt_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimate one logical provider payload without materializing references."""
+    total = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        payload = {
+            key: value for key, value in message.items() if key != CONTEXT_REFS_KEY
+        }
+        try:
+            serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            serialized = str(payload)
+        total += max(1, len(serialized) // 4)
+        try:
+            references = normalize_context_references(message.get(CONTEXT_REFS_KEY))
+        except (TypeError, ValueError):
+            references = ()
+        total += sum(reference.estimated_tokens() for reference in references)
+    if tools:
+        try:
+            serialized_tools = json.dumps(tools, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            serialized_tools = str(tools)
+        total += max(1, len(serialized_tools) // 4)
+    return total
 
 
 def _utcnow() -> datetime:
@@ -449,6 +482,14 @@ class ExecutionContext:
         if max_tokens:
             visible_messages = self._truncate_by_tokens(visible_messages, max_tokens)
         visible_messages = self._sanitize_tool_message_pairs(visible_messages)
+        latest_pending_message = next(
+            (
+                message
+                for message in reversed(visible_messages)
+                if pending_user_response(message) is not None
+            ),
+            None,
+        )
 
         for message in visible_messages:
             message_dict = message.to_dict()
@@ -458,12 +499,27 @@ class ExecutionContext:
                     message_dict["_xagent_provider_state"] = provider_state
             waiting_response = pending_user_response(message)
             if waiting_response is not None:
+                if message is latest_pending_message:
+                    framing = (
+                        "The exact allowlisted question and clean answer are in the "
+                        "canonical request-language evidence in the system context."
+                    )
+                else:
+                    framing = (
+                        "Historical pending-response evidence (JSON):\n"
+                        f"{json.dumps(serialize_pending_user_response(waiting_response), ensure_ascii=False)}"
+                    )
                 message_dict["content"] = (
-                    "This user message is the answer to a pending agent question. "
-                    "Treat it as the response to that pending question, not as a new "
-                    "independent task. The exact allowlisted question and clean answer "
-                    "are in the canonical request-language evidence in the system "
-                    "context. Execution-enriched message content follows:\n"
+                    "This user message is the answer to a pending agent question "
+                    "and is the primary response, not an independent task. "
+                    f"{framing}\nExecution-enriched message content follows:\n"
+                    f"{str(message_dict.get('content') or '')}"
+                )
+            elif pending_user_response_lifecycle(message) is not None:
+                message_dict["content"] = (
+                    "This user message is the primary response in a waiting lifecycle "
+                    "whose question text is unavailable or blank, not an independent "
+                    "task. Execution-enriched message content follows:\n"
                     f"{str(message_dict.get('content') or '')}"
                 )
             if include_system and message_dict.get("role") == "system":
@@ -1112,7 +1168,7 @@ class ExecutionContext:
             )
 
         top_level_user_request(self)
-        total_tokens = self._get_total_tokens()
+        total_tokens = self.estimate_context_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._drop_oldest_messages()
             return self._annotate_compact_result(result, total_tokens)
@@ -1129,7 +1185,7 @@ class ExecutionContext:
             return None
 
         top_level_user_request(self)
-        total_tokens = self._get_total_tokens()
+        total_tokens = self.estimate_context_tokens()
         if total_tokens <= self.compact_config.threshold:
             return None
 
@@ -1191,7 +1247,7 @@ class ExecutionContext:
         result.metadata.setdefault("original_tokens", original_tokens)
         result.metadata.setdefault("threshold", self.compact_config.threshold)
         if result.compacted:
-            compacted_tokens = self._estimate_message_tokens(self.messages)
+            compacted_tokens = self.estimate_context_tokens()
             result.metadata.setdefault("compacted_tokens", compacted_tokens)
             if original_tokens > 0:
                 ratio = compacted_tokens / original_tokens * 100
@@ -1559,19 +1615,19 @@ class ExecutionContext:
         return str(response) if response is not None else ""
 
     def estimate_context_tokens(
-        self, messages: list[dict[str, Any]] | None = None
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> int:
         """Public estimate of the current context size in tokens.
 
         When final provider messages are supplied, account for exactly their
         rendered dynamic system content rather than the persisted message list.
         """
-        if messages is not None:
-            return sum(
-                max(1, len(str(message.get("content") or "")) // 4)
-                for message in messages
-            )
-        return self._get_total_tokens()
+        provider_messages = (
+            messages if messages is not None else self.get_messages_for_llm()
+        )
+        return estimate_provider_prompt_tokens(provider_messages, tools)
 
     def _get_total_tokens(self) -> int:
         if self.llm_calls:

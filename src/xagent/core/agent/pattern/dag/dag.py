@@ -16,7 +16,6 @@ from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
     latest_pending_user_response,
-    pending_user_response,
     pending_user_response_marker,
     top_level_user_request,
 )
@@ -1542,7 +1541,6 @@ class DAGPattern(AgentPattern):
             {"role": message.role, "content": message.content}
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) == "user"
-            and pending_user_response(message) is None
         ]
         payload = {
             "independent_user_request": request.language_text,
@@ -1920,7 +1918,7 @@ class DAGPattern(AgentPattern):
             return False
 
         new_root_messages = root_user_messages[self.planned_user_message_count :]
-        response_index, response_message = new_root_messages[-1]
+        response_index, response_message = new_root_messages[0]
         pattern_state = self.active_step_pattern_states.get(step_id)
         waiting_request = (
             pattern_state.get("waiting_for_user_request")
@@ -1928,7 +1926,12 @@ class DAGPattern(AgentPattern):
             else None
         )
         marker = pending_user_response_marker(waiting_request)
-        response_metadata = dict(getattr(response_message, "metadata", None) or {})
+        raw_response_metadata = getattr(response_message, "metadata", None)
+        response_metadata = (
+            dict(raw_response_metadata)
+            if isinstance(raw_response_metadata, dict)
+            else {}
+        )
         if marker is not None:
             response_metadata["response_to_waiting_for_user"] = marker
             root_context.messages[response_index] = replace(

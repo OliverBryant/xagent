@@ -863,7 +863,7 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
     assert (
-            "canonical language contract provided by the system context"
+        "canonical language contract provided by the system context"
         in tool_schema["description"]
     )
     assert "canonical language contract" in answer_schema["description"]

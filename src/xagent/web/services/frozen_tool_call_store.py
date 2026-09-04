@@ -16,18 +16,18 @@ import logging
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from sqlalchemy import update
 
-from ..models.database import get_session_local
-from ..models.frozen_tool_call import FrozenToolCall
 from ...core.tools.adapters.vibe.write_gate import (
-    GateDecision,
     GatedCall,
+    GateDecision,
     set_write_gate_hook,
     set_write_gate_resume_hook,
 )
+from ..models.database import get_session_local
+from ..models.frozen_tool_call import FrozenToolCall
 from .task_lease_service import current_task_lease
 
 logger = logging.getLogger(__name__)
@@ -123,16 +123,24 @@ def install_write_gate(policy: WritePolicy | None = None) -> None:
             if row is None:
                 return _settled_result("This approval is no longer available.")
             arguments = dict(row.arguments or {})
-            expired = _as_utc(row.expires_at) <= now
+            # Read through cast(): the model declares its columns with bare
+            # ``Column(...)`` rather than ``Mapped[...]``, so an instance
+            # attribute is typed as the Column descriptor rather than the
+            # value it holds.
+            expired = _as_utc(cast(datetime, row.expires_at)) <= now
             target = "executed" if (approved and not expired) else "voided"
-            claimed = db.execute(
+            result = db.execute(
                 update(FrozenToolCall)
                 .where(
                     FrozenToolCall.interaction_id == interaction_id,
                     FrozenToolCall.status == "pending",
                 )
                 .values(status=target, settled_at=now)
-            ).rowcount
+            )
+            # ``rowcount`` is what makes this claim exclusive; it is defined
+            # for an UPDATE on both backends, but the generic ``Result``
+            # protocol does not declare it.
+            claimed = int(cast(Any, result).rowcount or 0)
             db.commit()
         if not claimed:
             return _settled_result("This approval has already been answered.")

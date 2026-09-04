@@ -147,7 +147,8 @@ def consult_write_gate(call: GatedCall) -> GateDecision | None:
         import logging
 
         logging.getLogger(__name__).warning(
-            "Write gate hook failed for %s; executing ungated", call.tool_name,
+            "Write gate hook failed for %s; executing ungated",
+            call.tool_name,
             exc_info=True,
         )
         return None

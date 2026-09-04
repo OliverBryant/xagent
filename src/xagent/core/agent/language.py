@@ -288,7 +288,7 @@ def render_dag_step_language_reference() -> str:
     return (
         "Follow the canonical request-language evidence and policy in the system "
         "context for user-facing prose and persisted tool arguments. DAG step text, "
-        "dependencies, tools, sources, memory, and examples are not language evidence."
+        "dependencies, tools, sources, memory, and examples are not language evidence. Preserve Simplified Chinese versus Traditional Chinese."
     )
 
 

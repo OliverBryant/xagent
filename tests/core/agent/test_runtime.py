@@ -1049,7 +1049,7 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     runtime = PatternRuntime(tracer=tracer, execution_id="task-1")
     ctx = ExecutionContext()
     ctx.compact_config.threshold = 96000
-    ctx.add_message("user", "x" * 400)
+    ctx.add_message("user", "persisted-only")
 
     await runtime.on_llm_start(
         context=ctx, messages=[{"role": "user", "content": "x" * 400}]
@@ -1059,7 +1059,7 @@ async def test_on_llm_start_emits_context_usage_fields() -> None:
     assert usage, tracer.events
     assert usage[0]["context_threshold"] == 96000
     assert isinstance(usage[0]["context_tokens"], int)
-    assert usage[0]["context_tokens"] > 0
+    assert usage[0]["context_tokens"] == 100
 
 
 @pytest.mark.asyncio

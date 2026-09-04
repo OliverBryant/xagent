@@ -31,7 +31,6 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
-    response_language_rules,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag import dag as dag_module
@@ -460,11 +459,10 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
     restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["confirm"])
     forwarded_message = restored_child.messages[-1]
     assert forwarded_message.content == "Choose B"
-    assert forwarded_message.metadata == {
-        "kind": "dag_waiting_user_response",
-        "forwarded_from_root": True,
-        "dag_step_id": "confirm",
-    }
+    assert forwarded_message.metadata["kind"] == "dag_waiting_user_response"
+    assert forwarded_message.metadata["response_to_waiting_for_user"]["question"] == (
+        "Choose A or B"
+    )
 
 
 @pytest.mark.asyncio
@@ -728,14 +726,14 @@ async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
     assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
     completion_messages = llm.stream_calls[1]["messages"]
     assert (
-        "same natural language as the output language policy"
+        "canonical request-language policy in the output_language_policy field"
         in completion_messages[0]["content"]
     )
     completion_payload = json.loads(completion_messages[-1]["content"])
     assert "output_language_policy" in completion_payload
     completion_tool = llm.stream_calls[1]["tools"][0]["function"]
     answer_schema = completion_tool["parameters"]["properties"]["answer"]
-    assert "tool results, source documents" in answer_schema["description"]
+    assert "canonical request-language policy" in answer_schema["description"]
     assert [event["type"] for event in outbound.events] == [
         "final_answer_start",
         "final_answer_delta",
@@ -1286,11 +1284,8 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     assert [message["role"] for message in messages].count("system") == 1
     assert "DAG step execution scope" in messages[0]["content"]
     assert "Overall user goal is background context only" in messages[0]["content"]
-    assert "Output language policy" in messages[0]["content"]
-    assert (
-        "Current user request, quoted for response language only:"
-        in messages[0]["content"]
-    )
+    assert "Canonical request-language evidence" in messages[0]["content"]
+    assert '"independent_user_request"' in messages[0]["content"]
     assert "Extract highlights and generate two posters." in messages[0]["content"]
     assert "Extract highlights and generate two posters." not in messages[-1]["content"]
     assert "Current step id: extract" in messages[0]["content"]
@@ -5441,7 +5436,7 @@ async def test_polluted_plan_language_is_not_a_hard_policy_for_dag_steps(
         assert "Output language: Simplified Chinese" not in system_content
         assert "Output language:" not in system_content
         assert request in system_content
-        assert response_language_rules() in system_content
+        assert "Canonical request-language evidence" in system_content
         step_instruction = [
             message.content
             for message in child.messages
@@ -5502,7 +5497,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     legacy_root = ExecutionContext(execution_id="dag-restored-language-legacy")
     legacy_root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
     stale_instruction = pattern._step_instruction(root_context=legacy_root, step=step)
-    assert "Output language: Simplified Chinese" in stale_instruction
+    assert "canonical request-language evidence" in stale_instruction
 
     child_context = ExecutionContext(execution_id="dag-restored-language:write")
     child_context.add_user_message(
@@ -5544,7 +5539,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
         if message.metadata.get("kind") == "dag_step_instruction"
     )
     assert "Output language: Simplified Chinese" not in instruction
-    assert "Use the same natural language as the current user request" in instruction
+    assert "canonical request-language evidence" in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

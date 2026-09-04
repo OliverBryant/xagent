@@ -27,7 +27,9 @@ from ...tools.artifacts import (
 )
 from ..language import (
     effective_output_language,
-    output_language_directives,
+    render_dag_step_language_reference,
+    render_request_language_harness,
+    render_root_request_language_harness,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -42,6 +44,8 @@ from .enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     SKILL_CONTEXT_METADATA_KEY,
+    latest_pending_user_response,
+    pending_user_response,
     top_level_user_request,
 )
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
@@ -452,18 +456,15 @@ class ExecutionContext:
                 provider_state = message.metadata.get("_xagent_provider_state")
                 if isinstance(provider_state, dict):
                     message_dict["_xagent_provider_state"] = provider_state
-            waiting_response = message.metadata.get("response_to_waiting_for_user")
-            if message_dict.get("role") == "user" and isinstance(
-                waiting_response, dict
-            ):
-                question = str(waiting_response.get("question") or "").strip()
-                answer = str(message_dict.get("content") or "").strip()
+            waiting_response = pending_user_response(message)
+            if waiting_response is not None:
                 message_dict["content"] = (
                     "This user message is the answer to a pending agent question. "
                     "Treat it as the response to that pending question, not as a new "
-                    "independent task.\n"
-                    f"Pending question: {question}\n"
-                    f"User answer: {answer}"
+                    "independent task. The exact allowlisted question and clean answer "
+                    "are in the canonical request-language evidence in the system "
+                    "context. Execution-enriched message content follows:\n"
+                    f"{str(message_dict.get('content') or '')}"
                 )
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
@@ -564,11 +565,15 @@ class ExecutionContext:
     def _system_context(self) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = self.current_user_request_text()
+        request = top_level_user_request(self)
+        current_task = request.execution_text
+        pending_response = latest_pending_user_response(self)
         output_language = effective_output_language(self)
         if current_task and not dag_step_id:
-            language_directives = output_language_directives(
-                output_language, section="root_system_context"
+            language_directives = render_root_request_language_harness(
+                request,
+                pending_response,
+                output_language,
             )
             parts.append(
                 "Current user request:\n"
@@ -607,11 +612,10 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
-            language_policy = output_language_directives(
-                output_language, section="dag_step_scope"
-            )
-            step_language_rules = output_language_directives(
-                output_language, section="dag_step_rules"
+            language_harness = render_request_language_harness(
+                request,
+                pending_response,
+                output_language=output_language,
             )
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(
@@ -632,7 +636,7 @@ class ExecutionContext:
                 "- Overall user goal is background context only and is already "
                 "available in the conversation when needed; do not treat it as "
                 "the executable goal for this step.\n"
-                f"- {language_policy}\n"
+                f"- {render_dag_step_language_reference()}\n"
                 f"- Current step id: {dag_step_id}\n"
                 f"- Current step title: {dag_step_name or dag_step_id}\n"
                 f"- Current step description: "
@@ -641,15 +645,8 @@ class ExecutionContext:
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
                 "provided in the latest DAG step instruction message.\n\n"
-                f"{step_language_rules}"
+                f"{language_harness}"
             )
-            request_anchor = output_language_directives(
-                output_language,
-                section="dag_step_request_anchor",
-                request=self.current_user_request_text(prefer_display=True),
-            )
-            if request_anchor:
-                parts.append(request_anchor)
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(
@@ -1561,12 +1558,19 @@ class ExecutionContext:
             return str(content)
         return str(response) if response is not None else ""
 
-    def estimate_context_tokens(self) -> int:
+    def estimate_context_tokens(
+        self, messages: list[dict[str, Any]] | None = None
+    ) -> int:
         """Public estimate of the current context size in tokens.
 
-        Uses the same accounting as the compaction decision so a UI gauge fed
-        by this value reaches its threshold exactly when compaction triggers.
+        When final provider messages are supplied, account for exactly their
+        rendered dynamic system content rather than the persisted message list.
         """
+        if messages is not None:
+            return sum(
+                max(1, len(str(message.get("content") or "")) // 4)
+                for message in messages
+            )
         return self._get_total_tokens()
 
     def _get_total_tokens(self) -> int:

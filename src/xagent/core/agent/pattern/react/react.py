@@ -78,6 +78,8 @@ from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
+    pending_user_response,
+    pending_user_response_marker,
 )
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
@@ -132,10 +134,8 @@ STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
-    "For Chinese requests, choose Simplified Chinese or Traditional Chinese to "
-    "match the request script; do not use generic Chinese. If the current user "
-    "request explicitly asks to answer in another language, use that requested "
-    "target language."
+    "Follow the canonical request-language policy in the system context; do not "
+    "collapse Chinese variants into generic Chinese."
 )
 
 
@@ -1758,18 +1758,15 @@ class ReActPattern(AgentPattern):
             message = messages[index]
             if getattr(message, "role", None) != "user":
                 continue
-            metadata = dict(getattr(message, "metadata", {}) or {})
-            if metadata.get("response_to_waiting_for_user"):
+            metadata = getattr(message, "metadata", None)
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            if pending_user_response(message) is not None:
                 return str(getattr(message, "content", "") or "")
             waiting_request = self.waiting_for_user_request or {}
-            metadata["response_to_waiting_for_user"] = {
-                "tool_name": waiting_request.get("tool_name"),
-                "tool_call_id": waiting_request.get("tool_call_id"),
-                "question": waiting_request.get("message", ""),
-                "message_type": waiting_request.get("message_type", "question"),
-                "interactions": waiting_request.get("interactions"),
-                "requests": waiting_request.get("requests"),
-            }
+            marker = pending_user_response_marker(waiting_request)
+            if marker is None:
+                return None
+            metadata["response_to_waiting_for_user"] = marker
             messages[index] = replace(message, metadata=metadata)
             return str(getattr(message, "content", "") or "")
         return None

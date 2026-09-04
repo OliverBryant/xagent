@@ -167,17 +167,15 @@ def test_harness_preserves_large_request_and_answer_exactly_once() -> None:
     assert harness.count("Which language?") == 1
 
 
-def test_request_language_harness_is_not_active_in_root_consumers() -> None:
+def test_request_language_harness_is_active_once_in_root_system_context() -> None:
     context = ExecutionContext()
     context.add_user_message("Draft the email.")
 
-    assert "Canonical request-language evidence" not in context._system_context()
-    assert "Canonical request-language evidence" not in json.dumps(
-        context.get_messages_for_llm()
-    )
+    system_context = context._system_context()
+    assert system_context.count("Canonical request-language evidence") == 1
 
 
-def test_request_language_representation_is_not_active_in_dag_forwarding() -> None:
+def test_dag_pending_response_is_symmetric() -> None:
     root = ExecutionContext()
     root.add_user_message("Draft the email.")
     child = root.create_child_context(execution_id="step")
@@ -200,6 +198,32 @@ def test_request_language_representation_is_not_active_in_dag_forwarding() -> No
     root.add_user_message("Spanish")
 
     assert pattern._forward_user_response_to_waiting_step(root)
-    assert "response_to_waiting_for_user" not in root.messages[-1].metadata
+    assert root.messages[-1].metadata["response_to_waiting_for_user"]["question"] == (
+        "Which output language?"
+    )
     restored_child = ExecutionContext.from_dict(pattern.active_step_contexts["draft"])
-    assert "response_to_waiting_for_user" not in restored_child.messages[-1].metadata
+    response = pending_user_response(restored_child.messages[-1])
+    assert response == PendingUserResponse(
+        answer="Spanish",
+        question="Which output language?",
+        message_type="question",
+    )
+
+
+@pytest.mark.parametrize("display", ["", "  \n\t"])
+def test_pending_response_present_blank_display_never_uses_enriched_content(
+    display: str,
+) -> None:
+    context = ExecutionContext()
+    context.add_user_message(
+        "Spanish\n\nAttached file: correo-es.pdf",
+        metadata={
+            "display_message": display,
+            "response_to_waiting_for_user": {"question": "Which output language?"},
+        },
+    )
+
+    restored = ExecutionContext.from_dict(context.to_dict()).messages[0]
+    response = pending_user_response(restored)
+
+    assert response and response.answer == ""

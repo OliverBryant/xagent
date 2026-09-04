@@ -10,6 +10,7 @@ from xagent.core.agent.language import (
     effective_output_language,
     output_language_directives,
     output_language_policy,
+    render_dag_step_language_reference,
     response_language_rules,
 )
 from xagent.core.agent.pattern.dag.dag import DAGPattern
@@ -119,42 +120,25 @@ def test_output_language_directives_render_each_section_verbatim() -> None:
 
 
 def test_every_consumer_renders_the_resolved_language() -> None:
-    root = _root_context("Japanese")._system_context()
-    assert output_language_directives("Japanese", section="root_system_context") in root
-
     step_system = _dag_step_context("Japanese")._system_context()
     assert output_language_directives("Japanese", section="dag_step_scope") in (
         step_system
     )
-    assert output_language_directives("Japanese", section="dag_step_rules") in (
-        step_system
-    )
+    assert "Follow the canonical request-language evidence and policy" in step_system
 
-    assert output_language_directives(
-        "Japanese", section="dag_step_instruction"
-    ) in _step_instruction("Japanese")
-    assert _completion_policy("Japanese") == output_language_directives(
-        "Japanese", section="completion_assessment"
-    )
-    assert _plan_payload_policy("Japanese") == output_language_directives(
-        "Japanese", section="plan_payload"
-    )
+    assert render_dag_step_language_reference() in _step_instruction("Japanese")
+    assert "Output language: Japanese" in _completion_policy("Japanese")
+    assert "Output language: Japanese" in _plan_payload_policy("Japanese")
 
 
 def test_every_consumer_falls_back_when_no_language_is_recorded() -> None:
+    assert "Canonical request-language evidence" in _root_context()._system_context()
     assert (
-        output_language_directives("", section="root_system_context")
-        in _root_context()._system_context()
+        "Canonical request-language evidence" in _dag_step_context()._system_context()
     )
-    assert (
-        output_language_directives("", section="dag_step_scope")
-        in _dag_step_context()._system_context()
-    )
-    assert output_language_directives(
-        "", section="dag_step_instruction"
-    ) in _step_instruction(None)
-    assert _completion_policy(None) == output_language_policy("")
-    assert _plan_payload_policy(None) == output_language_policy("")
+    assert render_dag_step_language_reference() in _step_instruction(None)
+    assert "sole hard language authority" in _completion_policy(None)
+    assert "sole hard language authority" in _plan_payload_policy(None)
 
 
 def test_consumers_normalize_an_aliased_language_label() -> None:
@@ -166,7 +150,7 @@ def test_consumers_normalize_an_aliased_language_label() -> None:
         "Output language: Simplified Chinese"
         in _dag_step_context("zh-cn")._system_context()
     )
-    assert "Output language: Simplified Chinese" in _step_instruction("zh-cn")
+    assert render_dag_step_language_reference() in _step_instruction("zh-cn")
     assert "Output language: Simplified Chinese" in _completion_policy("zh-cn")
     assert "Output language: Simplified Chinese" in _plan_payload_policy("zh-cn")
 

@@ -5503,10 +5503,7 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     pattern = DAGPattern(lambda **_: build_plan(step))
     pattern.plan = build_plan(step)
 
-    legacy_root = ExecutionContext(execution_id="dag-restored-language-legacy")
-    legacy_root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
-    stale_instruction = pattern._step_instruction(root_context=legacy_root, step=step)
-    assert "canonical request-language evidence" in stale_instruction
+    stale_instruction = "Legacy step instruction\nOutput language: Simplified Chinese"
 
     child_context = ExecutionContext(execution_id="dag-restored-language:write")
     child_context.add_user_message(
@@ -5547,8 +5544,8 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
         for message in captured[0].messages
         if message.metadata.get("kind") == "dag_step_instruction"
     )
+    assert instruction != stale_instruction
     assert "Output language: Simplified Chinese" not in instruction
-    assert "canonical request-language evidence" in instruction
 
 
 _FILE_REFERENCE_BLOCK = (

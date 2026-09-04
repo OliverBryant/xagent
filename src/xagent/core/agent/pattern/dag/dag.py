@@ -1969,8 +1969,8 @@ class DAGPattern(AgentPattern):
     ) -> None:
         """Re-emit the instruction message of a checkpoint-restored step.
 
-        The instruction bakes the output language policy into message content,
-        which the metadata-only checkpoint migration cannot reach.
+        Older checkpoints can bake an output-language policy into message
+        content, which the metadata-only checkpoint migration cannot reach.
         """
         instruction = self._step_instruction(root_context=root_context, step=step)
         for index, message in enumerate(child_context.messages):

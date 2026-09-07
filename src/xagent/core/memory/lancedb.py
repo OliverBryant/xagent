@@ -483,12 +483,7 @@ class LanceDBMemoryStore(MemoryStore):
             if missing_fields:
                 table.add_columns(pa.schema(missing_fields))
 
-            reader = (
-                table.search()
-                .select(["id", "metadata"])
-                .limit(None)
-                .to_batches(batch_size=512)
-            )
+            reader = table.search().limit(None).to_batches(batch_size=512)
             try:
                 for batch in reader:
                     rows = batch.to_pylist()
@@ -497,8 +492,7 @@ class LanceDBMemoryStore(MemoryStore):
                     ]
                     source = pa.table(
                         {
-                            "id": [row["id"] for row in rows],
-                            "metadata": [row["metadata"] for row in rows],
+                            **dict(zip(batch.schema.names, batch.columns, strict=True)),
                             USER_ID_COLUMN: pa.array(
                                 [projection[0] for projection in projections],
                                 pa.int64(),

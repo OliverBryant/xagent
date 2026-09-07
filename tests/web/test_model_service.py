@@ -386,6 +386,12 @@ class TestModelService:
                 lambda db, model_id, user_id: model_id != 99,
             )
             monkeypatch.setattr(
+                "xagent.web.services.model_service.get_default_embedding_model",
+                lambda user_id, *, db: (
+                    "system-embedding-model" if user_id is None else None
+                ),
+            )
+            monkeypatch.setattr(
                 "xagent.web.dynamic_memory_store.get_db",
                 mock_get_db,
             )

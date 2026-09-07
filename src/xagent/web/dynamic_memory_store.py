@@ -7,7 +7,7 @@ from typing import Optional, Union
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.model.embedding import DashScopeEmbedding
+from ..core.model import EmbeddingModelConfig
 from ..core.storage.manager import get_storage_root
 from .models.database import get_db
 from .models.model import Model as DBModel
@@ -146,7 +146,7 @@ class DynamicMemoryStoreManager:
             return None
 
     def _create_lancedb_store(
-        self, embedding_model: DBModel
+        self, embedding_model: DBModel, *, fallback_on_error: bool = True
     ) -> UserIsolatedMemoryStore:
         """Create LanceDB store with the given embedding model."""
         try:
@@ -169,8 +169,12 @@ class DynamicMemoryStoreManager:
             if embedding_model.model_provider == "dashscope":
                 lancedb_store = LanceDBMemoryStore(
                     db_dir=db_dir,
-                    embedding_model=DashScopeEmbedding(
+                    embedding_model=EmbeddingModelConfig(
+                        id=str(embedding_model.model_id),
+                        model_provider=str(embedding_model.model_provider),
+                        model_name=str(embedding_model.model_name),
                         api_key=str(embedding_model.api_key),
+                        base_url=embedding_model.base_url,
                         dimension=int(embedding_model.dimension or 1024),
                     ),
                     similarity_threshold=self._similarity_threshold or 1.5,
@@ -188,12 +192,14 @@ class DynamicMemoryStoreManager:
                 self._initialize_in_memory_store()
                 return self._memory_store  # type: ignore[return-value]
         except Exception as e:
+            if not fallback_on_error:
+                raise
             logger.error(f"Error creating LanceDB store: {e}")
             # Fallback to in-memory store
             self._initialize_in_memory_store()
             return self._memory_store  # type: ignore[return-value]
 
-    def _check_and_update_store(self) -> None:
+    def _check_and_update_store(self, *, fallback_on_error: bool = True) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
         with self._lock:
             embedding_model = self._get_embedding_model_from_db()
@@ -227,7 +233,9 @@ class DynamicMemoryStoreManager:
 
             if should_update:
                 if embedding_model:
-                    self._memory_store = self._create_lancedb_store(embedding_model)
+                    self._memory_store = self._create_lancedb_store(
+                        embedding_model, fallback_on_error=fallback_on_error
+                    )
                     self._is_lancedb = True
                     self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
                     self._last_embedding_model_fingerprint = current_fingerprint
@@ -245,6 +253,19 @@ class DynamicMemoryStoreManager:
         """
         self._check_and_update_store()
         return self._memory_store  # type: ignore[return-value]
+
+    def maintain_schema(self) -> None:
+        """Run persistent-memory maintenance during application startup."""
+        with self._lock:
+            self._check_and_update_store(fallback_on_error=False)
+            store = self._memory_store
+            base_store = (
+                store._base_store
+                if isinstance(store, UserIsolatedMemoryStore)
+                else store
+            )
+            if isinstance(base_store, LanceDBMemoryStore):
+                base_store.maintain_schema()
 
     def force_reinitialize(self) -> None:
         """Force reinitialization of the memory store."""

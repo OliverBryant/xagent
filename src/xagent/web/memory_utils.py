@@ -74,8 +74,6 @@ def create_memory_store(
 
             if embedding_model:
                 # Create LanceDB store with embedding model
-                from xagent.core.model.embedding import create_embedding_adapter
-
                 current_dir = os.path.dirname(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
                 )
@@ -83,7 +81,7 @@ def create_memory_store(
 
                 lancedb_store = LanceDBMemoryStore(
                     db_dir=db_dir,
-                    embedding_model=create_embedding_adapter(embedding_model),
+                    embedding_model=embedding_model,
                     similarity_threshold=similarity_threshold,
                 )
                 # Wrap with user isolation for web application

@@ -5,6 +5,8 @@ from __future__ import annotations
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest.mock import patch
 
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
@@ -17,6 +19,7 @@ from xagent.core.memory.schema_migration import (
     VectorSpaceCompatibility,
 )
 from xagent.core.model.embedding import BaseEmbedding
+from xagent.core.model.model import EmbeddingModelConfig
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 
@@ -66,6 +69,11 @@ class BatchFailEmbedding(BaseEmbedding):
         return ["embed"]
 
 
+class UnknownDimensionEmbedding(MockEmbedding):
+    def get_dimension(self):
+        return None
+
+
 @pytest.fixture
 def temp_db_dir():
     temp_dir = tempfile.mkdtemp()
@@ -106,16 +114,29 @@ def test_real_legacy_inspection_is_read_only_and_scope_columns_are_optional(
     embedding = MockEmbedding(64)
     store = _store(temp_db_dir, embedding, "legacy", _identity(), False)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        inspections = pool.submit(
-            lambda: [store.inspect_vector_space() for _ in range(8)]
-        )
-        write = pool.submit(store.add, MemoryNote(id="new", content="beta"))
-        states, added = inspections.result(), write.result()
+    inspected = Event()
+    release = Event()
 
-    assert states == [VectorSpaceCompatibility.LEGACY_COMPATIBLE] * 8
+    def inspect_during_write():
+        state = store.inspect_vector_space()
+        inspected.set()
+        assert release.wait(5)
+        return state
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        inspection = pool.submit(inspect_during_write)
+        assert inspected.wait(5)
+        added = pool.submit(store.add, MemoryNote(id="new", content="beta")).result()
+        release.set()
+        states = [inspection.result()]
+
+    assert states == [VectorSpaceCompatibility.LEGACY_COMPATIBLE]
     assert added.success and embedding.inputs == ["beta"]
-    arrow = _seed_table_missing_scope.open_table("legacy").to_arrow()
+    table = _seed_table_missing_scope.open_table("legacy")
+    try:
+        arrow = table.to_arrow()
+    finally:
+        _safe_close_table(table)
     assert set(arrow.column("id").to_pylist()) == {"old", "new"}
     assert {"user_id", "scope_dims"}.isdisjoint(arrow.schema.names)
 
@@ -127,6 +148,53 @@ def test_real_persisted_identity_match_and_mismatch(temp_db_dir):
     )
     assert matching.inspect_vector_space() is VectorSpaceCompatibility.MATCHING
     assert mismatch.inspect_vector_space() is VectorSpaceCompatibility.MISMATCHING
+
+
+def test_config_identity_keeps_model_and_endpoint(temp_db_dir):
+    config = EmbeddingModelConfig(
+        id="configured",
+        model_provider="dashscope",
+        model_name="text-embedding-custom",
+        base_url="https://embedding.example/v1",
+        api_key="unused",
+        dimension=64,
+    )
+    store = _store(temp_db_dir, config, identity=None, maintain=False)
+
+    assert store._vector_space_identity == {
+        "provider": "dashscope",
+        "model": "text-embedding-custom",
+        "endpoint": "https://embedding.example/v1",
+        "dimension": 64,
+        "instruct": None,
+    }
+    assert store.inspect_vector_space() is VectorSpaceCompatibility.MATCHING
+
+
+def test_unknown_dimension_is_probed_only_for_new_table(temp_db_dir):
+    first_embedding = UnknownDimensionEmbedding(64)
+    first = _store(temp_db_dir, first_embedding, maintain=False)
+    table = first._vector_store.get_raw_connection().open_table("mem")
+    try:
+        assert table.schema.field("vector").type.list_size == 64
+    finally:
+        _safe_close_table(table)
+    assert first_embedding.inputs == ["sample"]
+    assert first.add(MemoryNote(id="vectorized", content="alpha")).success
+    assert first_embedding.inputs == ["sample", "alpha"]
+
+    existing_embedding = UnknownDimensionEmbedding(128)
+    _store(temp_db_dir, existing_embedding, maintain=False)
+    assert existing_embedding.inputs == []
+
+
+def test_vector_compatibility_is_cached(temp_db_dir):
+    store = _store(temp_db_dir, MockEmbedding(64), identity=_identity(), maintain=False)
+    conn = store._vector_store.get_raw_connection()
+    with patch.object(conn, "open_table", wraps=conn.open_table) as opened:
+        assert store._vectors_are_compatible()
+        assert store._vectors_are_compatible()
+    assert opened.call_count == 1
 
 
 def test_add_dimension_change_falls_back_without_replacing_vectors(temp_db_dir):
@@ -146,6 +214,7 @@ def test_add_dimension_change_falls_back_without_replacing_vectors(temp_db_dir):
     assert got_alpha.success
     assert got_alpha.content.content == "alpha"
     assert store_b.get(new.memory_id).success
+    assert [note.id for note in store_b.search("beta", k=10)] == [new.memory_id]
     table = store_b._vector_store.get_raw_connection().open_table("mem")
     arrow = table.to_arrow()
     assert arrow.schema.field("vector").type.list_size == 64
@@ -179,6 +248,35 @@ def test_add_backfills_missing_non_vector_column(temp_db_dir):
     assert set(arrow.column("id").to_pylist()) == {"x", "y"}
     # The fully-formed new row round-trips through get().
     assert store.get("y").success
+
+
+def test_default_add_rejects_missing_required_columns(temp_db_dir):
+    conn = lancedb.connect(temp_db_dir)
+    table = conn.create_table(
+        "partial", data=pa.table({"id": ["old"], "text": ["old"]})
+    )
+    _safe_close_table(table)
+    store = _store(temp_db_dir, None, "partial", maintain=False)
+
+    result = store.add(MemoryNote(id="new", content="secret", metadata={"user_id": 7}))
+
+    assert not result.success
+    table = conn.open_table("partial")
+    try:
+        assert table.to_arrow().column("id").to_pylist() == ["old"]
+    finally:
+        _safe_close_table(table)
+
+
+def test_vectorless_record_uses_store_dimension_for_additive_maintenance(temp_db_dir):
+    _seed_table_missing_metadata(temp_db_dir)
+    store = _store(temp_db_dir, MockEmbedding(64), maintain=False)
+    store._run_schema_maintenance = True
+
+    result = store.add(MemoryNote(id="blank", content="   "))
+
+    assert result.success
+    assert store.get("blank").success
 
 
 def test_dimension_mismatch_never_attempts_batch_reembedding(temp_db_dir):

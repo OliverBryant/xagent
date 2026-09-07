@@ -33,6 +33,11 @@ from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.sandbox.base import SandboxRuntimeConflictError
 
 
+class _MemoryMaintenanceStub:
+    def maintain_schema(self) -> None:
+        return None
+
+
 def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Avoid chat-channel startup work in migration tests.
 
@@ -727,7 +732,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -859,7 +864,7 @@ async def test_startup_event_triggers_background_auto_migration(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -993,7 +998,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -1318,7 +1323,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -1504,7 +1509,7 @@ async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -1600,7 +1605,7 @@ async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -1693,7 +1698,7 @@ async def test_startup_event_skips_sandbox_readiness_when_manager_is_none(
         async def list_templates(self) -> list[str]:
             return []
 
-    class _FakeMemoryStoreManager:
+    class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,

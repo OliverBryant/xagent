@@ -34,6 +34,21 @@ def create_embedding_adapter(model_config: EmbeddingModelConfig) -> BaseEmbeddin
     )
 
 
+def embedding_identity_from_config(model_config: EmbeddingModelConfig) -> dict:
+    """Return the canonical vector-space identity for an embedding config."""
+    embedding = EmbeddingModelAdapter(model_config)._embedding_model
+    provider = model_config.model_provider.lower().strip()
+    if provider in ("openai_embedding", "openai-compatible"):
+        provider = "openai"
+    return {
+        "provider": provider,
+        "model": getattr(embedding, "model", model_config.model_name),
+        "endpoint": getattr(embedding, "base_url", model_config.base_url),
+        "dimension": embedding.get_dimension(),
+        "instruct": getattr(embedding, "instruct", model_config.instruct),
+    }
+
+
 class EmbeddingModelAdapter(BaseEmbedding):
     """Adapter that makes the new embedding interface compatible with existing EmbeddingModel configs."""
 

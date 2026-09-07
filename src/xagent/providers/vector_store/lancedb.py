@@ -14,9 +14,10 @@ import os
 import time
 from pathlib import Path
 from threading import RLock
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import lancedb
+import pyarrow as pa  # type: ignore
 from lancedb.db import DBConnection
 
 from ...config import get_lancedb_path, get_storage_root
@@ -230,7 +231,7 @@ class LanceDBVectorStore(VectorStore):
         db_dir: str,
         collection_name: str = "vectors",
         connection_manager: Optional[LanceDBConnectionManager] = None,
-        initial_data: Optional[Any] = None,
+        initial_data: Optional[Any | Callable[[], Any]] = None,
     ):
         """
         Initialize LanceDB vector store.
@@ -246,12 +247,16 @@ class LanceDBVectorStore(VectorStore):
         self._conn = self._conn_manager.get_connection(db_dir)
         self._ensure_table(initial_data)
 
-    def _ensure_table(self, initial_data: Optional[Any] = None) -> None:
+    def _ensure_table(
+        self, initial_data: Optional[Any | Callable[[], Any]] = None
+    ) -> None:
         """Ensure the vector table exists."""
         table = None
         try:
             table = self._conn.open_table(self._collection_name)
         except Exception as e:
+            if "was not found" not in str(e):
+                raise
             logger.debug(
                 "Table %s does not exist or open failed (%s), creating new table.",
                 self._collection_name,
@@ -268,15 +273,30 @@ class LanceDBVectorStore(VectorStore):
                 }
             ]
             if initial_data is not None:
-                sample_data = initial_data
+                sample_data = initial_data() if callable(initial_data) else initial_data
+            created = False
             try:
                 table = self._conn.create_table(self._collection_name, data=sample_data)
-            except Exception:
+                created = True
+            except Exception as create_error:
+                if "already exists" not in str(create_error):
+                    raise
                 # A concurrent constructor may have created the shared table.
                 # Open its winner; never overwrite it during acquisition.
                 table = self._conn.open_table(self._collection_name)
-            # Remove sample data
-            table.delete("id = 'sample'")
+                if isinstance(sample_data, pa.Table):
+                    expected = sample_data.schema
+                    if any(
+                        name not in table.schema.names
+                        or table.schema.field(name).type != expected.field(name).type
+                        for name in expected.names
+                    ):
+                        raise ValueError(
+                            f"Concurrent table {self._collection_name!r} has an "
+                            "incompatible schema"
+                        )
+            if created:
+                table.delete("id = 'sample'")
         finally:
             _safe_close_table(table)
 

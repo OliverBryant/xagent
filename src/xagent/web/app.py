@@ -1342,6 +1342,8 @@ async def startup_event() -> None:
     from .dynamic_memory_store import get_memory_store_manager
 
     manager = get_memory_store_manager()
+    with _startup_phase("memory schema maintenance"):
+        await asyncio.to_thread(manager.maintain_schema)
     store_info = manager.get_store_info()
 
     if store_info["is_lancedb"]:

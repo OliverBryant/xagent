@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 
 import lancedb  # type: ignore
 import pytest
@@ -18,7 +20,11 @@ import pytest
 from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
-from xagent.core.memory.scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN
+from xagent.core.memory.scope_columns import (
+    SCOPE_DIMS_COLUMN,
+    USER_ID_COLUMN,
+    derive_scope_columns,
+)
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 from .conftest import ConstantEmbedding
@@ -155,3 +161,48 @@ def test_promotion_is_idempotent(temp_db_dir):
     arrow = _arrow(store)
     assert arrow.num_rows == 2
     assert {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= set(arrow.schema.names)
+
+
+def test_promotion_never_overwrites_a_concurrent_append(temp_db_dir, monkeypatch):
+    _create_legacy_table(temp_db_dir)
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="mem",
+        embedding_model=ConstantEmbedding(64),
+        run_schema_maintenance=False,
+    )
+    entered = Event()
+    release = Event()
+    original = derive_scope_columns
+
+    def pause_after_snapshot(metadata_json):
+        entered.set()
+        assert release.wait(5)
+        return original(metadata_json)
+
+    monkeypatch.setattr(
+        "xagent.core.memory.lancedb.derive_scope_columns", pause_after_snapshot
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        maintenance = pool.submit(store.maintain_schema)
+        assert entered.wait(5)
+        table = store._vector_store.get_raw_connection().open_table("mem")
+        try:
+            table.add(
+                [
+                    {
+                        "id": "concurrent",
+                        "text": "new",
+                        "metadata": "{}",
+                        "vector": [0.3] * 64,
+                        USER_ID_COLUMN: None,
+                        SCOPE_DIMS_COLUMN: [],
+                    }
+                ]
+            )
+        finally:
+            _safe_close_table(table)
+        release.set()
+        maintenance.result()
+
+    assert set(_arrow(store).column("id").to_pylist()) == {"1", "2", "concurrent"}

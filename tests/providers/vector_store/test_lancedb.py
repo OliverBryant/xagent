@@ -10,13 +10,13 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pyarrow as pa  # type: ignore
 import pytest
 
-from xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils import (
-    list_table_names,
-)
+from xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils import list_table_names
 from xagent.providers.vector_store.lancedb import (
     LanceDBConnectionManager,
     LanceDBVectorStore,
@@ -125,6 +125,42 @@ class TestLanceDBVectorStore:
         conn = store.get_raw_connection()
         table = conn.open_table("test_collection")
         assert table is not None
+
+    @pytest.mark.parametrize("failure", [RuntimeError("open I/O"), OSError("disk I/O")])
+    def test_ensure_table_does_not_hide_open_failures(self, failure):
+        store = LanceDBVectorStore.__new__(LanceDBVectorStore)
+        store._collection_name = "memory"
+        store._conn = SimpleNamespace(
+            open_table=lambda _name: (_ for _ in ()).throw(failure)
+        )
+
+        with pytest.raises(type(failure), match="I/O"):
+            store._ensure_table()
+
+    def test_concurrent_create_rejects_an_incompatible_winner(self):
+        class Connection:
+            def __init__(self):
+                self.opens = 0
+
+            def open_table(self, _name):
+                self.opens += 1
+                if self.opens == 1:
+                    raise ValueError("Table 'memory' was not found")
+                return SimpleNamespace(
+                    schema=pa.schema([pa.field("text", pa.string())]),
+                    close=lambda: None,
+                )
+
+            def create_table(self, _name, data):
+                raise ValueError("Table 'memory' already exists")
+
+        store = LanceDBVectorStore.__new__(LanceDBVectorStore)
+        store._collection_name = "memory"
+        store._conn = Connection()
+        seed = pa.table({"id": ["sample"], "text": ["sample"]})
+
+        with pytest.raises(ValueError, match="incompatible schema"):
+            store._ensure_table(seed)
 
     def test_add_vectors_basic(self, vector_store):
         """Test basic vector addition."""

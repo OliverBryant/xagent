@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 
@@ -11,8 +12,8 @@ import pytest
 
 from xagent.core.memory.schema_migration import (
     LEGACY_DASHSCOPE_IDENTITY,
-    MemoryMismatchKind,
     VECTOR_SPACE_METADATA_KEY,
+    MemoryMismatchKind,
     VectorSpaceCompatibility,
     classify_memory_schema_mismatch,
     inspect_vector_space,
@@ -83,7 +84,7 @@ def test_vector_space_legacy_contract_requires_more_than_dimension(
 
 def test_vector_space_persisted_identity_matches_exactly():
     identity = _identity()
-    metadata = {VECTOR_SPACE_METADATA_KEY: __import__("json").dumps(identity).encode()}
+    metadata = {VECTOR_SPACE_METADATA_KEY: json.dumps(identity).encode()}
     schema = _vector_schema(64).with_metadata(metadata)
 
     assert inspect_vector_space(schema, identity) is VectorSpaceCompatibility.MATCHING

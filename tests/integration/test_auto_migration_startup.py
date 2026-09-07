@@ -14,11 +14,14 @@ import tempfile
 import threading
 from types import ModuleType
 
+import lancedb
 import pyarrow as pa
 import pytest
 
+from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.tools.core.RAG_tools.core.config import MIN_INT64
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    _safe_close_table,
     check_table_needs_migration,
 )
 from xagent.migrations.lancedb.backfill_user_id import (
@@ -712,8 +715,9 @@ def test_phase2_ensures_tables_exist(temp_lancedb_dir):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("schema_io_failure", [False, True], ids=["malformed", "io"])
 async def test_startup_event_skips_when_auto_migrate_disabled(
-    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir, schema_io_failure
 ):
     """Startup should not create migration task when auto migration is disabled."""
     import importlib
@@ -733,6 +737,31 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
             return []
 
     class _FakeMemoryStoreManager(_MemoryMaintenanceStub):
+        def maintain_schema(self) -> None:
+            table = lancedb.connect(temp_lancedb_dir).create_table(
+                "startup_memory",
+                pa.table(
+                    {
+                        "id": pa.array([None], pa.string()),
+                        "text": ["x"],
+                        "metadata": ["{}"],
+                    }
+                ),
+            )
+            _safe_close_table(table)
+            store = LanceDBMemoryStore(temp_lancedb_dir, "startup_memory", None)
+            if schema_io_failure:
+                store._vector_store.get_raw_connection = lambda: type(
+                    "BrokenConn",
+                    (),
+                    {
+                        "open_table": lambda *_: (_ for _ in ()).throw(
+                            OSError("schema I/O")
+                        )
+                    },
+                )()
+            store.maintain_schema()
+
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
@@ -833,6 +862,10 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
     monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
     monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
 
+    if schema_io_failure:
+        with pytest.raises(OSError, match="schema I/O"):
+            await web_app_module.startup_event()
+        return
     await web_app_module.startup_event()
     if created_tasks:
         await asyncio.gather(*created_tasks)

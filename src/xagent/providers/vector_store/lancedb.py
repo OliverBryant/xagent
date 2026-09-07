@@ -231,7 +231,7 @@ class LanceDBVectorStore(VectorStore):
         db_dir: str,
         collection_name: str = "vectors",
         connection_manager: Optional[LanceDBConnectionManager] = None,
-        initial_data: Optional[Any | Callable[[], Any]] = None,
+        initial_data: Optional[Callable[[], Any]] = None,
     ):
         """
         Initialize LanceDB vector store.
@@ -247,9 +247,7 @@ class LanceDBVectorStore(VectorStore):
         self._conn = self._conn_manager.get_connection(db_dir)
         self._ensure_table(initial_data)
 
-    def _ensure_table(
-        self, initial_data: Optional[Any | Callable[[], Any]] = None
-    ) -> None:
+    def _ensure_table(self, initial_data: Optional[Callable[[], Any]] = None) -> None:
         """Ensure the vector table exists."""
         table = None
         try:
@@ -273,7 +271,7 @@ class LanceDBVectorStore(VectorStore):
                 }
             ]
             if initial_data is not None:
-                sample_data = initial_data() if callable(initial_data) else initial_data
+                sample_data = initial_data()
             created = False
             try:
                 table = self._conn.create_table(self._collection_name, data=sample_data)

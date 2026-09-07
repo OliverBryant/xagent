@@ -169,6 +169,9 @@ def test_config_identity_keeps_model_and_endpoint(temp_db_dir):
         "instruct": None,
     }
     assert store.inspect_vector_space() is VectorSpaceCompatibility.MATCHING
+    config.model_provider = "openai-compatible"
+    alias = _store(temp_db_dir, config, "alias", maintain=False)
+    assert alias._vector_space_identity["provider"] == "openai"
 
 
 def test_unknown_dimension_is_probed_only_for_new_table(temp_db_dir):
@@ -180,11 +183,19 @@ def test_unknown_dimension_is_probed_only_for_new_table(temp_db_dir):
     finally:
         _safe_close_table(table)
     assert first_embedding.inputs == ["sample"]
-    assert first.add(MemoryNote(id="vectorized", content="alpha")).success
+    assert first.add(
+        MemoryNote(id="vectorized", content="alpha", metadata={"user_id": 7})
+    ).success
     assert first_embedding.inputs == ["sample", "alpha"]
 
+    table = first._vector_store.get_raw_connection().open_table("mem")
+    table.drop_columns(["user_id", "scope_dims"])
     existing_embedding = UnknownDimensionEmbedding(128)
-    _store(temp_db_dir, existing_embedding, maintain=False)
+    existing = _store(temp_db_dir, existing_embedding, maintain=False)
+    assert existing_embedding.inputs == []
+    assert [
+        n.id for n in existing.search("alpha", filters={"metadata": {"user_id": 7}})
+    ] == ["vectorized"]
     assert existing_embedding.inputs == []
 
 
@@ -200,21 +211,29 @@ def test_vector_compatibility_is_cached(temp_db_dir):
 def test_add_dimension_change_falls_back_without_replacing_vectors(temp_db_dir):
     """A new vector space writes text-only and leaves existing vectors intact."""
     store_a = _store(temp_db_dir, MockEmbedding(64))
-    added = store_a.add(MemoryNote(content="alpha"))
+    added = store_a.add(MemoryNote(content="alpha", metadata={"user_id": 7}))
     assert added.success
     alpha_id = added.memory_id
 
     # New store over the same table with a different embedding dimension.
     store_b = _store(temp_db_dir, MockEmbedding(128))
-    new = store_b.add(MemoryNote(content="beta"))
+    new = store_b.add(MemoryNote(content="beta", metadata={"user_id": 7}))
     assert new.success
+    secret = store_b.add(
+        MemoryNote(content="secret", metadata={"user_id": 8})
+    ).memory_id
 
-    # Both rows survive, while the authoritative vector schema remains at A.
     got_alpha = store_b.get(alpha_id)
     assert got_alpha.success
     assert got_alpha.content.content == "alpha"
     assert store_b.get(new.memory_id).success
     assert [note.id for note in store_b.search("beta", k=10)] == [new.memory_id]
+    matching_results = store_a.search("beta", k=1, filters={"metadata": {"user_id": 7}})
+    assert [note.id for note in matching_results] == [new.memory_id]
+    assert secret not in {
+        note.id
+        for note in store_a.search("secret", k=2, filters={"metadata": {"user_id": 7}})
+    }
     table = store_b._vector_store.get_raw_connection().open_table("mem")
     arrow = table.to_arrow()
     assert arrow.schema.field("vector").type.list_size == 64
@@ -234,7 +253,6 @@ def test_add_backfills_missing_non_vector_column(temp_db_dir):
     finally:
         _safe_close_table(table)
 
-    # Maintenance is explicit; request-time add never rewrites the table.
     store.maintain_schema()
     assert store.add(MemoryNote(id="y", content="new")).success
 
@@ -402,7 +420,6 @@ def test_init_maintenance_never_rebuilds_mismatching_vectors(temp_db_dir):
     finally:
         _safe_close_table(table)
     assert arrow.column("id").to_pylist() == ["a"]
-    # The vector column was not rebuilt; only ordinary columns were maintained.
     assert "vector" in arrow.schema.names
     assert arrow.schema.field("vector").type.list_size == 64
     assert "metadata" in arrow.schema.names

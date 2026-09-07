@@ -21,7 +21,6 @@ from ..model.embedding.adapter import (
 )
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from ..tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
 from .schema_migration import (
@@ -236,18 +235,31 @@ class LanceDBMemoryStore(MemoryStore):
         table = None
         try:
             table = conn.open_table(self._collection_name)
-            column_names = set(table.schema.names)
-        except Exception:
-            # Table doesn't exist yet, create it with the basic schema.
-            logger.info(f"Creating table {self._collection_name} with basic schema")
+        except Exception as error:
+            if "was not found" not in str(error):
+                raise
+            logger.info("Creating table %s with basic schema", self._collection_name)
             self._create_empty_table()
             return
+        try:
+            column_names = set(table.schema.names)
+            missing = tuple(
+                name for name in ("id", "text", "metadata") if name not in column_names
+            )
+            scope_missing = (
+                not {
+                    USER_ID_COLUMN,
+                    SCOPE_DIMS_COLUMN,
+                }
+                <= column_names
+            )
+            if not missing and not scope_missing:
+                return
+            if not self._legacy_ids_are_maintainable(table):
+                return
         finally:
             _safe_close_table(table)
 
-        missing = tuple(
-            name for name in ("id", "text", "metadata") if name not in column_names
-        )
         if missing:
             logger.warning(
                 f"Table {self._collection_name} has incompatible schema, "
@@ -259,7 +271,8 @@ class LanceDBMemoryStore(MemoryStore):
         # can be pushed into a `where` prefilter (slice 001). Idempotent and
         # data-preserving; runs after the base-schema resolution above so it sees
         # a table that already has id/text/metadata.
-        self._ensure_scope_columns(conn)
+        if scope_missing:
+            self._ensure_scope_columns(conn)
 
     def _create_empty_table(self) -> None:
         """Create an empty table with the correct schema."""
@@ -418,6 +431,34 @@ class LanceDBMemoryStore(MemoryStore):
             pa.array(scope_dims, pa.list_(pa.string())),
         )
 
+    def _legacy_ids_are_maintainable(self, table: Any) -> bool:
+        """Validate legacy row identifiers before any schema mutation."""
+        if (
+            "id" not in table.schema.names
+            or table.schema.field("id").type != pa.string()
+        ):
+            logger.warning(
+                "Skipping memory maintenance for table %s: id column must be string",
+                self._collection_name,
+            )
+            return False
+        seen_ids: set[str] = set()
+        reader = table.search().select(["id"]).limit(None).to_batches(batch_size=512)
+        try:
+            for batch in reader:
+                for note_id in batch.column("id").to_pylist():
+                    if not isinstance(note_id, str) or note_id in seen_ids:
+                        logger.warning(
+                            "Skipping memory maintenance for table %s: "
+                            "ids must be non-null unique strings",
+                            self._collection_name,
+                        )
+                        return False
+                    seen_ids.add(note_id)
+        finally:
+            reader.close()
+        return True
+
     def _ensure_scope_columns(self, conn: Any) -> None:
         """Promote user_id + scope_dims to real columns on an existing table (#822).
 
@@ -428,6 +469,9 @@ class LanceDBMemoryStore(MemoryStore):
         table = conn.open_table(self._collection_name)
         try:
             names = set(table.schema.names)
+            if {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names:
+                return
+
             missing_fields = [
                 field
                 for field in (
@@ -439,36 +483,46 @@ class LanceDBMemoryStore(MemoryStore):
             if missing_fields:
                 table.add_columns(pa.schema(missing_fields))
 
-            rows = (
+            reader = (
                 table.search()
-                .select(["id", "metadata", USER_ID_COLUMN, SCOPE_DIMS_COLUMN])
+                .select(["id", "metadata"])
                 .limit(None)
-                .to_arrow()
+                .to_batches(batch_size=512)
             )
-            for row in rows.to_pylist():
-                user_id, scope_dims = derive_scope_columns(row["metadata"])
-                if (
-                    row[USER_ID_COLUMN] == user_id
-                    and row[SCOPE_DIMS_COLUMN] == scope_dims
-                ):
-                    continue
-                note_id = row["id"]
-                if not isinstance(note_id, str):
-                    raise ValueError("Memory scope maintenance requires string ids")
-                where = f"id = '{escape_lancedb_string(note_id)}'"
-                if scope_dims:
-                    table.update(
-                        where,
-                        {USER_ID_COLUMN: user_id, SCOPE_DIMS_COLUMN: scope_dims},
+            try:
+                for batch in reader:
+                    rows = batch.to_pylist()
+                    projections = [
+                        derive_scope_columns(row["metadata"]) for row in rows
+                    ]
+                    source = pa.table(
+                        {
+                            "id": [row["id"] for row in rows],
+                            "metadata": [row["metadata"] for row in rows],
+                            USER_ID_COLUMN: pa.array(
+                                [projection[0] for projection in projections],
+                                pa.int64(),
+                            ),
+                            SCOPE_DIMS_COLUMN: pa.array(
+                                [projection[1] for projection in projections],
+                                pa.list_(pa.string()),
+                            ),
+                        }
                     )
-                else:
-                    table.update(
-                        where,
-                        values_sql={
-                            USER_ID_COLUMN: "NULL" if user_id is None else str(user_id),
-                            SCOPE_DIMS_COLUMN: "array_slice([''], 1, 0)",
-                        },
+                    merged = (
+                        table.merge_insert("id")
+                        .when_matched_update_all(
+                            where="target.metadata = source.metadata"
+                        )
+                        .execute(source)
                     )
+                    if merged.num_updated_rows != len(rows):
+                        logger.warning(
+                            "Scope maintenance skipped %s concurrently changed rows",
+                            len(rows) - merged.num_updated_rows,
+                        )
+            finally:
+                reader.close()
         finally:
             _safe_close_table(table)
 
@@ -947,6 +1001,32 @@ class LanceDBMemoryStore(MemoryStore):
                 logger.warning(
                     f"Embedding generation failed, using text search: {embedding_error}"
                 )
+
+            if results and k:
+                seen_ids = {note.id for note in results}
+                other_filters = self._flat_other_filters(filters)
+                null_rows = table.search().where("vector IS NULL").to_pandas()
+                for _, row in null_rows.iterrows():
+                    text = row.get("text", "")
+                    if query and query.lower() not in text.lower():
+                        continue
+                    try:
+                        note = self._dict_to_memory_note(row.to_dict())
+                    except Exception as row_error:
+                        logger.warning(
+                            "Skipping malformed NULL-vector row: %s", row_error
+                        )
+                        continue
+                    if note.id in seen_ids or (
+                        filters
+                        and not self._matches_filters(note, filters, other_filters)
+                    ):
+                        continue
+                    if len(results) >= k:
+                        results[-1] = note
+                    else:
+                        results.append(note)
+                    seen_ids.add(note.id)
 
             # Fallback to text search if no vector results or vector search failed
             if not results:

@@ -9,12 +9,14 @@ existing rows and the authoritative metadata JSON byte-for-byte.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 import lancedb  # type: ignore
+import pyarrow as pa  # type: ignore
 import pytest
 
 from xagent.core.execution_scope import MEMORY_DIMENSION_METADATA_PREFIX
@@ -55,6 +57,21 @@ def _arrow(store, name="mem"):
         return table.to_arrow()
     finally:
         _safe_close_table(table)
+
+
+def _version(store, name="mem"):
+    table = store._vector_store.get_raw_connection().open_table(name)
+    try:
+        return table.version
+    finally:
+        _safe_close_table(table)
+
+
+def _create_raw_table(temp_db_dir, data):
+    table = lancedb.connect(temp_db_dir).create_table("mem", data=pa.table(data))
+    version = table.version
+    _safe_close_table(table)
+    return version
 
 
 def test_fresh_table_has_scope_columns(temp_db_dir):
@@ -155,15 +172,19 @@ def test_legacy_table_is_migrated_and_backfilled(temp_db_dir):
 
 def test_promotion_is_idempotent(temp_db_dir):
     _create_legacy_table(temp_db_dir)
-    _store(temp_db_dir)  # first construction migrates
+    first = _store(temp_db_dir)  # first construction migrates
+    version = _version(first)
     # Second construction must not error, wipe, or duplicate rows.
     store = _store(temp_db_dir)
     arrow = _arrow(store)
+    assert _version(store) == version
     assert arrow.num_rows == 2
     assert {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= set(arrow.schema.names)
 
 
-def test_promotion_never_overwrites_a_concurrent_append(temp_db_dir, monkeypatch):
+def test_promotion_never_overwrites_a_concurrent_append(
+    temp_db_dir, monkeypatch, caplog
+):
     _create_legacy_table(temp_db_dir)
     store = LanceDBMemoryStore(
         db_dir=temp_db_dir,
@@ -200,9 +221,60 @@ def test_promotion_never_overwrites_a_concurrent_append(temp_db_dir, monkeypatch
                     }
                 ]
             )
+            table.update(
+                "id = '1'",
+                {
+                    "metadata": json.dumps({"user_id": 99}),
+                    USER_ID_COLUMN: 99,
+                },
+            )
         finally:
             _safe_close_table(table)
         release.set()
         maintenance.result()
 
     assert set(_arrow(store).column("id").to_pylist()) == {"1", "2", "concurrent"}
+    rows = {row["id"]: row for row in _arrow(store).to_pylist()}
+    assert rows["1"][USER_ID_COLUMN] == 99
+    assert "skipped 1 concurrently changed rows" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        pa.array([None], pa.string()),
+        pa.array([1], pa.int64()),
+        pa.array(["same", "same"], pa.string()),
+    ],
+)
+def test_malformed_legacy_ids_skip_all_maintenance(temp_db_dir, caplog, ids):
+    version = _create_raw_table(
+        temp_db_dir,
+        {"id": ids, "text": ["x"] * len(ids), "metadata": ["{}"] * len(ids)},
+    )
+    store = LanceDBMemoryStore(temp_db_dir, "mem", None)
+
+    with caplog.at_level(logging.WARNING):
+        store.maintain_schema()
+
+    assert _version(store) == version
+    assert {"user_id", "scope_dims"}.isdisjoint(_arrow(store).schema.names)
+    assert "Skipping memory maintenance" in caplog.text
+
+
+def test_scope_promotion_batches_and_handles_backslash_ids(temp_db_dir):
+    count = 513
+    ids = ["path\\note", *[f"n{i}" for i in range(count - 1)]]
+    version = _create_raw_table(
+        temp_db_dir,
+        {
+            "id": ids,
+            "text": ["x"] * count,
+            "metadata": [json.dumps({"user_id": 7})] * count,
+        },
+    )
+    store = LanceDBMemoryStore(temp_db_dir, "mem", None)
+    store.maintain_schema()
+
+    assert _version(store) == version + 3
+    assert _arrow(store).column(USER_ID_COLUMN).to_pylist() == [7] * count

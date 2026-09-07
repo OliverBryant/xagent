@@ -160,7 +160,7 @@ class TestLanceDBVectorStore:
         seed = pa.table({"id": ["sample"], "text": ["sample"]})
 
         with pytest.raises(ValueError, match="incompatible schema"):
-            store._ensure_table(seed)
+            store._ensure_table(lambda: seed)
 
     def test_add_vectors_basic(self, vector_store):
         """Test basic vector addition."""

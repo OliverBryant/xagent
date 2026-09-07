@@ -34,14 +34,18 @@ def create_embedding_adapter(model_config: EmbeddingModelConfig) -> BaseEmbeddin
     )
 
 
+def _normalize_embedding_provider(name: str) -> str:
+    provider = name.lower().strip()
+    if provider in ("openai_embedding", "openai-compatible"):
+        return "openai"
+    return provider
+
+
 def embedding_identity_from_config(model_config: EmbeddingModelConfig) -> dict:
     """Return the canonical vector-space identity for an embedding config."""
     embedding = EmbeddingModelAdapter(model_config)._embedding_model
-    provider = model_config.model_provider.lower().strip()
-    if provider in ("openai_embedding", "openai-compatible"):
-        provider = "openai"
     return {
-        "provider": provider,
+        "provider": _normalize_embedding_provider(model_config.model_provider),
         "model": getattr(embedding, "model", model_config.model_name),
         "endpoint": getattr(embedding, "base_url", model_config.base_url),
         "dimension": embedding.get_dimension(),
@@ -60,7 +64,7 @@ class EmbeddingModelAdapter(BaseEmbedding):
         """Create the actual embedding model from configuration."""
         # Normalize provider name: map variants to canonical names
         # Note: 'openai_embedding' is a legacy value that should be treated as 'openai'
-        provider = self.model_config.model_provider.lower().strip()
+        provider = _normalize_embedding_provider(self.model_config.model_provider)
         if provider in ("openai", "openai_embedding", "openai-compatible"):
             return OpenAIEmbedding(
                 model=self.model_config.model_name,

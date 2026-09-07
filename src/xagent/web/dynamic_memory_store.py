@@ -13,7 +13,7 @@ from .models.database import get_db
 from .models.model import Model as DBModel
 from .models.user import UserDefaultModel
 from .services.db_runtime import is_database_pool_timeout
-from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
+from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +69,20 @@ class DynamicMemoryStoreManager:
             logger.info("Initialized with in-memory store")
 
     def _get_embedding_model_from_db(self) -> Optional[DBModel]:
-        """Get the current embedding model from database."""
+        """Get the one global embedding model for the shared memory table."""
         try:
             db = next(get_db())
             try:
-                # Get current user ID from context
-                user_id = current_user_id.get()
+                # A shared table must not switch embedding identity with request
+                # context. Resolve only the shared/admin default.
+                user_id = None
 
-                from .services.model_service import _is_model_visible_to_user
+                from .services.model_service import (
+                    _is_model_visible_to_user,
+                    get_default_embedding_model,
+                )
 
                 if user_id:
-                    # First, try to get user's default embedding model
                     user_default = (
                         db.query(UserDefaultModel)
                         .filter(
@@ -90,7 +93,6 @@ class DynamicMemoryStoreManager:
                     )
 
                     if user_default:
-                        # Get the actual model
                         embedding_model = (
                             db.query(DBModel)
                             .filter(
@@ -107,7 +109,6 @@ class DynamicMemoryStoreManager:
                                 logger.warning(
                                     f"User default embedding model {user_default.model_id} is no longer visible"
                                 )
-                                # fall through to system fallback
                             else:
                                 logger.info(
                                     f"Found user's default embedding model: {embedding_model.model_id}"
@@ -118,10 +119,14 @@ class DynamicMemoryStoreManager:
                                 f"User default embedding model {user_default.model_id} not found or inactive"
                             )
 
-                # Fallback: look for first active embedding model visible to user
+                model_id = get_default_embedding_model(None, db=db)
+                if model_id is None:
+                    logger.info("No global shared embedding model found")
+                    return None
                 all_active_embeddings = (
                     db.query(DBModel)
                     .filter(
+                        DBModel.model_id == model_id,
                         DBModel.category == "embedding",
                         DBModel.is_active,
                     )
@@ -131,11 +136,11 @@ class DynamicMemoryStoreManager:
                 for embedding_model in all_active_embeddings:
                     if _is_model_visible_to_user(db, embedding_model.id, user_id):
                         logger.info(
-                            f"Using visible active embedding model: {embedding_model.model_id}"
+                            f"Using global shared embedding model: {embedding_model.model_id}"
                         )
                         return embedding_model
 
-                logger.info("No visible active embedding model found")
+                logger.info("No global shared embedding model found")
                 return None
             finally:
                 db.close()
@@ -146,7 +151,7 @@ class DynamicMemoryStoreManager:
             return None
 
     def _create_lancedb_store(
-        self, embedding_model: DBModel, *, fallback_on_error: bool = True
+        self, embedding_model: DBModel
     ) -> UserIsolatedMemoryStore:
         """Create LanceDB store with the given embedding model."""
         try:
@@ -191,13 +196,9 @@ class DynamicMemoryStoreManager:
                 )
                 self._initialize_in_memory_store()
                 return self._memory_store  # type: ignore[return-value]
-        except Exception as e:
-            if not fallback_on_error:
-                raise
-            logger.error(f"Error creating LanceDB store: {e}")
-            # Fallback to in-memory store
-            self._initialize_in_memory_store()
-            return self._memory_store  # type: ignore[return-value]
+        except Exception:
+            logger.exception("Error creating LanceDB store")
+            raise
 
     def _check_and_update_store(self, *, fallback_on_error: bool = True) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
@@ -233,9 +234,13 @@ class DynamicMemoryStoreManager:
 
             if should_update:
                 if embedding_model:
-                    self._memory_store = self._create_lancedb_store(
-                        embedding_model, fallback_on_error=fallback_on_error
-                    )
+                    try:
+                        new_store = self._create_lancedb_store(embedding_model)
+                    except Exception:
+                        if not fallback_on_error:
+                            raise
+                        return
+                    self._memory_store = new_store
                     self._is_lancedb = True
                     self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
                     self._last_embedding_model_fingerprint = current_fingerprint

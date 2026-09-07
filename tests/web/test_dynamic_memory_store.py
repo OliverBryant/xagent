@@ -6,8 +6,10 @@ from typing import Any
 import pytest
 
 from xagent.core.model import EmbeddingModelConfig
+from xagent.core.user_context import current_user_id
 from xagent.web import dynamic_memory_store
 from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 
 
 class FakeLanceStore:
@@ -87,25 +89,70 @@ def test_embedding_configuration_read_happens_under_lock(monkeypatch) -> None:
 def test_startup_maintenance_reaches_the_persistent_store(monkeypatch) -> None:
     holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
     manager = _manager_with_fake_db(monkeypatch, holder)
+    base = FakeLanceStore(holder["model"])
     monkeypatch.setattr(dynamic_memory_store, "LanceDBMemoryStore", FakeLanceStore)
+    monkeypatch.setattr(
+        manager, "_create_lancedb_store", lambda _model: UserIsolatedMemoryStore(base)
+    )
 
     manager.maintain_schema()
 
-    assert manager._memory_store.maintenance_calls == 1
+    assert base.maintenance_calls == 1
 
 
 def test_startup_maintenance_propagates_store_creation_failure(monkeypatch) -> None:
     holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
     manager = _manager_with_fake_db(monkeypatch, holder)
 
-    def fail(_model, *, fallback_on_error=True):
-        assert not fallback_on_error
+    def fail(_model):
         raise RuntimeError("memory table unavailable")
 
     monkeypatch.setattr(manager, "_create_lancedb_store", fail)
 
     with pytest.raises(RuntimeError, match="memory table unavailable"):
         manager.maintain_schema()
+
+
+def test_request_store_creation_failure_preserves_manager_state(monkeypatch) -> None:
+    holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
+    manager = _manager_with_fake_db(monkeypatch, holder)
+    original = manager.get_memory_store()
+    fingerprint = manager._last_embedding_model_fingerprint
+    holder["model"] = _model(2, "2026-07-17 11:00:00", "new-key")
+    monkeypatch.setattr(
+        manager,
+        "_create_lancedb_store",
+        lambda _model: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+
+    assert manager.get_memory_store() is original
+    assert manager._is_lancedb
+    assert manager._last_embedding_model_fingerprint == fingerprint
+
+
+def test_shared_embedding_identity_ignores_request_user(monkeypatch) -> None:
+    model = _model(2, "2026-07-17 10:00:00", "key")
+    query = SimpleNamespace(filter=lambda *_args: query, all=lambda: [model])
+    db = SimpleNamespace(query=lambda *_args: query, close=lambda: None)
+    monkeypatch.setattr(dynamic_memory_store, "get_db", lambda: iter([db]))
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_embedding_model",
+        lambda user_id, *, db: "embedding-2" if user_id is None else None,
+    )
+    manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(
+        manager, "_create_lancedb_store", lambda _model: FakeLanceStore(model)
+    )
+
+    resolved = []
+    for user_id in (7, 9):
+        token = current_user_id.set(user_id)
+        try:
+            resolved.append(manager.get_memory_store())
+        finally:
+            current_user_id.reset(token)
+    assert isinstance(resolved[0], FakeLanceStore)
+    assert resolved[1] is resolved[0]
 
 
 def test_dynamic_store_preserves_complete_embedding_config(

@@ -54,6 +54,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     should_sandbox_mcp_connection,
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
+from .write_gate_tool import gate_mcp_tools
 
 
 class MCPFailurePhase(str, Enum):
@@ -2194,7 +2195,13 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # The one place both transports meet: ``server_tools`` is either
+            # sandbox-wrapped tools or bare adapters by this point, and the
+            # gate wraps whichever it is. Deliberately not inside the adapter
+            # -- a sandboxed connector rebuilds that class in a guest process
+            # where no host hook or database exists, so a gate placed there
+            # is absent exactly for the transport that most needs it.
+            agent_tools.extend(gate_mcp_tools(server_tools))
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")

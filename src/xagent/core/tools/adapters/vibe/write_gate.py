@@ -1,0 +1,173 @@
+"""The seam a host uses to require approval before an MCP write executes.
+
+A gated call is not executed. The hook is handed the call exactly as it was
+about to run -- tool name and arguments -- and answers with either "run it"
+or a pause carrying the frozen payload's identity. On approval the same
+arguments are executed verbatim, because they were never handed back to the
+model to be written a second time.
+
+**Why a host-injected hook rather than a direct call into the web layer.**
+This module is imported by the tool adapters, which
+``sandboxed_tool/tool_runner.py`` reconstructs inside the sandbox for every
+npx/uvx MCP tool -- a process where sqlalchemy is not installed. Anything
+here that reached for a database would turn every sandboxed tool call into a
+``ModuleNotFoundError``. So this file stays free of the web layer and the
+host injects the policy instead.
+
+Where the gate is *consulted* is a separate question, answered in
+``write_gate_tool.py``: on the host, in ``WriteGateTool``, above both the
+direct adapter and the sandbox wrapper. A sandboxed write is therefore gated
+before anything crosses into the guest, which an earlier revision -- asking
+from inside the adapter, where a supported npx/uvx connector only ever runs
+in the guest -- got exactly backwards.
+
+Not registering a hook *is* the off switch. No hook means no gate: nothing
+to consult, nothing to record, and no behavior change at all -- including
+the tool metadata the scheduler reads.
+
+**Not a trust boundary.** The hook decides using, among other things, a
+server's own ``readOnlyHint``/``destructiveHint`` annotations, which the MCP
+spec says a client must not trust from an untrusted server. What this seam
+guarantees is narrower and worth stating exactly: *if* a call is gated, the
+arguments that eventually execute are the ones that were shown, byte for
+byte. It does not guarantee that every dangerous call gets gated.
+
+**Known limits of this version.** Both are deliberate, and neither is
+described elsewhere in this module as if it were solved:
+
+*An approval is not bound to a connector identity.* It is bound to the
+interaction it was shown for, and nothing more. If a same-name MCP server is
+repointed to another endpoint, reauthorized to a different account, or
+deleted and recreated between the pause and the answer, the approved
+arguments still execute -- against whatever that name resolves to when the
+answer arrives. Carrying an immutable server/account identity would need the
+MCP connection layer to expose one, which it does not today.
+
+*Only a surface that delivers the chosen option value verbatim can grant an
+approval.* The pause offers machine values (``approve``/``reject``), and the
+host decides what counts as consent. xagent's own ``ClarificationForm``
+cannot take part: it submits each answer's *display label* rather than the
+option's value -- for every interaction type, not just ``confirm``, which it
+renders as a localized yes/no switch that ignores ``options`` entirely. A
+pause surfaced through that form therefore reaches the host as ``"Yes"`` and
+is voided, not executed. The supported surface in this version is a host
+that passes the value through untouched (Toby delivers the Slack button's
+value as the resume message).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+
+@dataclass(frozen=True)
+class GatedCall:
+    """One MCP call presented to the gate before it runs."""
+
+    tool_name: str
+    """The tool's runtime name, as the model called it."""
+
+    server_name: str
+    """Normalized identity of the MCP server the tool came from."""
+
+    arguments: Mapping[str, Any]
+    """The arguments the call would have executed with.
+
+    Exactly as the model produced them, which is also exactly what a replay
+    re-enters the tool with: the adapter's own deterministic handling of them
+    then runs identically both times.
+    """
+
+    write_hint: str
+    """The server's own write declaration: an ``MCPWriteHint`` value.
+
+    Carried as a plain string so this module stays independent of the
+    adapter's enum. A hook must treat everything except ``"read_only"`` as a
+    write: ``"undeclared"`` is the common case, not a promise of safety.
+    """
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """What the host decided about one gated call.
+
+    ``interaction_id`` is the identity the frozen payload was stored under
+    and the identity the resume callback will be handed back. It is the
+    hook's to mint: the adapter neither generates nor interprets it, it only
+    carries it into the pause so the two halves meet.
+    """
+
+    approval_required: bool
+    interaction_id: str = ""
+    message: str = ""
+
+
+WriteGateHook = Callable[[GatedCall], Optional[GateDecision]]
+
+# Given the interaction's identity, whether the user approved, and a callable
+# that runs one frozen argument set, the host loads the payload it recorded,
+# settles that approval exactly once, and returns the tool result. The
+# executor is passed in rather than imported because only the tool knows how
+# to place a call on its own connection -- and going through it is what keeps
+# the replay on the tool's normal authorization and error-mapping path.
+WriteGateResumeHook = Callable[..., Any]
+
+_HOOK: WriteGateHook | None = None
+_RESUME_HOOK: WriteGateResumeHook | None = None
+
+
+def set_write_gate_hook(hook: WriteGateHook | None) -> None:
+    """Install (or clear) the process-wide approval hook.
+
+    Idempotent and last-writer-wins, matching ``set_connector_runtime_resolver``.
+    Passing ``None`` restores ungated execution.
+    """
+    global _HOOK
+    _HOOK = hook
+
+
+def get_write_gate_hook() -> WriteGateHook | None:
+    """Return the installed hook, or ``None`` when nothing gates writes."""
+    return _HOOK
+
+
+def set_write_gate_resume_hook(hook: WriteGateResumeHook | None) -> None:
+    """Install (or clear) the hook that settles an approved or rejected call."""
+    global _RESUME_HOOK
+    _RESUME_HOOK = hook
+
+
+def get_write_gate_resume_hook() -> WriteGateResumeHook | None:
+    """Return the installed resume hook, or ``None``."""
+    return _RESUME_HOOK
+
+
+def consult_write_gate(call: GatedCall) -> GateDecision | None:
+    """Ask the installed hook about ``call``; ``None`` means "just run it".
+
+    A hook that raises is treated as no decision and the call proceeds. That
+    direction is deliberate and is the opposite of what a security boundary
+    would do, for the reason in the module docstring: this seam makes an
+    approved call faithful, it is not what keeps a dangerous call from
+    running. Failing closed here would let a transient database error strand
+    every connector call in a workspace behind an approval nobody can grant,
+    which trades a bounded loss of gating for an unbounded loss of function.
+    The host owns the decision to fail closed on its own side, where it can
+    tell a policy miss from an outage.
+    """
+    hook = _HOOK
+    if hook is None:
+        return None
+    try:
+        return hook(call)
+    except Exception:  # noqa: BLE001 - see the docstring
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Write gate hook failed for %s; executing ungated",
+            call.tool_name,
+            exc_info=True,
+        )
+        return None

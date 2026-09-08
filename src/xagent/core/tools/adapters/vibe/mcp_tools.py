@@ -99,7 +99,14 @@ def _build_mcp_load_summary(
             continue
 
         successful_tool_count += 1
-        source_server = getattr(tool, "source_server", None)
+        # Read through the metadata contract, not off the tool. Every wrapper
+        # in this pipeline delegates ``metadata`` and forwards no other
+        # attribute -- ``SandboxedToolWrapper`` already did, so a healthy
+        # npx/uvx connector counted its tools here while never being marked
+        # loaded, and the loop below then synthesized ``no_tools_returned``
+        # for it and failed STRICT setup. Fixing the wrapper instead would
+        # have left the sandbox transport broken exactly as it is today.
+        source_server = getattr(getattr(tool, "metadata", None), "source_server", None)
         if type(source_server) is not str:
             continue
         key = normalize_mcp_server_name(source_server)

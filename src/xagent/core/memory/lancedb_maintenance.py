@@ -20,6 +20,7 @@ from .scope_columns import (
 )
 
 MAINTENANCE_METADATA_KEY = b"xagent.memory.scope_maintenance"
+MAINTENANCE_TABLE_VERSION_KEY = b"xagent.memory.scope_maintenance_table_version"
 MAINTENANCE_VERSION = b"1"
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_LOCK_TIMEOUT = 10.0
@@ -29,6 +30,7 @@ class MaintenanceStatus(str, Enum):
     COMPLETE = "complete"
     INCOMPLETE = "incomplete"
     INVALID_LEGACY_DATA = "invalid_legacy_data"
+    INCOMPATIBLE_SCHEMA = "incompatible_schema"
 
 
 @dataclass(frozen=True)
@@ -49,12 +51,35 @@ def _checkpoint(_stage: str, _batch: int | None = None) -> None:
     """Test seam for deterministic interruption; intentionally does nothing."""
 
 
-def _is_complete(schema: Any) -> bool:
+def _scope_schema_error(schema: Any) -> str | None:
+    expected = {
+        USER_ID_COLUMN: pa.int64(),
+        SCOPE_DIMS_COLUMN: pa.list_(pa.string()),
+    }
+    incompatible = [
+        f"{name} is {schema.field(name).type}, expected {field_type}"
+        for name, field_type in expected.items()
+        if name in schema.names and schema.field(name).type != field_type
+    ]
+    if not incompatible:
+        return None
+    return (
+        "incompatible scope column types: "
+        + "; ".join(incompatible)
+        + "; convert the legacy schema explicitly before retrying maintenance"
+    )
+
+
+def _is_complete(table: Any) -> bool:
+    schema = table.schema
     names = set(schema.names)
-    if not {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names:
+    if not {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names or _scope_schema_error(schema):
         return False
     metadata = schema.field(USER_ID_COLUMN).metadata or {}
-    return metadata.get(MAINTENANCE_METADATA_KEY) == MAINTENANCE_VERSION
+    return (
+        metadata.get(MAINTENANCE_METADATA_KEY) == MAINTENANCE_VERSION
+        and metadata.get(MAINTENANCE_TABLE_VERSION_KEY) == str(table.version).encode()
+    )
 
 
 def _lock_path(connection: Any, table_name: str) -> str:
@@ -133,16 +158,22 @@ def _backfill_batch(table: Any, rows: list[dict[str, Any]]) -> int:
     return int(result.rows_updated)
 
 
-def _mark_complete(table: Any) -> None:
-    marker = {MAINTENANCE_METADATA_KEY.decode(): MAINTENANCE_VERSION.decode()}
+def _mark_complete(table: Any, expected_version: int) -> int:
+    marker = {
+        MAINTENANCE_METADATA_KEY.decode(): MAINTENANCE_VERSION.decode(),
+        MAINTENANCE_TABLE_VERSION_KEY.decode(): str(expected_version),
+    }
     if hasattr(table, "update_field_metadata"):
-        table.update_field_metadata({"path": USER_ID_COLUMN, "metadata": marker})
-        return
+        result = table.update_field_metadata(
+            {"path": USER_ID_COLUMN, "metadata": marker}
+        )
+        return int(result.version)
     metadata = {
         key.decode(): value.decode()
         for key, value in (table.schema.field(USER_ID_COLUMN).metadata or {}).items()
     }
     table.replace_field_metadata(USER_ID_COLUMN, metadata | marker)
+    return int(table.version)
 
 
 def maintain_lancedb_memory_table(
@@ -170,7 +201,13 @@ def maintain_lancedb_memory_table(
     table = None
     try:
         table = connection.open_table(table_name)
-        if _is_complete(table.schema):
+        schema_error = _scope_schema_error(table.schema)
+        if schema_error:
+            return MaintenanceOutcome(
+                MaintenanceStatus.INCOMPATIBLE_SCHEMA,
+                detail=schema_error,
+            )
+        if _is_complete(table):
             return MaintenanceOutcome(MaintenanceStatus.COMPLETE)
 
         rows = _read_rows(table)
@@ -205,10 +242,12 @@ def maintain_lancedb_memory_table(
             commits += 1
             _checkpoint("batch_committed", commits)
 
+        validated_version = int(table.version)
         final_rows = _read_rows(table)
         final_invalid = _invalid_ids(final_rows)
         remaining = sum(_needs_update(row) for row in final_rows)
-        if final_invalid or skipped or remaining:
+        version_changed = int(table.version) != validated_version
+        if final_invalid or skipped or remaining or version_changed:
             return MaintenanceOutcome(
                 MaintenanceStatus.INCOMPLETE,
                 scanned_rows=len(rows),
@@ -219,7 +258,19 @@ def maintain_lancedb_memory_table(
             )
 
         _checkpoint("before_completion")
-        _mark_complete(table)
+        expected_marker_version = validated_version + 1
+        actual_marker_version = _mark_complete(table, expected_marker_version)
+        if (
+            actual_marker_version != expected_marker_version
+            or int(table.version) != expected_marker_version
+        ):
+            return MaintenanceOutcome(
+                MaintenanceStatus.INCOMPLETE,
+                scanned_rows=len(rows),
+                updated_rows=updated,
+                batches_committed=commits,
+                detail="concurrent changes invalidated the completion marker",
+            )
         return MaintenanceOutcome(
             MaintenanceStatus.COMPLETE,
             scanned_rows=len(rows),

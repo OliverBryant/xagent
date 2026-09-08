@@ -11,6 +11,7 @@ from filelock import FileLock
 from xagent.core.memory import lancedb_maintenance as maintenance
 from xagent.core.memory.lancedb_maintenance import (
     MAINTENANCE_METADATA_KEY,
+    MAINTENANCE_TABLE_VERSION_KEY,
     MAINTENANCE_VERSION,
     MaintenanceLockTimeout,
     MaintenanceStatus,
@@ -67,6 +68,14 @@ def _marker(table):
     )
 
 
+def _marker_table_version(table):
+    if USER_ID_COLUMN not in table.schema.names:
+        return None
+    return (table.schema.field(USER_ID_COLUMN).metadata or {}).get(
+        MAINTENANCE_TABLE_VERSION_KEY
+    )
+
+
 def test_complete_migration_and_second_run_is_schema_only(tmp_path, monkeypatch):
     connection = _connection(tmp_path)
     first = maintain_lancedb_memory_table(connection, "memories")
@@ -77,6 +86,7 @@ def test_complete_migration_and_second_run_is_schema_only(tmp_path, monkeypatch)
         {USER_ID_COLUMN: 1, SCOPE_DIMS_COLUMN: ["agent=agent-1"]},
     ]
     assert _marker(table) == MAINTENANCE_VERSION
+    assert _marker_table_version(table) == str(table.version).encode()
     assert table.schema.metadata[VECTOR_IDENTITY_METADATA_KEY] == b"preserved"
     _safe_close_table(table)
 
@@ -190,6 +200,111 @@ def test_concurrent_changes_are_preserved_and_metadata_change_is_reported(
     else:
         assert result.status is MaintenanceStatus.COMPLETE
         assert row[USER_ID_COLUMN] == 0
+
+
+def test_late_metadata_writer_invalidates_marker_and_resumes(tmp_path, monkeypatch):
+    connection = _connection(tmp_path, count=1, scoped=True)
+    changed_metadata = json.dumps({"user_id": 99})
+
+    def late_update(stage, _batch=None):
+        if stage == "before_completion":
+            writer = _table(connection)
+            writer.update("id = 'note-0'", values={"metadata": changed_metadata})
+            _safe_close_table(writer)
+
+    monkeypatch.setattr(maintenance, "_checkpoint", late_update)
+    first = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    row = table.to_arrow().to_pylist()[0]
+    assert first.status is MaintenanceStatus.INCOMPLETE
+    assert row["metadata"] == changed_metadata
+    assert row[USER_ID_COLUMN] == 0
+    assert _marker_table_version(table) != str(table.version).encode()
+    _safe_close_table(table)
+
+    monkeypatch.setattr(maintenance, "_checkpoint", lambda *_args: None)
+    resumed = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert resumed.status is MaintenanceStatus.COMPLETE
+    assert table.to_arrow().to_pylist()[0][USER_ID_COLUMN] == 99
+    assert _marker_table_version(table) == str(table.version).encode()
+    _safe_close_table(table)
+
+
+def test_table_version_change_invalidates_fast_path(tmp_path, monkeypatch):
+    connection = _connection(tmp_path, count=1)
+    assert (
+        maintain_lancedb_memory_table(connection, "memories").status
+        is MaintenanceStatus.COMPLETE
+    )
+    writer = _table(connection)
+    writer.update("id = 'note-0'", values={"text": "new text"})
+    _safe_close_table(writer)
+
+    scanned = False
+    original = maintenance._read_rows
+
+    def record_scan(table):
+        nonlocal scanned
+        scanned = True
+        return original(table)
+
+    monkeypatch.setattr(maintenance, "_read_rows", record_scan)
+    result = maintain_lancedb_memory_table(connection, "memories")
+    assert result.status is MaintenanceStatus.COMPLETE
+    assert scanned
+
+
+def test_exact_scope_schema_preserves_existing_field_metadata(tmp_path):
+    connection = _connection(tmp_path, count=1, scoped=True)
+    table = _table(connection)
+    metadata = {"preserved": "yes"}
+    if hasattr(table, "update_field_metadata"):
+        table.update_field_metadata({"path": USER_ID_COLUMN, "metadata": metadata})
+    else:
+        table.replace_field_metadata(USER_ID_COLUMN, metadata)
+    _safe_close_table(table)
+
+    result = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert result.status is MaintenanceStatus.COMPLETE
+    assert table.schema.field(USER_ID_COLUMN).metadata[b"preserved"] == b"yes"
+    assert _marker_table_version(table) == str(table.version).encode()
+    _safe_close_table(table)
+
+
+@pytest.mark.parametrize(
+    ("partial", "old_marker"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_incompatible_scope_schema_is_reported_without_mutation(
+    tmp_path, partial, old_marker
+):
+    connection = lancedb.connect(tmp_path)
+    columns = {
+        "id": ["note-0"],
+        "text": ["text-0"],
+        "metadata": pa.array([json.dumps({"user_id": 0})], pa.string()),
+        USER_ID_COLUMN: pa.array([0], pa.int32()),
+    }
+    if not partial:
+        columns[SCOPE_DIMS_COLUMN] = pa.array([[]], pa.list_(pa.int32()))
+    table = connection.create_table("memories", pa.table(columns))
+    if old_marker:
+        marker = {MAINTENANCE_METADATA_KEY.decode(): MAINTENANCE_VERSION.decode()}
+        if hasattr(table, "update_field_metadata"):
+            table.update_field_metadata({"path": USER_ID_COLUMN, "metadata": marker})
+        else:
+            table.replace_field_metadata(USER_ID_COLUMN, marker)
+    before = (table.version, table.schema, table.to_arrow().to_pylist())
+    _safe_close_table(table)
+
+    result = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert result.status is MaintenanceStatus.INCOMPATIBLE_SCHEMA
+    assert USER_ID_COLUMN in result.detail
+    assert (table.version, table.schema, table.to_arrow().to_pylist()) == before
+    _safe_close_table(table)
 
 
 def test_completion_marker_is_last_and_failure_before_it_resumes(tmp_path, monkeypatch):

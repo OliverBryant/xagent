@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 import pyarrow as pa  # type: ignore
 
@@ -26,6 +26,32 @@ _DEFAULT_ENDPOINTS = {
 _PROVIDER_ALIASES = {"openai_embedding": "openai", "openai-compatible": "openai"}
 _IDENTITY_FIELDS = {"provider", "model", "endpoint", "dimension", "instruct"}
 _REQUIRED_SCHEMA = {"id": pa.string(), "text": pa.string(), "metadata": pa.string()}
+
+
+class _ArrowDataType(Protocol):
+    """Structural subset used from a PyArrow data type."""
+
+    @property
+    def value_type(self) -> object: ...
+
+    @property
+    def list_size(self) -> int: ...
+
+
+class _ArrowField(Protocol):
+    """Structural subset used from a PyArrow field."""
+
+    @property
+    def type(self) -> _ArrowDataType: ...
+
+
+class _ArrowSchema(Protocol):
+    """Structural PyArrow schema boundary available without importing its type."""
+
+    @property
+    def metadata(self) -> Mapping[bytes, bytes] | None: ...
+
+    def field(self, name: str) -> _ArrowField: ...
 
 
 class VectorCompatibility(str, Enum):
@@ -100,7 +126,7 @@ def canonical_embedding_identity(
 
 
 def classify_vector_compatibility(
-    schema: pa.Schema,
+    schema: _ArrowSchema,
     expected_identity: EmbeddingIdentity | EmbeddingModelConfig | Mapping[str, Any],
 ) -> VectorCompatibility:
     """Purely classify an Arrow schema and its metadata; perform no I/O."""

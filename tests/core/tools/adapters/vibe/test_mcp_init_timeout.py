@@ -5,6 +5,7 @@ import asyncio
 
 import pytest
 
+from tests.core.tools.conftest import gated_targets
 from xagent.config import MCP_TOOL_INIT_TIMEOUT_SECONDS
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
@@ -43,7 +44,7 @@ async def test_stalled_server_times_out_and_other_servers_still_load(monkeypatch
         }
     )
 
-    assert result.tools == (healthy_tool,)
+    assert gated_targets(result.tools) == (healthy_tool,)
     assert result.loaded_servers == ("healthy",)
     assert len(result.failures) == 1
     assert result.failures[0].server_name == "stalled"

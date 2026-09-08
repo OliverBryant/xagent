@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.types import Tool as MCPTool
 
+from tests.core.tools.conftest import gated_targets
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPLoadResult,
@@ -127,7 +128,7 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=sandbox,
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert gated_targets(result.tools) == (wrapped_tool,)
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_list.assert_awaited_once_with(sandbox, connection)
@@ -162,7 +163,7 @@ class TestLoadMcpToolsAsAgentTools:
                 sandbox=MagicMock(),
             )
 
-        assert result.tools == (direct_tool,)
+        assert gated_targets(result.tools) == (direct_tool,)
         assert result.loaded_servers == ("demo",)
         assert result.failures == ()
         mock_direct.assert_awaited_once()
@@ -266,7 +267,7 @@ class TestLoadMcpToolsAsAgentTools:
                 {"demo": connection}, sandbox=sandbox
             )
 
-        assert result.tools == (wrapped_tool,)
+        assert gated_targets(result.tools) == (wrapped_tool,)
         assert result.loaded_servers == ("demo",)
         assert len(result.failures) == 1
         assert result.failures[0].phase is MCPFailurePhase.SANDBOX_TOOL_WRAP

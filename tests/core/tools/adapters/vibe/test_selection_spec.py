@@ -500,7 +500,21 @@ async def test_mcp_summary_reports_partial_success_and_same_server_failure(
     from xagent.core.tools.adapters.vibe import mcp_tools
 
     class _LoadedTool:
+        # Carries ``metadata``, because every tool that reaches the summary
+        # does: they are all ``AbstractBaseTool`` instances (whose metadata
+        # property mirrors ``source_server``) or ``UnavailableMCPTool``,
+        # which the summary takes on an earlier branch. A double with only
+        # the bare attribute is thinner than anything production produces,
+        # and the summary reads the metadata contract so that a wrapper --
+        # which forwards ``metadata`` and no other attribute -- is not
+        # mistaken for a server that returned nothing.
         source_server = "gmail"
+
+        @property
+        def metadata(self):
+            from xagent.core.tools.adapters.vibe.base import ToolMetadata
+
+            return ToolMetadata(name="gmail_send", source_server=self.source_server)
 
     gmail_failure = UnavailableMCPTool(
         server_name="Gmail",

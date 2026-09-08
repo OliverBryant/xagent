@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
@@ -73,7 +73,10 @@ def _read_rows(table: Any) -> list[dict[str, Any]]:
         raise ValueError(f"memory table is missing required columns: {missing}")
     projected = ["id", "metadata"]
     projected += [c for c in (USER_ID_COLUMN, SCOPE_DIMS_COLUMN) if c in names]
-    return table.search().select(projected).limit(None).to_arrow().to_pylist()
+    return cast(
+        list[dict[str, Any]],
+        table.search().select(projected).limit(None).to_arrow().to_pylist(),
+    )
 
 
 def _invalid_ids(rows: list[dict[str, Any]]) -> str | None:
@@ -90,17 +93,20 @@ def _needs_update(row: dict[str, Any]) -> bool:
     return (row.get(USER_ID_COLUMN), row.get(SCOPE_DIMS_COLUMN)) != expected
 
 
-def _source(rows: list[dict[str, Any]]) -> pa.Table:
+def _source(rows: list[dict[str, Any]]) -> object:
     derived = [derive_scope_columns(row["metadata"]) for row in rows]
-    return pa.table(
-        {
-            "id": pa.array([row["id"] for row in rows], pa.string()),
-            "metadata": pa.array([row["metadata"] for row in rows], pa.string()),
-            USER_ID_COLUMN: pa.array([item[0] for item in derived], pa.int64()),
-            SCOPE_DIMS_COLUMN: pa.array(
-                [item[1] for item in derived], pa.list_(pa.string())
-            ),
-        }
+    return cast(
+        object,
+        pa.table(
+            {
+                "id": pa.array([row["id"] for row in rows], pa.string()),
+                "metadata": pa.array([row["metadata"] for row in rows], pa.string()),
+                USER_ID_COLUMN: pa.array([item[0] for item in derived], pa.int64()),
+                SCOPE_DIMS_COLUMN: pa.array(
+                    [item[1] for item in derived], pa.list_(pa.string())
+                ),
+            }
+        ),
     )
 
 

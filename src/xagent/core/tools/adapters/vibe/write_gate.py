@@ -53,6 +53,30 @@ pause surfaced through that form therefore reaches the host as ``"Yes"`` and
 is voided, not executed. The supported surface in this version is a host
 that passes the value through untouched (Toby delivers the Slack button's
 value as the resume message).
+
+*Runtime-bound arguments are re-derived at execution, not frozen.* What is
+frozen and replayed byte for byte is everything the model authored -- which
+is also everything the approver was shown. On top of that the adapter
+injects its runtime bindings' current values (``_runtime_tool_arguments``,
+``_runtime_mcp_meta``), resolved from the connector runtime of whichever
+adapter instance executes. A resume runs on a rebuilt instance, so if a
+binding's source changed while the question waited, the value that goes out
+is the new one. This is the connector-identity limit above, seen in the
+argument dimension rather than the endpoint dimension.
+
+Closing it needs one of two things that are deliberately not in this
+change. Freezing the *prepared* payload means the guest can no longer
+prepare it: ``sandboxed_tool/tool_runner.py`` re-enters ``run_json_async``
+with the arguments it is handed, and preparation is not idempotent: the key
+set ``_runtime_bound_tool_argument_names`` strips is exactly the key set
+``_runtime_tool_arguments`` injects, so a prepared payload fed back through
+that entry point has its frozen runtime values stripped as though the model
+had set them and then replaced with current ones -- the round trip discards
+precisely the half that was worth freezing. So it needs a second guest
+entry point and a marker in the execution spec. Detecting the change instead
+needs the *host* to store the binding values with the approval and compare
+them at replay, which is a consumer this seam does not have; adding the
+field without it would be another value nobody reads.
 """
 
 from __future__ import annotations
@@ -73,11 +97,20 @@ class GatedCall:
     """Normalized identity of the MCP server the tool came from."""
 
     arguments: Mapping[str, Any]
-    """The arguments the call would have executed with.
+    """The model-authored arguments, exactly as the model produced them.
 
-    Exactly as the model produced them, which is also exactly what a replay
-    re-enters the tool with: the adapter's own deterministic handling of them
-    then runs identically both times.
+    Not the payload that goes on the wire, and the difference is worth
+    stating precisely because this seam's whole promise is about fidelity.
+    Before a call executes, the adapter normalizes these against the tool's
+    schema, applies the args model's defaults and coercion, strips any
+    runtime-bound field the model tried to set, and injects the current
+    values of its runtime bindings.
+
+    The first three of those are pure functions of these arguments and the
+    tool's schema, so they produce the same result at preview and at replay
+    -- the replay re-enters the same public entry point with these exact
+    arguments. The injected runtime values are not: see the third known
+    limit in the module docstring.
     """
 
     write_hint: str

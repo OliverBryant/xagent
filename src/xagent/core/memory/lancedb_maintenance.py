@@ -93,34 +93,56 @@ def _needs_update(row: dict[str, Any]) -> bool:
     return (row.get(USER_ID_COLUMN), row.get(SCOPE_DIMS_COLUMN)) != expected
 
 
-def _source(rows: list[dict[str, Any]]) -> object:
-    derived = [derive_scope_columns(row["metadata"]) for row in rows]
-    return cast(
-        object,
-        pa.table(
-            {
-                "id": pa.array([row["id"] for row in rows], pa.string()),
-                "metadata": pa.array([row["metadata"] for row in rows], pa.string()),
-                USER_ID_COLUMN: pa.array([item[0] for item in derived], pa.int64()),
-                SCOPE_DIMS_COLUMN: pa.array(
-                    [item[1] for item in derived], pa.list_(pa.string())
-                ),
-            }
-        ),
-    )
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_list(values: list[str]) -> str:
+    if not values:
+        return "arrow_cast([], 'List(Utf8)')"
+    return "[" + ", ".join(_sql_string(value) for value in values) + "]"
+
+
+def _sql_nullable_string(value: str | None) -> str:
+    return "arrow_cast(NULL, 'Utf8')" if value is None else _sql_string(value)
 
 
 def _backfill_batch(table: Any, rows: list[dict[str, Any]]) -> int:
+    ids = [_sql_string(row["id"]) for row in rows]
+    derived = [derive_scope_columns(row["metadata"]) for row in rows]
+    position = f"cast(array_position([{', '.join(ids)}], id) as bigint)"
+    metadata = ", ".join(_sql_nullable_string(row["metadata"]) for row in rows)
+    expected_metadata = f"array_element([{metadata}], {position})"
     condition = (
-        "(target.metadata = source.metadata) OR "
-        "((target.metadata IS NULL) AND (source.metadata IS NULL))"
+        f"id IN ({', '.join(ids)}) AND "
+        f"(metadata = {expected_metadata} OR "
+        f"(metadata IS NULL AND {expected_metadata} IS NULL))"
     )
-    result = (
-        table.merge_insert("id")
-        .when_matched_update_all(where=condition)
-        .execute(_source(rows))
+    user_ids = [
+        "cast(NULL as bigint)" if user_id is None else str(user_id)
+        for user_id, _scope_dims in derived
+    ]
+    scope_dims = [_sql_list(values) for _user_id, values in derived]
+    result = table.update(
+        where=condition,
+        values_sql={
+            USER_ID_COLUMN: f"array_element([{', '.join(user_ids)}], {position})",
+            SCOPE_DIMS_COLUMN: f"array_element([{', '.join(scope_dims)}], {position})",
+        },
     )
-    return int(result.num_updated_rows)
+    return int(result.rows_updated)
+
+
+def _mark_complete(table: Any) -> None:
+    marker = {MAINTENANCE_METADATA_KEY.decode(): MAINTENANCE_VERSION.decode()}
+    if hasattr(table, "update_field_metadata"):
+        table.update_field_metadata({"path": USER_ID_COLUMN, "metadata": marker})
+        return
+    metadata = {
+        key.decode(): value.decode()
+        for key, value in (table.schema.field(USER_ID_COLUMN).metadata or {}).items()
+    }
+    table.replace_field_metadata(USER_ID_COLUMN, metadata | marker)
 
 
 def maintain_lancedb_memory_table(
@@ -197,14 +219,7 @@ def maintain_lancedb_memory_table(
             )
 
         _checkpoint("before_completion")
-        table.update_field_metadata(
-            {
-                "path": USER_ID_COLUMN,
-                "metadata": {
-                    MAINTENANCE_METADATA_KEY.decode(): MAINTENANCE_VERSION.decode()
-                },
-            }
-        )
+        _mark_complete(table)
         return MaintenanceOutcome(
             MaintenanceStatus.COMPLETE,
             scanned_rows=len(rows),

@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, cast
 
 from ......config import get_chrome_session_ttl_seconds
 from ......sandbox.base import Sandbox
@@ -45,6 +45,29 @@ _CHROME_SANDBOX_ENV = {
     "NPM_CONFIG_CACHE": "/opt/npm-cache",
     "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
 }
+
+
+def chrome_metadata_connection(connection: Connection) -> Connection:
+    """Return the secret-minimal connection serialized for sandbox discovery."""
+
+    launch = ChromeDaemonLaunchSpec.from_connection(connection)
+    env = connection.get("env")
+    if not isinstance(env, Mapping):
+        raise ChromeSessionContractError("Chrome connection env is invalid")
+    return cast(
+        Connection,
+        {
+            "transport": connection.get("transport"),
+            "command": connection.get("command"),
+            "args": [
+                "-y",
+                "--prefer-offline",
+                CHROME_DEVTOOLS_PACKAGE,
+                *launch.server_args,
+            ],
+            "env": {**dict(env), **_CHROME_SANDBOX_ENV},
+        },
+    )
 
 
 class ChromeSessionContractError(RuntimeError):
@@ -96,6 +119,20 @@ class ChromeSandboxHandle:
 
     sandbox: Sandbox
     delete: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class ChromeExecutionScope:
+    """In-memory identity plus the only value allowed outside this process."""
+
+    key: tuple[Any, ...] = field(repr=False)
+    digest: str
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            raise ValueError("Chrome execution scope key must be non-empty")
+        if _SCOPE_DIGEST_RE.fullmatch(self.digest) is None:
+            raise ValueError("scope digest must be a SHA-256 lowercase hex digest")
 
 
 class ChromeDaemonClient:
@@ -210,15 +247,40 @@ class ChromeExecutionSession:
     def launch(self) -> ChromeDaemonLaunchSpec:
         return self._launch
 
+    @property
+    def sandbox(self) -> Sandbox:
+        return self._handle.sandbox
+
+    def _status_matches_launch(self, payload: Mapping[str, Any]) -> bool:
+        status = payload.get("status", payload)
+        if not isinstance(status, Mapping):
+            return False
+        args = status.get("args")
+        expected_args = [
+            *self._launch.server_args,
+            "--viaCli",
+            "--experimentalStructuredContent",
+        ]
+        return (
+            status.get("version") == CHROME_DEVTOOLS_PACKAGE.rsplit("@", 1)[1]
+            and args == expected_args
+        )
+
     async def _ensure_started_locked(self) -> None:
         if self._closed:
             raise ChromeSessionContractError("Chrome execution session is closed")
         if self._started:
             status = await self._client.status()
-            if status.get("running") is True:
+            if status.get("running") is True and self._status_matches_launch(status):
                 return
-            self._started = False
-        await self._client.start(self._launch)
+            raise ChromeSessionContractError(
+                "Chrome daemon status does not match its execution launch"
+            )
+        status = await self._client.start(self._launch)
+        if not self._status_matches_launch(status):
+            raise ChromeSessionContractError(
+                "Chrome daemon start does not match its execution launch"
+            )
         self._started = True
 
     async def invoke_tool(
@@ -262,14 +324,9 @@ class ChromeExecutionSessionPool:
 
     def __init__(self, sandbox_factory: ChromeSandboxFactory) -> None:
         self._sandbox_factory = sandbox_factory
-        self._sessions: dict[str, ChromeExecutionSession] = {}
+        self._sessions: dict[str, tuple[tuple[Any, ...], ChromeExecutionSession]] = {}
         self._locks: dict[str, _PoolLockEntry] = {}
         self._lock_guard = asyncio.Lock()
-
-    @staticmethod
-    def _validate_scope_digest(scope_digest: str) -> None:
-        if _SCOPE_DIGEST_RE.fullmatch(scope_digest) is None:
-            raise ValueError("scope_digest must be a SHA-256 lowercase hex digest")
 
     @asynccontextmanager
     async def _scope_locked(self, scope_digest: str) -> AsyncIterator[None]:
@@ -293,12 +350,17 @@ class ChromeExecutionSessionPool:
                     self._locks.pop(scope_digest, None)
 
     async def get_or_create(
-        self, scope_digest: str, launch: ChromeDaemonLaunchSpec
+        self, scope: ChromeExecutionScope, launch: ChromeDaemonLaunchSpec
     ) -> ChromeExecutionSession:
-        self._validate_scope_digest(scope_digest)
+        scope_digest = scope.digest
         async with self._scope_locked(scope_digest):
-            session = self._sessions.get(scope_digest)
-            if session is not None:
+            entry = self._sessions.get(scope_digest)
+            if entry is not None:
+                stored_key, session = entry
+                if stored_key != scope.key:
+                    raise ChromeSessionContractError(
+                        "Chrome execution scope digest collision"
+                    )
                 if session.launch != launch:
                     raise ChromeSessionContractError(
                         "one execution scope cannot change its Chrome launch spec"
@@ -310,31 +372,59 @@ class ChromeExecutionSessionPool:
                 session_id=scope_digest[:32],
                 launch=launch,
             )
-            self._sessions[scope_digest] = session
+            self._sessions[scope_digest] = (scope.key, session)
             return session
 
     async def invoke_tool(
         self,
-        scope_digest: str,
+        scope: ChromeExecutionScope,
         launch: ChromeDaemonLaunchSpec,
         tool_name: str,
         arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
-        session = await self.get_or_create(scope_digest, launch)
-        return await session.invoke_tool(tool_name, arguments)
+        session = await self.get_or_create(scope, launch)
+        try:
+            return await session.invoke_tool(tool_name, arguments)
+        except ChromeSessionContractError:
+            await self.close_shielded(scope)
+            raise
 
-    async def close(self, scope_digest: str) -> None:
-        self._validate_scope_digest(scope_digest)
+    async def close(self, scope: ChromeExecutionScope) -> None:
+        scope_digest = scope.digest
         async with self._scope_locked(scope_digest):
-            session = self._sessions.pop(scope_digest, None)
+            entry = self._sessions.get(scope_digest)
+            if entry is None:
+                return
+            stored_key, session = entry
+            if stored_key != scope.key:
+                raise ChromeSessionContractError(
+                    "Chrome execution scope digest collision"
+                )
+            self._sessions.pop(scope_digest, None)
             if session is not None:
                 await session.close()
+
+    async def close_shielded(self, scope: ChromeExecutionScope) -> None:
+        """Keep cleanup alive even when the execution task is cancelled."""
+
+        cleanup = asyncio.create_task(self.close(scope))
+
+        def consume(task: asyncio.Task[None]) -> None:
+            if not task.cancelled():
+                task.exception()
+
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cleanup.add_done_callback(consume)
+            raise
 
     async def close_all(self) -> None:
         cancelled: asyncio.CancelledError | None = None
         for scope_digest in tuple(self._sessions):
             try:
-                await self.close(scope_digest)
+                key, _session = self._sessions[scope_digest]
+                await self.close(ChromeExecutionScope(key=key, digest=scope_digest))
             except asyncio.CancelledError as exc:
                 cancelled = exc
             except Exception:
@@ -362,8 +452,11 @@ class ChromeSessionReaperCandidate:
     lease_fence: str
 
     def __post_init__(self) -> None:
-        if not self.lifecycle_id or not self.lease_fence:
-            raise ValueError("lifecycle_id and lease_fence must be non-empty")
+        if (
+            _SCOPE_DIGEST_RE.fullmatch(self.lifecycle_id) is None
+            or _SCOPE_DIGEST_RE.fullmatch(self.lease_fence) is None
+        ):
+            raise ValueError("Chrome lifecycle and lease fence must be opaque digests")
         if self.created_at.tzinfo is None:
             raise ValueError("created_at must be timezone-aware")
 

@@ -161,6 +161,7 @@ from ..services.managed_file_ref import (
     log_durable_storage_fault,
 )
 from ..services.mcp_runtime import (
+    MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
@@ -2768,6 +2769,23 @@ async def execute_task_background(
             )
 
         context_dict = context if isinstance(context, dict) else {}
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None
+        if (
+            mcp_runtime_authorization_policy is not None
+            and task_lease is not None
+            and task_lease.task_id == task_id
+        ):
+            try:
+                mcp_actor_execution_identity = MCPActorExecutionIdentity(
+                    task_id=task_id,
+                    run_id=task_lease.run_id,  # type: ignore[arg-type]
+                    turn_id=context_dict.get("turn_id"),  # type: ignore[arg-type]
+                    lease_attempt_id=task_lease.attempt_id,  # type: ignore[arg-type]
+                )
+            except ValueError:
+                # Only execution-scoped actor stdio requires this complete
+                # fence. Per-call stdio and existing OAuth remain available.
+                mcp_actor_execution_identity = None
         logger.info(f"Background task execution started for task {task_id}")
         task_user_id = snapshot.task.user_id
         user = snapshot.runtime_user
@@ -2804,6 +2822,7 @@ async def execute_task_background(
                 if isinstance(context_dict.get("turn_id"), str)
                 else None,
                 mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                mcp_actor_execution_identity=mcp_actor_execution_identity,
                 resolved_execution_scope=execution_scope,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):

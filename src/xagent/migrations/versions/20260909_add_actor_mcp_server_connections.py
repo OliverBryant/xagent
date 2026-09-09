@@ -22,7 +22,86 @@ depends_on: Union[str, Sequence[str], None] = None
 TABLE = "actor_mcp_server_connections"
 
 
+def _adopt_current_metadata_table() -> bool:
+    """Adopt an exact metadata-created table, rejecting partial schema drift."""
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(TABLE):
+        return False
+
+    columns = {column["name"]: column for column in inspector.get_columns(TABLE)}
+    expected_columns = {
+        "id",
+        "lifecycle_generation",
+        "user_id",
+        "resource_owner_key",
+        "app_id",
+        "catalog_app_generation",
+        "encrypted_env",
+        "created_at",
+        "updated_at",
+    }
+    nullable_columns = {name for name, column in columns.items() if column["nullable"]}
+    lengths = {
+        name: getattr(column["type"], "length", None)
+        for name, column in columns.items()
+    }
+    primary_key = tuple(inspector.get_pk_constraint(TABLE)["constrained_columns"])
+    unique_columns = {
+        tuple(constraint["column_names"])
+        for constraint in inspector.get_unique_constraints(TABLE)
+    }
+    foreign_keys = {
+        tuple(foreign_key["constrained_columns"]): (
+            foreign_key["referred_table"],
+            tuple(foreign_key["referred_columns"]),
+            str((foreign_key.get("options") or {}).get("ondelete")).upper(),
+        )
+        for foreign_key in inspector.get_foreign_keys(TABLE)
+    }
+    indexes = {
+        (index["name"], tuple(index["column_names"]))
+        for index in inspector.get_indexes(TABLE)
+    }
+    check_constraints = {
+        constraint["name"] for constraint in inspector.get_check_constraints(TABLE)
+    }
+    valid = (
+        set(columns) == expected_columns
+        and nullable_columns == {"encrypted_env"}
+        and lengths["resource_owner_key"] == 512
+        and lengths["app_id"] == 100
+        and columns["lifecycle_generation"]["default"] is not None
+        and columns["created_at"]["default"] is not None
+        and columns["updated_at"]["default"] is not None
+        and primary_key == ("id",)
+        and "ck_actor_mcp_server_connections_generation_nonempty" in check_constraints
+        and unique_columns
+        >= {
+            ("lifecycle_generation",),
+            ("user_id", "resource_owner_key", "app_id"),
+            ("user_id", "resource_owner_key", "catalog_app_generation"),
+        }
+        and foreign_keys
+        == {
+            ("user_id",): ("users", ("id",), "CASCADE"),
+            ("catalog_app_generation",): (
+                "public_mcp_apps",
+                ("generation",),
+                "CASCADE",
+            ),
+        }
+        and (op.f("ix_actor_mcp_server_connections_id"), ("id",)) in indexes
+    )
+    if not valid:
+        raise RuntimeError(
+            "actor_mcp_server_connections already exists with incompatible schema"
+        )
+    return True
+
+
 def upgrade() -> None:
+    if _adopt_current_metadata_table():
+        return
     op.create_table(
         TABLE,
         sa.Column("id", sa.Integer(), nullable=False),

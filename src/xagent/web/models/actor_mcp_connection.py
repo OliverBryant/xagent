@@ -104,5 +104,18 @@ class ActorMCPServerConnection(Base):  # type: ignore[no-any-unimported]
 def _prevent_actor_mcp_connection_generation_update(
     _mapper: Any, _connection: Any, target: ActorMCPServerConnection
 ) -> None:
-    if inspect(target).attrs.lifecycle_generation.history.has_changes():
-        raise ValueError("ActorMCPServerConnection.lifecycle_generation is immutable")
+    state: Any = inspect(target)
+    immutable_fields = (
+        "lifecycle_generation",
+        "user_id",
+        "resource_owner_key",
+        "app_id",
+        "catalog_app_generation",
+    )
+    changed = [
+        field for field in immutable_fields if state.attrs[field].history.has_changes()
+    ]
+    if changed:
+        raise ValueError(
+            "ActorMCPServerConnection identity and catalog binding are immutable"
+        )

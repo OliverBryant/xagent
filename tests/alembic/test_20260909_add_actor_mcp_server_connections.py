@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
 import uuid
+from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 
@@ -98,5 +99,53 @@ def test_sqlite_upgrade_constraints_and_downgrade() -> None:
 
         command.downgrade(config, DOWN_REVISION)
         assert TABLE not in sa.inspect(connection).get_table_names()
+
+    engine.dispose()
+
+
+def test_sqlite_upgrade_adopts_exact_metadata_table() -> None:
+    from xagent.web.models.actor_mcp_connection import ActorMCPServerConnection
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    config = create_alembic_config(engine)
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    with engine.connect() as connection:
+        connection.execute(sa.text("PRAGMA foreign_keys=ON"))
+        _legacy_schema(connection)
+        ActorMCPServerConnection.__table__.create(bind=connection)
+        config.attributes["connection"] = connection
+
+        command.upgrade(config, REVISION)
+
+        assert sa.inspect(connection).get_table_names().count(TABLE) == 1
+        assert (
+            connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            == REVISION
+        )
+
+    engine.dispose()
+
+
+def test_sqlite_upgrade_rejects_partial_preexisting_table() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    config = create_alembic_config(engine)
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    with engine.connect() as connection:
+        _legacy_schema(connection)
+        connection.execute(
+            sa.text(
+                f"CREATE TABLE {TABLE} (id INTEGER NOT NULL PRIMARY KEY, "
+                "user_id INTEGER NOT NULL)"
+            )
+        )
+        config.attributes["connection"] = connection
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            command.upgrade(config, REVISION)
+
+        assert (
+            connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            == DOWN_REVISION
+        )
 
     engine.dispose()

@@ -2832,10 +2832,15 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            agent_context = dict(context_dict)
+            agent_context.setdefault("task_source", snapshot.task.source)
+            run_id = task_lease.run_id if task_lease is not None else expected_run_id
+            if run_id is not None:
+                agent_context.setdefault("run_id", run_id)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,

@@ -114,7 +114,7 @@ def _check_expression_fingerprint(dialect: str, value: object) -> str:
         return "generation-nonempty"
     unwrapped = compact.replace("(", "").replace(")", "")
     if dialect == "postgresql" and re.fullmatch(
-        r"lifecycle_generation::(?:charactervarying|text)<>''::text",
+        r"lifecycle_generation::(?:charactervarying|text)(?:::text)?<>''::text",
         unwrapped,
     ):
         return "generation-nonempty"

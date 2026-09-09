@@ -55,7 +55,7 @@ def _connection(identity=...):
             "--headless",
             "--isolated",
         ],
-        "env": {"XAGENT_USER_ID": "11"},
+        "env": {"XAGENT_MCP_CALLER_ID": "11"},
     }
     if identity is ...:
         identity = _identity()

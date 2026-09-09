@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine, event

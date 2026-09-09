@@ -5,13 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
 
-from tests.web.pool_contention_shared import assert_pool_checkout_off_loop
 from xagent.core.memory.in_memory import InMemoryMemoryStore
-from xagent.web import dynamic_memory_store as dynamic_memory_store_module
 from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
@@ -319,43 +315,23 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
 
 
 @pytest.mark.asyncio
-async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
-    tmp_path,
+async def test_memory_policy_uses_published_store_without_database_query(
     monkeypatch,
 ) -> None:
-    """A real QueuePool wait must run off-loop and remain a visible failure."""
-
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
-        connect_args={"check_same_thread": False},
-        poolclass=QueuePool,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=0.05,
-    )
-    session_factory = sessionmaker(bind=engine)
-
-    def get_test_db():
-        db = session_factory()
-        try:
-            yield db
-        finally:
-            db.close()
-
-    monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
+    """Request policy must use the shared store admitted during startup."""
     memory_manager = DynamicMemoryStoreManager()
+    shared_store = memory_manager._memory_store
+    monkeypatch.setattr(
+        memory_manager,
+        "_get_embedding_model_from_db",
+        lambda **_kwargs: pytest.fail("request policy queried the database"),
+    )
     monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
 
-    held_connection = engine.connect()
-    try:
-        with assert_pool_checkout_off_loop(engine):
-            with pytest.raises(SQLAlchemyTimeoutError):
-                await chat_api.resolve_agent_service_memory_policy_async(
-                    agent_config={},
-                )
-    finally:
-        held_connection.close()
-        engine.dispose()
+    policy = await chat_api.resolve_agent_service_memory_policy_async(agent_config={})
+
+    assert policy.memory is shared_store
+    assert policy.memory_enabled is True
 
 
 def test_historical_file_projection_never_writes_unregistered_output(

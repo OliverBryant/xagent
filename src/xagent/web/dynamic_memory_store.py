@@ -7,13 +7,23 @@ from typing import Optional, Union
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.model.embedding import DashScopeEmbedding
+from ..core.memory.lancedb_maintenance import (
+    MaintenanceStatus,
+    maintain_lancedb_memory_table,
+)
+from ..core.memory.vector_compatibility import (
+    VectorCompatibility,
+    canonical_embedding_identity,
+    create_or_recreate_vector_capable_table,
+)
+from ..core.model import EmbeddingModelConfig
 from ..core.storage.manager import get_storage_root
+from ..core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .models.database import get_db
 from .models.model import Model as DBModel
-from .models.user import UserDefaultModel
+from .models.user import UserDefaultModel, UserModel
 from .services.db_runtime import is_database_pool_timeout
-from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
+from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +43,21 @@ def _embedding_model_fingerprint(model: Optional[DBModel]) -> Optional[tuple]:
     if model is None:
         return None
     return (model.id, str(model.updated_at))
+
+
+def _embedding_model_config(model: DBModel) -> EmbeddingModelConfig:
+    """Preserve the complete shared embedding configuration and credential."""
+    api_key = model.api_key
+    return EmbeddingModelConfig(
+        id=str(model.model_id),
+        model_provider=str(model.model_provider),
+        model_name=str(model.model_name),
+        api_key=str(api_key) if api_key is not None else None,
+        base_url=str(model.base_url) if model.base_url else None,
+        dimension=int(model.dimension) if model.dimension is not None else None,
+        instruct=getattr(model, "instruct", None),
+        max_retries=int(model.max_retries) if model.max_retries is not None else 10,
+    )
 
 
 class DynamicMemoryStoreManager:
@@ -68,79 +93,38 @@ class DynamicMemoryStoreManager:
             self._last_embedding_model_fingerprint = None
             logger.info("Initialized with in-memory store")
 
-    def _get_embedding_model_from_db(self) -> Optional[DBModel]:
-        """Get the current embedding model from database."""
+    def _get_embedding_model_from_db(
+        self, *, fail_fast: bool = False
+    ) -> Optional[DBModel]:
+        """Resolve one deterministic shared/admin default for the shared table."""
         try:
             db = next(get_db())
             try:
-                # Get current user ID from context
-                user_id = current_user_id.get()
+                from .services.model_service import _get_visible_user_ids
 
-                from .services.model_service import _is_model_visible_to_user
-
-                if user_id:
-                    # First, try to get user's default embedding model
-                    user_default = (
-                        db.query(UserDefaultModel)
-                        .filter(
-                            UserDefaultModel.user_id == user_id,
-                            UserDefaultModel.config_type == "embedding",
-                        )
-                        .first()
+                default = (
+                    db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .join(
+                        UserModel,
+                        (UserModel.model_id == DBModel.id)
+                        & (UserModel.user_id == UserDefaultModel.user_id),
                     )
-
-                    if user_default:
-                        # Get the actual model
-                        embedding_model = (
-                            db.query(DBModel)
-                            .filter(
-                                DBModel.id == user_default.model_id,
-                                DBModel.category == "embedding",
-                                DBModel.is_active,
-                            )
-                            .first()
-                        )
-                        if embedding_model:
-                            if not _is_model_visible_to_user(
-                                db, embedding_model.id, user_id
-                            ):
-                                logger.warning(
-                                    f"User default embedding model {user_default.model_id} is no longer visible"
-                                )
-                                # fall through to system fallback
-                            else:
-                                logger.info(
-                                    f"Found user's default embedding model: {embedding_model.model_id}"
-                                )
-                                return embedding_model
-                        else:
-                            logger.warning(
-                                f"User default embedding model {user_default.model_id} not found or inactive"
-                            )
-
-                # Fallback: look for first active embedding model visible to user
-                all_active_embeddings = (
-                    db.query(DBModel)
                     .filter(
+                        UserDefaultModel.config_type == "embedding",
+                        UserDefaultModel.user_id.in_(_get_visible_user_ids(db, None)),
+                        UserModel.is_shared.is_(True),
                         DBModel.category == "embedding",
                         DBModel.is_active,
                     )
-                    .all()
+                    .order_by(UserDefaultModel.user_id, UserDefaultModel.id)
+                    .first()
                 )
-
-                for embedding_model in all_active_embeddings:
-                    if _is_model_visible_to_user(db, embedding_model.id, user_id):
-                        logger.info(
-                            f"Using visible active embedding model: {embedding_model.model_id}"
-                        )
-                        return embedding_model
-
-                logger.info("No visible active embedding model found")
-                return None
+                return default.model if default is not None else None
             finally:
                 db.close()
         except Exception as e:
-            if is_database_pool_timeout(e):
+            if fail_fast or is_database_pool_timeout(e):
                 raise
             logger.error(f"Error checking for embedding model: {e}")
             return None
@@ -163,20 +147,64 @@ class DynamicMemoryStoreManager:
             os.makedirs(new_dir, exist_ok=True)
             db_dir = str(new_dir)
 
-        if embedding_model.model_provider != "dashscope":
-            raise ValueError(
-                f"Unsupported embedding model type: {embedding_model.model_provider}"
-            )
         lancedb_store = LanceDBMemoryStore(
             db_dir=db_dir,
-            embedding_model=DashScopeEmbedding(
-                api_key=str(embedding_model.api_key),
-                dimension=int(embedding_model.dimension or 1024),
-            ),
+            embedding_model=_embedding_model_config(embedding_model),
             similarity_threshold=self._similarity_threshold or 1.5,
+            initialize_schema=False,
+            include_null_vector_fallback=True,
         )
-        logger.info("Created LanceDB store with DashScope embedding model")
+        logger.info("Created LanceDB store with shared embedding model")
         return UserIsolatedMemoryStore(lancedb_store)
+
+    def run_startup_compatibility_lifecycle(self) -> None:
+        """Admit and maintain shared memory before runtime writers start."""
+        with self._lock:
+            model = self._get_embedding_model_from_db(fail_fast=True)
+            if model is None:
+                return
+            embedding_config = _embedding_model_config(model)
+            canonical_embedding_identity(embedding_config)
+            new_store = self._create_lancedb_store(model)
+            base_store = new_store._base_store
+            connection = base_store._vector_store.get_raw_connection()
+            table_name = base_store._collection_name
+
+            table = None
+            try:
+                try:
+                    table = connection.open_table(table_name)
+                except ValueError as error:
+                    if "was not found" not in str(error):
+                        raise
+                if table is not None:
+                    outcome = maintain_lancedb_memory_table(connection, table_name)
+                    if outcome.status is MaintenanceStatus.INVALID_LEGACY_DATA:
+                        base_store._embedding_model = None
+                    elif outcome.status is not MaintenanceStatus.COMPLETE:
+                        raise RuntimeError(
+                            f"memory maintenance failed: {outcome.status.value}: {outcome.detail}"
+                        )
+            finally:
+                _safe_close_table(table)
+
+            if base_store._embedding_model is not None:
+                compatibility = create_or_recreate_vector_capable_table(
+                    connection, table_name, embedding_config
+                )
+                if compatibility is VectorCompatibility.MISMATCHING:
+                    base_store._embedding_model = None
+                elif table is None:
+                    outcome = maintain_lancedb_memory_table(connection, table_name)
+                    if outcome.status is not MaintenanceStatus.COMPLETE:
+                        raise RuntimeError(
+                            f"memory maintenance failed: {outcome.status.value}: {outcome.detail}"
+                        )
+
+            self._memory_store = new_store
+            self._is_lancedb = True
+            self._last_embedding_model_id = model.id
+            self._last_embedding_model_fingerprint = _embedding_model_fingerprint(model)
 
     def _check_and_update_store(self) -> None:
         """Check if embedding model configuration has changed and update store accordingly."""
@@ -233,7 +261,6 @@ class DynamicMemoryStoreManager:
         Returns:
             Current memory store instance
         """
-        self._check_and_update_store()
         return self._memory_store  # type: ignore[return-value]
 
     def force_reinitialize(self) -> None:

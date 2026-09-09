@@ -1293,6 +1293,13 @@ async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     await asyncio.to_thread(shutdown_runtime_performance_telemetry)
 
 
+def run_memory_compatibility_lifecycle() -> None:
+    """Run the shared-memory admin lifecycle at the startup boundary."""
+    from .dynamic_memory_store import get_memory_store_manager
+
+    get_memory_store_manager().run_startup_compatibility_lifecycle()
+
+
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
@@ -1303,6 +1310,9 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     # has passed. An exception deliberately aborts startup unchanged.
     with _startup_phase("host admission"):
         await run_host_startup_admissions(app_instance)
+
+    with _startup_phase("memory compatibility lifecycle"):
+        await asyncio.to_thread(run_memory_compatibility_lifecycle)
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403

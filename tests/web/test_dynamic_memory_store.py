@@ -34,33 +34,31 @@ def _model(model_id: int, updated_at: str, api_key: str) -> Any:
     )
 
 
-def test_key_rotation_on_same_model_rebuilds_store(monkeypatch) -> None:
+def test_request_acquisition_does_not_rotate_shared_store(monkeypatch) -> None:
     holder = {"model": _model(2, "2026-07-17 10:00:00", "old-key")}
     manager = _manager_with_fake_db(monkeypatch, holder)
+    shared = FakeLanceStore(holder["model"])
+    manager._memory_store = shared
+    manager._is_lancedb = True
+    manager._last_embedding_model_fingerprint = (2, "2026-07-17 10:00:00")
 
     first = manager.get_memory_store()
-    assert isinstance(first, FakeLanceStore)
-    assert first.model.api_key == "old-key"
-
-    # Same model id, but the row was edited (key rotation bumps updated_at).
     holder["model"] = _model(2, "2026-07-17 11:00:00", "new-key")
-    assert manager.check_embedding_model_change() is True
     second = manager.get_memory_store()
-    assert isinstance(second, FakeLanceStore)
-    assert second.model.api_key == "new-key"
-    assert second is not first
+    assert first is second is shared
+    assert shared.model.api_key == "old-key"
 
 
 def test_unchanged_model_keeps_store_instance(monkeypatch) -> None:
     holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
     manager = _manager_with_fake_db(monkeypatch, holder)
 
+    manager.check_embedding_model_change()
     first = manager.get_memory_store()
-    assert manager.check_embedding_model_change() is False
     assert manager.get_memory_store() is first
 
 
-def test_embedding_configuration_read_happens_under_lock(monkeypatch) -> None:
+def test_explicit_configuration_check_reads_under_lock(monkeypatch) -> None:
     holder = {"model": _model(2, "2026-07-17 10:00:00", "key")}
     manager = _manager_with_fake_db(monkeypatch, holder)
 
@@ -70,4 +68,4 @@ def test_embedding_configuration_read_happens_under_lock(monkeypatch) -> None:
 
     monkeypatch.setattr(manager, "_get_embedding_model_from_db", get_model_under_lock)
 
-    assert isinstance(manager.get_memory_store(), FakeLanceStore)
+    assert manager.check_embedding_model_change() is True

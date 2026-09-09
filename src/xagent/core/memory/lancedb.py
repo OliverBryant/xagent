@@ -47,6 +47,8 @@ class LanceDBMemoryStore(MemoryStore):
         collection_name: str = "memories",
         embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]] = None,
         similarity_threshold: float = 1.0,
+        initialize_schema: bool = True,
+        include_null_vector_fallback: bool = False,
         **embedding_kwargs: Any,
     ):
         """
@@ -57,6 +59,8 @@ class LanceDBMemoryStore(MemoryStore):
             collection_name: Collection name for storing memories
             embedding_model: Optional BaseEmbedding instance or EmbeddingModel config
             similarity_threshold: Cosine distance threshold for vector search (lower = more strict)
+            initialize_schema: Whether construction may create or migrate the table
+            include_null_vector_fallback: Whether ANN searches include text-only rows
             **embedding_kwargs: Additional arguments for embedding model
         """
         self._collection_name = collection_name
@@ -87,9 +91,13 @@ class LanceDBMemoryStore(MemoryStore):
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
+        self._include_null_vector_fallback = include_null_vector_fallback
+        self._vector_store = LanceDBVectorStore(
+            db_dir, collection_name, ensure_table=initialize_schema
+        )
         self._conn_manager = LanceDBConnectionManager()
-        self._ensure_table_schema()
+        if initialize_schema:
+            self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage.
@@ -707,7 +715,7 @@ class LanceDBMemoryStore(MemoryStore):
             k=k,
             filters=filters,
             similarity_threshold=similarity_threshold,
-            include_null_vector_fallback=False,
+            include_null_vector_fallback=self._include_null_vector_fallback,
         )
 
     def search_with_null_vector_fallback(

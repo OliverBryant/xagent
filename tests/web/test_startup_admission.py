@@ -24,6 +24,11 @@ def _patch_runtime_starts(
     events: list[str],
 ) -> None:
     monkeypatch.setattr(
+        app_module,
+        "run_memory_compatibility_lifecycle",
+        lambda: events.append("memory lifecycle"),
+    )
+    monkeypatch.setattr(
         app_module, "register_local_browser_runtime", lambda: events.append("runtime")
     )
 
@@ -61,6 +66,7 @@ async def test_no_host_admission_preserves_runtime_startup_order(
 
     assert events == [
         "database",
+        "memory lifecycle",
         "runtime",
         "task admission",
         "file sync",
@@ -95,8 +101,8 @@ async def test_host_admissions_run_after_database_and_before_runtime(
         "database",
         "first admission",
         "second admission",
+        "memory lifecycle",
         "runtime",
-        "task admission",
     ]
 
 
@@ -129,6 +135,27 @@ async def test_host_admission_stops_at_first_error_and_propagates_it(
 
     assert raised.value is rejection
     assert events == ["database", "first admission", "rejected admission"]
+
+
+@pytest.mark.asyncio
+async def test_memory_lifecycle_failure_prevents_runtime_ingress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    failure = OSError("memory I/O failed")
+    monkeypatch.setattr(app_module, "init_db", lambda: events.append("database"))
+    _patch_runtime_starts(monkeypatch, events)
+    monkeypatch.setattr(
+        app_module,
+        "run_memory_compatibility_lifecycle",
+        lambda: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(OSError) as raised:
+        await app_module._initialize_database_and_admit_runtime(FastAPI())
+
+    assert raised.value is failure
+    assert events == ["database"]
 
 
 @pytest.mark.asyncio

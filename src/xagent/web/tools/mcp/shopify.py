@@ -313,7 +313,7 @@ def _throttle_wait_seconds(status_code: int, payload: Any) -> float | None:
         extensions = payload.get("extensions")
         cost = extensions.get("cost") if isinstance(extensions, dict) else None
         throttle_status = cost.get("throttleStatus") if isinstance(cost, dict) else None
-        if not isinstance(throttle_status, dict):
+        if not isinstance(cost, dict) or not isinstance(throttle_status, dict):
             return 1.0
         requested = cost.get("requestedQueryCost")
         available = throttle_status.get("currentlyAvailable")

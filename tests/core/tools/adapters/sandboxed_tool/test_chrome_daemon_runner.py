@@ -97,7 +97,7 @@ def test_start_uses_exact_pin_private_environment_and_health_check(tmp_path):
     assert run.call_args.kwargs["env"]["CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS"] == "1"
 
 
-def test_start_restarts_a_healthy_daemon_with_the_wrong_launch_spec(tmp_path):
+def test_start_fails_closed_for_healthy_daemon_with_wrong_launch_spec(tmp_path):
     runtime = tmp_path / "runtime"
     profile = tmp_path / "profile"
     daemon_home = runtime / f"chrome-devtools-mcp-{'a' * 32}"
@@ -106,15 +106,6 @@ def test_start_restarts_a_healthy_daemon_with_the_wrong_launch_spec(tmp_path):
     socket_path, pid_file = chrome_daemon_runner._runtime_paths("a" * 32, runtime)
     pid_file.write_text("42")
     wrong = {"version": "1.6.0", "args": ["--headless"]}
-    right = {
-        "version": "1.6.0",
-        "args": [
-            "--headless",
-            "--isolated",
-            "--viaCli",
-            "--experimentalStructuredContent",
-        ],
-    }
 
     with (
         patch.object(
@@ -122,22 +113,22 @@ def test_start_restarts_a_healthy_daemon_with_the_wrong_launch_spec(tmp_path):
             "_session_environment",
             return_value=({}, runtime, profile),
         ),
-        patch.object(chrome_daemon_runner, "_status", side_effect=[wrong, right]),
-        patch.object(
-            chrome_daemon_runner, "_pid_is_expected_daemon", return_value=True
-        ),
+        patch.object(chrome_daemon_runner, "_status", return_value=wrong),
         patch.object(chrome_daemon_runner, "_terminate_expected_daemon") as terminate,
         patch.object(
             chrome_daemon_runner.subprocess,
             "run",
             return_value=MagicMock(returncode=0),
-        ),
+        ) as run,
     ):
-        assert (
-            chrome_daemon_runner._start("a" * 32, ["--headless", "--isolated"]) == right
-        )
+        with pytest.raises(
+            chrome_daemon_runner.ChromeDaemonRunnerError,
+            match="does not match",
+        ):
+            chrome_daemon_runner._start("a" * 32, ["--headless", "--isolated"])
 
-    terminate.assert_called_once_with(pid_file)
+    terminate.assert_not_called()
+    run.assert_not_called()
 
 
 def test_private_dir_rejects_symlink(tmp_path):

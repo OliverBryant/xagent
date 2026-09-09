@@ -44,6 +44,26 @@ def test_successful_settlement_rejects_a_failed_tool_result() -> None:
         ToolInteractionSettlement.succeeded({"success": False, "error": "failed"})
 
 
+@pytest.mark.parametrize(
+    "result, message",
+    [
+        (None, "needs a result"),
+        ({"status": "waiting_for_user"}, "cannot wait for user input"),
+    ],
+)
+def test_successful_settlement_rejects_non_terminal_results(
+    result, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ToolInteractionSettlement.succeeded(result)
+
+
+def test_successful_settlement_uses_the_canonical_failure_classifier() -> None:
+    result = {"status": " error "}
+
+    assert ToolInteractionSettlement.succeeded(result).result is result
+
+
 @pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
 def test_non_successful_settlement_has_an_unambiguous_failure_shape(
     status: str,
@@ -52,7 +72,7 @@ def test_non_successful_settlement_has_an_unambiguous_failure_shape(
 
     assert settlement.projected_result() == {
         "success": False,
-        "status": status,
+        "settlement_status": status,
         "error": {
             "rejected": "The user rejected the tool call.",
             "failed": "The resumed tool call failed.",
@@ -63,6 +83,15 @@ def test_non_successful_settlement_has_an_unambiguous_failure_shape(
         }[status],
         "detail": "safe",
     }
+
+
+def test_failed_settlement_preserves_a_tool_specific_status() -> None:
+    settlement = ToolInteractionSettlement.failed(
+        result={"status": "cancelled_by_policy"}
+    )
+
+    assert settlement.projected_result()["status"] == "cancelled_by_policy"
+    assert settlement.projected_result()["settlement_status"] == "failed"
 
 
 def test_settlement_rejects_an_unknown_status() -> None:

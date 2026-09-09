@@ -6985,15 +6985,13 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
             )
             return self.resume_result
 
-    first_tool = WaitingTool()
     first_context = ExecutionContext(execution_id="durable-interaction-task")
     first_context.add_user_message("Publish the approved post.")
     first_pattern = ReActPattern(max_iterations=3)
     first_runtime = PatternRuntime(execution_id="durable-interaction-task")
-
     waiting = await first_pattern.run(
         context=first_context,
-        tools=[first_tool],
+        tools=[WaitingTool()],
         llm=FakeLLM(
             [
                 {
@@ -7011,14 +7009,12 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
         ),
         runtime=first_runtime,
     )
-
     assert waiting["status"] == "waiting_for_user"
     checkpoint = next(
         checkpoint
         for checkpoint in reversed(first_runtime.checkpoints)
         if checkpoint["label"] == "waiting_for_user"
     )
-
     # Rebuild every runtime-owned object from the durable checkpoint.
     restored_context = ExecutionContext.from_dict(checkpoint["context"])
     restored_context.add_user_message("Approve")
@@ -7053,14 +7049,12 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
         execution_id="durable-interaction-task",
         tracer=tracer,
     )
-
     resumed = await restored_pattern.run(
         context=restored_context,
         tools=[resumed_tool],
         llm=resumed_llm,
         runtime=resumed_runtime,
     )
-
     assert resumed["success"] is True
     assert resumed_tool.run_calls == []
     assert resumed_tool.resume_calls == [
@@ -7082,10 +7076,9 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     assert projected_messages[0].metadata["raw_result"] == record.result
     assert "urn:li:share:123" in str(resumed_llm.calls[0]["messages"])
     assert restored_pattern.pending_tool_interaction_responses == []
-    assert any(
-        event["event_type"] == "action_end_tool"
+    assert not any(
+        event["event_type"] in {"action_end_tool", "action_error_tool"}
         and event["data"].get("tool_call_id") == "original-publish-call"
-        and event["data"].get("result") == record.result
         for event in tracer.events
     )
 
@@ -7238,8 +7231,22 @@ async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
     ]
     pattern = ReActPattern()
     pattern.pending_tool_interaction_responses = list(pending)
+    for index in (1, 2):
+        pattern.tool_ledger[f"call-{index}"] = ToolCallRecord(
+            tool_call_id=f"call-{index}",
+            tool_name="approval_gate",
+            args={},
+            args_hash="stored-hash",
+            status="waiting_for_user",
+        )
     tool = ResumableTool()
     context = ExecutionContext(execution_id="interaction-delivery")
+    for index in (1, 2):
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            f"call-{index}",
+        )
     runtime = PatternRuntime(execution_id="interaction-delivery")
 
     with pytest.raises(RuntimeError, match="delivery failed"):
@@ -7276,7 +7283,6 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
     settlement = ToolInteractionSettlement.succeeded(
         {"success": True, "post_urn": "urn:li:share:123"}
     )
-
     class ResumableTool:
         metadata = SimpleNamespace(
             name="approval_gate",
@@ -7317,15 +7323,15 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
         "call-1",
     )
     tool = ResumableTool()
-
     with pytest.raises(RuntimeError, match="checkpoint unavailable"):
         await pattern._deliver_pending_tool_interaction_responses(
             tools=[tool],
             context=context,
             runtime=PatternRuntime(tracer=FailingCheckpointTracer()),
         )
-
     assert pattern.pending_tool_interaction_responses == [pending]
+    assert pattern.tool_ledger["call-1"].status == "waiting_for_user"
+    assert context.messages[0].metadata["raw_result"]["status"] == "waiting_for_user"
     assert (
         len(
             [
@@ -7342,7 +7348,6 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
         context=context,
         runtime=PatternRuntime(),
     )
-
     assert tool.calls == 2
     assert pattern.pending_tool_interaction_responses == []
     assert pattern.tool_ledger["call-1"].result == settlement.result
@@ -7385,26 +7390,166 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
         "call-1",
     )
     tracer = TraceEventRecorder()
-
     await pattern._deliver_pending_tool_interaction_responses(
         tools=[ResumableTool()],
         context=context,
         runtime=PatternRuntime(tracer=tracer),
     )
-
     record = pattern.tool_ledger["call-1"]
     assert record.status == "failed"
     assert record.settlement_status == status
     assert record.result["success"] is False
-    assert record.result["status"] == status
+    assert record.result["settlement_status"] == status
     assert pattern.force_final_answer_next is (
         status in {"rejected", "dispatch_unknown"}
     )
-    assert any(
-        event["event_type"] == "action_error_tool"
+    assert not any(
+        event["event_type"] in {"action_end_tool", "action_error_tool"}
         and event["data"].get("tool_call_id") == "call-1"
         for event in tracer.events
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "message", "expected_calls"),
+    [
+        ("missing_ledger", "without its original ledger", 0),
+        ("wrong_tool", "does not match its original ledger", 0),
+        ("not_waiting", "not waiting for user input", 0),
+        ("missing_result", "found 0", 0),
+        ("duplicate_result", "found 2", 0),
+        ("wrong_return", "must return ToolInteractionSettlement or None", 1),
+    ],
+)
+async def test_resume_target_is_validated_before_callback_or_projection(
+    case: str, message: str, expected_calls: int
+) -> None:
+    class ResumableTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Resume a persisted interaction.",
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resume_user_interaction(self, **_: str) -> Any:
+            self.calls += 1
+            return {"unexpected": True}
+
+    pattern = ReActPattern()
+    pending = {
+        "tool_name": "approval_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Approve",
+    }
+    pattern.pending_tool_interaction_responses = [pending]
+    if case != "missing_ledger":
+        pattern.tool_ledger["call-1"] = ToolCallRecord(
+            tool_call_id="call-1",
+            tool_name="different_tool" if case == "wrong_tool" else "approval_gate",
+            args={},
+            args_hash="stored-hash",
+            status="completed" if case == "not_waiting" else "waiting_for_user",
+        )
+    context = ExecutionContext(execution_id="invalid-resume-target")
+    if case not in {"missing_result"}:
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            "call-1",
+        )
+    if case == "duplicate_result":
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            "call-1",
+        )
+    tool = ResumableTool()
+    with pytest.raises((RuntimeError, TypeError), match=message):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=PatternRuntime(),
+        )
+    assert tool.calls == expected_calls
+    assert pattern.pending_tool_interaction_responses == [pending]
+
+
+@pytest.mark.asyncio
+async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
+    class ResumableTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Resume persisted interactions.",
+        )
+
+        async def resume_user_interaction(self, *, interaction_id: str, **_: str) -> Any:
+            if interaction_id == "interaction-1":
+                return ToolInteractionSettlement.rejected()
+            return ToolInteractionSettlement.succeeded({"success": True})
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="settlement-batch")
+    for index in (1, 2):
+        pattern.pending_tool_interaction_responses.append(
+            {
+                "tool_name": "approval_gate",
+                "tool_call_id": f"call-{index}",
+                "interaction_id": f"interaction-{index}",
+                "response": "Approve",
+            }
+        )
+        pattern.tool_ledger[f"call-{index}"] = ToolCallRecord(
+            tool_call_id=f"call-{index}",
+            tool_name="approval_gate",
+            args={},
+            args_hash="stored-hash",
+            status="waiting_for_user",
+        )
+        context.add_tool_result(
+            "approval_gate",
+            {"success": False, "status": "waiting_for_user"},
+            f"call-{index}",
+        )
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[ResumableTool()],
+        context=context,
+        runtime=PatternRuntime(),
+    )
+    assert pattern.force_final_answer_next is False
+
+
+def test_resumed_success_guards_only_its_settlement_turn() -> None:
+    pattern = ReActPattern()
+    args = {"text": "approved"}
+    pattern.tool_ledger["original-call"] = ToolCallRecord(
+        tool_call_id="original-call",
+        tool_name="publish",
+        args=args,
+        args_hash=pattern._args_hash(args),
+        status="completed",
+        result={"success": True},
+        settlement_status="succeeded",
+        turn_id="original-turn",
+        settlement_turn_id="approval-turn",
+    )
+    tool = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish"),
+    )
+    same_turn = pattern._suppressed_duplicate_write_result(
+        {"id": "new-call", "name": "publish", "args": args, "turn_id": "approval-turn"},
+        [tool],
+    )
+    later_turn = pattern._suppressed_duplicate_write_result(
+        {"id": "later-call", "name": "publish", "args": args, "turn_id": "later-turn"},
+        [tool],
+    )
+    assert same_turn["duplicate_write_suppressed"] is True
+    assert later_turn is None
 
 
 @pytest.mark.asyncio

@@ -168,6 +168,10 @@ class ToolCallRecord:
     # the embedding provides no turn tracking, and for records restored from
     # checkpoints written before the field existed.
     turn_id: str | None = None
+    # The turn that delivered a terminal settlement. This is separate from
+    # ``turn_id`` so the original call keeps its execution identity while the
+    # duplicate-write guard can protect the one resumed turn that follows it.
+    settlement_turn_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +184,7 @@ class ToolCallRecord:
             "error": self.error,
             "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
+            "settlement_turn_id": self.settlement_turn_id,
         }
 
     @classmethod
@@ -194,10 +199,15 @@ class ToolCallRecord:
             error=data.get("error"),
             settlement_status=(
                 str(data["settlement_status"])
-                if data.get("settlement_status")
+                if data.get("settlement_status") is not None
                 else None
             ),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            settlement_turn_id=(
+                str(data["settlement_turn_id"])
+                if data.get("settlement_turn_id") is not None
+                else None
+            ),
         )
 
 
@@ -1906,27 +1916,44 @@ class ReActPattern(AgentPattern):
                 )
                 continue
 
+            record = self._validate_tool_interaction_settlement_target(
+                pending=pending,
+                context=context,
+            )
             resumed = resume(
                 interaction_id=pending.get("interaction_id", ""),
                 response=pending.get("response", ""),
             )
             if inspect.isawaitable(resumed):
                 resumed = await resumed
-
-            if isinstance(resumed, ToolInteractionSettlement):
-                await self._project_tool_interaction_settlement(
-                    pending=pending,
-                    settlement=resumed,
-                    context=context,
-                    runtime=runtime,
+            if resumed is not None and not isinstance(
+                resumed, ToolInteractionSettlement
+            ):
+                raise TypeError(
+                    "resume_user_interaction must return "
+                    "ToolInteractionSettlement or None"
                 )
 
-            # Remove the response for the checkpoint, but restore it in memory
-            # if persistence fails. The last durable checkpoint still contains
-            # the response either way, and the host callback is required to
-            # replay its already-persisted settlement on a retry.
-            self.pending_tool_interaction_responses.pop(0)
+            ledger_before = copy.deepcopy(self.tool_ledger)
+            messages = getattr(context, "messages", None)
+            messages_before = copy.deepcopy(messages) if isinstance(messages, list) else None
+            force_final_before = self.force_final_answer_next
+            popped = False
             try:
+                if isinstance(resumed, ToolInteractionSettlement):
+                    self._project_tool_interaction_settlement(
+                        record=record,
+                        settlement=resumed,
+                        context=context,
+                        runtime=runtime,
+                    )
+
+                # The checkpoint must contain the terminal projection and no
+                # pending callback. If persistence fails, restore the entire
+                # in-memory transaction so replay starts from the last durable
+                # waiting state.
+                self.pending_tool_interaction_responses.pop(0)
+                popped = True
                 await runtime.checkpoint(
                     "tool_interaction_response_delivered",
                     context=context,
@@ -1943,18 +1970,21 @@ class ReActPattern(AgentPattern):
                     },
                 )
             except BaseException:
-                self.pending_tool_interaction_responses.insert(0, pending)
+                self.tool_ledger = ledger_before
+                if messages_before is not None and isinstance(messages, list):
+                    messages[:] = messages_before
+                self.force_final_answer_next = force_final_before
+                if popped:
+                    self.pending_tool_interaction_responses.insert(0, pending)
                 raise
 
-    async def _project_tool_interaction_settlement(
+    def _validate_tool_interaction_settlement_target(
         self,
         *,
         pending: dict[str, str],
-        settlement: ToolInteractionSettlement,
         context: Any,
-        runtime: PatternRuntime,
-    ) -> None:
-        """Project a resumed outcome onto its original tool protocol slot."""
+    ) -> ToolCallRecord:
+        """Validate every durable identity before a resume callback can run."""
 
         tool_call_id = str(pending.get("tool_call_id") or "")
         record = self.tool_ledger.get(tool_call_id)
@@ -1969,13 +1999,37 @@ class ReActPattern(AgentPattern):
                 "Resumed tool interaction does not match its original ledger "
                 f"record: {pending_tool_name!r} != {record.tool_name!r}"
             )
-        if record.status != "waiting_for_user" and (
-            record.settlement_status != settlement.status
-        ):
+        if record.status != "waiting_for_user":
             raise RuntimeError(
-                "Cannot overwrite a tool call that was not waiting for this "
-                f"settlement: {tool_call_id!r} is {record.status!r}."
+                "Cannot resume a tool call that is not waiting for user input: "
+                f"{tool_call_id!r} is {record.status!r} with settlement "
+                f"{record.settlement_status!r}."
             )
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matches = [
+            message
+            for message in messages
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matches)}."
+            )
+        return record
+
+    def _project_tool_interaction_settlement(
+        self,
+        *,
+        record: ToolCallRecord,
+        settlement: ToolInteractionSettlement,
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Project a resumed outcome onto its original tool protocol slot."""
 
         result = settlement.projected_result()
         self._replace_tool_result(
@@ -1998,30 +2052,26 @@ class ReActPattern(AgentPattern):
                 status="completed",
                 result=result,
                 settlement_status=settlement.status,
+                settlement_turn_id=getattr(runtime, "active_turn_id", None),
             )
-            await runtime.on_tool_end(tool_call=tool_call, result=result)
-            return
-
-        error = str(
-            settlement.error
-            or (result.get("error") if isinstance(result, dict) else result)
-        )
-        self._record_tool_call(
-            tool_call,
-            status="failed",
-            result=result,
-            error=error,
-            settlement_status=settlement.status,
-        )
-        if settlement.status in {"rejected", "dispatch_unknown"}:
-            # Neither outcome authorizes another attempt in this turn. A new
-            # external write must originate from a later user request.
-            self.force_final_answer_next = True
-        await runtime.on_tool_error(
-            tool_call=tool_call,
-            error=RuntimeError(error),
-            result=result,
-        )
+        else:
+            error = str(
+                settlement.error
+                or (result.get("error") if isinstance(result, dict) else result)
+            )
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=result,
+                error=error,
+                settlement_status=settlement.status,
+                settlement_turn_id=getattr(runtime, "active_turn_id", None),
+            )
+        # Recompute for every entry in a multi-interaction delivery batch.
+        self.force_final_answer_next = settlement.status in {
+            "rejected",
+            "dispatch_unknown",
+        }
 
     @staticmethod
     def _replace_tool_result(
@@ -2048,12 +2098,14 @@ class ReActPattern(AgentPattern):
                 f"{tool_call_id!r}; found {len(matching_indexes)}."
             )
 
-        context.add_tool_result(
+        replacement = context.add_tool_result(
             tool_name=tool_name,
             result=result,
             tool_call_id=tool_call_id,
         )
-        replacement = messages.pop()
+        if not messages or messages[-1] is not replacement:
+            raise RuntimeError("Execution context did not append the replacement result.")
+        messages.pop()
         messages[matching_indexes[0]] = replacement
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
@@ -3837,18 +3889,17 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any] | None:
         """Return the suppression envelope when this call repeats a completed write.
 
-        The comparison key is (turn_id, tool_name, args_hash), each side
+        The comparison key is (guard turn id, tool name, args hash), each side
         computed from the same post-transform ``tool_call`` that
         ``_record_tool_call`` hashes and ``_execute_tool`` executes — so two
         calls compare equal exactly when their executions would be identical.
-        The turn_id equality is what makes the guard strictly per-turn: the
-        runner stamps a fresh turn_id on every user message (initial and
-        injected), and ``active_turn_id`` is re-resolved from the latest user
-        message at each pattern start — so an explicit repeat requested in a
-        later turn always executes, while an intra-turn resume of the
-        checkpointed ledger keeps suppressing the replay. A call with no
-        stamped turn_id is never guarded: without a turn to scope to,
-        suppression could outlive a turn, so an unknowable turn fails open.
+        An ordinary completion uses its original ``turn_id``. A resumed
+        success uses ``settlement_turn_id``, the approval turn that received
+        that result. This keeps duplicate suppression active for subsequent
+        planning in the resumed turn without rewriting the original call's
+        identity or suppressing a new request in a later turn. A call with no
+        guard turn id is never guarded: without a turn to scope to, suppression
+        could outlive a turn, so an unknowable turn fails open.
 
         Serial execution makes the check-then-record window safe for guarded
         tools: they are non-idempotent by declaration, so
@@ -3876,7 +3927,12 @@ class ReActPattern(AgentPattern):
         for record in self.tool_ledger.values():
             if record.status != "completed":
                 continue
-            if record.turn_id != turn_id:
+            guard_turn_id = (
+                record.settlement_turn_id
+                if record.settlement_status == "succeeded"
+                else record.turn_id
+            )
+            if guard_turn_id != turn_id:
                 continue
             if record.tool_name != tool_name or record.args_hash != args_hash:
                 continue
@@ -4160,6 +4216,7 @@ class ReActPattern(AgentPattern):
         result: Any = None,
         error: str | None = None,
         settlement_status: str | None = None,
+        settlement_turn_id: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
@@ -4174,6 +4231,9 @@ class ReActPattern(AgentPattern):
             error=error,
             settlement_status=settlement_status,
             turn_id=self._tool_call_turn_id(tool_call),
+            settlement_turn_id=(
+                str(settlement_turn_id) if settlement_turn_id else None
+            ),
         )
 
     @staticmethod

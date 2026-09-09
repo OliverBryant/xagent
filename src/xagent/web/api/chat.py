@@ -705,6 +705,9 @@ async def create_default_tools(
 
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
+    from ..services.actor_mcp_runtime import (
+        production_actor_mcp_stdio_connection_adapter,
+    )
     from .agents import voice_from_runtime_user
 
     db_factory = None
@@ -765,6 +768,11 @@ async def create_default_tools(
         voice=voice_from_runtime_user(user),
         connector_runtime_turn_id=connector_runtime_turn_id,
         mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=(
+            production_actor_mcp_stdio_connection_adapter()
+            if mcp_runtime_authorization_policy is not None
+            else None
+        ),
         mcp_actor_execution_identity=mcp_actor_execution_identity,
         mcp_failure_policy=mcp_failure_policy,
         mcp_load_summary_tracer=mcp_load_summary_tracer,

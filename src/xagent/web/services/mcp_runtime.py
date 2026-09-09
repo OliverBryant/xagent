@@ -25,21 +25,32 @@ class MCPBuiltinOAuthActorPolicyMismatchError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class MCPBuiltinOAuthActorPolicy:
-    """Trusted actor owner namespace for catalog OAuth MCP execution.
+class MCPActorAuthorizationPolicy:
+    """Trusted actor identity and connector capabilities for MCP execution.
 
     Server visibility and catalog classification remain xagent runtime
     decisions. The caller supplies only the immutable credential owner. The
-    owner governs both builtin-provider and remote MCP OAuth credentials.
+    owner governs builtin-provider OAuth, remote MCP OAuth, and explicitly
+    enabled actor-scoped stdio credentials. Stdio remains disabled by default
+    so existing OAuth-only callers retain their current behavior.
     """
 
     resource_owner_key: str = dataclass_field(repr=False)
+    allow_builtin_stdio: bool = False
 
     def __post_init__(self) -> None:
         owner_key = normalize_user_oauth_resource_owner_key(self.resource_owner_key)
         if owner_key is None:  # pragma: no cover - normalization preserves None only
             raise ValueError("resource_owner_key must not be null")
+        if type(self.allow_builtin_stdio) is not bool:
+            raise ValueError("allow_builtin_stdio must be a boolean")
         object.__setattr__(self, "resource_owner_key", owner_key)
+
+
+# Compatibility import for trusted callers deployed before actor-scoped stdio
+# support. Keep this as a direct alias so equality and isinstance semantics do
+# not diverge between old and new callers.
+MCPBuiltinOAuthActorPolicy = MCPActorAuthorizationPolicy
 
 
 @dataclass(frozen=True)

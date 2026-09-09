@@ -62,6 +62,10 @@ def _raw_row(note_id, text, user_id, *, vector=None, priority="keep"):
     }
 
 
+def _add_raw_rows(table, rows):
+    table.add(pa.Table.from_pylist(rows, schema=table.schema))
+
+
 def test_ann_then_null_vector_fallback_is_filtered_deduplicated_and_stable(store):
     assert store.add(
         MemoryNote(
@@ -71,7 +75,8 @@ def test_ann_then_null_vector_fallback_is_filtered_deduplicated_and_stable(store
         )
     ).success
     table = store._vector_store.get_raw_connection().open_table("memories")
-    table.add(
+    _add_raw_rows(
+        table,
         [
             _raw_row("z", "alpha alpha", 7),
             _raw_row("a", "alpha", 7),
@@ -79,7 +84,7 @@ def test_ann_then_null_vector_fallback_is_filtered_deduplicated_and_stable(store
             _raw_row("filtered", "alpha", 7, priority="drop"),
             _raw_row("ann", "alpha", 7),
             _raw_row("null-text", None, 7),
-        ]
+        ],
     )
     _safe_close_table(table)
 
@@ -101,7 +106,7 @@ def test_ann_then_null_vector_fallback_is_filtered_deduplicated_and_stable(store
 def test_standard_search_does_not_enable_null_vector_supplement(store):
     assert store.add(MemoryNote(id="ann", content="winner")).success
     table = store._vector_store.get_raw_connection().open_table("memories")
-    table.add([_raw_row("fallback", "alpha", None)])
+    _add_raw_rows(table, [_raw_row("fallback", "alpha", None)])
     _safe_close_table(table)
     assert [note.id for note in store.search("alpha", k=2)] == ["ann"]
 

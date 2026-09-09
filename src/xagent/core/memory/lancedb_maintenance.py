@@ -24,6 +24,8 @@ MAINTENANCE_TABLE_VERSION_KEY = b"xagent.memory.scope_maintenance_table_version"
 MAINTENANCE_VERSION = b"1"
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_LOCK_TIMEOUT = 10.0
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 
 
 class MaintenanceStatus(str, Enum):
@@ -76,6 +78,8 @@ def _is_complete(table: Any) -> bool:
     if not {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= names or _scope_schema_error(schema):
         return False
     metadata = schema.field(USER_ID_COLUMN).metadata or {}
+    # LanceDB versions increase monotonically on every commit. Binding completion
+    # to the exact marker commit makes any later write invalidate this fast path.
     return (
         metadata.get(MAINTENANCE_METADATA_KEY) == MAINTENANCE_VERSION
         and metadata.get(MAINTENANCE_TABLE_VERSION_KEY) == str(table.version).encode()
@@ -110,6 +114,20 @@ def _invalid_ids(rows: list[dict[str, Any]]) -> str | None:
         return "legacy IDs must be non-empty strings"
     if len(ids) != len(set(ids)):
         return "legacy IDs must be unique"
+    return None
+
+
+def _invalid_legacy_data(rows: list[dict[str, Any]]) -> str | None:
+    invalid_ids = _invalid_ids(rows)
+    if invalid_ids:
+        return invalid_ids
+    for row in rows:
+        metadata = row["metadata"]
+        if metadata is not None and not isinstance(metadata, str):
+            return f"metadata for legacy ID {row['id']!r} must be a string or SQL NULL"
+        user_id, _scope_dims = derive_scope_columns(metadata)
+        if user_id is not None and not _INT64_MIN <= user_id <= _INT64_MAX:
+            return f"user_id for legacy ID {row['id']!r} must fit signed int64"
     return None
 
 
@@ -183,10 +201,20 @@ def maintain_lancedb_memory_table(
     batch_size: int = DEFAULT_BATCH_SIZE,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
 ) -> MaintenanceOutcome:
-    """Backfill scope projections under an explicit, serialized admin boundary."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    if not math.isfinite(lock_timeout) or lock_timeout <= 0:
+    """Backfill scope projections under an explicit, serialized admin boundary.
+
+    Completion requires a short write-quiet window. Every later table commit
+    invalidates the version-bound O(1) fast path, so a subsequent explicit call
+    scans and validates the table again.
+    """
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if (
+        isinstance(lock_timeout, bool)
+        or not isinstance(lock_timeout, (int, float))
+        or not math.isfinite(lock_timeout)
+        or lock_timeout <= 0
+    ):
         raise ValueError("lock_timeout must be a finite positive duration")
 
     lock = FileLock(_lock_path(connection, table_name), timeout=lock_timeout)
@@ -211,7 +239,7 @@ def maintain_lancedb_memory_table(
             return MaintenanceOutcome(MaintenanceStatus.COMPLETE)
 
         rows = _read_rows(table)
-        invalid = _invalid_ids(rows)
+        invalid = _invalid_legacy_data(rows)
         if invalid:
             return MaintenanceOutcome(
                 MaintenanceStatus.INVALID_LEGACY_DATA,
@@ -244,22 +272,36 @@ def maintain_lancedb_memory_table(
 
         validated_version = int(table.version)
         final_rows = _read_rows(table)
-        final_invalid = _invalid_ids(final_rows)
+        final_invalid = _invalid_legacy_data(final_rows)
+        if final_invalid:
+            return MaintenanceOutcome(
+                MaintenanceStatus.INVALID_LEGACY_DATA,
+                scanned_rows=len(rows),
+                updated_rows=updated,
+                cas_skipped_rows=skipped,
+                batches_committed=commits,
+                detail=final_invalid,
+            )
         remaining = sum(_needs_update(row) for row in final_rows)
+        # Default LanceDB connections cache read snapshots, while callers may opt
+        # into strong reads with read_consistency_interval=timedelta(0).
         version_changed = int(table.version) != validated_version
-        if final_invalid or skipped or remaining or version_changed:
+        if skipped or remaining or version_changed:
             return MaintenanceOutcome(
                 MaintenanceStatus.INCOMPLETE,
                 scanned_rows=len(rows),
                 updated_rows=updated,
                 cas_skipped_rows=skipped,
                 batches_committed=commits,
-                detail=final_invalid or "concurrent changes require another pass",
+                detail="concurrent changes require another pass",
             )
 
         _checkpoint("before_completion")
         expected_marker_version = validated_version + 1
         actual_marker_version = _mark_complete(table, expected_marker_version)
+        # Writes always commit against the latest table version even when this
+        # handle's reads are cached. A concurrent commit therefore makes the
+        # marker land after V+1 and leaves it intentionally invalid/resumable.
         if (
             actual_marker_version != expected_marker_version
             or int(table.version) != expected_marker_version

@@ -1,7 +1,10 @@
 """Real-LanceDB coverage for resumable scope-column maintenance."""
 
 import json
+import multiprocessing
+import socket
 import time
+from datetime import timedelta
 
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
@@ -31,8 +34,16 @@ def _metadata(index):
     )
 
 
-def _connection(tmp_path, count=2, *, ids=None, metadata=None, scoped=False):
-    connection = lancedb.connect(tmp_path)
+def _connection(
+    tmp_path,
+    count=2,
+    *,
+    ids=None,
+    metadata=None,
+    scoped=False,
+    connection_kwargs=None,
+):
+    connection = lancedb.connect(tmp_path, **(connection_kwargs or {}))
     ids = ids if ids is not None else [f"note-{index}" for index in range(count)]
     metadata = (
         metadata if metadata is not None else [_metadata(i) for i in range(count)]
@@ -74,6 +85,12 @@ def _marker_table_version(table):
     return (table.schema.field(USER_ID_COLUMN).metadata or {}).get(
         MAINTENANCE_TABLE_VERSION_KEY
     )
+
+
+def _hold_file_lock(lock_path, ready, release):
+    with FileLock(lock_path):
+        ready.set()
+        release.wait(30)
 
 
 def test_complete_migration_and_second_run_is_schema_only(tmp_path, monkeypatch):
@@ -119,9 +136,7 @@ def test_sql_null_metadata_projects_to_empty_scope_without_network(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("maintenance must not embed or use the network")
 
-    monkeypatch.setattr(
-        "xagent.core.model.embedding.DashScopeEmbedding.encode", forbidden
-    )
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
     outcome = maintain_lancedb_memory_table(connection, "memories")
     row = _table(connection).to_arrow().to_pylist()[0]
     assert outcome.status is MaintenanceStatus.COMPLETE
@@ -141,6 +156,36 @@ def test_invalid_ids_leave_table_unchanged(tmp_path, ids):
     result = maintain_lancedb_memory_table(connection, "memories")
     table = _table(connection)
     assert result.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    assert (table.version, table.schema, table.to_arrow().to_pylist()) == before
+    _safe_close_table(table)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "detail"),
+    [
+        (pa.array([7], pa.int64()), "must be a string or SQL NULL"),
+        (pa.array([json.dumps({"user_id": 2**63})], pa.string()), "signed int64"),
+        (
+            pa.array([json.dumps({"user_id": -(2**63) - 1})], pa.string()),
+            "signed int64",
+        ),
+    ],
+)
+def test_invalid_metadata_or_user_id_range_leaves_table_unchanged(
+    tmp_path, metadata, detail
+):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["note-0"], "text": ["text-0"], "metadata": metadata}),
+    )
+    before = (table.version, table.schema, table.to_arrow().to_pylist())
+    _safe_close_table(table)
+
+    result = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert result.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    assert detail in result.detail
     assert (table.version, table.schema, table.to_arrow().to_pylist()) == before
     _safe_close_table(table)
 
@@ -255,6 +300,72 @@ def test_table_version_change_invalidates_fast_path(tmp_path, monkeypatch):
     assert scanned
 
 
+def test_strong_consistency_detects_version_change_during_final_read(
+    tmp_path, monkeypatch
+):
+    connection = _connection(
+        tmp_path,
+        count=1,
+        scoped=True,
+        connection_kwargs={"read_consistency_interval": timedelta(0)},
+    )
+    original = maintenance._read_rows
+    calls = 0
+
+    def update_after_final_read(table):
+        nonlocal calls
+        rows = original(table)
+        calls += 1
+        if calls == 2:
+            writer = _table(connection)
+            writer.update("id = 'note-0'", values={"text": "concurrent text"})
+            _safe_close_table(writer)
+        return rows
+
+    monkeypatch.setattr(maintenance, "_read_rows", update_after_final_read)
+    result = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert result.status is MaintenanceStatus.INCOMPLETE
+    assert table.to_arrow().to_pylist()[0]["text"] == "concurrent text"
+    assert _marker(table) is None
+    _safe_close_table(table)
+
+
+def test_final_invalid_id_returns_invalid_and_preserves_concurrent_row(
+    tmp_path, monkeypatch
+):
+    connection = _connection(
+        tmp_path,
+        count=1,
+        connection_kwargs={"read_consistency_interval": timedelta(0)},
+    )
+
+    def append_invalid_id(stage, _batch=None):
+        if stage == "batch_committed":
+            writer = _table(connection)
+            writer.add(
+                [
+                    {
+                        "id": None,
+                        "text": "concurrent text",
+                        "metadata": "{}",
+                        "vector": [3.0, 4.0],
+                        USER_ID_COLUMN: None,
+                        SCOPE_DIMS_COLUMN: [],
+                    }
+                ]
+            )
+            _safe_close_table(writer)
+
+    monkeypatch.setattr(maintenance, "_checkpoint", append_invalid_id)
+    result = maintain_lancedb_memory_table(connection, "memories")
+    table = _table(connection)
+    assert result.status is MaintenanceStatus.INVALID_LEGACY_DATA
+    assert any(row["id"] is None for row in table.to_arrow().to_pylist())
+    assert _marker(table) is None
+    _safe_close_table(table)
+
+
 def test_exact_scope_schema_preserves_existing_field_metadata(tmp_path):
     connection = _connection(tmp_path, count=1, scoped=True)
     table = _table(connection)
@@ -346,8 +457,57 @@ def test_lock_timeout_is_bounded_and_success_releases_lock(tmp_path):
         pass
 
 
+def test_lock_timeout_against_second_process(tmp_path):
+    connection = _connection(tmp_path)
+    lock_path = maintenance._lock_path(connection, "memories")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    process = context.Process(target=_hold_file_lock, args=(lock_path, ready, release))
+    process.start()
+    try:
+        assert ready.wait(20)
+        with pytest.raises(MaintenanceLockTimeout, match="stop the other"):
+            maintain_lancedb_memory_table(connection, "memories", lock_timeout=0.05)
+    finally:
+        release.set()
+        process.join(10)
+    assert process.exitcode == 0
+
+
+def test_non_local_uri_is_rejected():
+    class RemoteConnection:
+        uri = "s3://bucket/database"
+
+    with pytest.raises(ValueError, match="writable local database URI"):
+        maintain_lancedb_memory_table(RemoteConnection(), "memories")
+
+
 @pytest.mark.parametrize("timeout", [0, float("inf")])
 def test_nonpositive_lock_timeout_is_rejected(tmp_path, timeout):
     connection = _connection(tmp_path)
     with pytest.raises(ValueError, match="finite positive"):
         maintain_lancedb_memory_table(connection, "memories", lock_timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"batch_size": True},
+        {"batch_size": 1.5},
+        {"batch_size": "1"},
+        {"lock_timeout": True},
+        {"lock_timeout": "1"},
+        {"lock_timeout": float("nan")},
+    ],
+)
+def test_invalid_parameter_types_do_not_access_connection(kwargs):
+    class ForbiddenConnection:
+        @property
+        def uri(self):
+            raise AssertionError(
+                "invalid parameters must fail before connection access"
+            )
+
+    with pytest.raises(ValueError):
+        maintain_lancedb_memory_table(ForbiddenConnection(), "memories", **kwargs)

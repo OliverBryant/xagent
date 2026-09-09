@@ -2622,7 +2622,7 @@ class TestGetSandboxIdleTtl:
             assert get_sandbox_idle_ttl() is None
 
 
-class TestGetChromeSessionTtl:
+class TestGetChromeReaperThreshold:
     def test_default_and_valid_override(self, monkeypatch):
         monkeypatch.delenv(CHROME_SESSION_TTL_SECONDS, raising=False)
         assert get_chrome_session_ttl_seconds() == 1800.0
@@ -2630,7 +2630,7 @@ class TestGetChromeSessionTtl:
         assert get_chrome_session_ttl_seconds() == 45.5
 
     @pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "nan", "inf"])
-    def test_invalid_values_keep_hard_default(self, monkeypatch, value):
+    def test_invalid_values_keep_component_default(self, monkeypatch, value):
         monkeypatch.setenv(CHROME_SESSION_TTL_SECONDS, value)
         assert get_chrome_session_ttl_seconds() == 1800.0
 

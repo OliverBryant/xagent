@@ -2783,3 +2783,16 @@ def test_inline_file_delivery_budget(monkeypatch, caplog):
         caplog.clear()
         assert config.get_inline_file_delivery_max_bytes() == 0
         assert "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES" in caplog.text
+
+
+def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(config.TOBY_PERSONAL_STDIO_ENABLED, raising=False)
+
+    assert config.get_toby_personal_stdio_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
+    monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
+
+    assert config.get_toby_personal_stdio_enabled() is True

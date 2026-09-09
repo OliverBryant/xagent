@@ -8,6 +8,7 @@ import sqlalchemy as sa
 from alembic import command
 
 from xagent.db.config import create_alembic_config
+from xagent.web.models.generation import RandomUUID
 
 REVISION = "20260909_actor_mcp_connections"
 DOWN_REVISION = "20260901_seed_zendesk_mcp_app"
@@ -34,6 +35,94 @@ def _legacy_schema(connection: sa.Connection) -> None:
         sa.text("INSERT INTO alembic_version VALUES (:revision)"),
         {"revision": DOWN_REVISION},
     )
+
+
+def _create_actor_table(
+    connection: sa.Connection,
+    *,
+    encrypted_env_type: sa.types.TypeEngine | None = None,
+    lifecycle_default: sa.sql.ClauseElement | None = None,
+    check_expression: str = "CAST(lifecycle_generation AS VARCHAR) <> ''",
+    extra_user_unique: bool = False,
+) -> None:
+    metadata = sa.MetaData()
+    sa.Table("users", metadata, autoload_with=connection)
+    sa.Table("public_mcp_apps", metadata, autoload_with=connection)
+    constraints: list[sa.Constraint] = [
+        sa.CheckConstraint(
+            check_expression,
+            name="ck_actor_mcp_server_connections_generation_nonempty",
+        ),
+        sa.UniqueConstraint(
+            "lifecycle_generation",
+            name="uq_actor_mcp_server_connections_lifecycle_generation",
+        ),
+        sa.UniqueConstraint(
+            "user_id",
+            "resource_owner_key",
+            "app_id",
+            name="uq_actor_mcp_server_connections_actor_app",
+        ),
+        sa.UniqueConstraint(
+            "user_id",
+            "resource_owner_key",
+            "catalog_app_generation",
+            name="uq_actor_mcp_server_connections_actor_catalog_generation",
+        ),
+    ]
+    if extra_user_unique:
+        constraints.append(
+            sa.UniqueConstraint(
+                "user_id", name="uq_actor_mcp_server_connections_user_id_drift"
+            )
+        )
+    table = sa.Table(
+        TABLE,
+        metadata,
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column(
+            "lifecycle_generation",
+            sa.Uuid(),
+            server_default=(
+                lifecycle_default if lifecycle_default is not None else RandomUUID()
+            ),
+            nullable=False,
+        ),
+        sa.Column(
+            "user_id",
+            sa.Integer(),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("resource_owner_key", sa.String(512), nullable=False),
+        sa.Column("app_id", sa.String(100), nullable=False),
+        sa.Column(
+            "catalog_app_generation",
+            sa.Uuid(),
+            sa.ForeignKey("public_mcp_apps.generation", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "encrypted_env",
+            encrypted_env_type if encrypted_env_type is not None else sa.JSON(),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        *constraints,
+    )
+    table.create(connection)
+    sa.Index("ix_actor_mcp_server_connections_id", table.c.id).create(connection)
 
 
 def test_sqlite_upgrade_constraints_and_downgrade() -> None:
@@ -138,6 +227,40 @@ def test_sqlite_upgrade_rejects_partial_preexisting_table() -> None:
                 "user_id INTEGER NOT NULL)"
             )
         )
+        config.attributes["connection"] = connection
+
+        with pytest.raises(RuntimeError, match="incompatible schema"):
+            command.upgrade(config, REVISION)
+
+        assert (
+            connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            == DOWN_REVISION
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["encrypted-type", "fixed-uuid-default", "same-name-check", "extra-unique"],
+)
+def test_sqlite_upgrade_rejects_semantic_schema_drift(drift: str) -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    config = create_alembic_config(engine)
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    with engine.connect() as connection:
+        connection.execute(sa.text("PRAGMA foreign_keys=ON"))
+        _legacy_schema(connection)
+        kwargs: dict[str, object] = {}
+        if drift == "encrypted-type":
+            kwargs["encrypted_env_type"] = sa.Text()
+        elif drift == "fixed-uuid-default":
+            kwargs["lifecycle_default"] = sa.text("'00000000000000000000000000000000'")
+        elif drift == "same-name-check":
+            kwargs["check_expression"] = "1 = 1"
+        elif drift == "extra-unique":
+            kwargs["extra_user_unique"] = True
+        _create_actor_table(connection, **kwargs)  # type: ignore[arg-type]
         config.attributes["connection"] = connection
 
         with pytest.raises(RuntimeError, match="incompatible schema"):

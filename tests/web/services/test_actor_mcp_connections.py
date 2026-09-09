@@ -7,7 +7,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from xagent.core.utils.encryption import _is_encrypted, encrypt_env_dict
+from xagent.core.utils.encryption import _is_encrypted, encrypt_env_dict, get_cipher
 from xagent.web.models.actor_mcp_connection import ActorMCPServerConnection
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -669,7 +669,10 @@ def test_create_is_idempotent_and_conflict_keeps_transaction_usable(
     assert db.query(User).filter(User.username == "transaction-still-usable").one()
 
 
-def test_create_race_converges_through_savepoint(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("winner_uses_different_credentials", [False, True])
+def test_simulated_create_race_preserves_outer_transaction(
+    tmp_path, monkeypatch, winner_uses_different_credentials: bool
+) -> None:
     import xagent.web.services.actor_mcp_connections as service
 
     engine = create_engine(f"sqlite:///{tmp_path / 'create-race.db'}")
@@ -698,7 +701,11 @@ def test_create_race_converges_through_savepoint(tmp_path, monkeypatch) -> None:
                         catalog_app_generation=catalog_generation,
                         encrypted_env=encrypt_env_dict(
                             {
-                                "POSTHOG_API_KEY": "secret-value",
+                                "POSTHOG_API_KEY": (
+                                    "winner-secret"
+                                    if winner_uses_different_credentials
+                                    else "secret-value"
+                                ),
                                 "POSTHOG_HOST": "https://x.test",
                             }
                         ),
@@ -712,24 +719,33 @@ def test_create_race_converges_through_savepoint(tmp_path, monkeypatch) -> None:
         service, "get_current_actor_mcp_connection_for_create", racing_lookup
     )
     with Session(engine) as contender:
-        snapshot = _create(
-            contender,
-            user_id=user_id,
-            owner=ALICE_OWNER,
-            app_id=app_id,
-        )
-        secret_snapshot = get_actor_mcp_connection_snapshot(
-            contender,
-            user_id=user_id,
-            resource_owner_key=ALICE_OWNER,
-            app_id=app_id,
-            expected_lifecycle_generation=snapshot.lifecycle_generation,
-        )
-        assert secret_snapshot is not None
-        assert secret_snapshot.credentials == {
-            "POSTHOG_API_KEY": "secret-value",
-            "POSTHOG_HOST": "https://x.test",
-        }
+        if winner_uses_different_credentials:
+            with pytest.raises(ActorMCPConnectionConflictError):
+                _create(
+                    contender,
+                    user_id=user_id,
+                    owner=ALICE_OWNER,
+                    app_id=app_id,
+                )
+        else:
+            snapshot = _create(
+                contender,
+                user_id=user_id,
+                owner=ALICE_OWNER,
+                app_id=app_id,
+            )
+            secret_snapshot = get_actor_mcp_connection_snapshot(
+                contender,
+                user_id=user_id,
+                resource_owner_key=ALICE_OWNER,
+                app_id=app_id,
+                expected_lifecycle_generation=snapshot.lifecycle_generation,
+            )
+            assert secret_snapshot is not None
+            assert secret_snapshot.credentials == {
+                "POSTHOG_API_KEY": "secret-value",
+                "POSTHOG_HOST": "https://x.test",
+            }
         contender.add(User(username="outer-write", password_hash="x"))
         contender.flush()
         assert contender.query(User).filter(User.username == "outer-write").one()
@@ -1016,11 +1032,9 @@ def test_plaintext_at_rest_is_treated_as_credential_corruption(db: Session) -> N
 
 
 def test_token_shaped_input_round_trips_as_exact_plaintext(db: Session) -> None:
-    from cryptography.fernet import Fernet
-
     user, _other = _seed_users(db)
     app = _seed_app(db)
-    token_shaped_plaintext = Fernet(Fernet.generate_key()).encrypt(b"nested").decode()
+    token_shaped_plaintext = get_cipher().encrypt(b"nested").decode()
     created = _create(
         db,
         user_id=user.id,

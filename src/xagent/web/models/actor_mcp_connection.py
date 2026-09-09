@@ -31,6 +31,10 @@ class ActorMCPServerConnection(Base):  # type: ignore[no-any-unimported]
     actor connections are not ordinary xagent connector associations and are
     not visible to the existing runtime until a later integration explicitly
     opts into this storage.
+
+    Actor identity and catalog binding are immutable through supported ORM and
+    service writes. Database-owner operations, database Core statements, and
+    native SQL are trusted and outside this enforcement boundary.
     """
 
     __tablename__ = "actor_mcp_server_connections"
@@ -117,5 +121,6 @@ def _prevent_actor_mcp_connection_generation_update(
     ]
     if changed:
         raise ValueError(
-            "ActorMCPServerConnection identity and catalog binding are immutable"
+            "ActorMCPServerConnection identity and catalog binding are immutable "
+            "through supported ORM and service writes"
         )

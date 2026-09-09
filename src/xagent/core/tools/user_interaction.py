@@ -59,16 +59,19 @@ class ToolInteractionSettlement:
     def __post_init__(self) -> None:
         if self.status not in _TOOL_INTERACTION_SETTLEMENT_STATUSES:
             raise ValueError(f"Invalid tool interaction settlement: {self.status!r}")
-        if self.status == "succeeded" and isinstance(self.result, dict):
-            result_status = self.result.get("status")
-            if (
-                self.result.get("success") is False
-                or self.result.get("is_error") is True
-                or (
-                    isinstance(result_status, str)
-                    and result_status.strip().lower() == "error"
+        if self.status == "succeeded":
+            if self.result is None:
+                raise ValueError(
+                    "A succeeded tool interaction settlement needs a result."
                 )
-            ):
+            if tool_result_waits_for_user(self.result):
+                raise ValueError(
+                    "A succeeded tool interaction settlement cannot wait for user input."
+                )
+            # Deferred import avoids the agent.result -> tools import cycle.
+            from ..agent.result import tool_result_succeeded
+
+            if not tool_result_succeeded(self.result):
                 raise ValueError(
                     "A succeeded tool interaction settlement cannot carry a "
                     "failed tool result."
@@ -119,12 +122,12 @@ class ToolInteractionSettlement:
             return {
                 **self.result,
                 "success": False,
-                "status": self.status,
+                "settlement_status": self.status,
                 "error": error,
             }
         projected = {
             "success": False,
-            "status": self.status,
+            "settlement_status": self.status,
             "error": error,
         }
         if self.result is not None:
@@ -141,8 +144,13 @@ class ResumableUserInteractionTool(Protocol):
         *,
         interaction_id: str,
         response: str,
-    ) -> Any:
-        """Accept a response and optionally settle the suspended tool call."""
+    ) -> ToolInteractionSettlement | None:
+        """Accept a response and optionally settle the suspended tool call.
+
+        A host may invoke this callback again after a failed checkpoint or
+        process restart. Implementations that perform external work must
+        durably replay the same terminal settlement for the interaction.
+        """
 
 
 def tool_result_waits_for_user(result: Any) -> bool:

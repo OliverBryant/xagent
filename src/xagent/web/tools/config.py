@@ -1682,6 +1682,7 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
+        mcp_actor_stdio_connection_adapter: Any = None,
         # Appended after every pre-existing parameter (not inserted
         # alongside its closest siblings above) so a caller still using
         # positional arguments for anything after agent_call_stack keeps
@@ -1714,6 +1715,12 @@ class WebToolConfig(BaseToolConfig):
         # object can be overwritten by the model, and this value must not
         # be confusable with that one at the resolution point.
         self._declared_knowledge_bases = declared_knowledge_bases
+        # Internal storage boundary for actor-scoped stdio. It is deliberately
+        # separate from ordinary MCP env/auth hooks and receives the exact
+        # actor and lifecycle identity on every secret read.
+        self._mcp_actor_stdio_connection_adapter = (
+            mcp_actor_stdio_connection_adapter
+        )
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -4631,11 +4638,33 @@ class WebToolConfig(BaseToolConfig):
                     ):
                         actor_classifications[int(visible_server.id)] = (None, True)
 
+            from ..services.actor_mcp_runtime import resolve_actor_mcp_stdio_configs
+
+            actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
+                self.db,
+                user_id=(
+                    int(self._user_id) if isinstance(self._user_id, int) else 0
+                ),
+                policy=self._mcp_runtime_authorization_policy,
+                adapter=self._mcp_actor_stdio_connection_adapter,
+                visible_servers=servers,
+            )
+            for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
+                actor_classifications[blocked_server_id] = (None, True)
+
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
-            user_env_by_id = load_user_env_overrides(self.db, self._user_id)
-            shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
-            env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            if servers:
+                user_env_by_id = load_user_env_overrides(self.db, self._user_id)
+                shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
+                env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            else:
+                # Synthetic actor stdio is intentionally independent from
+                # every ordinary MCP credential source. Avoid even querying
+                # those stores when there are no ordinary server rows.
+                user_env_by_id = {}
+                shared_env_by_id = {}
+                env_source_by_id = {}
 
             # Re-key the shared env layer, for team-owned ids only, onto the
             # governing team's own row -- never the run owner's team, and
@@ -4646,7 +4675,7 @@ class WebToolConfig(BaseToolConfig):
             # the credential-side hook was never installed -- the shared
             # layer stays user-keyed in that state, which is exactly the
             # cross-team influence this block exists to remove.
-            if self._connector_team_id is not None and team_mcp_ids:
+            if servers and self._connector_team_id is not None and team_mcp_ids:
                 if not team_env_hook_installed():
                     warn_team_env_hook_missing_once(
                         team_id=self._connector_team_id,
@@ -4714,6 +4743,7 @@ class WebToolConfig(BaseToolConfig):
             )
             for server in servers
         ]
+        configs.extend(actor_stdio_resolution.configs)
         logger.info("Loaded %s MCP server configurations", len(configs))
         return configs
 

@@ -38,6 +38,14 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    GateDecision,
+    GatedCall,
+    current_tool_call_execution_context,
+    gate_mcp_tools,
+    register_mcp_approval_gate,
+    unregister_mcp_approval_gate,
+)
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
@@ -88,6 +96,66 @@ class FakeWorkspaceOutputTool:
 
     def args_type(self) -> type[BaseModel]:
         return EmptyArgs
+
+
+@pytest.mark.asyncio
+async def test_react_binds_exact_execution_identity_for_mcp_gate() -> None:
+    seen: list[GatedCall] = []
+
+    async def gate(call: GatedCall) -> GateDecision:
+        seen.append(call)
+        return GateDecision.deny()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    registration = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume
+    )
+    try:
+        target = FakeTool()
+        target.name = "calculator"
+        (gated,) = gate_mcp_tools([target], connection={"id": 41})
+        context = ExecutionContext(
+            execution_id="task-248032",
+            metadata={"task_source": "slack", "run_id": "run-1"},
+        )
+        context.add_user_message("Publish.", metadata={"turn_id": "turn-1"})
+
+        result = await ReActPattern(max_iterations=2).run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "function": {
+                                    "name": "calculator",
+                                    "arguments": '{"expression":"2+2"}',
+                                },
+                            }
+                        ]
+                    },
+                    {"content": "The connector call was denied.", "done": True},
+                ]
+            ),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert result["success"] is True
+    assert target.calls == []
+    assert len(seen) == 1
+    execution = seen[0].execution_context
+    assert execution.task_source == "slack"
+    assert execution.task_id == "task-248032"
+    assert execution.run_id == "run-1"
+    assert execution.turn_id == "turn-1"
+    assert execution.tool_call_id == "call-1"
+    assert execution.pattern == "react"
+    assert execution.react_step_id
 
 
 class FakeWriteFileTool:
@@ -6779,6 +6847,7 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
                 description="Run an action after the user responds.",
             )
             self.resume_calls: list[dict[str, str]] = []
+            self.resume_context = None
             self.user_response: str | None = None
 
         def args_type(self) -> type[BaseModel]:
@@ -6790,6 +6859,7 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
             interaction_id: str,
             response: str,
         ) -> None:
+            self.resume_context = current_tool_call_execution_context()
             self.resume_calls.append(
                 {"interaction_id": interaction_id, "response": response}
             )
@@ -6934,6 +7004,9 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     assert resumed_tool.resume_calls == [
         {"interaction_id": "interaction-1", "response": "Continue"}
     ]
+    assert resumed_tool.resume_context.react_step_id == (
+        pattern.tool_ledger["wait-call"].step_id
+    )
     assert resumed_mutation.calls == []
     assert resumed_pattern.pending_tool_interaction_responses == []
     response_metadata = next(

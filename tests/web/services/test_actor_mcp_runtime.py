@@ -1,16 +1,29 @@
 from __future__ import annotations
 
 import logging
+import json
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp.types import Tool as MCPTool
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
+from xagent.core.tools.adapters.vibe import mcp_adapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    ChromeExecutionMCPToolAdapter,
+)
+from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
+    ChromeExecutionSessionPool,
+)
+from xagent.web.builtin_mcp_registry import (
+    get_builtin_execution_fields,
+    get_builtin_public_mcp_app,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.services.actor_mcp_connections import (
@@ -698,3 +711,80 @@ async def test_tool_factory_threads_actor_stdio_session_identity_to_connection(
     assert (
         captured["chrome-devtools"]["actor_stdio_session_identity"] is session_identity
     )  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox", [None, SimpleNamespace(name="existing-sandbox")])
+async def test_production_storage_resolver_factory_chrome_consumes_identity_before_ipc(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox: object | None,
+) -> None:
+    """Exercise the real storage/resolver/factory chain up to sandbox I/O."""
+
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="chrome-devtools")
+    builtin = get_builtin_public_mcp_app("chrome-devtools")
+    assert builtin is not None
+    assert builtin["is_visible_in_connector"] is False
+    create_actor_mcp_connection(
+        db,
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id="chrome-devtools",
+        credentials={},
+    )
+    resolution = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=production_actor_mcp_stdio_connection_adapter(),
+        visible_servers=(),
+        execution_identity=_execution_identity(),
+    )
+    assert len(resolution.configs) == 1
+    synthetic = resolution.configs[0]
+    identity = synthetic["actor_stdio_session_identity"]
+    assert type(identity) is ActorMCPStdioSessionIdentity
+
+    pool = AsyncMock(spec=ChromeExecutionSessionPool)
+    pool.get_or_create.return_value = SimpleNamespace(sandbox=object())
+    child_connections: list[dict[str, object]] = []
+
+    async def serializer_spy(_sandbox: object, connection: dict[str, object]):
+        child_connections.append(connection)
+        json.dumps(connection)
+        return [
+            MCPTool(
+                name="navigate_page",
+                description="Navigate",
+                inputSchema={"type": "object", "properties": {}},
+            )
+        ]
+
+    direct = AsyncMock()
+    generic_sandbox = AsyncMock()
+    monkeypatch.setattr(mcp_adapter, "list_tools_in_sandbox", serializer_spy)
+    monkeypatch.setattr(mcp_adapter, "_load_direct_mcp_tools", direct)
+    monkeypatch.setattr(mcp_adapter, "load_sandboxed_mcp_tools", generic_sandbox)
+    monkeypatch.setattr(
+        "xagent.web.services.chrome_mcp_runtime.get_chrome_execution_session_pool",
+        lambda: pool,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        list(resolution.configs),
+        sandbox=sandbox,  # type: ignore[arg-type]
+    )
+
+    assert len(tools) == 1
+    assert isinstance(tools[0], ChromeExecutionMCPToolAdapter)
+    assert "actor_stdio_session_identity" not in tools[0].connection
+    assert len(child_connections) == 1
+    child = child_connections[0]
+    assert "actor_stdio_session_identity" not in child
+    assert OWNER not in repr(child)
+    assert identity.execution.run_id not in repr(child)
+    direct.assert_not_awaited()
+    generic_sandbox.assert_not_awaited()
+    assert app.is_visible_in_connector is True

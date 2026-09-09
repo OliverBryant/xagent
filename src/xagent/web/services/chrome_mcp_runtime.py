@@ -21,6 +21,7 @@ from .actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
 )
 from .mcp_runtime import (
+    CALLER_ID_ENV_VAR,
     MCPActorAuthorizationPolicy,
     MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicyRequiredError,
@@ -94,7 +95,7 @@ def consume_chrome_execution_scope(
     ):
         raise ChromeSessionContractError("Chrome session identity does not match")
     env = executable_connection.get("env")
-    if not isinstance(env, Mapping) or env.get("XAGENT_USER_ID") != str(
+    if not isinstance(env, Mapping) or env.get(CALLER_ID_ENV_VAR) != str(
         identity.connection.user_id
     ):
         raise ChromeSessionContractError(

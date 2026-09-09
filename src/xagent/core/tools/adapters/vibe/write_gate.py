@@ -82,8 +82,11 @@ field without it would be another value nobody reads.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -133,8 +136,19 @@ class GateDecision:
     """
 
     approval_required: bool
-    interaction_id: str = ""
+    interaction_id: str
     message: str = ""
+
+    def __post_init__(self) -> None:
+        # Required, not defaulted. An empty identity does not degrade the
+        # pause, it loses the write: ReAct falls back to the raw
+        # ``tool_call_id`` (see its pending-response construction), which the
+        # host never recorded, so the answer arrives against an interaction
+        # nobody is holding and the approved call never runs. That was a
+        # silent default away, so the field has no default and an empty one
+        # is refused here rather than three layers later.
+        if self.approval_required and not self.interaction_id:
+            raise ValueError("a pause must carry the interaction id it is stored under")
 
 
 WriteGateHook = Callable[[GatedCall], Optional[GateDecision]]
@@ -145,6 +159,14 @@ WriteGateHook = Callable[[GatedCall], Optional[GateDecision]]
 # executor is passed in rather than imported because only the tool knows how
 # to place a call on its own connection -- and going through it is what keeps
 # the replay on the tool's normal authorization and error-mapping path.
+#
+# **Precondition on the host.** This seam correlates a resume by the
+# interaction id and the tool's runtime name, and neither is proof of
+# ownership: the name is user-editable and an id is only as scoped as
+# whoever minted it. So the host must verify that the interaction it loads
+# belongs to the conversation, workspace and user the answer arrived from,
+# before it hands the payload to the executor. Nothing here can do that
+# check -- this module has no notion of a tenant.
 WriteGateResumeHook = Callable[..., Any]
 
 _HOOK: WriteGateHook | None = None
@@ -194,13 +216,27 @@ def consult_write_gate(call: GatedCall) -> GateDecision | None:
     if hook is None:
         return None
     try:
-        return hook(call)
+        decision = hook(call)
     except Exception:  # noqa: BLE001 - see the docstring
-        import logging
-
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "Write gate hook failed for %s; executing ungated",
             call.tool_name,
             exc_info=True,
         )
         return None
+    if decision is None or isinstance(decision, GateDecision):
+        return decision
+    # Checked, not trusted. A hook written ``async def`` returns a coroutine
+    # rather than raising, so the type error would surface as an
+    # ``AttributeError`` on ``decision.approval_required`` at the call site
+    # -- and it would do that for every gated call thereafter, since nothing
+    # about the hook has changed. Treated as no decision, the same as a hook
+    # that raised: this seam's documented direction on hook failure is to
+    # execute rather than strand a workspace behind an unanswerable pause.
+    logger.warning(
+        "Write gate hook returned %s rather than a GateDecision for %s; "
+        "executing ungated",
+        type(decision).__name__,
+        call.tool_name,
+    )
+    return None

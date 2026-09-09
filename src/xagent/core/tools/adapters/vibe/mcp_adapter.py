@@ -2197,10 +2197,9 @@ async def load_mcp_tools_as_agent_tools(
 
             # The one place both transports meet: ``server_tools`` is either
             # sandbox-wrapped tools or bare adapters by this point, and the
-            # gate wraps whichever it is. Deliberately not inside the adapter
-            # -- a sandboxed connector rebuilds that class in a guest process
-            # where no host hook or database exists, so a gate placed there
-            # is absent exactly for the transport that most needs it.
+            # gate wraps whichever it is. Why here and not inside the
+            # adapter is the whole subject of ``write_gate_tool``'s module
+            # docstring; it is not repeated here.
             agent_tools.extend(gate_mcp_tools(server_tools))
             if server_tools:
                 loaded_servers.append(server_name)

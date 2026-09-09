@@ -1,11 +1,10 @@
 """A gated MCP write must not execute before it is approved -- on either transport.
 
-The first version of this feature consulted the gate inside
-``MCPToolAdapter.run_json_async``, which is the one place a supported npx/uvx
-connector never reaches: the sandbox serializes that adapter and
-``tool_runner.py`` rebuilds it in a guest process where no host hook and no
-database exist. Every sandboxed write went out ungated while the host tests
-were green, because those tests called the adapter directly.
+The first version consulted the gate inside the adapter -- the one place a
+supported npx/uvx connector never reaches (``write_gate_tool``'s module
+docstring has the mechanism). Every sandboxed write went out ungated while
+the host tests stayed green, because those tests called the adapter
+directly.
 
 So the tests here refuse a hand-rolled stand-in for that boundary. They drive
 a real ``SandboxedToolWrapper`` and watch its guest dispatch (``sandbox.exec``
@@ -14,6 +13,7 @@ transport, or an approval whose arguments are re-derived on the way into the
 guest, fails here rather than in production.
 """
 
+import asyncio
 import base64
 import json
 from typing import Any, Mapping, Optional
@@ -97,11 +97,22 @@ class _RecordingGate:
 
 
 class _RecordingResume:
-    """The host half: holds the frozen arguments and spends them once."""
+    """The host half: replays what the gate recorded, and only that.
 
-    def __init__(self, frozen: dict[str, Any]) -> None:
-        self.frozen = frozen
+    Takes the gate rather than a copy of the arguments. Reading them from a
+    separate test constant would let a gate that recorded the *wrong*
+    arguments still pass every fidelity assertion here -- the payload and
+    the expectation would come from the same place, and the subject would
+    never be consulted.
+    """
+
+    def __init__(self, gate: "_RecordingGate") -> None:
+        self._gate = gate
         self.calls: list[tuple[str, str, str]] = []
+
+    @property
+    def frozen(self) -> dict[str, Any]:
+        return dict(self._gate.calls[0].arguments)
 
     async def __call__(
         self,
@@ -194,8 +205,9 @@ async def test_sandboxed_write_does_not_reach_the_guest_before_approval():
 
 async def test_approved_sandboxed_call_carries_the_shown_arguments_into_the_guest():
     """What executes is what was shown, across the wrapper/runner seam."""
-    set_write_gate_hook(_RecordingGate())
-    resume = _RecordingResume(dict(SHOWN_ARGUMENTS))
+    gate = _RecordingGate()
+    set_write_gate_hook(gate)
+    resume = _RecordingResume(gate)
     set_write_gate_resume_hook(resume)
     gated, _target, sandbox = _sandboxed_gated_tool()
 
@@ -211,8 +223,9 @@ async def test_approved_sandboxed_call_carries_the_shown_arguments_into_the_gues
 
 
 async def test_rejected_sandboxed_call_never_reaches_the_guest():
-    set_write_gate_hook(_RecordingGate())
-    set_write_gate_resume_hook(_RecordingResume(dict(SHOWN_ARGUMENTS)))
+    gate = _RecordingGate()
+    set_write_gate_hook(gate)
+    set_write_gate_resume_hook(_RecordingResume(gate))
     gated, _target, sandbox = _sandboxed_gated_tool()
 
     paused = await gated.run_json_async(SHOWN_ARGUMENTS)
@@ -252,8 +265,9 @@ async def test_approved_direct_call_replays_through_the_targets_own_entry_point(
     still run for an approved call. A replay that reached for a lower-level
     call would skip every one of them, and the row is already spent.
     """
-    set_write_gate_hook(_RecordingGate())
-    resume = _RecordingResume(dict(SHOWN_ARGUMENTS))
+    gate = _RecordingGate()
+    set_write_gate_hook(gate)
+    resume = _RecordingResume(gate)
     set_write_gate_resume_hook(resume)
     target = _FakeMCPTool()
     (gated,) = gate_mcp_tools([target])
@@ -273,7 +287,7 @@ async def test_replay_is_not_gated_a_second_time():
     """And the replay marker does not outlive the replay."""
     gate = _RecordingGate()
     set_write_gate_hook(gate)
-    set_write_gate_resume_hook(_RecordingResume(dict(SHOWN_ARGUMENTS)))
+    set_write_gate_resume_hook(_RecordingResume(gate))
     target = _FakeMCPTool()
     (gated,) = gate_mcp_tools([target])
 
@@ -377,3 +391,145 @@ def test_the_sync_entry_point_cannot_run_a_gated_write():
 
     assert _guest_arguments(sandbox) == []
     assert target.direct_calls == []
+
+
+async def test_a_hook_that_returns_a_coroutine_executes_ungated():
+    """The easy mistake, and it must not be a crash.
+
+    Writing the hook ``async def`` returns a coroutine instead of raising,
+    so a type error would surface as ``AttributeError`` on
+    ``decision.approval_required`` -- and it would do that for every gated
+    call afterwards, since nothing about the hook has changed. Treated as no
+    decision, the same as a hook that raised.
+    """
+
+    async def _async_hook(call: GatedCall) -> Optional[GateDecision]:
+        return GateDecision(approval_required=True, interaction_id="i-1")
+
+    set_write_gate_hook(_async_hook)  # type: ignore[arg-type]
+    target = _FakeMCPTool()
+    (gated,) = gate_mcp_tools([target])
+
+    result = await gated.run_json_async(SHOWN_ARGUMENTS)
+
+    assert result["success"] is True
+    assert target.direct_calls == [SHOWN_ARGUMENTS]
+
+
+async def test_a_hook_that_returns_a_bare_string_executes_ungated():
+    """Any non-decision, not just a coroutine."""
+    set_write_gate_hook(lambda call: "approve")  # type: ignore[arg-type,return-value]
+    target = _FakeMCPTool()
+    (gated,) = gate_mcp_tools([target])
+
+    assert (await gated.run_json_async(SHOWN_ARGUMENTS))["success"] is True
+    assert target.direct_calls == [SHOWN_ARGUMENTS]
+
+
+def test_a_pause_without_an_interaction_id_is_refused():
+    """The identity is what makes the two halves meet.
+
+    An empty one does not weaken the pause, it loses the write: ReAct falls
+    back to the raw ``tool_call_id``, which the host never recorded, so the
+    answer arrives against an interaction nobody holds. Refused where it is
+    constructed rather than three layers later.
+    """
+    with pytest.raises(ValueError, match="interaction id"):
+        GateDecision(approval_required=True, interaction_id="")
+
+    # A decision that does not pause needs no identity.
+    assert GateDecision(approval_required=False, interaction_id="").interaction_id == ""
+
+
+def test_the_sync_entry_point_passes_through_with_no_hook_installed():
+    """The off switch has to cover both entry points.
+
+    With nothing installed there is no gate to bypass, so refusing here
+    would contradict the module's own "no behavior change" claim. The target
+    still refuses on its own if it is async-only, which every MCP adapter
+    is.
+    """
+    target = _FakeMCPTool()
+    (gated,) = gate_mcp_tools([target])
+
+    assert gated.run_json_sync(SHOWN_ARGUMENTS) == {}
+
+
+class _SelectiveGate:
+    """Pauses one tool by name and lets everything else through."""
+
+    def __init__(self, paused_tool: str) -> None:
+        self._paused = paused_tool
+        self.calls: list[GatedCall] = []
+
+    def __call__(self, call: GatedCall) -> Optional[GateDecision]:
+        self.calls.append(call)
+        if call.tool_name != self._paused:
+            return None
+        return GateDecision(approval_required=True, interaction_id="interaction-1")
+
+
+@sandbox_config()
+class _SlowMCPTool(_FakeMCPTool):
+    """Blocks inside ``run_json_async`` so two calls genuinely interleave."""
+
+    def __init__(self, released: asyncio.Event, entered: asyncio.Event) -> None:
+        super().__init__()
+        self._released = released
+        self._entered = entered
+
+    @property
+    def name(self) -> str:
+        return "slack_post_message"
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        self.replay_flags.append(is_replaying_approved_call())
+        self._entered.set()
+        await self._released.wait()
+        self.direct_calls.append(dict(args))
+        return {"success": True}
+
+
+@sandbox_config()
+class _OtherMCPTool(_FakeMCPTool):
+    @property
+    def name(self) -> str:
+        return "slack_list_channels"
+
+
+async def test_the_replay_marker_does_not_leak_into_a_concurrent_call():
+    """A ContextVar, not an attribute, and this is why.
+
+    While one call is mid-replay, an ordinary call on another tool runs in a
+    different task. If the marker were shared state, that second call would
+    see itself as an approved replay and skip the gate entirely.
+    """
+    released = asyncio.Event()
+    entered = asyncio.Event()
+    gate = _SelectiveGate("slack_post_message")
+    set_write_gate_hook(gate)
+    slow = _SlowMCPTool(released, entered)
+    other = _OtherMCPTool()
+    gated_slow, gated_other = gate_mcp_tools([slow, other])
+    set_write_gate_resume_hook(_RecordingResume(gate))  # type: ignore[arg-type]
+
+    paused = await gated_slow.run_json_async(SHOWN_ARGUMENTS)
+    assert paused["status"] == WAITING_FOR_USER_STATUS
+
+    replay = asyncio.ensure_future(
+        gated_slow.resume_user_interaction(
+            interaction_id=paused["interaction_id"], response="approve"
+        )
+    )
+    await entered.wait()
+
+    # Mid-replay: an unrelated call must not inherit the marker.
+    assert is_replaying_approved_call() is False
+    await gated_other.run_json_async({"limit": 10})
+    assert other.replay_flags == [False]
+
+    released.set()
+    await replay
+
+    assert slow.replay_flags == [True]
+    assert is_replaying_approved_call() is False

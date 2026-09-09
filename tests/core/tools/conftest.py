@@ -10,10 +10,8 @@ def gated_targets(tools: Any) -> tuple[Any, ...]:
 
     Every loaded MCP tool leaves ``load_mcp_tools_as_agent_tools`` inside a
     ``WriteGateTool``: that function is the one place the direct and
-    sandboxed transports converge, which is why the gate is applied there
-    rather than inside the adapter -- a sandboxed npx/uvx connector rebuilds
-    the adapter in a guest process where no host hook exists, so a gate
-    placed there is absent for exactly the transport that most needs it.
+    sandboxed transports converge (see ``write_gate_tool``'s module
+    docstring for why the gate lives there and not in the adapter).
 
     Asserting through this helper keeps each caller's test about the thing it
     was written for -- which transport ran, what a timeout did -- while still

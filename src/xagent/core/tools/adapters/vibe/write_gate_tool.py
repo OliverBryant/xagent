@@ -157,6 +157,12 @@ class WriteGateTool(AbstractBaseTool):
         and makes both transports refuse identically -- which is the point of
         wrapping them in the same place.
         """
+        if get_write_gate_hook() is None:
+            # Nothing in this process can pause a call, so there is no gate
+            # to bypass -- and refusing here anyway would contradict the off
+            # switch this module documents. The target still refuses on its
+            # own if it is async-only, which every MCP adapter is.
+            return self._target.run_json_sync(args)
         raise RuntimeError(
             f"MCP tool {self.name} is async only; please use run_json_async()"
         )
@@ -180,7 +186,11 @@ class WriteGateTool(AbstractBaseTool):
                 # ``target.source_server`` reported no server at all for
                 # exactly the npx/uvx transport this wrapper exists to cover.
                 server_name=metadata.source_server or "",
-                arguments=args,
+                # A copy, not the caller's mapping. The host records this
+                # as the payload it will replay, and a live reference would
+                # let anything that mutates ``args`` afterwards rewrite what
+                # was approved.
+                arguments=dict(args),
                 write_hint=self._write_hint_value(metadata),
             )
         )
@@ -239,6 +249,37 @@ class WriteGateTool(AbstractBaseTool):
             return await self._target.run_json_async(arguments)
         finally:
             _REPLAYING.reset(token)
+
+    @property
+    def category(self) -> Any:
+        """Forwarded like the rest of the descriptive surface.
+
+        Delegated explicitly rather than through ``__getattr__``: every name
+        below is defined on ``AbstractBaseTool``, so normal lookup succeeds
+        on this class and ``__getattr__`` is never consulted -- it would
+        silently answer with the *wrapper's* base implementation instead of
+        the target's. ``metadata`` is the case that makes this concrete: the
+        base rebuilds it from attributes this wrapper does not have, which
+        is how a wrapped tool once reported no source server at all.
+
+        A blanket ``__getattr__`` would also forward ``__sandbox_config__``,
+        which is *not* on the base -- and ``resolve_sandbox_config`` reading
+        it through the wrapper would offer an already-sandboxed tool up for
+        sandboxing a second time.
+        """
+        return getattr(self._target, "category", None)
+
+    async def setup(self, task_id: Optional[str] = None) -> None:
+        await self._target.setup(task_id)
+
+    async def teardown(self, task_id: Optional[str] = None) -> None:
+        await self._target.teardown(task_id)
+
+    async def save_state_json(self) -> Mapping[str, Any]:
+        return await self._target.save_state_json()
+
+    async def load_state_json(self, state: Mapping[str, Any]) -> None:
+        await self._target.load_state_json(state)
 
     def _write_hint_value(self, metadata: ToolMetadata) -> str:
         """The target's write declaration, as a plain string."""

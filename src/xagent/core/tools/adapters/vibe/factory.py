@@ -1118,6 +1118,7 @@ class ToolFactory:
                             "runtime_input_schema",
                             "connector_runtime",
                             "allow_delegated_authorization",
+                            "actor_stdio_session_identity",
                         ):
                             if runtime_key in config:
                                 connection_config[runtime_key] = config[runtime_key]

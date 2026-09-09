@@ -338,6 +338,7 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -490,6 +491,7 @@ async def test_running_with_dag_plan_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -539,6 +541,7 @@ async def test_paused_with_no_history_still_runs_reconstruct() -> None:
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -584,6 +587,7 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
         task_setup_snapshot=snapshot,
         connector_runtime_turn_id=None,
         mcp_runtime_authorization_policy=None,
+        mcp_actor_execution_identity=None,
     )
     snapshot_loader.assert_called_once_with(42, None)
 
@@ -624,10 +628,12 @@ async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
         task_setup_snapshot: TaskSetupSnapshot | None = None,
         connector_runtime_turn_id: str | None = None,
         mcp_runtime_authorization_policy: Any = None,
+        mcp_actor_execution_identity: Any = None,
     ) -> None:
         assert task_setup_snapshot is snapshot
         assert connector_runtime_turn_id == "turn-reconstructed"
         assert mcp_runtime_authorization_policy is None
+        assert mcp_actor_execution_identity is None
         manager._agents[task_id] = reconstructed_agent
 
     with (

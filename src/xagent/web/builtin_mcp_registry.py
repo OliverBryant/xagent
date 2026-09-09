@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from copy import deepcopy
-from typing import Any
+from typing import Any, Literal
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
@@ -1004,6 +1004,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Productivity",
             "oauth_scopes": None,
+            # Runtime-only metadata. This is intentionally outside
+            # launch_config so enabling execution-scoped session handling does
+            # not create persisted PublicMCPApp execution drift.
+            "stdio_session_scope": "execution",
             # Hidden until the runtime supports execution-scoped (persistent)
             # stdio MCP sessions: today every tool call spawns a fresh
             # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
@@ -1598,6 +1602,17 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def get_builtin_stdio_session_scope(
+    app_id: str,
+) -> Literal["per_call", "execution"]:
+    """Return code-owned stdio session scope; ordinary apps are per-call."""
+
+    row = get_builtin_public_mcp_app(app_id)
+    if row is not None and row.get("stdio_session_scope") == "execution":
+        return "execution"
+    return "per_call"
 
 
 def get_builtin_execution_fields_and_optional_scopes(

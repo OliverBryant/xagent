@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from xagent.core.tools.user_interaction import (
+    ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
@@ -26,3 +29,42 @@ def test_resume_capability_detection() -> None:
 
     assert callable(user_interaction_resume_callable(Resumable()))
     assert user_interaction_resume_callable(object()) is None
+
+
+def test_successful_settlement_preserves_the_tool_result() -> None:
+    result = {"success": True, "post_urn": "urn:li:share:123"}
+
+    settlement = ToolInteractionSettlement.succeeded(result)
+
+    assert settlement.projected_result() is result
+
+
+def test_successful_settlement_rejects_a_failed_tool_result() -> None:
+    with pytest.raises(ValueError, match="cannot carry a failed tool result"):
+        ToolInteractionSettlement.succeeded({"success": False, "error": "failed"})
+
+
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+def test_non_successful_settlement_has_an_unambiguous_failure_shape(
+    status: str,
+) -> None:
+    settlement = ToolInteractionSettlement(status=status, result={"detail": "safe"})  # type: ignore[arg-type]
+
+    assert settlement.projected_result() == {
+        "success": False,
+        "status": status,
+        "error": {
+            "rejected": "The user rejected the tool call.",
+            "failed": "The resumed tool call failed.",
+            "dispatch_unknown": (
+                "The tool call may have reached the external system. Automatic retry "
+                "is disabled; verify the external system before trying again."
+            ),
+        }[status],
+        "detail": "safe",
+    }
+
+
+def test_settlement_rejects_an_unknown_status() -> None:
+    with pytest.raises(ValueError, match="Invalid tool interaction settlement"):
+        ToolInteractionSettlement(status="unknown")  # type: ignore[arg-type]

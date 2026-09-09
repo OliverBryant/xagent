@@ -81,8 +81,8 @@ field without it would be another value nobody reads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 

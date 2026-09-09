@@ -8,14 +8,19 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.services.actor_mcp_runtime import (
     ActorMCPStdioConnectionIdentity,
+    ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
 )
-from xagent.web.services.mcp_runtime import MCPActorAuthorizationPolicy
+from xagent.web.services.mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
+)
 from xagent.web.tools.config import WebToolConfig
 
 USER_ID = 41
@@ -32,11 +37,11 @@ def db() -> Session:
     engine.dispose()
 
 
-def _seed_app(db: Session) -> PublicMCPApp:
-    execution = get_builtin_execution_fields(APP_ID)
+def _seed_app(db: Session, *, app_id: str = APP_ID) -> PublicMCPApp:
+    execution = get_builtin_execution_fields(app_id)
     assert execution is not None
     app = PublicMCPApp(
-        app_id=APP_ID,
+        app_id=app_id,
         name=execution["name"],
         transport=execution["transport"],
         provider_name=execution["provider_name"],
@@ -109,7 +114,7 @@ def _identity(app: PublicMCPApp, **overrides: object):
     values = {
         "user_id": USER_ID,
         "resource_owner_key": OWNER,
-        "app_id": APP_ID,
+        "app_id": app.app_id,
         "catalog_app_generation": app.generation,
         "lifecycle_generation": uuid.uuid4(),
     }
@@ -131,6 +136,21 @@ def _policy(*, allow: bool = True) -> MCPActorAuthorizationPolicy:
     )
 
 
+def _execution_identity(
+    *,
+    task_id: int = 91,
+    run_id: str = "run-1",
+    turn_id: str = "turn-1",
+    lease_attempt_id: str = "attempt-1",
+) -> MCPActorExecutionIdentity:
+    return MCPActorExecutionIdentity(
+        task_id=task_id,
+        run_id=run_id,
+        turn_id=turn_id,
+        lease_attempt_id=lease_attempt_id,
+    )
+
+
 def test_synthetic_config_uses_exact_lifecycle_fenced_adapter_inputs(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -147,9 +167,7 @@ def test_synthetic_config_uses_exact_lifecycle_fenced_adapter_inputs(
         visible_servers=(),
     )
 
-    assert adapter.list_calls == [
-        {"user_id": USER_ID, "resource_owner_key": OWNER}
-    ]
+    assert adapter.list_calls == [{"user_id": USER_ID, "resource_owner_key": OWNER}]
     assert adapter.secret_calls == [
         {
             "user_id": USER_ID,
@@ -305,3 +323,126 @@ async def test_web_loader_appends_synthetic_config_without_env_source_queries(
     result = await config._load_mcp_server_configs()
 
     assert [item["name"] for item in result] == [APP_ID]
+
+
+def test_execution_scoped_chrome_requires_complete_execution_identity(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="chrome-devtools")
+    adapter = _FakeAdapter(_identity(app), None)
+
+    missing = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+    present = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+        execution_identity=_execution_identity(),
+    )
+
+    assert missing.configs == ()
+    assert len(present.configs) == 1
+    session_identity = present.configs[0]["actor_stdio_session_identity"]
+    assert isinstance(session_identity, ActorMCPStdioSessionIdentity)
+    assert session_identity.key == (
+        91,
+        "run-1",
+        "turn-1",
+        "attempt-1",
+        USER_ID,
+        OWNER,
+        "chrome-devtools",
+        app.generation,
+        adapter.identity.lifecycle_generation,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("task_id", None),
+        ("run_id", None),
+        ("turn_id", None),
+        ("lease_attempt_id", None),
+    ],
+)
+def test_actor_execution_identity_rejects_each_missing_field(
+    field_name: str, value: object
+) -> None:
+    values: dict[str, object] = {
+        "task_id": 91,
+        "run_id": "run-1",
+        "turn_id": "turn-1",
+        "lease_attempt_id": "attempt-1",
+    }
+    values[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
+        MCPActorExecutionIdentity(**values)  # type: ignore[arg-type]
+
+
+def test_chrome_session_key_changes_for_retry_and_later_turn() -> None:
+    connection = ActorMCPStdioConnectionIdentity(
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id="chrome-devtools",
+        catalog_app_generation=uuid.uuid4(),
+        lifecycle_generation=uuid.uuid4(),
+    )
+    initial = ActorMCPStdioSessionIdentity(_execution_identity(), connection)
+    retry = ActorMCPStdioSessionIdentity(
+        _execution_identity(lease_attempt_id="attempt-2"), connection
+    )
+    later_turn = ActorMCPStdioSessionIdentity(
+        _execution_identity(turn_id="turn-2"), connection
+    )
+
+    assert initial.key != retry.key
+    assert initial.key != later_turn.key
+
+
+@pytest.mark.asyncio
+async def test_tool_factory_threads_actor_stdio_session_identity_to_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = ActorMCPStdioConnectionIdentity(
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id="chrome-devtools",
+        catalog_app_generation=uuid.uuid4(),
+        lifecycle_generation=uuid.uuid4(),
+    )
+    session_identity = ActorMCPStdioSessionIdentity(_execution_identity(), connection)
+    captured: dict[str, object] = {}
+
+    async def fake_load(connections: dict[str, object], **_kwargs: object) -> object:
+        captured.update(connections)
+        return SimpleNamespace(tools=(), failures=())
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fake_load,
+    )
+
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "chrome-devtools",
+                "transport": "stdio",
+                "config": {"command": "npx", "args": [], "env": {}},
+                "actor_stdio_session_identity": session_identity,
+            }
+        ]
+    )
+
+    assert (
+        captured["chrome-devtools"]["actor_stdio_session_identity"] is session_identity
+    )  # type: ignore[index]

@@ -47,7 +47,7 @@ def _connection(identity=None):
         "transport": "stdio",
         "command": "npx",
         "args": [],
-        "env": {"XAGENT_USER_ID": "11"},
+        "env": {"XAGENT_MCP_CALLER_ID": "11"},
     }
     if identity is not None:
         connection["actor_stdio_session_identity"] = identity
@@ -142,7 +142,7 @@ def test_every_execution_and_connection_dimension_changes_scope(part, field, val
         "chrome-devtools", _connection(identity)
     )
     changed_connection = _connection(changed)
-    changed_connection["env"]["XAGENT_USER_ID"] = str(changed.connection.user_id)
+    changed_connection["env"]["XAGENT_MCP_CALLER_ID"] = str(changed.connection.user_id)
 
     if field == "app_id":
         with pytest.raises(ChromeSessionContractError, match="does not match"):
@@ -186,7 +186,7 @@ def test_execution_scoped_chrome_rejects_wrong_nested_identity_type():
 
 def test_chrome_identity_user_mismatch_fails_closed():
     connection = _connection(_identity())
-    connection["env"]["XAGENT_USER_ID"] = "999"
+    connection["env"]["XAGENT_MCP_CALLER_ID"] = "999"
     with pytest.raises(ChromeSessionContractError, match="caller identity"):
         consume_chrome_execution_scope("chrome-devtools", connection)
 

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+import logging
+from typing import Any, Protocol, final
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -14,12 +15,28 @@ from ..builtin_mcp_registry import (
     get_builtin_stdio_session_scope,
 )
 from ..models.public_mcp import PublicMCPApp
+from .actor_mcp_connections import (
+    ActorMCPConnectionCredentialCorruptionError,
+    ActorMCPConnectionNotFoundOrStaleError,
+    ActorMCPConnectionValidationError,
+    get_actor_mcp_connection_credentials_internal,
+    list_actor_mcp_connection_metadata,
+)
 from .mcp_runtime import (
     MCPActorAuthorizationPolicy,
     MCPActorExecutionIdentity,
     caller_id_env,
 )
 from .user_oauth import normalize_user_oauth_resource_owner_key
+
+logger = logging.getLogger(__name__)
+
+
+_ACTOR_MCP_STORAGE_ERRORS = (
+    ActorMCPConnectionValidationError,
+    ActorMCPConnectionNotFoundOrStaleError,
+    ActorMCPConnectionCredentialCorruptionError,
+)
 
 
 class ActorMCPRuntimeDefinitionError(ValueError):
@@ -111,6 +128,63 @@ class ActorMCPStdioConnectionAdapter(Protocol):
         catalog_app_generation: UUID,
         expected_lifecycle_generation: UUID,
     ) -> Mapping[str, str] | None: ...
+
+
+@final
+class ActorMCPConnectionServiceAdapter:
+    """Stateless adapter over the lifecycle-fenced actor connection service."""
+
+    def list_connection_identities(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        resource_owner_key: str,
+    ) -> Sequence[ActorMCPStdioConnectionIdentity]:
+        metadata = list_actor_mcp_connection_metadata(
+            db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+        )
+        return tuple(
+            ActorMCPStdioConnectionIdentity(
+                user_id=item.user_id,
+                resource_owner_key=item.resource_owner_key,
+                app_id=item.app_id,
+                catalog_app_generation=item.catalog_app_generation,
+                lifecycle_generation=item.lifecycle_generation,
+            )
+            for item in metadata
+        )
+
+    def get_connection_credentials(
+        self,
+        db: Session,
+        *,
+        user_id: int,
+        resource_owner_key: str,
+        app_id: str,
+        catalog_app_generation: UUID,
+        expected_lifecycle_generation: UUID,
+    ) -> Mapping[str, str] | None:
+        snapshot = get_actor_mcp_connection_credentials_internal(
+            db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+            app_id=app_id,
+            catalog_app_generation=catalog_app_generation,
+            expected_lifecycle_generation=expected_lifecycle_generation,
+        )
+        return snapshot.credentials
+
+
+_ACTOR_MCP_CONNECTION_SERVICE_ADAPTER = ActorMCPConnectionServiceAdapter()
+
+
+def production_actor_mcp_stdio_connection_adapter() -> ActorMCPStdioConnectionAdapter:
+    """Return the immutable production storage adapter."""
+
+    return _ACTOR_MCP_CONNECTION_SERVICE_ADAPTER
 
 
 @dataclass(frozen=True)
@@ -267,12 +341,21 @@ def resolve_actor_mcp_stdio_configs(
         return ActorMCPStdioResolution((), blocked_server_ids)
 
     try:
-        identities = adapter.list_connection_identities(
-            db,
-            user_id=user_id,
-            resource_owner_key=policy.resource_owner_key,
+        identities = tuple(
+            adapter.list_connection_identities(
+                db,
+                user_id=user_id,
+                resource_owner_key=policy.resource_owner_key,
+            )
         )
-    except Exception:
+    except _ACTOR_MCP_STORAGE_ERRORS as exc:
+        logger.info("Actor stdio connection list unavailable (%s)", type(exc).__name__)
+        return ActorMCPStdioResolution((), blocked_server_ids)
+    except Exception as exc:
+        logger.warning(
+            "Actor stdio connection list failed unexpectedly (%s)",
+            type(exc).__name__,
+        )
         return ActorMCPStdioResolution((), blocked_server_ids)
     configs: list[dict[str, Any]] = []
     for identity in identities:
@@ -301,6 +384,17 @@ def resolve_actor_mcp_stdio_configs(
                 for server in visible_servers
             ):
                 continue
+        except ActorMCPRuntimeDefinitionError as exc:
+            logger.info("Actor stdio definition unavailable (%s)", type(exc).__name__)
+            continue
+        except Exception as exc:
+            logger.warning(
+                "Actor stdio definition failed unexpectedly (%s)",
+                type(exc).__name__,
+            )
+            continue
+
+        try:
             credentials = adapter.get_connection_credentials(
                 db,
                 user_id=user_id,
@@ -313,7 +407,16 @@ def resolve_actor_mcp_stdio_configs(
                 credentials,
                 required_fields=required_fields,
             )
-        except Exception:
+        except (*_ACTOR_MCP_STORAGE_ERRORS, ActorMCPRuntimeDefinitionError) as exc:
+            logger.info(
+                "Actor stdio credential read unavailable (%s)", type(exc).__name__
+            )
+            continue
+        except Exception as exc:
+            logger.warning(
+                "Actor stdio credential read failed unexpectedly (%s)",
+                type(exc).__name__,
+            )
             continue
 
         launch = execution["launch_config"]

@@ -61,7 +61,10 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
-from ..services.mcp_runtime import MCPBuiltinOAuthActorPolicy
+from ..services.mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+)
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -1688,6 +1691,7 @@ class WebToolConfig(BaseToolConfig):
         # positional arguments for anything after agent_call_stack keeps
         # binding the same values it always did.
         voice: Optional[str] = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1718,9 +1722,8 @@ class WebToolConfig(BaseToolConfig):
         # Internal storage boundary for actor-scoped stdio. It is deliberately
         # separate from ordinary MCP env/auth hooks and receives the exact
         # actor and lifecycle identity on every secret read.
-        self._mcp_actor_stdio_connection_adapter = (
-            mcp_actor_stdio_connection_adapter
-        )
+        self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
+        self._mcp_actor_execution_identity = mcp_actor_execution_identity
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -2157,6 +2160,19 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
+    def set_mcp_actor_execution_identity(
+        self, identity: MCPActorExecutionIdentity | None
+    ) -> bool:
+        """Advance the exact actor execution fence on a reused tool config."""
+
+        if self._mcp_actor_execution_identity == identity:
+            return False
+        self._mcp_actor_execution_identity = identity
         self._cached_mcp_configs = None
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
@@ -4642,12 +4658,11 @@ class WebToolConfig(BaseToolConfig):
 
             actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
                 self.db,
-                user_id=(
-                    int(self._user_id) if isinstance(self._user_id, int) else 0
-                ),
+                user_id=(int(self._user_id) if isinstance(self._user_id, int) else 0),
                 policy=self._mcp_runtime_authorization_policy,
                 adapter=self._mcp_actor_stdio_connection_adapter,
                 visible_servers=servers,
+                execution_identity=self._mcp_actor_execution_identity,
             )
             for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
                 actor_classifications[blocked_server_id] = (None, True)

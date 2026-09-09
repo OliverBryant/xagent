@@ -2361,15 +2361,16 @@ def get_sandbox_idle_ttl() -> float | None:
 
 
 def get_chrome_session_ttl_seconds() -> float:
-    """Hard non-zero TTL for an orphaned execution-scoped Chrome sandbox.
+    """Default age threshold for the unwired Chrome reaper primitive.
 
     Priority:
         1. XAGENT_CHROME_SESSION_TTL_SECONDS environment variable
         2. Default ``1800`` (30 minutes)
 
-    Unlike the general sandbox idle TTL, Chrome reclamation cannot be
-    disabled because a worker crash can otherwise leave a browser and its
-    temporary profile alive indefinitely. Invalid values use the default.
+    This value alone does not enforce cleanup: the current Chrome primitive
+    has no durable candidate store or startup/periodic sweep registration.
+    Durable lifecycle wiring is required before Chrome is enabled. Invalid
+    values use the non-zero component default.
     """
     value = _get_positive_float_env(CHROME_SESSION_TTL_SECONDS, None)
     return 1800.0 if value is None else value

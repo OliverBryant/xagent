@@ -101,6 +101,7 @@ DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
 DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+CHROME_SESSION_TTL_SECONDS = "XAGENT_CHROME_SESSION_TTL_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -2298,6 +2299,21 @@ def get_sandbox_idle_ttl() -> float | None:
         TTL in seconds, or None when idle reclamation is disabled.
     """
     return _get_positive_float_env(SANDBOX_IDLE_TTL, None)
+
+
+def get_chrome_session_ttl_seconds() -> float:
+    """Hard non-zero TTL for an orphaned execution-scoped Chrome sandbox.
+
+    Priority:
+        1. XAGENT_CHROME_SESSION_TTL_SECONDS environment variable
+        2. Default ``1800`` (30 minutes)
+
+    Unlike the general sandbox idle TTL, Chrome reclamation cannot be
+    disabled because a worker crash can otherwise leave a browser and its
+    temporary profile alive indefinitely. Invalid values use the default.
+    """
+    value = _get_positive_float_env(CHROME_SESSION_TTL_SECONDS, None)
+    return 1800.0 if value is None else value
 
 
 def get_sandbox_sweep_interval() -> float:

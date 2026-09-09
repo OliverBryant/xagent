@@ -34,7 +34,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 # exec user. Doesn't by itself guarantee the warmed cache gets used;
 # see the npx warm-up comment below (xorbitsai/xagent#1869).
 ENV NPM_CONFIG_CACHE=/opt/npm-cache
-RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 1777 "$NPM_CONFIG_CACHE"
+RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 0755 "$NPM_CONFIG_CACHE"
 
 ######################## python 3.11 install (apt)
 
@@ -123,9 +123,9 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 #
 # `--help` exercises resolution without starting Chrome, so this needs
 # no display/GPU setup at build time. umask 0022, not 0000: only
-# cross-user *read* access is needed, so a laxer mask would needlessly
-# leave the cache tree writable by any future lower-privileged process
-# in the container.
+# cross-user *read* access is needed during this root-owned build step. The
+# completed tree is handed to the dedicated sandbox uid below so Boxlite can
+# also update npm metadata on a cache miss without making it world-writable.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         umask 0022 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi
@@ -152,9 +152,17 @@ RUN printf '[global]\nbreak-system-packages = true\n' > /etc/pip.conf
 
 # Create sandbox user
 RUN groupadd --gid 1010 sandbox \
-    && useradd --uid 1100 --gid sandbox --shell /bin/bash --create-home sandbox
+    && useradd --uid 1100 --gid sandbox --shell /bin/bash --create-home sandbox \
+    && chown -R 1100:1010 "$NPM_CONFIG_CACHE"
 
 USER sandbox
 WORKDIR /home/sandbox
+
+# Prove the warmed package is usable by Boxlite's actual uid without network
+# access. This also catches root-owned cache metadata before the image ships.
+RUN if [ "$INSTALL_CHROME" = "true" ]; then \
+        CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 NPM_CONFIG_OFFLINE=true \
+        npx -y --offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
+    fi
 
 CMD ["bash"]

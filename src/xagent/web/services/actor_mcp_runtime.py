@@ -11,9 +11,14 @@ from ... import config as xagent_config
 from ..builtin_mcp_registry import (
     get_builtin_execution_fields,
     get_builtin_public_mcp_app_rows,
+    get_builtin_stdio_session_scope,
 )
 from ..models.public_mcp import PublicMCPApp
-from .mcp_runtime import MCPActorAuthorizationPolicy, caller_id_env
+from .mcp_runtime import (
+    MCPActorAuthorizationPolicy,
+    MCPActorExecutionIdentity,
+    caller_id_env,
+)
 from .user_oauth import normalize_user_oauth_resource_owner_key
 
 
@@ -61,6 +66,28 @@ class ActorMCPStdioConnectionIdentity:
             raise ActorMCPRuntimeDefinitionError(
                 "actor stdio identity requires lifecycle_generation"
             )
+
+
+@dataclass(frozen=True)
+class ActorMCPStdioSessionIdentity:
+    """Complete key for one execution-scoped actor stdio child session."""
+
+    execution: MCPActorExecutionIdentity
+    connection: ActorMCPStdioConnectionIdentity
+
+    @property
+    def key(self) -> tuple[int, str, str, str, int, str, str, UUID, UUID]:
+        return (
+            self.execution.task_id,
+            self.execution.run_id,
+            self.execution.turn_id,
+            self.execution.lease_attempt_id,
+            self.connection.user_id,
+            self.connection.resource_owner_key,
+            self.connection.app_id,
+            self.connection.catalog_app_generation,
+            self.connection.lifecycle_generation,
+        )
 
 
 class ActorMCPStdioConnectionAdapter(Protocol):
@@ -206,16 +233,12 @@ def _validated_runtime_credentials(
     if not required_fields and credentials is None:
         return {}
     if not isinstance(credentials, Mapping) or set(credentials) != set(required_fields):
-        raise ActorMCPRuntimeDefinitionError(
-            "actor stdio credentials are incomplete"
-        )
+        raise ActorMCPRuntimeDefinitionError("actor stdio credentials are incomplete")
     values = dict(credentials)
     if any(
         not isinstance(value, str) or not value.strip() for value in values.values()
     ):
-        raise ActorMCPRuntimeDefinitionError(
-            "actor stdio credentials are incomplete"
-        )
+        raise ActorMCPRuntimeDefinitionError("actor stdio credentials are incomplete")
     return values
 
 
@@ -226,6 +249,7 @@ def resolve_actor_mcp_stdio_configs(
     policy: MCPActorAuthorizationPolicy | None,
     adapter: ActorMCPStdioConnectionAdapter | None,
     visible_servers: Sequence[Any],
+    execution_identity: MCPActorExecutionIdentity | None = None,
 ) -> ActorMCPStdioResolution:
     """Build actor configs without consulting any persisted MCP server definition."""
 
@@ -260,6 +284,14 @@ def resolve_actor_mcp_stdio_configs(
             continue
         try:
             execution, required_fields = _canonical_stdio_execution(db, identity)
+            session_identity: ActorMCPStdioSessionIdentity | None = None
+            if get_builtin_stdio_session_scope(identity.app_id) == "execution":
+                if execution_identity is None:
+                    continue
+                session_identity = ActorMCPStdioSessionIdentity(
+                    execution=execution_identity,
+                    connection=identity,
+                )
             app_keys = {
                 _normalized_catalog_key(identity.app_id),
                 _normalized_catalog_key(execution.get("name")),
@@ -286,20 +318,21 @@ def resolve_actor_mcp_stdio_configs(
 
         launch = execution["launch_config"]
         trusted_env = {**env, **caller_id_env(user_id)}
-        configs.append(
-            {
-                "name": identity.app_id,
-                "transport": "stdio",
-                "description": execution.get("name"),
-                "config": {
-                    "command": launch["command"],
-                    "args": list(launch.get("args") or []),
-                    "env": trusted_env,
-                    "concurrency_safe": False,
-                    "concurrent_tools": [],
-                },
-                "user_id": str(user_id),
-            }
-        )
+        config: dict[str, Any] = {
+            "name": identity.app_id,
+            "transport": "stdio",
+            "description": execution.get("name"),
+            "config": {
+                "command": launch["command"],
+                "args": list(launch.get("args") or []),
+                "env": trusted_env,
+                "concurrency_safe": False,
+                "concurrent_tools": [],
+            },
+            "user_id": str(user_id),
+        }
+        if session_identity is not None:
+            config["actor_stdio_session_identity"] = session_identity
+        configs.append(config)
 
     return ActorMCPStdioResolution(tuple(configs), blocked_server_ids)

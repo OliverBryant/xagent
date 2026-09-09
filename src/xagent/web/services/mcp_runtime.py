@@ -54,6 +54,30 @@ MCPBuiltinOAuthActorPolicy = MCPActorAuthorizationPolicy
 
 
 @dataclass(frozen=True)
+class MCPActorExecutionIdentity:
+    """Exact task turn and lease acquisition that owns one actor execution."""
+
+    task_id: int
+    run_id: str
+    turn_id: str
+    lease_attempt_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.task_id, bool)
+            or not isinstance(self.task_id, int)
+            or self.task_id <= 0
+        ):
+            raise ValueError("actor execution identity requires a persisted task_id")
+        for field_name in ("run_id", "turn_id", "lease_attempt_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(
+                    f"actor execution identity requires an exact {field_name}"
+                )
+
+
+@dataclass(frozen=True)
 class MCPRuntimeConnectionBuild:
     """Executable MCP connection plus any runtime authorization diagnostic."""
 

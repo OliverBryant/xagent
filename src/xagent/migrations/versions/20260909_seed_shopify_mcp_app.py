@@ -10,6 +10,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
+from xagent.builtin_identity import canonicalize_builtin_identity
+
 logger = logging.getLogger(__name__)
 
 revision: str = "20260909_seed_shopify_mcp_app"
@@ -33,6 +35,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 MCP_SERVERS_TABLE = sa.table(
     "mcp_servers",
     sa.column("name", sa.String),
+    sa.column("auth", sa.JSON),
 )
 
 APP_ID = "shopify"
@@ -74,6 +77,19 @@ def _has_provenance(launch_config: object) -> bool:
     )
 
 
+def _has_server_provenance(auth: object) -> bool:
+    return (
+        isinstance(auth, dict) and auth.get("builtin_provenance") == BUILTIN_PROVENANCE
+    )
+
+
+def _collides_with_shopify_identity(value: object) -> bool:
+    return canonicalize_builtin_identity(value) in {
+        canonicalize_builtin_identity(APP_ID),
+        canonicalize_builtin_identity(ROW["name"]),
+    }
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -88,34 +104,63 @@ def upgrade() -> None:
             "is required for provenance"
         )
 
-    existing = (
+    catalog_rows = list(
         bind.execute(
             sa.select(
                 PUBLIC_MCP_APPS_TABLE.c.app_id,
+                PUBLIC_MCP_APPS_TABLE.c.name,
                 PUBLIC_MCP_APPS_TABLE.c.launch_config,
-            ).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        )
-        .mappings()
-        .first()
+            )
+        ).mappings()
     )
-    if existing is not None:
-        if _has_provenance(existing["launch_config"]):
+    colliding_catalog_rows = [
+        row
+        for row in catalog_rows
+        if _collides_with_shopify_identity(row["app_id"])
+        or _collides_with_shopify_identity(row["name"])
+    ]
+    exact_app_rows = [row for row in catalog_rows if row["app_id"] == APP_ID]
+    if exact_app_rows:
+        existing = exact_app_rows[0]
+        if _has_provenance(existing["launch_config"]) and colliding_catalog_rows == [
+            existing
+        ]:
             return
         raise RuntimeError(
+            "Cannot seed builtin Shopify connector: custom or ambiguous "
+            "public_mcp_apps identity collides with 'shopify'"
+        )
+    if colliding_catalog_rows:
+        raise RuntimeError(
             "Cannot seed builtin Shopify connector: custom public_mcp_apps "
-            "row with app_id 'shopify' already exists"
+            "identity collides with 'shopify'"
         )
 
     if "mcp_servers" in tables:
-        server_collision = bind.execute(
-            sa.select(MCP_SERVERS_TABLE.c.name).where(
-                MCP_SERVERS_TABLE.c.name == APP_ID
+        server_columns = {
+            column["name"] for column in inspector.get_columns("mcp_servers")
+        }
+        if "auth" not in server_columns:
+            raise RuntimeError(
+                "Cannot verify builtin Shopify server provenance: "
+                "mcp_servers.auth is required"
             )
-        ).first()
-        if server_collision is not None:
+        colliding_servers = [
+            row
+            for row in bind.execute(
+                sa.select(MCP_SERVERS_TABLE.c.name, MCP_SERVERS_TABLE.c.auth)
+            ).mappings()
+            if _collides_with_shopify_identity(row["name"])
+        ]
+        trusted_round_trip = (
+            len(colliding_servers) == 1
+            and colliding_servers[0]["name"] == APP_ID
+            and _has_server_provenance(colliding_servers[0]["auth"])
+        )
+        if colliding_servers and not trusted_round_trip:
             raise RuntimeError(
                 "Cannot seed builtin Shopify connector: custom mcp_servers "
-                "row named 'shopify' already exists"
+                "identity collides with 'shopify'"
             )
 
     dropped_keys = sorted(set(ROW) - columns)

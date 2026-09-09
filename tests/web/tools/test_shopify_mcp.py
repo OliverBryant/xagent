@@ -581,6 +581,73 @@ def test_mutation_error_log_redacts_token(caplog, monkeypatch):
     assert token not in caplog.text
 
 
+def test_mutation_redacts_token_crossing_truncation_boundary_in_result_and_log(
+    caplog, monkeypatch
+):
+    token = "shpat_boundary_secret_value"
+    monkeypatch.setenv("SHOPIFY_ACCESS_TOKEN", token)
+    detail = "x" * 985 + token
+
+    result = shopify._error(detail)
+    shopify._log_failure("mutation", RuntimeError(detail))
+
+    assert token not in result
+    assert token not in caplog.text
+    assert "shpat_boundary" not in result
+    assert "shpat_boundary" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        MockResponse(status_code=200, text="not-json", json_raises=True),
+        MockResponse(json_data=[]),
+        MockResponse(json_data={"data": None}),
+        MockResponse(json_data={"data": {}, "errors": "invalid-shape"}),
+        MockResponse(json_data={"data": {"one": {}, "two": {}}}),
+    ],
+)
+def test_mutation_anomalous_2xx_responses_are_indeterminate(monkeypatch, response):
+    monkeypatch.setattr(shopify.requests, "post", Mock(return_value=response))
+
+    result = json.loads(shopify.shopify_create_product("Shirt"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["mutation_may_have_completed"] is True
+
+
+def test_mutation_explicit_http_rejection_is_ordinary_error(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={"errors": [{"message": "request rejected"}]},
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_create_product("Shirt"))
+
+    assert result["status"] == "error"
+    assert "request rejected" in result["message"]
+
+
+def test_read_anomalous_2xx_response_remains_ordinary_error(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": None})),
+    )
+
+    result = json.loads(shopify.shopify_get_product("1"))
+
+    assert result["status"] == "error"
+    assert "top-level data" in result["message"]
+
+
 def test_validate_connection_checks_required_and_optional_scopes(monkeypatch):
     monkeypatch.setattr(
         shopify,
@@ -1016,6 +1083,37 @@ def test_get_product_caps_output_size(monkeypatch):
     assert len(result["product"]["tags"]) < 200
 
 
+def test_capped_single_result_keeps_bounded_warning_summary(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "product": {
+                            "id": "gid://shopify/Product/1",
+                            "title": "Shirt",
+                            "tags": [f"tag-{index}" * 20 for index in range(200)],
+                        }
+                    },
+                    "errors": [{"message": "warning-" + "w" * 2000}],
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(shopify, "get_tool_max_output_length", lambda: 500)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 500)
+
+    raw = shopify.shopify_get_product("1")
+    result = json.loads(raw)
+
+    assert len(raw) <= 500
+    assert result["status"] == "success"
+    assert result["warnings"]
+    assert result["warnings_truncated"] is True
+
+
 def test_create_product_requires_title():
     result = json.loads(shopify.shopify_create_product(""))
 
@@ -1189,7 +1287,7 @@ def test_update_product_rejects_blank_title(monkeypatch):
     mock_post.assert_not_called()
 
 
-def test_create_product_fails_closed_when_mutation_field_missing(monkeypatch):
+def test_create_product_is_indeterminate_when_mutation_field_missing(monkeypatch):
     # A malformed/empty response for the requested mutation field must be
     # treated as a failure, not silently reported as success with an empty
     # product.
@@ -1201,7 +1299,9 @@ def test_create_product_fails_closed_when_mutation_field_missing(monkeypatch):
 
     result = json.loads(shopify.shopify_create_product("Shirt"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["mutation_may_have_completed"] is True
 
 
 def test_create_product_is_indeterminate_when_projection_is_null_after_mutation(
@@ -1232,7 +1332,7 @@ def test_create_product_is_indeterminate_when_projection_is_null_after_mutation(
     assert "Access denied for tags field" in result["message"]
 
 
-def test_create_product_fails_closed_when_object_null_with_no_top_level_errors(
+def test_create_product_is_indeterminate_when_object_null_with_no_top_level_errors(
     monkeypatch,
 ):
     # Same null-object-despite-empty-userErrors shape as above, but with no
@@ -1253,7 +1353,9 @@ def test_create_product_fails_closed_when_object_null_with_no_top_level_errors(
 
     result = json.loads(shopify.shopify_create_product("Shirt"))
 
-    assert result["status"] == "error"
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["mutation_may_have_completed"] is True
     assert "productCreate" in result["message"]
 
 
@@ -1306,7 +1408,7 @@ def test_success_routes_warnings_through_errors_detail(monkeypatch):
                     "data": {
                         "product": {"id": "gid://shopify/Product/1", "title": "Shirt"}
                     },
-                    "errors": "[API] partial failure",
+                    "errors": [{"message": "[API] partial failure"}],
                 }
             )
         ),
@@ -1644,4 +1746,4 @@ def test_custom_shopify_catalog_row_is_not_overlaid_as_builtin():
 
     assert rendered["name"] == "Custom Shopify"
     assert rendered["launch_config"] == custom_launch
-    assert is_builtin_public_mcp_app("shopify", custom_launch) is False
+    assert is_builtin_public_mcp_app("shopify") is True

@@ -6,7 +6,7 @@ import socket
 import time
 from collections.abc import Callable
 from os import environ
-from typing import Any
+from typing import Any, NoReturn
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -75,9 +75,13 @@ def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
 
 
 def _safe_text(value: Any) -> str:
-    text = redact_sensitive_text(truncate_error_text(str(value)))
+    # Redact the complete value before truncating. Reversing this order can
+    # leave a recognizable token prefix when the boundary splits the token.
+    text = str(value)
     token = environ.get("SHOPIFY_ACCESS_TOKEN", "")
-    return text.replace(token, "[REDACTED]") if token else text
+    if token:
+        text = text.replace(token, "[REDACTED]")
+    return truncate_error_text(redact_sensitive_text(text))
 
 
 def _log_failure(operation: str, exc: BaseException) -> None:
@@ -306,6 +310,12 @@ class MutationOutcomeIndeterminate(RuntimeError):
     """The request may have reached Shopify, so retrying could duplicate a write."""
 
 
+def _raise_response_shape(message: str, *, mutation: bool) -> NoReturn:
+    if mutation:
+        raise MutationOutcomeIndeterminate(message)
+    raise RuntimeError(message)
+
+
 def _granted_admin_scopes() -> set[str]:
     """Read the scopes granted to the current custom-app token."""
     try:
@@ -396,9 +406,10 @@ def _graphql(
 
     Returns (data, errors). Every query/mutation in this module selects
     exactly one top-level field, so if that field comes back null alongside
-    a non-empty "errors" array there is nothing usable to return -- that is
-    treated as a hard failure and raises instead. If at least one top-level
-    field is non-null, it's a genuine partial success (e.g. a nested
+    a non-empty "errors" array there is nothing usable to return. Reads fail;
+    mutations retain that response so the dispatched write can be reported as
+    indeterminate. If at least one top-level field is non-null, it's a genuine
+    partial success (e.g. a nested
     sub-field's resolver failed): errors is returned alongside data so the
     caller can surface it as a warning rather than only logging it. Mirrors
     linear.py's `_graphql`, adapted for Shopify's cost-based throttling
@@ -465,22 +476,38 @@ def _graphql(
         raise RuntimeError(message)
 
     if payload is None:
-        detail = truncate_error_text(response.text.strip())
-        raise RuntimeError(
-            f"Shopify API returned a non-JSON response: {detail}"
-        ) from None
+        detail = _safe_text(response.text.strip())
+        _raise_response_shape(
+            f"Shopify API returned a non-JSON response: {detail}",
+            mutation=mutation,
+        )
     if not isinstance(payload, dict):
-        raise RuntimeError(
-            "Shopify API returned an unexpected (non-object) response body"
+        _raise_response_shape(
+            "Shopify API returned an unexpected (non-object) response body",
+            mutation=mutation,
         )
 
-    data = payload.get("data") or {}
-    if len(data) > 1:
-        raise RuntimeError(
-            f"Shopify API response had {len(data)} top-level fields "
-            f"({sorted(data)}), but this module's error handling assumes exactly one"
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        _raise_response_shape(
+            "Shopify API response has an invalid top-level data field",
+            mutation=mutation,
         )
-    errors = payload.get("errors") or []
+    if len(data) > 1:
+        _raise_response_shape(
+            f"Shopify API response had {len(data)} top-level fields "
+            f"({sorted(data)}), but this module's error handling assumes exactly one",
+            mutation=mutation,
+        )
+    raw_errors = payload.get("errors", [])
+    if not isinstance(raw_errors, list) or not all(
+        isinstance(entry, dict) for entry in raw_errors
+    ):
+        _raise_response_shape(
+            "Shopify API response has an invalid top-level errors field",
+            mutation=mutation,
+        )
+    errors = raw_errors
     if errors:
         message = _errors_detail(errors)
         if all(value is None for value in data.values()):
@@ -627,31 +654,34 @@ def _run_mutation(
     update order): run the mutation, then apply the same
     result-missing/userErrors/success discriminator each one needs.
 
-    `result.get(mutation_field)` being falsy covers two distinct failure
-    shapes the same way: the mutation field resolved to null (Shopify's own
-    signal that the input's id/lookup didn't resolve to anything), or --
-    defensively -- a malformed response where the field was omitted
-    entirely with no errors at all. Either way there is nothing usable to
-    return, so this fails closed instead of reporting an empty object as a
-    success, matching linear.py's `if not result.get("success")` check
+    A missing, null, or non-object mutation projection covers two ambiguous
+    shapes: the field resolved to null, or a malformed response omitted it.
+    Either way there is nothing usable to return after dispatch, so this
+    reports an unsafe-to-retry indeterminate outcome instead of an empty
+    success or an ordinary retryable-looking error
     (Shopify's write mutations here use an empty `userErrors` list as their
     success signal instead of Linear's boolean `success` field, but an
-    absent result must still be treated as failure, not vacuously "no
-    errors").
+    absent result must still be treated as indeterminate, not vacuously
+    "no errors").
     """
     try:
         data, errors = _graphql(mutation, variables, mutation=True)
     except MutationOutcomeIndeterminate as exc:
         return _indeterminate(str(exc))
     result = data.get(mutation_field)
-    if not result:
-        if errors:
-            return _indeterminate(
-                f"Shopify returned no {mutation_field} projection after the "
-                f"mutation request: {_errors_detail(errors)}"
-            )
-        return _error(f"Shopify returned no result for {mutation_field}")
-    user_errors = result.get("userErrors") or []
+    if not isinstance(result, dict):
+        detail = f": {_errors_detail(errors)}" if errors else ""
+        return _indeterminate(
+            f"Shopify returned no valid {mutation_field} projection after the "
+            f"mutation request{detail}"
+        )
+    user_errors = result.get("userErrors")
+    if not isinstance(user_errors, list) or not all(
+        isinstance(entry, dict) for entry in user_errors
+    ):
+        return _indeterminate(
+            f"Shopify returned an invalid userErrors projection for {mutation_field}"
+        )
     if user_errors:
         # userErrors alone can omit useful context a top-level GraphQL
         # `errors` entry carries (e.g. a query-level access-scope warning
@@ -663,18 +693,17 @@ def _run_mutation(
             message = f"{message} ({_errors_detail(errors)})"
         return _error(message)
     object_value = result.get(object_key)
-    if not object_value:
+    if not isinstance(object_value, dict):
         # userErrors is empty, but the object itself is also null -- e.g. an
         # access-scope error on one selected field null-propagated up to the
         # whole object, with the real cause only in the top-level `errors`
         # this response still carries. Reporting this as success with an
         # all-null object would hide that entirely.
-        if errors:
-            return _indeterminate(
-                f"Shopify returned no {object_key} projection after "
-                f"{mutation_field}: {_errors_detail(errors)}"
-            )
-        return _error(f"Shopify did not return a {object_key} for {mutation_field}")
+        detail = f": {_errors_detail(errors)}" if errors else ""
+        return _indeterminate(
+            f"Shopify returned no valid {object_key} projection after "
+            f"{mutation_field}{detail}"
+        )
     return _success_capped(object_key, summary_fn(object_value), errors)
 
 
@@ -702,16 +731,33 @@ def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -
     capped = success_with_capped_dict(field_name, value)
     if not errors:
         return capped
-    # success_with_capped_dict's payload shape has no room for the
-    # `_errors`-derived "warnings" key `_success` above would have added --
-    # re-add it only if the now-shrunk response still fits, since appending
-    # it unconditionally could push an already-fitted response back over
-    # the cap (the same reasoning `_success_paginated`'s dead-end message
-    # follows).
     payload = json.loads(capped)
-    payload["warnings"] = [_errors_detail(errors)]
+    warning = _errors_detail(errors)
+    payload["warnings"] = [warning]
+    payload["warnings_truncated"] = False
     with_warnings = json.dumps(payload, ensure_ascii=False)
-    return with_warnings if len(with_warnings) <= max_output_length else capped
+    if len(with_warnings) <= max_output_length:
+        return with_warnings
+
+    payload["warnings_truncated"] = True
+    payload["truncated"] = True
+    marker = "... [truncated]"
+    low, high = 0, len(warning)
+    while low < high:
+        middle = (low + high + 1) // 2
+        payload["warnings"] = [warning[:middle] + marker]
+        if len(json.dumps(payload, ensure_ascii=False)) <= max_output_length:
+            low = middle
+        else:
+            high = middle - 1
+    payload["warnings"] = [warning[:low] + marker]
+    while len(json.dumps(payload, ensure_ascii=False)) > max_output_length:
+        value = payload.get(field_name)
+        if not isinstance(value, dict) or not value:
+            break
+        keys = list(value)
+        payload[field_name] = {key: value[key] for key in keys[: len(keys) // 2]}
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _shop_summary(shop: dict[str, Any]) -> dict[str, Any]:

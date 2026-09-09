@@ -1534,7 +1534,6 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
     "oauth_scopes",
     "launch_config",
 )
-_UNSPECIFIED_LAUNCH_CONFIG = object()
 
 
 def _matches_builtin_provenance(
@@ -1546,7 +1545,7 @@ def _matches_builtin_provenance(
         if isinstance(canonical_launch, dict)
         else None
     )
-    if marker is None or persisted_launch_config is _UNSPECIFIED_LAUNCH_CONFIG:
+    if marker is None:
         return True
     return (
         isinstance(persisted_launch_config, dict)
@@ -1561,18 +1560,25 @@ def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     return None
 
 
-def is_builtin_public_mcp_app(
-    app_id: str, persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG
+def _persisted_builtin_provenance_matches(
+    app_id: str, persisted_launch_config: Any
 ) -> bool:
+    """Whether a persisted row carries any provenance required by its builtin.
+
+    An absent registry row has no provenance constraint. This keeps callers
+    composable with an injected registry while Shopify's real row is checked.
+    """
     row = get_builtin_public_mcp_app(app_id)
-    return row is not None and _matches_builtin_provenance(row, persisted_launch_config)
+    return row is None or _matches_builtin_provenance(row, persisted_launch_config)
 
 
-def get_builtin_execution_fields(
-    app_id: str, persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG
-) -> dict[str, Any] | None:
+def is_builtin_public_mcp_app(app_id: str) -> bool:
+    return get_builtin_public_mcp_app(app_id) is not None
+
+
+def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     row = get_builtin_public_mcp_app(app_id)
-    if row is None or not _matches_builtin_provenance(row, persisted_launch_config):
+    if row is None:
         return None
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
@@ -1581,7 +1587,6 @@ def get_builtin_execution_fields(
 
 def get_builtin_execution_fields_and_optional_scopes(
     app_id: str,
-    persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """The app's execution fields, plus OAuth scopes requested via the
     authorize request's optional_scope parameter rather than its required
@@ -1600,7 +1605,7 @@ def get_builtin_execution_fields_and_optional_scopes(
     scopes at all, hence the plain ``.get`` default.
     """
     row = get_builtin_public_mcp_app(app_id)
-    if row is None or not _matches_builtin_provenance(row, persisted_launch_config):
+    if row is None:
         return None, []
     execution_fields = {
         field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES

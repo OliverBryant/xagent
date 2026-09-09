@@ -8,6 +8,7 @@ import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 
 def _load_migration():
@@ -51,7 +52,8 @@ def _create_tables(connection):
             """
             CREATE TABLE mcp_servers (
                 id INTEGER PRIMARY KEY,
-                name VARCHAR(100) NOT NULL UNIQUE
+                name VARCHAR(100) NOT NULL UNIQUE,
+                auth JSON
             )
             """
         )
@@ -105,7 +107,7 @@ def test_upgrade_refuses_custom_catalog_collision(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            with pytest.raises(RuntimeError, match="custom public_mcp_apps"):
+            with pytest.raises(RuntimeError, match="public_mcp_apps"):
                 migration.upgrade()
         row = connection.execute(
             text("SELECT name FROM public_mcp_apps WHERE app_id='shopify'")
@@ -126,6 +128,46 @@ def test_upgrade_refuses_custom_server_name_collision(tmp_path):
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
         ).scalar_one()
     assert count == 0
+
+
+@pytest.mark.parametrize(
+    "app_id,name",
+    [
+        (" SHOPIFY ", "Unrelated"),
+        ("other", " shopify "),
+        ("ShOpIfY", "Unrelated"),
+    ],
+)
+def test_upgrade_refuses_normalized_custom_catalog_collision(tmp_path, app_id, name):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES (:app_id, :name, 'stdio', '{\"command\": \"custom\"}')"
+            ),
+            {"app_id": app_id, "name": name},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="public_mcp_apps"):
+                migration.upgrade()
+
+
+@pytest.mark.parametrize("name", [" SHOPIFY ", "ShOpIfY"])
+def test_upgrade_refuses_normalized_custom_server_collision(tmp_path, name):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text("INSERT INTO mcp_servers (name) VALUES (:name)"), {"name": name}
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="custom mcp_servers"):
+                migration.upgrade()
 
 
 def test_downgrade_only_deletes_provenance_owned_row(tmp_path):
@@ -170,3 +212,65 @@ def test_seed_row_matches_registry():
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "shopify"
     )
     assert migration.ROW == registry
+
+
+def test_upgrade_connect_downgrade_reupgrade_preserves_official_connection(tmp_path):
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer, UserMCPServer
+    from xagent.web.models.user import User
+
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'roundtrip.sqlite'}")
+    Base.metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    user = User(id=1, username="shop-owner", password_hash="x")
+    db.add(user)
+    db.commit()
+    connect_mcp_app(
+        "shopify",
+        MCPAppConnectRequest(
+            env={
+                "SHOPIFY_STORE_DOMAIN": "acme",
+                "SHOPIFY_ACCESS_TOKEN": "shpat_roundtrip_secret",
+            }
+        ),
+        current_user=user,
+        db=db,
+    )
+    server = db.query(MCPServer).filter(MCPServer.name == "shopify").one()
+    association = (
+        db.query(UserMCPServer)
+        .filter(UserMCPServer.mcpserver_id == server.id, UserMCPServer.user_id == 1)
+        .one()
+    )
+    server_id = int(server.id)
+    association_id = int(association.id)
+    encrypted_env = association.env
+    assert server.auth == {"builtin_provenance": migration.BUILTIN_PROVENANCE}
+    db.close()
+
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+            migration.upgrade()
+
+    db = session_factory()
+    assert db.query(MCPServer).filter(MCPServer.id == server_id).one().auth == {
+        "builtin_provenance": migration.BUILTIN_PROVENANCE
+    }
+    preserved = db.query(UserMCPServer).filter(UserMCPServer.id == association_id).one()
+    assert preserved.env == encrypted_env
+    assert (
+        db.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
+        ).scalar_one()
+        == 1
+    )
+    db.close()

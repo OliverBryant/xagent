@@ -158,7 +158,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     # One registry scan (not two - see the helper's own docstring) since
     # this runs per app on the connector-listing path.
     execution_fields, optional_oauth_scopes = (
-        get_builtin_execution_fields_and_optional_scopes(app.app_id)
+        get_builtin_execution_fields_and_optional_scopes(app.app_id, app.launch_config)
     )
     if execution_fields is None:
         execution_fields = {
@@ -301,7 +301,7 @@ def _strict_catalog_app_by_id(
         )
 
     execution_fields, _optional_scopes = (
-        get_builtin_execution_fields_and_optional_scopes(app.app_id)
+        get_builtin_execution_fields_and_optional_scopes(app.app_id, app.launch_config)
     )
     if require_builtin_oauth and execution_fields is None:
         raise BuiltinOAuthServerDefinitionError(

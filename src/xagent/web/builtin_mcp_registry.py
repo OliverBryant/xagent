@@ -1434,6 +1434,44 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "shopify",
+            "name": "Shopify",
+            "description": "Connect a Shopify custom app with a store label (for example, acme for acme.myshopify.com) and Admin API access token. Grant write_products, write_orders, and read_customers; read_all_orders is optional for orders older than 60 days.",
+            "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "required_env": [
+                    "SHOPIFY_STORE_DOMAIN",
+                    "SHOPIFY_ACCESS_TOKEN",
+                ],
+                "required_admin_scopes": [
+                    "write_products",
+                    "write_orders",
+                    "read_customers",
+                ],
+                "optional_admin_scopes": ["read_all_orders"],
+                # Compatibility metadata only. Current main ignores this
+                # field; a later actor-scoped stdio runtime can recognize
+                # that credentials are personal without this PR enabling
+                # delegated/Toby access or bypassing current isolation.
+                "credential_scope": "personal",
+                # Stable ownership marker used by the seed migration. It is
+                # intentionally inside launch_config because current main
+                # has no dedicated catalog-provenance column.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "shopify",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "magento",
             "name": "Magento",
             "description": 'Connect to a self-hosted Magento/Adobe Commerce store with an Integration access token to search and manage products, look up orders and add order comments, and browse customers and categories. On Magento 2.4.4+, enable Stores > Configuration > Services > OAuth > Consumer Settings > "Allow OAuth Access Tokens to be used as standalone Bearer tokens" first.',
@@ -1496,6 +1534,24 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
     "oauth_scopes",
     "launch_config",
 )
+_UNSPECIFIED_LAUNCH_CONFIG = object()
+
+
+def _matches_builtin_provenance(
+    canonical_row: dict[str, Any], persisted_launch_config: Any
+) -> bool:
+    canonical_launch = canonical_row.get("launch_config")
+    marker = (
+        canonical_launch.get("builtin_provenance")
+        if isinstance(canonical_launch, dict)
+        else None
+    )
+    if marker is None or persisted_launch_config is _UNSPECIFIED_LAUNCH_CONFIG:
+        return True
+    return (
+        isinstance(persisted_launch_config, dict)
+        and persisted_launch_config.get("builtin_provenance") == marker
+    )
 
 
 def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
@@ -1505,13 +1561,18 @@ def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
     return None
 
 
-def is_builtin_public_mcp_app(app_id: str) -> bool:
-    return any(row["app_id"] == app_id for row in get_builtin_public_mcp_app_rows())
-
-
-def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
+def is_builtin_public_mcp_app(
+    app_id: str, persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG
+) -> bool:
     row = get_builtin_public_mcp_app(app_id)
-    if row is None:
+    return row is not None and _matches_builtin_provenance(row, persisted_launch_config)
+
+
+def get_builtin_execution_fields(
+    app_id: str, persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG
+) -> dict[str, Any] | None:
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None or not _matches_builtin_provenance(row, persisted_launch_config):
         return None
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
@@ -1520,6 +1581,7 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
 
 def get_builtin_execution_fields_and_optional_scopes(
     app_id: str,
+    persisted_launch_config: Any = _UNSPECIFIED_LAUNCH_CONFIG,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """The app's execution fields, plus OAuth scopes requested via the
     authorize request's optional_scope parameter rather than its required
@@ -1538,7 +1600,7 @@ def get_builtin_execution_fields_and_optional_scopes(
     scopes at all, hence the plain ``.get`` default.
     """
     row = get_builtin_public_mcp_app(app_id)
-    if row is None:
+    if row is None or not _matches_builtin_provenance(row, persisted_launch_config):
         return None, []
     execution_fields = {
         field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES
@@ -1582,6 +1644,10 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
     for app_id, canonical_row in canonical_by_app_id.items():
         persisted_row = persisted_by_app_id.get(app_id)
         if persisted_row is None:
+            continue
+        if not _matches_builtin_provenance(
+            canonical_row, persisted_row["launch_config"]
+        ):
             continue
 
         mismatched_fields = [

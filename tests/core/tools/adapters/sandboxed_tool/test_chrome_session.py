@@ -11,6 +11,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
     CHROME_DEVTOOLS_PACKAGE,
     ChromeDaemonClient,
     ChromeDaemonLaunchSpec,
+    ChromeExecutionScope,
     ChromeExecutionSession,
     ChromeExecutionSessionPool,
     ChromeLeaseState,
@@ -41,10 +42,27 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _scope(value: str) -> ChromeExecutionScope:
+    return ChromeExecutionScope(key=(value,), digest=_digest(value))
+
+
 def _sandbox() -> AsyncMock:
     sandbox = AsyncMock(spec=Sandbox)
     sandbox.name = "chrome-execution::test"
     return sandbox
+
+
+def _healthy_status(*, suffix: list[str] | None = None):
+    return {
+        "version": "1.6.0",
+        "args": [
+            "--headless",
+            "--isolated",
+            *(suffix or []),
+            "--viaCli",
+            "--experimentalStructuredContent",
+        ],
+    }
 
 
 class TestChromeDaemonLaunchSpec:
@@ -136,7 +154,8 @@ class TestChromeExecutionSession:
             launch=ChromeDaemonLaunchSpec.from_connection(_connection()),
         )
         client = AsyncMock()
-        client.status.return_value = {"running": True}
+        client.start.return_value = _healthy_status()
+        client.status.return_value = {"running": True, "status": _healthy_status()}
         client.invoke_tool.side_effect = [{"value": 1}, {"value": 2}]
         session._client = client
 
@@ -193,6 +212,27 @@ class TestChromeExecutionSession:
         release.set()
         await asyncio.wait_for(deleted.wait(), timeout=1)
 
+    @pytest.mark.asyncio
+    async def test_status_mismatch_fails_closed(self):
+        delete = AsyncMock()
+        session = ChromeExecutionSession(
+            ChromeSandboxHandle(sandbox=_sandbox(), delete=delete),
+            session_id="f" * 32,
+            launch=ChromeDaemonLaunchSpec.from_connection(_connection()),
+        )
+        session._started = True
+        client = AsyncMock()
+        client.status.return_value = {
+            "running": True,
+            "status": {**_healthy_status(), "version": "unexpected"},
+        }
+        session._client = client
+
+        with pytest.raises(ChromeSessionContractError, match="status does not match"):
+            await session.invoke_tool("take_snapshot", {})
+
+        client.invoke_tool.assert_not_awaited()
+
 
 class TestChromeExecutionSessionPool:
     @pytest.mark.asyncio
@@ -204,8 +244,8 @@ class TestChromeExecutionSessionPool:
         )
         pool = ChromeExecutionSessionPool(factory)
         launch = ChromeDaemonLaunchSpec.from_connection(_connection())
-        one = _digest("exact execution one")
-        two = _digest("exact execution two")
+        one = _scope("exact execution one")
+        two = _scope("exact execution two")
 
         first, duplicate = await asyncio.gather(
             pool.get_or_create(one, launch), pool.get_or_create(one, launch)
@@ -214,8 +254,8 @@ class TestChromeExecutionSessionPool:
 
         assert first is duplicate
         assert distinct is not first
-        assert factory.await_args_list[0].args == (one,)
-        assert factory.await_args_list[1].args == (two,)
+        assert factory.await_args_list[0].args == (one.digest,)
+        assert factory.await_args_list[1].args == (two.digest,)
 
     @pytest.mark.asyncio
     async def test_factory_failure_propagates_without_fallback(self):
@@ -223,7 +263,7 @@ class TestChromeExecutionSessionPool:
         pool = ChromeExecutionSessionPool(factory)
         with pytest.raises(RuntimeError, match="sandbox unavailable"):
             await pool.get_or_create(
-                _digest("execution"),
+                _scope("execution"),
                 ChromeDaemonLaunchSpec.from_connection(_connection()),
             )
 
@@ -234,7 +274,7 @@ class TestChromeExecutionSessionPool:
                 return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=AsyncMock())
             )
         )
-        scope = _digest("execution")
+        scope = _scope("execution")
         await pool.get_or_create(
             scope, ChromeDaemonLaunchSpec.from_connection(_connection())
         )
@@ -264,7 +304,7 @@ class TestChromeExecutionSessionPool:
         )
         pool = ChromeExecutionSessionPool(factory)
         launch = ChromeDaemonLaunchSpec.from_connection(_connection())
-        scope = _digest("execution")
+        scope = _scope("execution")
         first = await pool.get_or_create(scope, launch)
 
         closing = asyncio.create_task(pool.close(scope))
@@ -281,30 +321,81 @@ class TestChromeExecutionSessionPool:
         assert factory.await_count == 2
 
     def test_rejects_partial_or_non_digest_scope(self):
-        pool = ChromeExecutionSessionPool(AsyncMock())
         with pytest.raises(ValueError, match="SHA-256"):
-            pool._validate_scope_digest("connection-identity-only")
+            ChromeExecutionScope(
+                key=("full", "identity"), digest="connection-identity-only"
+            )
+
+    @pytest.mark.asyncio
+    async def test_digest_collision_fails_closed_on_full_in_memory_key(self):
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(
+                return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=AsyncMock())
+            )
+        )
+        digest = _digest("collision")
+        first = ChromeExecutionScope(key=("one",), digest=digest)
+        second = ChromeExecutionScope(key=("two",), digest=digest)
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        await pool.get_or_create(first, launch)
+
+        with pytest.raises(ChromeSessionContractError, match="digest collision"):
+            await pool.get_or_create(second, launch)
+
+    @pytest.mark.asyncio
+    async def test_daemon_status_mismatch_deletes_sandbox_without_retry(self):
+        delete = AsyncMock()
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(
+                return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=delete)
+            )
+        )
+        scope = _scope("status-mismatch")
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        session = await pool.get_or_create(scope, launch)
+        session._started = True
+        session._client = AsyncMock()
+        session._client.status.return_value = {
+            "running": True,
+            "status": {**_healthy_status(), "args": ["--headless"]},
+        }
+
+        with pytest.raises(ChromeSessionContractError, match="status does not match"):
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
+
+        session._client.invoke_tool.assert_not_awaited()
+        delete.assert_awaited_once()
 
 
 class TestChromeSessionReaper:
+    def test_candidate_rejects_raw_lifecycle_and_lease_identifiers(self):
+        with pytest.raises(ValueError, match="opaque digests"):
+            ChromeSessionReaperCandidate(
+                "task-7-run-one-attempt-one",
+                datetime.now(timezone.utc),
+                "attempt-one",
+            )
+
     @pytest.mark.asyncio
     async def test_only_ttl_expired_stale_fences_reach_atomic_reclaim(self):
         now = datetime(2026, 9, 9, tzinfo=timezone.utc)
-        fresh = ChromeSessionReaperCandidate("fresh", now, "f1")
+        fresh = ChromeSessionReaperCandidate(_digest("fresh"), now, _digest("f1"))
         current = ChromeSessionReaperCandidate(
-            "current", now - timedelta(hours=1), "f2"
+            _digest("current"), now - timedelta(hours=1), _digest("f2")
         )
         unknown = ChromeSessionReaperCandidate(
-            "unknown", now - timedelta(hours=1), "f3"
+            _digest("unknown"), now - timedelta(hours=1), _digest("f3")
         )
-        stale = ChromeSessionReaperCandidate("stale", now - timedelta(hours=1), "f4")
+        stale = ChromeSessionReaperCandidate(
+            _digest("stale"), now - timedelta(hours=1), _digest("f4")
+        )
 
         async def classify(candidate):
             return {
-                "current": ChromeLeaseState.CURRENT,
-                "unknown": ChromeLeaseState.UNKNOWN,
-                "stale": ChromeLeaseState.STALE,
-            }[candidate.lifecycle_id]
+                current: ChromeLeaseState.CURRENT,
+                unknown: ChromeLeaseState.UNKNOWN,
+                stale: ChromeLeaseState.STALE,
+            }[candidate]
 
         reclaim = AsyncMock(return_value=True)
         reaper = ChromeSessionReaper(
@@ -314,15 +405,15 @@ class TestChromeSessionReaper:
             ttl=timedelta(minutes=30),
         )
 
-        assert await reaper.sweep(now=now) == ("stale",)
+        assert await reaper.sweep(now=now) == (_digest("stale"),)
         reclaim.assert_awaited_once_with(stale)
 
     @pytest.mark.asyncio
     async def test_classification_failure_is_fail_closed(self):
         candidate = ChromeSessionReaperCandidate(
-            "candidate",
+            _digest("candidate"),
             datetime.now(timezone.utc) - timedelta(hours=1),
-            "fence",
+            _digest("fence"),
         )
         reclaim = AsyncMock()
         reaper = ChromeSessionReaper(
@@ -337,8 +428,12 @@ class TestChromeSessionReaper:
     @pytest.mark.asyncio
     async def test_reclaim_failure_does_not_skip_later_orphans(self):
         now = datetime.now(timezone.utc)
-        first = ChromeSessionReaperCandidate("first", now - timedelta(hours=1), "f1")
-        second = ChromeSessionReaperCandidate("second", now - timedelta(hours=1), "f2")
+        first = ChromeSessionReaperCandidate(
+            _digest("first"), now - timedelta(hours=1), _digest("f1")
+        )
+        second = ChromeSessionReaperCandidate(
+            _digest("second"), now - timedelta(hours=1), _digest("f2")
+        )
         reclaim = AsyncMock(side_effect=[RuntimeError("delete failed"), True])
         reaper = ChromeSessionReaper(
             list_candidates=AsyncMock(return_value=[first, second]),
@@ -346,13 +441,14 @@ class TestChromeSessionReaper:
             reclaim_if_stale=reclaim,
         )
 
-        assert await reaper.sweep(now=now) == ("second",)
+        assert await reaper.sweep(now=now) == (_digest("second"),)
         assert reclaim.await_count == 2
 
 
-def test_chrome_session_primitives_are_not_wired_into_generic_mcp_loader():
+def test_chrome_session_is_wired_without_replacing_generic_mcp_lifecycle():
     import xagent.core.tools.adapters.vibe.mcp_adapter as generic_loader
 
     source = generic_loader.__loader__.get_source(generic_loader.__name__)
     assert source is not None
-    assert "ChromeExecutionSessionPool" not in source
+    assert "ChromeExecutionSessionPool" in source
+    assert "async with create_session(connection) as session" in source

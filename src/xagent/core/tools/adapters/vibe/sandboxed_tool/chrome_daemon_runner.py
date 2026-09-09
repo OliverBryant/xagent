@@ -197,8 +197,12 @@ def _start(session_id: str, server_args: list[Any]) -> dict[str, Any]:
     status = _status(socket_path)
     if status is not None and _status_matches_managed_daemon(status):
         return status
+    if status is not None:
+        raise ChromeDaemonRunnerError(
+            "existing daemon does not match the pinned launch contract"
+        )
 
-    if status is not None or pid_file.exists():
+    if pid_file.exists():
         pid = _read_pid(pid_file)
         if pid is not None and _pid_is_expected_daemon(pid):
             _terminate_expected_daemon(pid_file)

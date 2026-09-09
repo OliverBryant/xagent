@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
@@ -12,9 +13,18 @@ from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.services.actor_mcp_connections import (
+    ActorMCPConnectionCredentialCorruptionError,
+    ActorMCPConnectionMetadata,
+    ActorMCPConnectionSnapshot,
+    ActorMCPConnectionValidationError,
+    create_actor_mcp_connection,
+)
 from xagent.web.services.actor_mcp_runtime import (
+    ActorMCPConnectionServiceAdapter,
     ActorMCPStdioConnectionIdentity,
     ActorMCPStdioSessionIdentity,
+    production_actor_mcp_stdio_connection_adapter,
     resolve_actor_mcp_stdio_configs,
 )
 from xagent.web.services.mcp_runtime import (
@@ -189,6 +199,248 @@ def test_synthetic_config_uses_exact_lifecycle_fenced_adapter_inputs(
         "XAGENT_MCP_CALLER_ID": str(USER_ID),
     }
     assert "id" not in config
+
+
+def test_production_adapter_is_a_stateless_exact_service_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_generation = uuid.uuid4()
+    lifecycle_generation = uuid.uuid4()
+    metadata = ActorMCPConnectionMetadata(
+        id=7,
+        lifecycle_generation=lifecycle_generation,
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id=APP_ID,
+        catalog_app_generation=catalog_generation,
+        configured_field_names=frozenset(_credentials()),
+    )
+    snapshot = ActorMCPConnectionSnapshot(
+        id=7,
+        lifecycle_generation=lifecycle_generation,
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id=APP_ID,
+        catalog_app_generation=catalog_generation,
+        credentials=_credentials(),
+    )
+    list_calls: list[dict[str, object]] = []
+    secret_calls: list[dict[str, object]] = []
+
+    def fake_list(_db: Session, **kwargs: object) -> list[object]:
+        list_calls.append(kwargs)
+        return [metadata]
+
+    def fake_get(_db: Session, **kwargs: object) -> object:
+        secret_calls.append(kwargs)
+        return snapshot
+
+    monkeypatch.setattr(
+        "xagent.web.services.actor_mcp_runtime.list_actor_mcp_connection_metadata",
+        fake_list,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.actor_mcp_runtime.get_actor_mcp_connection_credentials_internal",
+        fake_get,
+    )
+    adapter = ActorMCPConnectionServiceAdapter()
+
+    identities = adapter.list_connection_identities(
+        object(),  # type: ignore[arg-type]
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+    )
+    credentials = adapter.get_connection_credentials(
+        object(),  # type: ignore[arg-type]
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id=APP_ID,
+        catalog_app_generation=catalog_generation,
+        expected_lifecycle_generation=lifecycle_generation,
+    )
+
+    assert identities == (
+        ActorMCPStdioConnectionIdentity(
+            user_id=USER_ID,
+            resource_owner_key=OWNER,
+            app_id=APP_ID,
+            catalog_app_generation=catalog_generation,
+            lifecycle_generation=lifecycle_generation,
+        ),
+    )
+    assert credentials == _credentials()
+    assert list_calls == [{"user_id": USER_ID, "resource_owner_key": OWNER}]
+    assert secret_calls == [
+        {
+            "user_id": USER_ID,
+            "resource_owner_key": OWNER,
+            "app_id": APP_ID,
+            "catalog_app_generation": catalog_generation,
+            "expected_lifecycle_generation": lifecycle_generation,
+        }
+    ]
+
+
+def test_production_adapter_resolves_credentials_from_storage_service(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    _seed_app(db)
+    create_actor_mcp_connection(
+        db,
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id=APP_ID,
+        credentials=_credentials(),
+    )
+
+    def forbidden_transaction_boundary() -> None:
+        raise AssertionError("runtime adapter must not own commit or rollback")
+
+    monkeypatch.setattr(db, "commit", forbidden_transaction_boundary)
+    monkeypatch.setattr(db, "rollback", forbidden_transaction_boundary)
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=production_actor_mcp_stdio_connection_adapter(),
+        visible_servers=(),
+    )
+
+    assert len(result.configs) == 1
+    assert result.configs[0]["config"]["env"] == {
+        **_credentials(),
+        "XAGENT_MCP_CALLER_ID": str(USER_ID),
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_registers_production_adapter_only_for_actor_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.chat import create_default_tools
+
+    captured: list[dict[str, object]] = []
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+
+        def set_task_runtime_contribution(self, _contribution: object) -> None:
+            pass
+
+    async def create_tools(_config: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: object()
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    for policy in (None, _policy()):
+        await create_default_tools(
+            None,
+            user=SimpleNamespace(id=USER_ID, is_admin=False),
+            task_id="91",
+            mcp_runtime_authorization_policy=policy,
+        )
+
+    assert captured[0]["mcp_actor_stdio_connection_adapter"] is None
+    assert (
+        captured[1]["mcp_actor_stdio_connection_adapter"]
+        is production_actor_mcp_stdio_connection_adapter()
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ActorMCPConnectionCredentialCorruptionError("sensitive-value"),
+        RuntimeError("sensitive-value"),
+    ],
+)
+def test_credential_failures_remain_blocked_without_logging_values(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    caplog.set_level(logging.INFO)
+    app = _seed_app(db)
+
+    class _FailingAdapter(_FakeAdapter):
+        def get_connection_credentials(self, *_args: object, **_kwargs: object):
+            raise failure
+
+    collision = _StableIdentityOnlyServer(73, "chrome-devtools")
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=_FailingAdapter(_identity(app), _credentials()),
+        visible_servers=(collision,),
+    )
+
+    assert result.configs == ()
+    assert result.blocked_server_ids == frozenset({73})
+    assert type(failure).__name__ in caplog.text
+    assert "sensitive-value" not in caplog.text
+
+
+def test_missing_adapter_remains_blocked_without_custom_fallback(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    collision = _StableIdentityOnlyServer(73, APP_ID)
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=None,
+        visible_servers=(collision,),
+    )
+
+    assert result.configs == ()
+    assert result.blocked_server_ids == frozenset({73})
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ActorMCPConnectionValidationError("sensitive-value"),
+        RuntimeError("sensitive-value"),
+    ],
+)
+def test_list_failures_remain_blocked_without_logging_values(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    caplog.set_level(logging.INFO)
+
+    class _FailingListAdapter:
+        def list_connection_identities(self, *_args: object, **_kwargs: object):
+            raise failure
+
+    collision = _StableIdentityOnlyServer(73, APP_ID)
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=_FailingListAdapter(),  # type: ignore[arg-type]
+        visible_servers=(collision,),
+    )
+
+    assert result.configs == ()
+    assert result.blocked_server_ids == frozenset({73})
+    assert type(failure).__name__ in caplog.text
+    assert "sensitive-value" not in caplog.text
 
 
 def test_reserved_collision_reads_only_stable_server_identity(

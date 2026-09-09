@@ -3,7 +3,7 @@
 import logging
 import os
 import threading
-from typing import Optional, Union
+from typing import Optional, Union, cast
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
@@ -167,6 +167,10 @@ class DynamicMemoryStoreManager:
             canonical_embedding_identity(embedding_config)
             new_store = self._create_lancedb_store(model)
             base_store = new_store._base_store
+            if not isinstance(base_store, LanceDBMemoryStore):
+                raise TypeError(
+                    "startup memory lifecycle requires a LanceDB base store"
+                )
             connection = base_store._vector_store.get_raw_connection()
             table_name = base_store._collection_name
 
@@ -203,7 +207,7 @@ class DynamicMemoryStoreManager:
 
             self._memory_store = new_store
             self._is_lancedb = True
-            self._last_embedding_model_id = model.id
+            self._last_embedding_model_id = cast(int, model.id)
             self._last_embedding_model_fingerprint = _embedding_model_fingerprint(model)
 
     def _check_and_update_store(self) -> None:

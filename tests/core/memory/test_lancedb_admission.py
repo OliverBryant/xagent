@@ -21,7 +21,6 @@ from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_
 from xagent.providers.vector_store.lancedb import clear_connection_cache
 from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
 
-
 IDENTITY = EmbeddingIdentity(
     "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None
 )

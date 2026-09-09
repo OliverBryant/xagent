@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, cast
 
 import pyarrow as pa  # type: ignore
 
@@ -53,6 +53,13 @@ class _ArrowSchema(Protocol):
     def metadata(self) -> Mapping[bytes, bytes] | None: ...
 
     def field(self, name: str) -> _ArrowField: ...
+
+
+class _ArrowTable(Protocol):
+    """Typed boundary for the Arrow table returned to LanceDB."""
+
+    @property
+    def schema(self) -> _ArrowSchema: ...
 
 
 class VectorCompatibility(str, Enum):
@@ -181,7 +188,7 @@ def inspect_lancedb_vector_compatibility(
 
 def _vector_capable_data(
     identity: EmbeddingIdentity, existing: Any | None = None
-) -> pa.Table:
+) -> _ArrowTable:
     """Build typed memory data carrying one authoritative vector identity."""
     if existing is None:
         data = pa.table(
@@ -228,7 +235,7 @@ def _vector_capable_data(
     metadata[VECTOR_IDENTITY_METADATA_KEY] = json.dumps(
         identity.as_dict(), sort_keys=True, separators=(",", ":")
     ).encode()
-    return data.replace_schema_metadata(metadata)
+    return cast(_ArrowTable, data.replace_schema_metadata(metadata))
 
 
 def create_or_recreate_vector_capable_table(

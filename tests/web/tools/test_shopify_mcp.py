@@ -536,6 +536,18 @@ def test_throttle_wait_seconds_falls_back_to_one_second_when_restore_rate_not_po
     assert shopify._throttle_wait_seconds(429, payload) == 1.0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"errors": "THROTTLED", "extensions": []},
+        {"extensions": {"cost": []}},
+        {"extensions": {"cost": {"throttleStatus": []}}},
+    ],
+)
+def test_throttle_wait_seconds_handles_malformed_nested_shapes(payload):
+    assert shopify._throttle_wait_seconds(429, payload) == 1.0
+
+
 def test_graphql_redacts_connection_error_message(monkeypatch):
     def _raise(*args, **kwargs):
         raise requests.exceptions.ProxyError(
@@ -577,6 +589,8 @@ def test_mutation_error_log_redacts_token(caplog, monkeypatch):
     result = json.loads(shopify.shopify_create_product("Shirt"))
 
     assert result["status"] == "indeterminate"
+    assert "Shopify mutation outcome indeterminate" in caplog.text
+    assert "request headers contained [REDACTED]" in caplog.text
     assert token not in result["message"]
     assert token not in caplog.text
 
@@ -635,6 +649,96 @@ def test_mutation_explicit_http_rejection_is_ordinary_error(monkeypatch):
     assert "request rejected" in result["message"]
 
 
+@pytest.mark.parametrize(
+    "tool_name,args",
+    [
+        ("shopify_create_product", ("Shirt",)),
+        ("shopify_update_product", ("1",)),
+        ("shopify_update_order", ("1",)),
+    ],
+)
+@pytest.mark.parametrize(
+    "failure",
+    [
+        requests.ConnectionError("connection dropped after dispatch"),
+        MockResponse(status_code=503, text="upstream unavailable"),
+    ],
+)
+def test_all_mutation_tools_report_transport_ambiguity_as_indeterminate(
+    monkeypatch, tool_name, args, failure
+):
+    post = (
+        Mock(side_effect=failure)
+        if isinstance(failure, Exception)
+        else Mock(return_value=failure)
+    )
+    monkeypatch.setattr(shopify.requests, "post", post)
+    kwargs = {}
+    if tool_name == "shopify_update_product":
+        kwargs = {"title": "Updated"}
+    elif tool_name == "shopify_update_order":
+        kwargs = {"note": "Updated"}
+
+    result = json.loads(getattr(shopify, tool_name)(*args, **kwargs))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert result["mutation_may_have_completed"] is True
+
+
+def test_update_product_summary_serialization_failure_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "productUpdate": {
+                            "product": {"id": "gid://shopify/Product/1", "tags": {1}},
+                            "userErrors": [],
+                        }
+                    }
+                },
+                text="response",
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_update_product("1", title="Updated"))
+
+    assert result["status"] == "indeterminate"
+    assert result["mutation_may_have_completed"] is True
+
+
+def test_update_order_malformed_total_price_is_indeterminate(monkeypatch):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "orderUpdate": {
+                            "order": {
+                                "id": "gid://shopify/Order/1",
+                                "totalPriceSet": [],
+                            },
+                            "userErrors": [],
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(shopify.shopify_update_order("1", note="Updated"))
+
+    assert result["status"] == "indeterminate"
+    assert result["retryable"] is False
+    assert "order.totalPriceSet" in result["message"]
+
+
 def test_read_anomalous_2xx_response_remains_ordinary_error(monkeypatch):
     monkeypatch.setattr(
         shopify.requests,
@@ -646,6 +750,72 @@ def test_read_anomalous_2xx_response_remains_ordinary_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "top-level data" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "connection,error_fragment",
+    [
+        ([], "products connection"),
+        ({"edges": [], "pageInfo": []}, "products.pageInfo"),
+        (
+            {"edges": [], "pageInfo": {"hasNextPage": "false"}},
+            "products.pageInfo.hasNextPage",
+        ),
+        (
+            {"edges": "invalid", "pageInfo": {"hasNextPage": False}},
+            "products.edges",
+        ),
+        (
+            {"nodes": ["invalid"], "pageInfo": {"hasNextPage": False}},
+            "node in products.nodes",
+        ),
+    ],
+)
+def test_list_products_returns_clean_error_for_malformed_connection_shapes(
+    monkeypatch, connection, error_fragment
+):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"products": connection}})),
+    )
+
+    result = json.loads(shopify.shopify_list_products())
+
+    assert result["status"] == "error"
+    assert error_fragment in result["message"]
+    assert "AttributeError" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    "summary_fn,value,error_fragment",
+    [
+        (shopify._order_summary, {"totalPriceSet": []}, "order.totalPriceSet"),
+        (
+            shopify._order_summary,
+            {"totalPriceSet": {"shopMoney": []}},
+            "order.totalPriceSet.shopMoney",
+        ),
+        (
+            shopify._customer_summary,
+            {"defaultEmailAddress": []},
+            "customer.defaultEmailAddress",
+        ),
+        (
+            shopify._customer_summary,
+            {"defaultPhoneNumber": "invalid"},
+            "customer.defaultPhoneNumber",
+        ),
+        (
+            shopify._collection_summary,
+            {"productsCount": []},
+            "collection.productsCount",
+        ),
+    ],
+)
+def test_summaries_reject_malformed_nested_objects(summary_fn, value, error_fragment):
+    with pytest.raises(RuntimeError, match=error_fragment):
+        summary_fn(value)
 
 
 def test_validate_connection_checks_required_and_optional_scopes(monkeypatch):
@@ -672,7 +842,25 @@ def test_validate_connection_reports_missing_scope(monkeypatch):
     result = json.loads(shopify.shopify_validate_connection())
 
     assert result["status"] == "error"
-    assert "write_orders" in result["message"]
+    assert "customers" in result["message"]
+    assert "orders" in result["message"]
+
+
+def test_validate_connection_accepts_read_only_token_and_reports_no_write_support(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        shopify,
+        "_granted_admin_scopes",
+        lambda: {"read_products", "read_orders", "read_customers"},
+    )
+
+    result = json.loads(shopify.shopify_validate_connection())
+
+    assert result["status"] == "success"
+    assert result["read_capable"] is True
+    assert result["write_capable"] is False
+    assert result["missing_write_scopes"] == ["write_orders", "write_products"]
 
 
 def test_required_scope_validation_is_cached_per_credential(monkeypatch):
@@ -722,7 +910,7 @@ def test_extract_connection_skips_null_nodes():
                     {"cursor": "bad", "node": None},
                     {"cursor": "c2", "node": {"id": "2"}},
                 ],
-                "pageInfo": {},
+                "pageInfo": {"hasNextPage": False},
             }
         },
         "products",
@@ -743,17 +931,48 @@ def test_extract_connection_no_cursor_when_not_truncated():
     assert after_cursor is None
 
 
-def test_extract_connection_treats_missing_end_cursor_as_no_more_pages():
-    # hasNextPage=true with no endCursor would otherwise tell a caller to
-    # retry with after=None -- the first page again, forever.
-    _items, has_more, after_cursor = shopify._extract_connection(
-        {"products": {"nodes": [{"id": "1"}], "pageInfo": {"hasNextPage": True}}},
-        "products",
-        lambda n: n,
+def test_extract_connection_rejects_missing_end_cursor_when_has_more():
+    with pytest.raises(RuntimeError, match="without a continuation cursor"):
+        shopify._extract_connection(
+            {
+                "products": {
+                    "nodes": [{"id": "1"}],
+                    "pageInfo": {"hasNextPage": True},
+                }
+            },
+            "products",
+            lambda n: n,
+        )
+
+
+@pytest.mark.parametrize("end_cursor", [None, ""])
+def test_list_products_fails_closed_on_falsy_end_cursor(monkeypatch, end_cursor):
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "products": {
+                            "edges": [
+                                {"cursor": "item-1", "node": {"id": "product-1"}}
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": end_cursor,
+                            },
+                        }
+                    }
+                }
+            )
+        ),
     )
 
-    assert has_more is False
-    assert after_cursor is None
+    result = json.loads(shopify.shopify_list_products())
+
+    assert result["status"] == "error"
+    assert "without a continuation cursor" in result["message"]
 
 
 def test_shop_summary_snake_cases_fields():
@@ -1491,7 +1710,12 @@ def test_update_order_sends_tags_and_note(monkeypatch):
             json_data={
                 "data": {
                     "orderUpdate": {
-                        "order": {"id": "gid://shopify/Order/1"},
+                        "order": {
+                            "id": "gid://shopify/Order/1",
+                            "totalPriceSet": {
+                                "shopMoney": {"amount": "10.00", "currencyCode": "USD"}
+                            },
+                        },
                         "userErrors": [],
                     }
                 }
@@ -1516,7 +1740,12 @@ def test_update_order_clears_note_with_explicit_empty_string(monkeypatch):
             json_data={
                 "data": {
                     "orderUpdate": {
-                        "order": {"id": "gid://shopify/Order/1"},
+                        "order": {
+                            "id": "gid://shopify/Order/1",
+                            "totalPriceSet": {
+                                "shopMoney": {"amount": "10.00", "currencyCode": "USD"}
+                            },
+                        },
                         "userErrors": [],
                     }
                 }

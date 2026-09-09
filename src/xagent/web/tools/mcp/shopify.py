@@ -41,7 +41,17 @@ SHOPIFY_REQUIRED_ADMIN_SCOPES = frozenset(
     {"write_products", "write_orders", "read_customers"}
 )
 SHOPIFY_OPTIONAL_ADMIN_SCOPES = frozenset({"read_all_orders"})
+# The host currently starts a fresh stdio process for every tool invocation, so
+# this cache only deduplicates checks within one invocation. Keeping it keyed by
+# credential still makes it safe if stdio sessions are pooled in the future.
 _scope_cache: tuple[str, frozenset[str]] | None = None
+
+_READ_CAPABILITY_SCOPE_GROUPS = {
+    "products": frozenset({"read_products", "write_products"}),
+    "orders": frozenset({"read_orders", "write_orders"}),
+    "customers": frozenset({"read_customers", "write_customers"}),
+}
+_WRITE_CAPABILITY_SCOPES = frozenset({"write_products", "write_orders"})
 
 # Only a DNS *label* (no dots, scheme, port, or slashes) is ever accepted, so
 # the string itself can never name a host outside "*.myshopify.com" -- but a
@@ -112,6 +122,13 @@ def _indeterminate(message: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _mutation_indeterminate(message: str) -> str:
+    """Log and return an unsafe-to-retry mutation outcome."""
+    safe_message = _safe_text(message)
+    logger.error("Shopify mutation outcome indeterminate: %s", safe_message)
+    return _indeterminate(safe_message)
 
 
 def _headers() -> dict[str, str]:
@@ -273,7 +290,9 @@ def _throttle_wait_seconds(status_code: int, payload: Any) -> float | None:
     """
     throttled = status_code == 429
     if not throttled and isinstance(payload, dict):
-        for entry in payload.get("errors") or []:
+        raw_errors = payload.get("errors")
+        errors = raw_errors if isinstance(raw_errors, list) else []
+        for entry in errors:
             if not isinstance(entry, dict):
                 continue
             if str(entry.get("message", "")).strip().lower() == "throttled":
@@ -291,8 +310,11 @@ def _throttle_wait_seconds(status_code: int, payload: Any) -> float | None:
     # precise wait (how long until enough "bucket" capacity restores to
     # cover the query that was just rejected) instead of guessing.
     if isinstance(payload, dict):
-        cost = (payload.get("extensions") or {}).get("cost") or {}
-        throttle_status = cost.get("throttleStatus") or {}
+        extensions = payload.get("extensions")
+        cost = extensions.get("cost") if isinstance(extensions, dict) else None
+        throttle_status = cost.get("throttleStatus") if isinstance(cost, dict) else None
+        if not isinstance(throttle_status, dict):
+            return 1.0
         requested = cost.get("requestedQueryCost")
         available = throttle_status.get("currentlyAvailable")
         restore_rate = throttle_status.get("restoreRate")
@@ -373,20 +395,32 @@ def _require_admin_scopes(*accepted_scopes: str) -> None:
 def shopify_validate_connection() -> str:
     """Validate the token and its Admin API scopes before using tools.
 
-    Required: write_products, write_orders, read_customers. Optional:
-    read_all_orders, which expands order history beyond the default 60 days.
+    A token is valid when it can read products, orders, and customers. The
+    response separately reports whether every write tool is available.
+    read_all_orders is optional and expands order history beyond 60 days.
     """
     try:
         granted = _granted_admin_scopes()
-        missing = sorted(SHOPIFY_REQUIRED_ADMIN_SCOPES - granted)
-        if missing:
+        missing_read_capabilities = sorted(
+            resource
+            for resource, alternatives in _READ_CAPABILITY_SCOPE_GROUPS.items()
+            if not alternatives.intersection(granted)
+        )
+        if missing_read_capabilities:
             return _error(
-                "Shopify token is missing required Admin API scopes: "
-                + ", ".join(missing)
+                "Shopify token cannot read required resources: "
+                + ", ".join(missing_read_capabilities)
             )
+        missing_write_scopes = sorted(_WRITE_CAPABILITY_SCOPES - granted)
         return _success(
             connection_valid=True,
-            required_scopes=sorted(SHOPIFY_REQUIRED_ADMIN_SCOPES),
+            read_capable=True,
+            write_capable=not missing_write_scopes,
+            missing_write_scopes=missing_write_scopes,
+            read_scope_alternatives={
+                resource: sorted(alternatives)
+                for resource, alternatives in _READ_CAPABILITY_SCOPE_GROUPS.items()
+            },
             optional_scopes=sorted(SHOPIFY_OPTIONAL_ADMIN_SCOPES),
             granted_optional_scopes=sorted(SHOPIFY_OPTIONAL_ADMIN_SCOPES & granted),
         )
@@ -526,18 +560,52 @@ def _extract_connection(
     summary_fn: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> tuple[list[tuple[dict[str, Any], str | None]], bool, str | None]:
     """Return summarized nodes paired with their own Relay edge cursors."""
-    connection = data.get(field_name) or {}
+    connection = data.get(field_name)
+    if not isinstance(connection, dict):
+        raise RuntimeError(
+            f"Shopify API response has an invalid {field_name} connection"
+        )
     edges = connection.get("edges")
-    page_info = connection.get("pageInfo") or {}
+    page_info = connection.get("pageInfo")
+    if not isinstance(page_info, dict):
+        raise RuntimeError(
+            f"Shopify API response has an invalid {field_name}.pageInfo object"
+        )
     end_cursor = page_info.get("endCursor")
-    has_more = bool(page_info.get("hasNextPage")) and bool(end_cursor)
+    has_next_page = page_info.get("hasNextPage")
+    if not isinstance(has_next_page, bool):
+        raise RuntimeError(
+            f"Shopify API response has an invalid {field_name}.pageInfo.hasNextPage"
+        )
+    has_more = has_next_page
+    if has_more and not end_cursor:
+        raise RuntimeError(
+            "Shopify returned hasNextPage=true without a continuation cursor; "
+            "pagination stopped to prevent an infinite loop"
+        )
+    if end_cursor is not None and not isinstance(end_cursor, str):
+        raise RuntimeError(
+            f"Shopify API response has an invalid {field_name}.pageInfo.endCursor"
+        )
 
-    # Defensive fallback for a non-conforming response. Without edge cursors,
-    # local truncation is rejected later rather than guessing a cursor.
+    # Some mocked/legacy responses use nodes instead of the requested edges.
+    # Support that shape only when nodes is itself a valid list; without edge
+    # cursors, local output truncation will fail closed rather than guess one.
+    if edges is None:
+        nodes = connection.get("nodes")
+        if not isinstance(nodes, list):
+            raise RuntimeError(
+                f"Shopify API response has an invalid {field_name}.nodes list"
+            )
+        if not all(isinstance(node, dict) for node in nodes):
+            raise RuntimeError(
+                f"Shopify API response has an invalid node in {field_name}.nodes"
+            )
+        return [(summary_fn(node), None) for node in nodes], has_more, end_cursor
     if not isinstance(edges, list):
-        nodes = connection.get("nodes") or []
-        summarized = [summary_fn(node) for node in nodes if isinstance(node, dict)]
-        return [(item, None) for item in summarized], has_more, end_cursor
+        raise RuntimeError(
+            f"Shopify API response has an invalid {field_name}.edges list"
+        )
 
     items: list[tuple[dict[str, Any], str | None]] = []
     for edge in edges:
@@ -667,44 +735,50 @@ def _run_mutation(
     try:
         data, errors = _graphql(mutation, variables, mutation=True)
     except MutationOutcomeIndeterminate as exc:
-        return _indeterminate(str(exc))
-    result = data.get(mutation_field)
-    if not isinstance(result, dict):
-        detail = f": {_errors_detail(errors)}" if errors else ""
-        return _indeterminate(
-            f"Shopify returned no valid {mutation_field} projection after the "
-            f"mutation request{detail}"
+        return _mutation_indeterminate(str(exc))
+    try:
+        result = data.get(mutation_field)
+        if not isinstance(result, dict):
+            detail = f": {_errors_detail(errors)}" if errors else ""
+            return _mutation_indeterminate(
+                f"Shopify returned no valid {mutation_field} projection after the "
+                f"mutation request{detail}"
+            )
+        user_errors = result.get("userErrors")
+        if not isinstance(user_errors, list) or not all(
+            isinstance(entry, dict) for entry in user_errors
+        ):
+            return _mutation_indeterminate(
+                f"Shopify returned an invalid userErrors projection for {mutation_field}"
+            )
+        if user_errors:
+            # userErrors alone can omit useful context a top-level GraphQL
+            # `errors` entry carries (e.g. a query-level access-scope warning
+            # attached to the same response) -- fold both in, mirroring
+            # linear.py's `_mutation_failure_message`, which does the same for
+            # Linear's boolean `success` discriminator.
+            message = _user_errors_message(user_errors)
+            if errors:
+                message = f"{message} ({_errors_detail(errors)})"
+            return _error(message)
+        object_value = result.get(object_key)
+        if not isinstance(object_value, dict):
+            # userErrors is empty, but the object itself is also null -- e.g. an
+            # access-scope error on one selected field null-propagated up to the
+            # whole object, with the real cause only in the top-level `errors`
+            # this response still carries. Reporting this as success with an
+            # all-null object would hide that entirely.
+            detail = f": {_errors_detail(errors)}" if errors else ""
+            return _mutation_indeterminate(
+                f"Shopify returned no valid {object_key} projection after "
+                f"{mutation_field}{detail}"
+            )
+        return _success_capped(object_key, summary_fn(object_value), errors)
+    except Exception as exc:
+        return _mutation_indeterminate(
+            f"Shopify could not validate the {mutation_field} response after "
+            f"dispatch ({type(exc).__name__}): {_safe_text(exc)}"
         )
-    user_errors = result.get("userErrors")
-    if not isinstance(user_errors, list) or not all(
-        isinstance(entry, dict) for entry in user_errors
-    ):
-        return _indeterminate(
-            f"Shopify returned an invalid userErrors projection for {mutation_field}"
-        )
-    if user_errors:
-        # userErrors alone can omit useful context a top-level GraphQL
-        # `errors` entry carries (e.g. a query-level access-scope warning
-        # attached to the same response) -- fold both in, mirroring
-        # linear.py's `_mutation_failure_message`, which does the same for
-        # Linear's boolean `success` discriminator.
-        message = _user_errors_message(user_errors)
-        if errors:
-            message = f"{message} ({_errors_detail(errors)})"
-        return _error(message)
-    object_value = result.get(object_key)
-    if not isinstance(object_value, dict):
-        # userErrors is empty, but the object itself is also null -- e.g. an
-        # access-scope error on one selected field null-propagated up to the
-        # whole object, with the real cause only in the top-level `errors`
-        # this response still carries. Reporting this as success with an
-        # all-null object would hide that entirely.
-        detail = f": {_errors_detail(errors)}" if errors else ""
-        return _indeterminate(
-            f"Shopify returned no valid {object_key} projection after "
-            f"{mutation_field}{detail}"
-        )
-    return _success_capped(object_key, summary_fn(object_value), errors)
 
 
 def _success_capped(field_name: str, value: dict[str, Any], errors: list[Any]) -> str:
@@ -797,7 +871,14 @@ _ORDER_FIELDS = (
 
 
 def _order_summary(order: dict[str, Any]) -> dict[str, Any]:
-    total_price = (order.get("totalPriceSet") or {}).get("shopMoney") or {}
+    total_price_set = order.get("totalPriceSet")
+    if not isinstance(total_price_set, dict):
+        raise RuntimeError("Shopify API response has an invalid order.totalPriceSet")
+    total_price = total_price_set.get("shopMoney")
+    if not isinstance(total_price, dict):
+        raise RuntimeError(
+            "Shopify API response has an invalid order.totalPriceSet.shopMoney"
+        )
     return {
         "id": order.get("id"),
         "name": order.get("name"),
@@ -819,12 +900,22 @@ _CUSTOMER_FIELDS = (
 
 
 def _customer_summary(customer: dict[str, Any]) -> dict[str, Any]:
+    email_address = customer.get("defaultEmailAddress")
+    if email_address is not None and not isinstance(email_address, dict):
+        raise RuntimeError(
+            "Shopify API response has an invalid customer.defaultEmailAddress"
+        )
+    phone_number = customer.get("defaultPhoneNumber")
+    if phone_number is not None and not isinstance(phone_number, dict):
+        raise RuntimeError(
+            "Shopify API response has an invalid customer.defaultPhoneNumber"
+        )
     return {
         "id": customer.get("id"),
         "first_name": customer.get("firstName"),
         "last_name": customer.get("lastName"),
-        "email": (customer.get("defaultEmailAddress") or {}).get("emailAddress"),
-        "phone": (customer.get("defaultPhoneNumber") or {}).get("phoneNumber"),
+        "email": email_address.get("emailAddress") if email_address else None,
+        "phone": phone_number.get("phoneNumber") if phone_number else None,
         "number_of_orders": customer.get("numberOfOrders"),
         "tags": customer.get("tags"),
         "created_at": customer.get("createdAt"),
@@ -835,11 +926,16 @@ _COLLECTION_FIELDS = "id title handle productsCount { count }"
 
 
 def _collection_summary(collection: dict[str, Any]) -> dict[str, Any]:
+    products_count = collection.get("productsCount")
+    if not isinstance(products_count, dict):
+        raise RuntimeError(
+            "Shopify API response has an invalid collection.productsCount"
+        )
     return {
         "id": collection.get("id"),
         "title": collection.get("title"),
         "handle": collection.get("handle"),
-        "products_count": (collection.get("productsCount") or {}).get("count"),
+        "products_count": products_count.get("count"),
     }
 
 
@@ -855,7 +951,7 @@ def shopify_get_shop() -> str:
             "query { shop { name myshopifyDomain email currencyCode ianaTimezone } }"
         )
         shop = data.get("shop")
-        if not shop:
+        if not isinstance(shop, dict) or not shop:
             return _error("Shopify did not return shop info")
         return _success_capped("shop", _shop_summary(shop), errors)
     except Exception as exc:
@@ -895,7 +991,7 @@ def shopify_get_product(product_id: str) -> str:
             {"id": _gid("Product", product_id)},
         )
         product = data.get("product")
-        if not product:
+        if not isinstance(product, dict) or not product:
             return _error(f"Product '{product_id}' not found")
         return _success_capped("product", _product_summary(product), errors)
     except Exception as exc:
@@ -1039,7 +1135,7 @@ def shopify_get_order(order_id: str) -> str:
             {"id": _gid("Order", order_id)},
         )
         order = data.get("order")
-        if not order:
+        if not isinstance(order, dict) or not order:
             return _error(f"Order '{order_id}' not found")
         return _success_capped("order", _order_summary(order), errors)
     except Exception as exc:
@@ -1114,7 +1210,7 @@ def shopify_get_customer(customer_id: str) -> str:
             {"id": _gid("Customer", customer_id)},
         )
         customer = data.get("customer")
-        if not customer:
+        if not isinstance(customer, dict) or not customer:
             return _error(f"Customer '{customer_id}' not found")
         return _success_capped("customer", _customer_summary(customer), errors)
     except Exception as exc:

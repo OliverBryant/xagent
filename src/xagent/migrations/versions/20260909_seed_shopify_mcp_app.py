@@ -10,7 +10,10 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from xagent.builtin_identity import canonicalize_builtin_identity
+from xagent.builtin_identity import (
+    builtin_provenance_identity,
+    canonicalize_builtin_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,16 +74,15 @@ ROW = {
 
 
 def _has_provenance(launch_config: object) -> bool:
-    return (
-        isinstance(launch_config, dict)
-        and launch_config.get("builtin_provenance") == BUILTIN_PROVENANCE
-    )
+    return isinstance(launch_config, dict) and builtin_provenance_identity(
+        launch_config.get("builtin_provenance")
+    ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
 def _has_server_provenance(auth: object) -> bool:
-    return (
-        isinstance(auth, dict) and auth.get("builtin_provenance") == BUILTIN_PROVENANCE
-    )
+    return isinstance(auth, dict) and builtin_provenance_identity(
+        auth.get("builtin_provenance")
+    ) == builtin_provenance_identity(BUILTIN_PROVENANCE)
 
 
 def _collides_with_shopify_identity(value: object) -> bool:

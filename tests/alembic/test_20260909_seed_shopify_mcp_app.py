@@ -1,6 +1,7 @@
 """Tests for the provenance-safe Shopify connector seed."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,6 +92,33 @@ def test_upgrade_is_idempotent_for_provenance_owned_row(tmp_path):
         count = connection.execute(
             text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
         ).scalar_one()
+    assert count == 1
+
+
+def test_upgrade_accepts_owned_row_from_an_older_provenance_version(tmp_path):
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
+    with engine.begin() as connection:
+        _create_tables(connection)
+        launch_config = dict(migration.ROW["launch_config"])
+        marker = dict(migration.BUILTIN_PROVENANCE)
+        marker["version"] = 0
+        launch_config["builtin_provenance"] = marker
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, transport, launch_config) "
+                "VALUES ('shopify', 'Shopify', 'stdio', :launch_config)"
+            ),
+            {"launch_config": json.dumps(launch_config)},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
+        ).scalar_one()
+
     assert count == 1
 
 
@@ -255,7 +283,6 @@ def test_upgrade_connect_downgrade_reupgrade_preserves_official_connection(tmp_p
     encrypted_env = association.env
     assert server.auth == {"builtin_provenance": migration.BUILTIN_PROVENANCE}
     db.close()
-
     with engine.begin() as connection:
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
@@ -274,3 +301,66 @@ def test_upgrade_connect_downgrade_reupgrade_preserves_official_connection(tmp_p
         == 1
     )
     db.close()
+
+
+def test_fresh_registry_seed_rejects_normalized_custom_server_collision(tmp_path):
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-seed.sqlite'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    db.add(
+        MCPServer(
+            name=" Shopify ",
+            managed="external",
+            transport="stdio",
+            command="custom",
+        )
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as connection:
+        with pytest.raises(RuntimeError, match="custom mcp_servers identity"):
+            seed_builtin_oauth_and_public_mcp_apps(connection)
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
+        ).scalar_one()
+
+    assert count == 0
+
+
+def test_fresh_registry_seed_accepts_owned_server_from_older_version(tmp_path):
+    from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from xagent.web.models.database import Base
+    from xagent.web.models.mcp import MCPServer
+
+    migration = _load_migration()
+    engine = create_engine(f"sqlite:///{tmp_path / 'fresh-owned.sqlite'}")
+    Base.metadata.create_all(engine)
+    old_marker = dict(migration.BUILTIN_PROVENANCE)
+    old_marker["version"] = 0
+    session_factory = sessionmaker(bind=engine)
+    db = session_factory()
+    db.add(
+        MCPServer(
+            name="shopify",
+            managed="external",
+            transport="stdio",
+            command="python",
+            auth={"builtin_provenance": old_marker},
+        )
+    )
+    db.commit()
+    db.close()
+
+    with engine.begin() as connection:
+        seed_builtin_oauth_and_public_mcp_apps(connection)
+        count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='shopify'")
+        ).scalar_one()
+
+    assert count == 1

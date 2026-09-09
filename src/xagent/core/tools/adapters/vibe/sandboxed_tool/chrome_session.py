@@ -462,11 +462,13 @@ class ChromeSessionReaperCandidate:
 
 
 class ChromeSessionReaper:
-    """TTL gate plus fail-closed lease fencing for orphan cleanup.
+    """Unwired TTL gate plus fail-closed lease fencing for orphan cleanup.
 
     ``reclaim_if_stale`` must perform the final fence comparison atomically
     with claiming/deleting the lifecycle.  The pre-classification avoids
     unnecessary destructive calls; it is not itself the race-proof delete.
+    No production candidate store or startup/periodic sweep constructs this
+    component yet, so this class does not currently enforce a hard TTL.
     """
 
     def __init__(

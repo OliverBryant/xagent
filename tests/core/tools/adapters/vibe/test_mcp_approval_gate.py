@@ -57,9 +57,7 @@ class _Target(AbstractBaseTool):
         return {"success": True, "arguments": dict(args)}
 
 
-def _context(
-    *, task_source: str = "slack", pattern: str = "react"
-) -> ToolCallExecutionContext:
+def _context(*, task_source: str = "slack", pattern: str = "react") -> ToolCallExecutionContext:
     return ToolCallExecutionContext(
         task_source=task_source,
         task_id="248032",
@@ -81,11 +79,8 @@ def registrations() -> list[Any]:
 
 
 def _register(registrations: list[Any], gate: Any, resume: Any, **kwargs: Any) -> None:
-    registrations.append(
-        register_mcp_approval_gate(
-            task_source="slack", gate=gate, resume=resume, **kwargs
-        )
-    )
+    handle = register_mcp_approval_gate(task_source="slack", gate=gate, resume=resume, **kwargs)
+    registrations.append(handle)
 
 
 async def _unused_resume(**_: Any) -> None:
@@ -189,19 +184,14 @@ async def test_canonical_snapshot_is_deep_and_drives_allowed_dispatch(
 
     canonical = '{"image":{"path":"/tmp/a.png"},"text":"内容 A"}'
     assert seen[0].canonical_arguments_json == canonical
-    assert (
-        seen[0].arguments_sha256
-        == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    )
+    assert seen[0].arguments_sha256 == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     assert seen[0].arguments == json.loads(canonical)
     assert target.calls == [json.loads(canonical)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "timeout", "sync", "invalid"])
-async def test_gate_failures_never_dispatch(
-    registrations: list[Any], failure: str
-) -> None:
+async def test_gate_failures_never_dispatch(registrations: list[Any], failure: str) -> None:
     if failure == "exception":
 
         async def gate(_: GatedCall) -> GateDecision:
@@ -240,9 +230,7 @@ async def test_gate_failures_never_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_pause_is_refused_for_dag_execution(
-    registrations: list[Any],
-) -> None:
+async def test_pause_is_refused_for_dag_execution(registrations: list[Any]) -> None:
     async def gate(_: GatedCall) -> GateDecision:
         return GateDecision.require_approval("orphan")
 
@@ -258,9 +246,7 @@ async def test_pause_is_refused_for_dag_execution(
 
 
 @pytest.mark.asyncio
-async def test_resume_uses_one_ephemeral_executor_for_host_payload(
-    registrations: list[Any],
-) -> None:
+async def test_resume_uses_one_ephemeral_executor_for_host_payload(registrations: list[Any]) -> None:
     frozen = {"text": "approved", "image": {"file_id": "file-1"}}
     second_error: list[str] = []
 
@@ -294,9 +280,7 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(
 
 
 @pytest.mark.asyncio
-async def test_resume_hook_failures_never_dispatch(
-    registrations: list[Any],
-) -> None:
+async def test_resume_hook_failures_never_dispatch(registrations: list[Any]) -> None:
     async def gate(_: GatedCall) -> GateDecision:
         return GateDecision.require_approval("interaction-1")
 

@@ -74,6 +74,7 @@ from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ....tools.user_interaction import (
+    ToolInteractionSettlement,
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
@@ -159,6 +160,10 @@ class ToolCallRecord:
     status: str
     result: Any = None
     error: str | None = None
+    # Terminal outcome supplied by a resumable tool callback. Kept separate
+    # from ``status`` so existing completed/failed ledger readers remain
+    # backward-compatible.
+    settlement_status: str | None = None
     # The durable turn the call ran in (see _with_runtime_turn_id). None when
     # the embedding provides no turn tracking, and for records restored from
     # checkpoints written before the field existed.
@@ -173,6 +178,7 @@ class ToolCallRecord:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
         }
 
@@ -186,6 +192,11 @@ class ToolCallRecord:
             status=str(data.get("status", "pending")),
             result=data.get("result"),
             error=data.get("error"),
+            settlement_status=(
+                str(data["settlement_status"])
+                if data.get("settlement_status")
+                else None
+            ),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
         )
 
@@ -1900,20 +1911,150 @@ class ReActPattern(AgentPattern):
                 response=pending.get("response", ""),
             )
             if inspect.isawaitable(resumed):
-                await resumed
+                resumed = await resumed
 
-            # Keep the response retryable until the tool acknowledges delivery.
+            if isinstance(resumed, ToolInteractionSettlement):
+                await self._project_tool_interaction_settlement(
+                    pending=pending,
+                    settlement=resumed,
+                    context=context,
+                    runtime=runtime,
+                )
+
+            # Remove the response for the checkpoint, but restore it in memory
+            # if persistence fails. The last durable checkpoint still contains
+            # the response either way, and the host callback is required to
+            # replay its already-persisted settlement on a retry.
             self.pending_tool_interaction_responses.pop(0)
-            await runtime.checkpoint(
-                "tool_interaction_response_delivered",
-                context=context,
-                pattern=self,
-                metadata={
-                    "tool_name": tool_name,
-                    "tool_call_id": pending.get("tool_call_id", ""),
-                    "interaction_id": pending.get("interaction_id", ""),
-                },
+            try:
+                await runtime.checkpoint(
+                    "tool_interaction_response_delivered",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_call_id": pending.get("tool_call_id", ""),
+                        "interaction_id": pending.get("interaction_id", ""),
+                        "settlement_status": (
+                            resumed.status
+                            if isinstance(resumed, ToolInteractionSettlement)
+                            else None
+                        ),
+                    },
+                )
+            except BaseException:
+                self.pending_tool_interaction_responses.insert(0, pending)
+                raise
+
+    async def _project_tool_interaction_settlement(
+        self,
+        *,
+        pending: dict[str, str],
+        settlement: ToolInteractionSettlement,
+        context: Any,
+        runtime: PatternRuntime,
+    ) -> None:
+        """Project a resumed outcome onto its original tool protocol slot."""
+
+        tool_call_id = str(pending.get("tool_call_id") or "")
+        record = self.tool_ledger.get(tool_call_id)
+        if record is None:
+            raise RuntimeError(
+                "Cannot settle resumed tool interaction without its original "
+                f"ledger record: {tool_call_id or '<missing>'}"
             )
+        pending_tool_name = str(pending.get("tool_name") or "")
+        if pending_tool_name != record.tool_name:
+            raise RuntimeError(
+                "Resumed tool interaction does not match its original ledger "
+                f"record: {pending_tool_name!r} != {record.tool_name!r}"
+            )
+        if record.status != "waiting_for_user" and (
+            record.settlement_status != settlement.status
+        ):
+            raise RuntimeError(
+                "Cannot overwrite a tool call that was not waiting for this "
+                f"settlement: {tool_call_id!r} is {record.status!r}."
+            )
+
+        result = settlement.projected_result()
+        self._replace_tool_result(
+            context=context,
+            tool_name=record.tool_name,
+            tool_call_id=record.tool_call_id,
+            result=result,
+        )
+        tool_call: dict[str, Any] = {
+            "id": record.tool_call_id,
+            "name": record.tool_name,
+            "args": copy.deepcopy(record.args),
+        }
+        if record.turn_id:
+            tool_call["turn_id"] = record.turn_id
+
+        if settlement.status == "succeeded":
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result=result,
+                settlement_status=settlement.status,
+            )
+            await runtime.on_tool_end(tool_call=tool_call, result=result)
+            return
+
+        error = str(
+            settlement.error
+            or (result.get("error") if isinstance(result, dict) else result)
+        )
+        self._record_tool_call(
+            tool_call,
+            status="failed",
+            result=result,
+            error=error,
+            settlement_status=settlement.status,
+        )
+        if settlement.status in {"rejected", "dispatch_unknown"}:
+            # Neither outcome authorizes another attempt in this turn. A new
+            # external write must originate from a later user request.
+            self.force_final_answer_next = True
+        await runtime.on_tool_error(
+            tool_call=tool_call,
+            error=RuntimeError(error),
+            result=result,
+        )
+
+    @staticmethod
+    def _replace_tool_result(
+        *,
+        context: Any,
+        tool_name: str,
+        tool_call_id: str,
+        result: Any,
+    ) -> None:
+        """Replace the waiting observation without creating a second tool row."""
+
+        messages = getattr(context, "messages", None)
+        if not isinstance(messages, list):
+            raise RuntimeError("Execution context does not expose a message list.")
+        matching_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) == tool_call_id
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "Expected exactly one tool result for resumed tool call "
+                f"{tool_call_id!r}; found {len(matching_indexes)}."
+            )
+
+        context.add_tool_result(
+            tool_name=tool_name,
+            result=result,
+            tool_call_id=tool_call_id,
+        )
+        replacement = messages.pop()
+        messages[matching_indexes[0]] = replacement
 
     def _normalize_llm_response(self, response: Any) -> dict[str, Any]:
         if isinstance(response, str):
@@ -4018,6 +4159,7 @@ class ReActPattern(AgentPattern):
         status: str,
         result: Any = None,
         error: str | None = None,
+        settlement_status: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
@@ -4030,6 +4172,7 @@ class ReActPattern(AgentPattern):
             status=status,
             result=result,
             error=error,
+            settlement_status=settlement_status,
             turn_id=self._tool_call_turn_id(tool_call),
         )
 

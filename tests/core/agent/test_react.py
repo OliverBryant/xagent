@@ -38,6 +38,7 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
 class CalculatorArgs(BaseModel):
@@ -6945,6 +6946,150 @@ async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() -> None:
+    class WaitingTool:
+        def __init__(self, *, resume_result: Any = None) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Publish after explicit approval.",
+            )
+            self.resume_result = resume_result
+            self.run_calls: list[dict[str, Any]] = []
+            self.resume_calls: list[dict[str, str]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.run_calls.append(args)
+            if self.resume_result is not None:
+                raise AssertionError("resume must not execute a new tool call")
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "publish-interaction-1",
+                "message": "Publish this exact post?",
+                "message_type": "confirmation",
+                "interactions": [],
+            }
+
+        async def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> Any:
+            self.resume_calls.append(
+                {"interaction_id": interaction_id, "response": response}
+            )
+            return self.resume_result
+
+    first_tool = WaitingTool()
+    first_context = ExecutionContext(execution_id="durable-interaction-task")
+    first_context.add_user_message("Publish the approved post.")
+    first_pattern = ReActPattern(max_iterations=3)
+    first_runtime = PatternRuntime(execution_id="durable-interaction-task")
+
+    waiting = await first_pattern.run(
+        context=first_context,
+        tools=[first_tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "original-publish-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"publish"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=first_runtime,
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+    checkpoint = next(
+        checkpoint
+        for checkpoint in reversed(first_runtime.checkpoints)
+        if checkpoint["label"] == "waiting_for_user"
+    )
+
+    # Rebuild every runtime-owned object from the durable checkpoint.
+    restored_context = ExecutionContext.from_dict(checkpoint["context"])
+    restored_context.add_user_message("Approve")
+    restored_pattern = ReActPattern(max_iterations=3)
+    restored_pattern.load_state(checkpoint["pattern_state"])
+    resumed_tool = WaitingTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "post_urn": "urn:li:share:123"}
+        )
+    )
+    resumed_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"Published.",'
+                                '"outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    tracer = TraceEventRecorder()
+    resumed_runtime = PatternRuntime(
+        execution_id="durable-interaction-task",
+        tracer=tracer,
+    )
+
+    resumed = await restored_pattern.run(
+        context=restored_context,
+        tools=[resumed_tool],
+        llm=resumed_llm,
+        runtime=resumed_runtime,
+    )
+
+    assert resumed["success"] is True
+    assert resumed_tool.run_calls == []
+    assert resumed_tool.resume_calls == [
+        {
+            "interaction_id": "publish-interaction-1",
+            "response": "Approve",
+        }
+    ]
+    record = restored_pattern.tool_ledger["original-publish-call"]
+    assert record.status == "completed"
+    assert record.settlement_status == "succeeded"
+    assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
+    projected_messages = [
+        message
+        for message in restored_context.messages
+        if message.role == "tool" and message.tool_call_id == "original-publish-call"
+    ]
+    assert len(projected_messages) == 1
+    assert projected_messages[0].metadata["raw_result"] == record.result
+    assert "urn:li:share:123" in str(resumed_llm.calls[0]["messages"])
+    assert restored_pattern.pending_tool_interaction_responses == []
+    assert any(
+        event["event_type"] == "action_end_tool"
+        and event["data"].get("tool_call_id") == "original-publish-call"
+        and event["data"].get("result") == record.result
+        for event in tracer.events
+    )
+
+
 @pytest.mark.parametrize("waiting_request", [None, [], "malformed"])
 def test_tool_interaction_response_queue_ignores_malformed_requests(
     waiting_request: Any,
@@ -7122,6 +7267,144 @@ async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
         "response": "Reject second",
     }
     assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds() -> (
+    None
+):
+    settlement = ToolInteractionSettlement.succeeded(
+        {"success": True, "post_urn": "urn:li:share:123"}
+    )
+
+    class ResumableTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Resume a persisted interaction.",
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resume_user_interaction(self, **_: str) -> Any:
+            self.calls += 1
+            return settlement
+
+    class FailingCheckpointTracer:
+        async def checkpoint(self, **_: Any) -> None:
+            raise RuntimeError("checkpoint unavailable")
+
+    pending = {
+        "tool_name": "approval_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Approve",
+    }
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [pending]
+    pattern.tool_ledger["call-1"] = ToolCallRecord(
+        tool_call_id="call-1",
+        tool_name="approval_gate",
+        args={"expression": "publish"},
+        args_hash="stored-hash",
+        status="waiting_for_user",
+        result={"status": "waiting_for_user"},
+    )
+    context = ExecutionContext(execution_id="interaction-retry")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    tool = ResumableTool()
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=PatternRuntime(tracer=FailingCheckpointTracer()),
+        )
+
+    assert pattern.pending_tool_interaction_responses == [pending]
+    assert (
+        len(
+            [
+                message
+                for message in context.messages
+                if message.tool_call_id == "call-1"
+            ]
+        )
+        == 1
+    )
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=PatternRuntime(),
+    )
+
+    assert tool.calls == 2
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern.tool_ledger["call-1"].result == settlement.result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+async def test_non_successful_settlement_fails_the_original_tool_call(
+    status: str,
+) -> None:
+    class ResumableTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Resume a persisted interaction.",
+        )
+
+        async def resume_user_interaction(self, **_: str) -> Any:
+            return ToolInteractionSettlement(status=status)  # type: ignore[arg-type]
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Reject",
+        }
+    ]
+    pattern.tool_ledger["call-1"] = ToolCallRecord(
+        tool_call_id="call-1",
+        tool_name="approval_gate",
+        args={},
+        args_hash="stored-hash",
+        status="waiting_for_user",
+    )
+    context = ExecutionContext(execution_id="terminal-interaction")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    tracer = TraceEventRecorder()
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[ResumableTool()],
+        context=context,
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    record = pattern.tool_ledger["call-1"]
+    assert record.status == "failed"
+    assert record.settlement_status == status
+    assert record.result["success"] is False
+    assert record.result["status"] == status
+    assert pattern.force_final_answer_next is (
+        status in {"rejected", "dispatch_unknown"}
+    )
+    assert any(
+        event["event_type"] == "action_error_tool"
+        and event["data"].get("tool_call_id") == "call-1"
+        for event in tracer.events
+    )
 
 
 @pytest.mark.asyncio

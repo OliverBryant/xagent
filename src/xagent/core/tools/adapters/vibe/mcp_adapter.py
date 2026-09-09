@@ -53,6 +53,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
+from .mcp_approval_gate import gate_mcp_tools
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 
@@ -2259,7 +2260,9 @@ async def load_mcp_tools_as_agent_tools(
                 server_tools = direct_result.tools
                 failures.extend(direct_result.failures)
 
-            agent_tools.extend(server_tools)
+            # Both direct adapters and sandbox wrappers reach this host-side
+            # boundary before any connector dispatch.
+            agent_tools.extend(gate_mcp_tools(server_tools, connection=connection))
             if server_tools:
                 loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")

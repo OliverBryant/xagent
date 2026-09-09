@@ -73,6 +73,10 @@ from ....file_ref import (
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+from ....tools.adapters.vibe.mcp_approval_gate import (
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
+)
 from ....tools.user_interaction import (
     ToolInteractionSettlement,
     tool_result_waits_for_user,
@@ -168,6 +172,9 @@ class ToolCallRecord:
     # the embedding provides no turn tracking, and for records restored from
     # checkpoints written before the field existed.
     turn_id: str | None = None
+    # The ReAct step that issued the call. Persisted so a rebuilt runtime can
+    # resume the exact gate identity instead of inventing a new execution slot.
+    step_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +187,7 @@ class ToolCallRecord:
             "error": self.error,
             "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
+            "step_id": self.step_id,
         }
 
     @classmethod
@@ -198,6 +206,7 @@ class ToolCallRecord:
                 else None
             ),
             turn_id=str(data["turn_id"]) if data.get("turn_id") else None,
+            step_id=str(data["step_id"]) if data.get("step_id") else None,
         )
 
 
@@ -1906,12 +1915,23 @@ class ReActPattern(AgentPattern):
                 )
                 continue
 
-            resumed = resume(
-                interaction_id=pending.get("interaction_id", ""),
-                response=pending.get("response", ""),
-            )
-            if inspect.isawaitable(resumed):
-                resumed = await resumed
+            tool_call_id = str(pending.get("tool_call_id") or "")
+            record = self.tool_ledger.get(tool_call_id)
+            resume_call = {
+                "id": tool_call_id,
+                "name": tool_name,
+                "turn_id": record.turn_id if record is not None else None,
+                "step_id": record.step_id if record is not None else None,
+            }
+            with bind_tool_call_execution_context(
+                self._mcp_gate_execution_context(resume_call, context, runtime)
+            ):
+                resumed = resume(
+                    interaction_id=pending.get("interaction_id", ""),
+                    response=pending.get("response", ""),
+                )
+                if inspect.isawaitable(resumed):
+                    resumed = await resumed
 
             if isinstance(resumed, ToolInteractionSettlement):
                 await self._project_tool_interaction_settlement(
@@ -3041,7 +3061,9 @@ class ReActPattern(AgentPattern):
 
         async def _guarded(tool_call: dict[str, Any]) -> Any:
             async with semaphore:
-                return await self._execute_tool_safely(tool_call, tools, runtime)
+                return await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
 
         raw_results = await asyncio.gather(
             *(_guarded(tool_call) for tool_call in batch),
@@ -3255,7 +3277,9 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_call": tool_call},
                 )
-                result = await self._execute_tool_safely(tool_call, tools, runtime)
+                result = await self._execute_tool_safely(
+                    tool_call, tools, runtime, context=context
+                )
                 self._backfill_result(tool_call, result, context)
                 self.pending_tool_calls = self.pending_tool_calls[1:]
                 if tool_result_waits_for_user(result):
@@ -3976,9 +4000,12 @@ class ReActPattern(AgentPattern):
                 return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                result = await runtime.run_tool_call(
-                    lambda: self._execute_tool(tool_call, tools)
-                )
+                with bind_tool_call_execution_context(
+                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                ):
+                    result = await runtime.run_tool_call(
+                        lambda: self._execute_tool(tool_call, tools)
+                    )
             except ToolCallInterrupted as exc:
                 await runtime.on_tool_cancelled(
                     tool_call=tool_call,
@@ -4115,6 +4142,33 @@ class ReActPattern(AgentPattern):
             "dag_step_id": str(step_id),
         }
 
+    @staticmethod
+    def _mcp_gate_execution_context(
+        tool_call: dict[str, Any], context: Any, runtime: PatternRuntime
+    ) -> ToolCallExecutionContext:
+        metadata = getattr(context, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        dag_step_id = metadata.get("dag_step_id")
+        task_source = metadata.get("task_source")
+        run_id = metadata.get("run_id")
+        return ToolCallExecutionContext(
+            task_source=str(task_source) if task_source else None,
+            task_id=str(
+                getattr(context, "execution_id", None)
+                or getattr(runtime, "execution_id", None)
+                or ""
+            )
+            or None,
+            run_id=str(run_id) if run_id else None,
+            turn_id=str(tool_call.get("turn_id")) if tool_call.get("turn_id") else None,
+            tool_call_id=str(tool_call.get("id") or ""),
+            pattern="dag" if dag_step_id else "react",
+            react_step_id=(
+                str(tool_call.get("step_id")) if tool_call.get("step_id") else None
+            ),
+            dag_step_id=str(dag_step_id) if dag_step_id else None,
+        )
+
     def _with_runtime_turn_id(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
     ) -> dict[str, Any]:
@@ -4174,6 +4228,9 @@ class ReActPattern(AgentPattern):
             error=error,
             settlement_status=settlement_status,
             turn_id=self._tool_call_turn_id(tool_call),
+            step_id=(
+                str(tool_call["step_id"]) if tool_call.get("step_id") else None
+            ),
         )
 
     @staticmethod

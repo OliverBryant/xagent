@@ -7139,6 +7139,7 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     record = restored_pattern.tool_ledger["original-publish-call"]
     assert record.status == "completed"
     assert record.settlement_status == "succeeded"
+    assert record.step_id
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     projected_messages = [
         message

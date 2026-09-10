@@ -21,6 +21,7 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
 class _Args(BaseModel):
@@ -69,7 +70,7 @@ class _Target(AbstractBaseTool):
 
 
 def _context(
-    *, task_source: str = "slack", pattern: str = "react"
+    *, task_source: str | None = "slack", pattern: str = "react"
 ) -> ToolCallExecutionContext:
     return ToolCallExecutionContext(
         task_source=task_source,
@@ -132,13 +133,14 @@ async def test_registration_only_applies_to_its_task_source(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("task_source", [None, ""])
 async def test_missing_source_fails_closed_when_any_gate_is_registered(
-    registrations: list[Any],
+    registrations: list[Any], task_source: str | None
 ) -> None:
     _register(registrations, lambda _: None, _unused_resume)
     target = _Target()
     (tool,) = gate_mcp_tools([target], connection={"id": 41})
-    missing_source = replace(_context(), task_source="")
+    missing_source = replace(_context(), task_source=task_source)
 
     with bind_tool_call_execution_context(missing_source):
         result = await tool.run_json_async({"text": "must not publish"})
@@ -146,6 +148,26 @@ async def test_missing_source_fails_closed_when_any_gate_is_registered(
             tool.run_json_sync({"text": "must not publish"})
 
     assert result["status"] == "error"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_source", [None, ""])
+async def test_missing_source_resume_fails_closed_when_any_gate_is_registered(
+    registrations: list[Any], task_source: str | None
+) -> None:
+    _register(registrations, lambda _: None, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(replace(_context(), task_source=task_source)):
+        settlement = await tool.resume_user_interaction(
+            interaction_id="interaction-1", response="approve"
+        )
+
+    assert settlement is not None
+    assert settlement.status == "failed"
+    assert settlement.projected_result()["status"] == "error"
     assert target.calls == []
 
 
@@ -309,12 +331,12 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(
     async def gate(_: GatedCall) -> GateDecision:
         return GateDecision.require_approval("interaction-1")
 
-    async def resume(*, executor: Any, **_: Any) -> Any:
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
         result = await executor(frozen)
         with pytest.raises(RuntimeError, match="no longer available") as exc:
             await executor(frozen)
         second_error.append(str(exc.value))
-        return result
+        return ToolInteractionSettlement.succeeded(result)
 
     _register(registrations, gate, resume)
     target = _Target()
@@ -326,7 +348,8 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(
             interaction_id=paused["interaction_id"], response="approve"
         )
 
-    assert result["success"] is True
+    assert result.status == "succeeded"
+    assert result.projected_result()["success"] is True
     assert target.calls == [frozen]
     replay = target.replay_contexts[0]
     assert replay.interaction_id == "interaction-1"
@@ -352,7 +375,8 @@ async def test_resume_hook_failures_never_dispatch(registrations: list[Any]) -> 
             interaction_id="interaction-1", response="approve"
         )
 
-    assert result["status"] == "error"
+    assert result.status == "failed"
+    assert result.projected_result()["status"] == "error"
     assert target.calls == []
 
 
@@ -368,8 +392,9 @@ async def test_resume_timeout_does_not_cancel_a_started_dispatch(
             completed.set()
             return await super().run_json_async(args)
 
-    async def resume(*, executor: Any, **_: Any) -> Any:
-        return await executor({"text": "approved"})
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        result = await executor({"text": "approved"})
+        return ToolInteractionSettlement.succeeded(result)
 
     _register(registrations, lambda _: None, resume, timeout_seconds=0.001)
     target = SlowTarget()
@@ -381,7 +406,8 @@ async def test_resume_timeout_does_not_cancel_a_started_dispatch(
         )
 
     assert completed.is_set()
-    assert result["success"] is True
+    assert result.status == "succeeded"
+    assert result.projected_result()["success"] is True
     assert target.calls == [{"text": "approved"}]
 
 
@@ -394,8 +420,9 @@ async def test_unhandled_failure_after_dispatch_is_reported_as_unknown(
             self.calls.append(dict(args))
             raise RuntimeError("connection lost after request write")
 
-    async def resume(*, executor: Any, **_: Any) -> Any:
-        return await executor({"text": "approved"})
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        result = await executor({"text": "approved"})
+        return ToolInteractionSettlement.succeeded(result)
 
     _register(registrations, lambda _: None, resume)
     target = FailingTarget()
@@ -406,7 +433,7 @@ async def test_unhandled_failure_after_dispatch_is_reported_as_unknown(
             interaction_id="interaction-1", response="approve"
         )
 
-    assert result["status"] == "dispatch_unknown"
+    assert result.status == "dispatch_unknown"
     assert target.calls == [{"text": "approved"}]
 
 

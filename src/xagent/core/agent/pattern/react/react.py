@@ -4293,9 +4293,7 @@ class ReActPattern(AgentPattern):
             settlement_turn_id=(
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
-            step_id=(
-                str(tool_call["step_id"]) if tool_call.get("step_id") else None
-            ),
+            step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
         )
 
     @staticmethod

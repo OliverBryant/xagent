@@ -112,8 +112,8 @@ class _ProcessLifecycleManager(DynamicMemoryStoreManager):
         with super()._lifecycle_lock(connection, table_name):
             if self._acquired is not None:
                 self._acquired.set()
-            if self._release is not None and not self._release.wait(timeout=10):
-                raise RuntimeError("test did not release first lifecycle worker")
+            if self._release is not None:
+                self._release.wait()
             yield
             table = connection.open_table(table_name)
             try:
@@ -796,30 +796,46 @@ def test_cross_process_lifecycle_reopens_after_lock_without_stale_overwrite(tmp_
         target=_run_process_lifecycle,
         args=(str(db_dir), queue, first_acquired, release_first),
     )
-    first.start()
-    assert first_acquired.wait(timeout=30), (
-        queue.get(timeout=5) if not queue.empty() else "first worker did not initialize"
-    )
+    processes = []
+    try:
+        first.start()
+        processes.append(first)
+        assert first_acquired.wait(timeout=30), (
+            queue.get(timeout=5)
+            if not queue.empty()
+            else "first worker did not initialize"
+        )
 
-    # The second process constructs its connection while the first still owns
-    # the lock and the on-disk table is vectorless. Correct admission performs
-    # no table read until after it acquires the lock.
-    second = context.Process(
-        target=_run_process_lifecycle,
-        args=(str(db_dir), queue, second_acquired, None, second_attempting),
-    )
-    second.start()
-    assert second_attempting.wait(timeout=30)
-    second_was_blocked = not second_acquired.wait(timeout=1)
-    release_first.set()
-    first.join(timeout=30)
-    second.join(timeout=30)
-    assert second_was_blocked
-    assert first.exitcode == 0
-    assert second.exitcode == 0
-    outcomes = [queue.get(timeout=5), queue.get(timeout=5)]
-    assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
-    assert outcomes[0][1] == outcomes[1][1]
+        # The second process constructs its connection while the first still owns
+        # the lock and the on-disk table is vectorless. Correct admission performs
+        # no table read until after it acquires the lock.
+        second = context.Process(
+            target=_run_process_lifecycle,
+            args=(str(db_dir), queue, second_acquired, None, second_attempting),
+        )
+        second.start()
+        processes.append(second)
+        assert second_attempting.wait(timeout=30)
+        second_was_blocked = not second_acquired.wait(timeout=1)
+        release_first.set()
+        first.join(timeout=30)
+        second.join(timeout=30)
+        assert second_was_blocked
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        outcomes = [queue.get(timeout=5), queue.get(timeout=5)]
+        assert all(outcome[0] == "ok" for outcome in outcomes), outcomes
+        assert outcomes[0][1] == outcomes[1][1]
+    finally:
+        release_first.set()
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
 
     final_connection = lancedb.connect(db_dir)
     table = final_connection.open_table("memories")

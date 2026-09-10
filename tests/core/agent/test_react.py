@@ -7283,6 +7283,7 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
     settlement = ToolInteractionSettlement.succeeded(
         {"success": True, "post_urn": "urn:li:share:123"}
     )
+
     class ResumableTool:
         metadata = SimpleNamespace(
             name="approval_gate",
@@ -7486,7 +7487,9 @@ async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
             description="Resume persisted interactions.",
         )
 
-        async def resume_user_interaction(self, *, interaction_id: str, **_: str) -> Any:
+        async def resume_user_interaction(
+            self, *, interaction_id: str, **_: str
+        ) -> Any:
             if interaction_id == "interaction-1":
                 return ToolInteractionSettlement.rejected()
             return ToolInteractionSettlement.succeeded({"success": True})

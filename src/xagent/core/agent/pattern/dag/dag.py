@@ -13,6 +13,7 @@ from ....task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ...checkpoint import CheckpointPersistenceError
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
@@ -20,7 +21,6 @@ from ...context.enrichment import (
     pending_user_response_marker,
     top_level_user_request,
 )
-from ...checkpoint import CheckpointPersistenceError
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (

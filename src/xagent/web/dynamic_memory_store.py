@@ -182,7 +182,7 @@ class DynamicMemoryStoreManager:
                 )
                 if default is None:
                     return None
-                model = default.model
+                model = cast(DBModel, default.model)
                 model._memory_default_id = default.id
                 model._memory_default_user_id = default.user_id
                 return model
@@ -285,9 +285,9 @@ class DynamicMemoryStoreManager:
                     self._startup_admission_error = None
                     return
                 new_store = self._create_lancedb_store(None, db_dir=db_dir)
-                base_store = cast(LanceDBMemoryStore, new_store._base_store)
-                connection = base_store._vector_store.get_raw_connection()
-                table_name = base_store._collection_name
+                text_base_store = cast(LanceDBMemoryStore, new_store._base_store)
+                connection = text_base_store._vector_store.get_raw_connection()
+                table_name = text_base_store._collection_name
                 with self._lifecycle_lock(connection, table_name):
                     table = open_lancedb_table_if_exists(connection, table_name)
                     if table is None:

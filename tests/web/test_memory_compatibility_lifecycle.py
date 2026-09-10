@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.lancedb_maintenance import (
     MAINTENANCE_METADATA_KEY,
@@ -32,6 +33,8 @@ from xagent.web import dynamic_memory_store as memory_module
 from xagent.web.dynamic_memory_store import (
     DynamicMemoryStoreManager,
     MemoryAdmissionLockTimeout,
+    MemoryStoreRestartRequired,
+    MemoryStoreStartupAdmissionError,
     _embedding_model_config,
 )
 from xagent.web.models import Base, Model, User, UserDefaultModel, UserModel
@@ -146,13 +149,45 @@ def test_shared_config_and_store_are_stable_across_request_users(monkeypatch):
     monkeypatch.setattr(
         manager,
         "_get_embedding_model_from_db",
-        lambda: pytest.fail("request acquisition resolved an embedding identity"),
+        lambda **_: pytest.fail("request acquisition resolved an embedding identity"),
     )
     with UserContext(101):
         first = manager.get_memory_store()
     with UserContext(202):
         second = manager.get_memory_store()
     assert first is second is shared
+
+
+def test_published_store_rejects_authoritative_fingerprint_drift(monkeypatch):
+    model = _model()
+    connection = SimpleNamespace(
+        list_tables=lambda: ["memories"],
+        open_table=lambda _name: _fake_table(),
+    )
+    manager, wrapper, _base = _mock_lifecycle(monkeypatch, connection)
+    monkeypatch.setattr(manager, "_get_embedding_model_from_db", lambda **_: model)
+    monkeypatch.setattr(
+        memory_module,
+        "maintain_lancedb_memory_table",
+        lambda *_args: MaintenanceOutcome(MaintenanceStatus.COMPLETE),
+    )
+    monkeypatch.setattr(
+        memory_module,
+        "create_or_recreate_vector_capable_table",
+        lambda *_args: VectorCompatibility.MATCHING,
+    )
+
+    manager.run_startup_compatibility_lifecycle()
+    assert manager.get_memory_store() is wrapper
+
+    model.api_key = "rotated-secret"
+    with pytest.raises(MemoryStoreRestartRequired) as exc_info:
+        manager.get_memory_store()
+
+    detail = str(exc_info.value)
+    assert "restart every worker" in detail
+    assert "shared-secret" not in detail
+    assert "rotated-secret" not in detail
 
 
 def test_manager_constructs_dormant_store_with_complete_shared_config(
@@ -207,12 +242,12 @@ def test_startup_lifecycle_unwraps_serializes_and_orders_primitives(monkeypatch)
     assert manager._memory_store is wrapper
 
 
-def test_malformed_legacy_data_admits_text_only_without_recreation(monkeypatch, caplog):
+def test_malformed_legacy_data_fails_closed_without_publication(monkeypatch, caplog):
     connection = SimpleNamespace(
         list_tables=lambda: ["memories"],
         open_table=lambda _name: _fake_table(),
     )
-    manager, wrapper, base = _mock_lifecycle(monkeypatch, connection)
+    manager, _wrapper, base = _mock_lifecycle(monkeypatch, connection)
     monkeypatch.setattr(
         memory_module,
         "maintain_lancedb_memory_table",
@@ -226,15 +261,21 @@ def test_malformed_legacy_data_admits_text_only_without_recreation(monkeypatch, 
         memory_module, "create_or_recreate_vector_capable_table", recreate
     )
 
-    with caplog.at_level("WARNING"):
+    previous = manager._memory_store
+    with (
+        caplog.at_level("ERROR"),
+        pytest.raises(
+            MemoryStoreStartupAdmissionError, match="repair the table offline"
+        ),
+    ):
         manager.run_startup_compatibility_lifecycle()
 
-    assert base._embedding_model is None
-    assert manager._memory_store is wrapper
-    assert manager._is_lancedb is True
+    assert base._embedding_model is not None
+    assert manager._memory_store is previous
+    assert manager._is_lancedb is False
     recreate.assert_not_called()
-    assert "invalid legacy data" in caplog.text
-    assert "duplicate legacy IDs" in caplog.text
+    assert "repair the table offline" in caplog.text
+    assert "duplicate legacy IDs" not in caplog.text
     assert "shared-secret" not in caplog.text
 
 
@@ -566,6 +607,96 @@ def test_real_vectorless_lifecycle_recreates_and_marks_complete_same_startup(
         ).scanned_rows
         == 0
     )
+
+
+def test_real_existing_table_without_default_is_admitted_text_only(
+    tmp_path, monkeypatch
+):
+    db_dir = tmp_path / "memory_store"
+    db_dir.mkdir()
+    _vectorless_table(
+        db_dir,
+        [
+            {
+                "id": "legacy",
+                "text": "remember alpha",
+                "metadata": json.dumps({"user_id": 7}),
+            }
+        ],
+    )
+    manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(memory_module, "get_storage_root", lambda: tmp_path)
+    monkeypatch.setattr(manager, "_get_embedding_model_from_db", lambda **_: None)
+
+    manager.run_startup_compatibility_lifecycle()
+
+    assert manager.get_store_info()["is_lancedb"] is True
+    assert manager.get_store_info()["supports_vector_search"] is False
+    with UserContext(7):
+        store = manager.get_memory_store()
+        assert [note.id for note in store.list_all()] == ["legacy"]
+        assert store.add(MemoryNote(content="new durable memory")).success
+    table = lancedb.connect(db_dir).open_table("memories")
+    try:
+        rows = table.to_arrow().to_pylist()
+        assert len(rows) == 2
+        assert "legacy" in {row["id"] for row in rows}
+        assert {row[USER_ID_COLUMN] for row in rows} == {7}
+        assert {USER_ID_COLUMN, SCOPE_DIMS_COLUMN} <= set(table.schema.names)
+    finally:
+        _safe_close_table(table)
+
+
+def test_no_default_and_no_table_does_not_create_persistent_artifacts(
+    tmp_path, monkeypatch
+):
+    manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(memory_module, "get_storage_root", lambda: tmp_path)
+    monkeypatch.setattr(manager, "_get_embedding_model_from_db", lambda **_: None)
+
+    manager.run_startup_compatibility_lifecycle()
+
+    assert not (tmp_path / "memory_store").exists()
+    assert manager.get_store_info()["is_lancedb"] is False
+
+
+def test_real_malformed_legacy_table_blocks_scoped_reads_and_writes(
+    tmp_path, monkeypatch
+):
+    db_dir = tmp_path / "memory_store"
+    db_dir.mkdir()
+    connection = _vectorless_table(
+        db_dir,
+        [
+            {"id": "duplicate", "text": "first", "metadata": '{"user_id": 7}'},
+            {"id": "duplicate", "text": "second", "metadata": '{"user_id": 7}'},
+        ],
+    )
+    table = connection.open_table("memories")
+    try:
+        before_schema = table.schema
+        before_rows = table.to_arrow().to_pylist()
+    finally:
+        _safe_close_table(table)
+    manager = _real_manager(tmp_path, monkeypatch)
+    previous = manager._memory_store
+
+    with pytest.raises(MemoryStoreStartupAdmissionError):
+        manager.run_startup_compatibility_lifecycle()
+
+    assert manager._memory_store is previous
+    assert manager._is_lancedb is False
+    with UserContext(7):
+        with pytest.raises(MemoryStoreStartupAdmissionError):
+            manager.get_memory_store().list_all()
+        with pytest.raises(MemoryStoreStartupAdmissionError):
+            manager.get_memory_store().add(MemoryNote(content="must not migrate"))
+    table = connection.open_table("memories")
+    try:
+        assert table.schema == before_schema
+        assert table.to_arrow().to_pylist() == before_rows
+    finally:
+        _safe_close_table(table)
 
 
 def test_real_matching_and_mismatching_tables_drive_vector_capability(

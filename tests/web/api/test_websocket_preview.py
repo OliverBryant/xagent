@@ -340,6 +340,19 @@ async def test_memory_policy_uses_published_store_without_database_query(
 
 
 @pytest.mark.asyncio
+async def test_memory_policy_propagates_restart_required(monkeypatch) -> None:
+    from xagent.web.dynamic_memory_store import MemoryStoreRestartRequired
+
+    def restart_required():
+        raise MemoryStoreRestartRequired("restart required")
+
+    monkeypatch.setattr(chat_api, "get_memory_store", restart_required)
+
+    with pytest.raises(MemoryStoreRestartRequired, match="restart required"):
+        await chat_api.resolve_agent_service_memory_policy_async(agent_config={})
+
+
+@pytest.mark.asyncio
 async def test_async_memory_policy_runs_trusted_resolver_off_event_loop() -> None:
     entered = threading.Event()
     release = threading.Event()

@@ -1,7 +1,6 @@
 """Real-LanceDB coverage for dormant memory admission primitives."""
 
 import json
-from types import SimpleNamespace
 
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
@@ -110,32 +109,26 @@ def test_standard_search_does_not_enable_null_vector_supplement(store):
     assert [note.id for note in store.search("alpha", k=2)] == ["ann"]
 
 
-def test_real_null_vector_fallback_caps_rows_before_python_materialization(
-    store, monkeypatch
-):
+def test_real_null_vector_fallback_streams_to_tail_exact_winner(store):
     table = store._vector_store.get_raw_connection().open_table("memories")
     _add_raw_rows(
         table,
-        [_raw_row(f"row-{index:03d}", "alpha", 7) for index in range(150)],
+        [
+            *[
+                _raw_row(f"row-{index:03d}", "alpha broad match", 7)
+                for index in range(300)
+            ],
+            _raw_row("tail-exact", "alpha", 7),
+        ],
     )
     _safe_close_table(table)
     store._embedding_model = None
-    converted = 0
-    original = store._dict_to_memory_note
-
-    def count_conversion(row):
-        nonlocal converted
-        converted += 1
-        return original(row)
-
-    monkeypatch.setattr(store, "_dict_to_memory_note", count_conversion)
 
     result = store.search_with_null_vector_fallback(
         "alpha", k=1, filters={"metadata": {"user_id": 7}}
     )
 
-    assert [note.id for note in result] == ["row-000"]
-    assert converted == 100
+    assert [note.id for note in result] == ["tail-exact"]
 
 
 def test_real_scope_pushdown_prevents_foreign_rows_from_consuming_scan_cap(store):
@@ -157,39 +150,94 @@ def test_real_scope_pushdown_prevents_foreign_rows_from_consuming_scan_cap(store
     assert [note.id for note in result] == ["tenant-hit"]
 
 
-def test_null_fallback_combines_scope_and_null_predicates_before_bounded_scan(
-    store,
-):
+def test_null_fallback_streams_projected_backend_filtered_batches(store):
     observed = {}
 
-    class Query:
-        def where(self, predicate):
-            observed["where"] = predicate
-            return self
+    class Table:
+        def to_batches(self, **kwargs):
+            observed.update(kwargs)
+            return iter([pa.record_batch({"id": [], "text": [], "metadata": []})])
 
-        def limit(self, value):
-            observed["limit"] = value
-            return self
-
-        def to_arrow(self):
-            return pa.table({"id": [], "text": [], "metadata": []})
-
-    table = SimpleNamespace(search=Query)
     assert (
         store._lexical_candidates(
-            table,
+            Table(),
             "alpha",
             {},
             scope_where="user_id = 7",
             null_vectors_only=True,
-            scan_limit=100,
+            candidate_limit=1,
         )
         == []
     )
     assert observed == {
-        "where": "(user_id = 7) AND vector IS NULL",
-        "limit": 100,
+        "filter": "(user_id = 7) AND vector IS NULL",
+        "columns": ["id", "text", "metadata"],
+        "batch_size": 256,
     }
+
+
+def test_streaming_fallback_skips_ineligible_early_batches_and_malformed_rows(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    rows = [
+        _raw_row(f"drop-{index:03d}", "alpha", 7, priority="drop")
+        for index in range(280)
+    ]
+    malformed = _raw_row("malformed", "alpha", 7)
+    malformed["metadata"] = json.dumps(
+        {"content": "alpha", "user_id": 7, "timestamp": "not-a-date"}
+    )
+    rows.extend([malformed, _raw_row("eligible", "alpha", 7)])
+    _add_raw_rows(table, rows)
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    result = store.search_with_null_vector_fallback(
+        "alpha",
+        k=1,
+        filters={"metadata": {"user_id": 7}, "priority": "keep"},
+    )
+
+    assert [note.id for note in result] == ["eligible"]
+
+
+def test_streaming_fallback_ranks_stably_across_batches(store):
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            *[
+                _raw_row(f"broad-{index:03d}", "prefix alpha", 7)
+                for index in range(260)
+            ],
+            _raw_row("z-prefix", "alpha suffix", 7),
+            _raw_row("a-prefix", "alpha suffix", 7),
+        ],
+    )
+    _safe_close_table(table)
+    store._embedding_model = None
+
+    first = store.search_with_null_vector_fallback("alpha", k=2)
+    second = store.search_with_null_vector_fallback("alpha", k=2)
+
+    assert [note.id for note in first] == ["a-prefix", "z-prefix"]
+    assert [note.id for note in second] == ["a-prefix", "z-prefix"]
+
+
+def test_ann_duplicate_does_not_consume_streaming_lexical_quota(store):
+    assert store.add(MemoryNote(id="ann", content="semantic winner")).success
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    _add_raw_rows(
+        table,
+        [
+            _raw_row("ann", "alpha", None),
+            _raw_row("fallback", "alpha", None),
+        ],
+    )
+    _safe_close_table(table)
+
+    result = store.search_with_null_vector_fallback("alpha", k=2)
+
+    assert [note.id for note in result] == ["ann", "fallback"]
 
 
 def test_create_and_recreate_use_typed_vectors_and_canonical_identity(tmp_path):

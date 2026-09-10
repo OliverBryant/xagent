@@ -1,5 +1,6 @@
 """Dynamic memory store manager for web application."""
 
+import json
 import logging
 import os
 import threading
@@ -48,6 +49,27 @@ class InvalidEmbeddingModelConfiguration(ValueError):
     """Raised when persisted embedding fields cannot form a model config."""
 
 
+class MemoryStoreStartupAdmissionError(RuntimeError):
+    """Raised when persistent memory cannot be safely admitted at startup."""
+
+
+class MemoryStoreRestartRequired(RuntimeError):
+    """Raised when the published store no longer matches authoritative config."""
+
+
+MEMORY_STORE_RESTART_REQUIRED_DETAIL = (
+    "Persistent memory configuration changed after startup. Quiesce all API, "
+    "worker, and scheduler memory writers, restart every worker, and keep memory "
+    "ingress closed until startup admission completes. Identity-changing repairs "
+    "must be performed offline."
+)
+MEMORY_STORE_STARTUP_REPAIR_DETAIL = (
+    "Persistent memory startup admission found legacy data that cannot be safely "
+    "projected. Quiesce all API, worker, and scheduler memory writers and repair "
+    "the table offline before restarting every worker."
+)
+
+
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
     InMemoryMemoryStore, LanceDBMemoryStore, UserIsolatedMemoryStore
@@ -77,8 +99,38 @@ def _embedding_model_config(model: DBModel) -> EmbeddingModelConfig:
         raise InvalidEmbeddingModelConfiguration from exc
 
 
+def _embedding_model_fingerprint(model: Optional[DBModel]) -> str:
+    """Hash the complete authoritative adapter input without retaining secrets."""
+    if model is None:
+        payload: dict[str, Any] = {"default": None}
+    else:
+        api_key = getattr(model, "api_key", None)
+        api_key_digest = sha256(
+            ("" if api_key is None else str(api_key)).encode("utf-8")
+        ).hexdigest()
+        payload = {
+            "database_id": getattr(model, "id", None),
+            "default_id": getattr(model, "_memory_default_id", None),
+            "default_user_id": getattr(model, "_memory_default_user_id", None),
+            "model_id": getattr(model, "model_id", None),
+            "category": getattr(model, "category", None),
+            "model_provider": getattr(model, "model_provider", None),
+            "model_name": getattr(model, "model_name", None),
+            "base_url": getattr(model, "base_url", None),
+            "dimension": getattr(model, "dimension", None),
+            "instruct": None,
+            "max_retries": getattr(model, "max_retries", None),
+            "is_active": getattr(model, "is_active", None),
+            "created_at": str(getattr(model, "created_at", None)),
+            "updated_at": str(getattr(model, "updated_at", None)),
+            "api_key_sha256": api_key_digest,
+        }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class DynamicMemoryStoreManager:
-    """Dynamic memory store manager that supports lazy initialization and reconfiguration."""
+    """Publish one startup-admitted store and reject configuration drift."""
 
     def __init__(self, similarity_threshold: Optional[float] = None):
         """
@@ -92,6 +144,8 @@ class DynamicMemoryStoreManager:
         self._lock = threading.RLock()
         self._last_embedding_model_id: Optional[int] = None
         self._is_lancedb: bool = False
+        self._admitted_embedding_fingerprint: Optional[str] = None
+        self._startup_admission_error: Optional[MemoryStoreStartupAdmissionError] = None
 
         # Initialize with in-memory store (will be replaced with LanceDB when embedding model is configured)
         self._initialize_in_memory_store()
@@ -126,7 +180,12 @@ class DynamicMemoryStoreManager:
                     .order_by(UserDefaultModel.user_id, UserDefaultModel.id)
                     .first()
                 )
-                return default.model if default is not None else None
+                if default is None:
+                    return None
+                model = default.model
+                model._memory_default_id = default.id
+                model._memory_default_user_id = default.user_id
+                return model
             finally:
                 db.close()
         except Exception as e:
@@ -135,10 +194,8 @@ class DynamicMemoryStoreManager:
             logger.error(f"Error checking for embedding model: {e}")
             return None
 
-    def _create_lancedb_store(
-        self, embedding_model: BaseEmbedding
-    ) -> UserIsolatedMemoryStore:
-        """Create the filesystem-backed store after model admission succeeds."""
+    def _memory_db_dir(self, *, create: bool) -> Optional[str]:
+        """Resolve storage without creating artifacts during discovery."""
         legacy_dir = os.path.join(
             os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -147,20 +204,34 @@ class DynamicMemoryStoreManager:
         )
         if os.path.exists(legacy_dir) and os.listdir(legacy_dir):
             logger.info(f"Using legacy memory store location: {legacy_dir}")
-            db_dir = legacy_dir
-        else:
-            new_dir = get_storage_root() / "memory_store"
+            return legacy_dir
+
+        new_dir = get_storage_root() / "memory_store"
+        if create:
             os.makedirs(new_dir, exist_ok=True)
-            db_dir = str(new_dir)
+        elif not new_dir.is_dir():
+            return None
+        return str(new_dir)
+
+    def _create_lancedb_store(
+        self,
+        embedding_model: Optional[BaseEmbedding],
+        *,
+        db_dir: Optional[str] = None,
+    ) -> UserIsolatedMemoryStore:
+        """Create a dormant filesystem-backed store without touching its table."""
+        resolved_db_dir = db_dir or self._memory_db_dir(create=True)
+        if resolved_db_dir is None:  # pragma: no cover - create=True always resolves
+            raise RuntimeError("memory storage directory could not be resolved")
 
         lancedb_store = LanceDBMemoryStore(
-            db_dir=db_dir,
+            db_dir=resolved_db_dir,
             embedding_model=embedding_model,
             similarity_threshold=self._similarity_threshold or 1.5,
             initialize_schema=False,
             include_null_vector_fallback=True,
         )
-        logger.info("Created LanceDB store with shared embedding model")
+        logger.info("Created dormant LanceDB memory store")
         return UserIsolatedMemoryStore(lancedb_store)
 
     @staticmethod
@@ -206,7 +277,43 @@ class DynamicMemoryStoreManager:
         """Admit and maintain shared memory before runtime writers start."""
         with self._lock:
             model = self._get_embedding_model_from_db(fail_fast=True)
+            admitted_fingerprint = _embedding_model_fingerprint(model)
             if model is None:
+                db_dir = self._memory_db_dir(create=False)
+                if db_dir is None:
+                    self._admitted_embedding_fingerprint = admitted_fingerprint
+                    self._startup_admission_error = None
+                    return
+                new_store = self._create_lancedb_store(None, db_dir=db_dir)
+                base_store = cast(LanceDBMemoryStore, new_store._base_store)
+                connection = base_store._vector_store.get_raw_connection()
+                table_name = base_store._collection_name
+                with self._lifecycle_lock(connection, table_name):
+                    table = open_lancedb_table_if_exists(connection, table_name)
+                    if table is None:
+                        self._admitted_embedding_fingerprint = admitted_fingerprint
+                        self._startup_admission_error = None
+                        return
+                    _safe_close_table(table)
+                    outcome = maintain_lancedb_memory_table(connection, table_name)
+                    if outcome.status is MaintenanceStatus.INVALID_LEGACY_DATA:
+                        logger.error(MEMORY_STORE_STARTUP_REPAIR_DETAIL)
+                        self._startup_admission_error = (
+                            MemoryStoreStartupAdmissionError(
+                                MEMORY_STORE_STARTUP_REPAIR_DETAIL
+                            )
+                        )
+                        raise self._startup_admission_error
+                    if outcome.status is not MaintenanceStatus.COMPLETE:
+                        raise RuntimeError(
+                            "memory maintenance failed: "
+                            f"{outcome.status.value}: {outcome.detail}"
+                        )
+                self._memory_store = new_store
+                self._is_lancedb = True
+                self._last_embedding_model_id = None
+                self._admitted_embedding_fingerprint = admitted_fingerprint
+                self._startup_admission_error = None
                 return
             # Model validation and adapter construction are intentionally kept
             # ahead of every LanceDB/filesystem operation. Only definite model
@@ -218,6 +325,7 @@ class DynamicMemoryStoreManager:
                     "Configured default embedding model has invalid fields; "
                     "preserving the current memory store"
                 )
+                self._admitted_embedding_fingerprint = admitted_fingerprint
                 return
             try:
                 canonical_embedding_identity(embedding_config)
@@ -226,6 +334,7 @@ class DynamicMemoryStoreManager:
                     "Configured default embedding model has an invalid vector "
                     "identity; preserving the current memory store"
                 )
+                self._admitted_embedding_fingerprint = admitted_fingerprint
                 return
             try:
                 embedding_model = create_embedding_adapter(embedding_config)
@@ -234,6 +343,7 @@ class DynamicMemoryStoreManager:
                     "Configured default embedding model uses an unsupported "
                     "provider; preserving the current memory store"
                 )
+                self._admitted_embedding_fingerprint = admitted_fingerprint
                 return
 
             new_store = self._create_lancedb_store(embedding_model)
@@ -262,13 +372,13 @@ class DynamicMemoryStoreManager:
                         )
                         outcome = maintain_lancedb_memory_table(connection, table_name)
                         if outcome.status is MaintenanceStatus.INVALID_LEGACY_DATA:
-                            logger.warning(
-                                "Persistent memory contains invalid legacy data; "
-                                "vector admission is disabled until the reported "
-                                "rows are repaired offline: %s",
-                                outcome.detail,
+                            logger.error(MEMORY_STORE_STARTUP_REPAIR_DETAIL)
+                            self._startup_admission_error = (
+                                MemoryStoreStartupAdmissionError(
+                                    MEMORY_STORE_STARTUP_REPAIR_DETAIL
+                                )
                             )
-                            base_store._embedding_model = None
+                            raise self._startup_admission_error
                         elif outcome.status is not MaintenanceStatus.COMPLETE:
                             raise RuntimeError(
                                 "memory maintenance failed: "
@@ -305,15 +415,33 @@ class DynamicMemoryStoreManager:
             self._memory_store = new_store
             self._is_lancedb = True
             self._last_embedding_model_id = cast(int, model.id)
+            self._admitted_embedding_fingerprint = admitted_fingerprint
+            self._startup_admission_error = None
 
     def get_memory_store(self) -> MemoryStoreType:
         """
-        Get the current memory store, initializing or updating as necessary.
+        Get the startup-admitted store after verifying authoritative identity.
 
         Returns:
             Current memory store instance
         """
-        return self._memory_store  # type: ignore[return-value]
+        with self._lock:
+            if self._startup_admission_error is not None:
+                raise self._startup_admission_error
+            admitted = self._admitted_embedding_fingerprint
+            if admitted is not None:
+                try:
+                    current_model = self._get_embedding_model_from_db(fail_fast=True)
+                    current = _embedding_model_fingerprint(current_model)
+                except Exception as exc:
+                    raise MemoryStoreRestartRequired(
+                        MEMORY_STORE_RESTART_REQUIRED_DETAIL
+                    ) from exc
+                if current != admitted:
+                    raise MemoryStoreRestartRequired(
+                        MEMORY_STORE_RESTART_REQUIRED_DETAIL
+                    )
+            return self._memory_store  # type: ignore[return-value]
 
     def get_store_info(self) -> dict:
         """
@@ -362,6 +490,6 @@ def get_memory_store_manager(
 
 
 def get_memory_store() -> MemoryStoreType:
-    """Get the current memory store (for backward compatibility)."""
+    """Get the admitted store, failing closed after configuration drift."""
     manager = get_memory_store_manager()
     return manager.get_memory_store()

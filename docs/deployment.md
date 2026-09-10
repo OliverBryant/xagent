@@ -16,6 +16,24 @@ persistent memory. Start only new-version processes, wait for startup admission
 to complete, and then reopen memory-writing ingress. Use the same quiescence for
 rollback or offline remediation.
 
+The admitted store is a startup snapshot. Every shared-store acquisition checks
+the current authoritative administrator embedding default, model/provider/name,
+endpoint, dimension, instruction, retry policy, and credential fingerprint. A
+change after startup fails closed with a restart-required response; workers do
+not reload adapters online and never continue with the stale store. Quiesce all
+API, task worker, and scheduler memory writers, restart every worker, wait for
+startup admission on all of them, and only then reopen memory ingress. Credential
+material is represented in the fingerprint only by an irreversible SHA-256
+digest and is never included in errors or logs.
+
+If an identity-changing edit requires existing vectors to be repaired or
+re-embedded, keep all writers quiesced and perform that work offline before the
+coordinated restart. A missing eligible administrator default does not hide an
+existing table: startup admits a valid existing table as text-only storage. If
+legacy rows cannot be projected safely, startup preserves the previous manager
+state and fails with an offline-repair instruction instead of publishing a
+projection-dependent store or permitting request-time migration.
+
 Vector tables created before identity metadata was introduced remain vector
 enabled only for the exact historical DashScope identity (provider, model,
 endpoint, dimension, and instruction). A non-exact legacy table is admitted in

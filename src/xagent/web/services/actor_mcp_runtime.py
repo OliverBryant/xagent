@@ -234,6 +234,20 @@ def _cached_builtin_stdio_execution(app_id: str) -> dict[str, Any] | None:
     return get_builtin_execution_fields(app_id)
 
 
+def _canonical_oauth_scopes(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(scope, str) or not scope for scope in value)
+        or len(value) != len(set(value))
+    ):
+        raise ActorMCPRuntimeDefinitionError(
+            "actor stdio OAuth scope definition is invalid"
+        )
+    return tuple(sorted(value))
+
+
 def _canonical_stdio_execution(
     db: Session,
     identity: ActorMCPStdioConnectionIdentity,
@@ -270,14 +284,14 @@ def _canonical_stdio_execution(
         "name": app.name,
         "transport": app.transport,
         "provider_name": app.provider_name,
-        "oauth_scopes": list(app.oauth_scopes or []),
+        "oauth_scopes": _canonical_oauth_scopes(app.oauth_scopes),
         "launch_config": app.launch_config or {},
     }
     expected_execution = {
         "name": execution["name"],
         "transport": execution["transport"],
         "provider_name": execution["provider_name"],
-        "oauth_scopes": list(execution["oauth_scopes"] or []),
+        "oauth_scopes": _canonical_oauth_scopes(execution["oauth_scopes"]),
         "launch_config": execution["launch_config"],
     }
     if persisted_execution != expected_execution:

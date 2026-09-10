@@ -2,6 +2,7 @@
 
 import json
 from types import SimpleNamespace
+
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
 import pytest

@@ -34,8 +34,8 @@ from xagent.web.dynamic_memory_store import (
     MemoryAdmissionLockTimeout,
     _embedding_model_config,
 )
-from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 from xagent.web.models import Base, Model, User, UserDefaultModel, UserModel
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 
 def _model(**overrides):

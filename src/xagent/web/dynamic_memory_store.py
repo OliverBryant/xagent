@@ -23,12 +23,12 @@ from ..core.memory.vector_compatibility import (
     create_or_recreate_vector_capable_table,
     open_lancedb_table_if_exists,
 )
+from ..core.model import EmbeddingModelConfig
 from ..core.model.embedding.adapter import (
     UnsupportedEmbeddingProviderError,
     create_embedding_adapter,
 )
 from ..core.model.embedding.base import BaseEmbedding
-from ..core.model import EmbeddingModelConfig
 from ..core.storage.manager import get_storage_root
 from ..core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .models.database import get_db

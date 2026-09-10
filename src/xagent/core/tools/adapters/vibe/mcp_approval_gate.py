@@ -14,7 +14,7 @@ import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from ...user_interaction import WAITING_FOR_USER_STATUS
 from .base import AbstractBaseTool, ToolMetadata
-from .connector_runtime import CONNECTOR_TYPE_MCP, ConnectorRef
+from .connector_runtime import ConnectorRef
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,14 @@ _UNSUPPORTED_PATTERN = {
     "success": False,
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
+}
+_DISPATCH_UNKNOWN = {
+    "success": False,
+    "status": "dispatch_unknown",
+    "error": (
+        "The connector call may have been sent, but its outcome could not be "
+        "confirmed. Do not retry it automatically."
+    ),
 }
 
 
@@ -118,7 +126,10 @@ class GatedCall:
     def arguments(self) -> dict[str, Any]:
         """Return a fresh deep copy of the canonical argument snapshot."""
 
-        return json.loads(self.canonical_arguments_json)
+        decoded: Any = json.loads(self.canonical_arguments_json)
+        if not isinstance(decoded, dict):
+            raise ValueError("canonical MCP arguments no longer encode an object")
+        return decoded
 
 
 @dataclass(frozen=True)
@@ -282,7 +293,48 @@ def _connector_ref(connection: Mapping[str, Any]) -> ConnectorRef | None:
     connector_id = connection.get("id")
     if type(connector_id) is not int or connector_id <= 0:
         return None
-    return ConnectorRef(CONNECTOR_TYPE_MCP, connector_id)
+    return ConnectorRef("mcp", connector_id)
+
+
+async def _call_resume_hook(
+    hook: Callable[..., Any],
+    timeout_seconds: float,
+    dispatch_started: asyncio.Event,
+    /,
+    **kwargs: Any,
+) -> Any:
+    """Bound only pre-dispatch resume policy; never cancel a started write."""
+
+    returned = hook(**kwargs)
+    if not inspect.isawaitable(returned):
+        raise TypeError("MCP approval gate hooks must be async")
+
+    hook_task = asyncio.ensure_future(returned)
+    dispatch_wait = asyncio.create_task(dispatch_started.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {hook_task, dispatch_wait},
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if hook_task in done:
+            return hook_task.result()
+        if dispatch_wait in done or dispatch_started.is_set():
+            # The host has entered the one-shot executor. Connector latency is
+            # no longer approval-policy latency and must not be cancelled by
+            # the short gate deadline: cancellation cannot prove a remote
+            # write did not commit.
+            return await hook_task
+
+        hook_task.cancel()
+        try:
+            await hook_task
+        except asyncio.CancelledError:
+            pass
+        raise TimeoutError("MCP approval resume hook timed out before dispatch")
+    finally:
+        if not dispatch_wait.done():
+            dispatch_wait.cancel()
 
 
 class MCPApprovalGateTool(AbstractBaseTool):
@@ -315,7 +367,15 @@ class MCPApprovalGateTool(AbstractBaseTool):
 
     @property
     def metadata(self) -> ToolMetadata:
-        return self._target.metadata
+        metadata = self._target.metadata
+        if not _has_registrations():
+            return metadata
+        # ReAct fans one response out to every interaction paused in a
+        # concurrent batch. A gated tool must therefore revoke the scheduler's
+        # concurrency/idempotency declaration while any gate can be active.
+        return metadata.model_copy(
+            update={"read_only": False, "concurrency_safe": False}
+        )
 
     @property
     def is_sandboxed(self) -> bool:
@@ -339,7 +399,11 @@ class MCPApprovalGateTool(AbstractBaseTool):
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
-        if registration is None and not (context is None and _has_registrations()):
+        if registration is None:
+            if (context is None or not context.task_source) and _has_registrations():
+                raise RuntimeError(
+                    f"MCP tool {self.name} requires async approval evaluation"
+                )
             return self._target.run_json_sync(args)
         raise RuntimeError(f"MCP tool {self.name} requires async approval evaluation")
 
@@ -347,7 +411,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
         if registration is None:
-            if context is None and _has_registrations():
+            if (context is None or not context.task_source) and _has_registrations():
                 return dict(_GATE_FAILURE)
             return await self._target.run_json_async(args)
         if context is None or not context.is_complete() or self._connector_ref is None:
@@ -415,22 +479,20 @@ class MCPApprovalGateTool(AbstractBaseTool):
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
         if registration is None:
-            if context is None and _has_registrations():
+            if (context is None or not context.task_source) and _has_registrations():
                 return dict(_GATE_FAILURE)
             target_resume = getattr(self._target, "resume_user_interaction", None)
             if not callable(target_resume):
                 return None
             resumed = target_resume(interaction_id=interaction_id, response=response)
             return await resumed if inspect.isawaitable(resumed) else resumed
-        if (
-            context is None
-            or not context.is_complete()
-            or self._connector_ref is None
-        ):
+        if context is None or not context.is_complete() or self._connector_ref is None:
             return dict(_GATE_FAILURE)
 
+        connector_ref = self._connector_ref
         active = True
         used = False
+        dispatch_started = asyncio.Event()
 
         async def executor(arguments: Mapping[str, Any]) -> Any:
             nonlocal used
@@ -438,7 +500,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 raise RuntimeError("approval replay executor is no longer available")
             used = True
             canonical = GatedCall.from_arguments(
-                connector_ref=self._connector_ref,
+                connector_ref=connector_ref,
                 tool_name=self.name,
                 arguments=arguments,
                 execution_context=context,
@@ -450,17 +512,23 @@ class MCPApprovalGateTool(AbstractBaseTool):
             )
             token = _CURRENT_REPLAY_CONTEXT.set(replay)
             try:
+                # The host resume hook must persist its EXECUTING/dispatch
+                # marker before awaiting this executor. From this point on,
+                # an exception is conservatively ambiguous unless the host
+                # returns a persisted known outcome.
+                dispatch_started.set()
                 return await self._target.run_json_async(canonical.arguments)
             finally:
                 _CURRENT_REPLAY_CONTEXT.reset(token)
 
         try:
-            return await _call_async_hook(
+            return await _call_resume_hook(
                 registration.resume,
                 registration.timeout_seconds,
+                dispatch_started,
                 interaction_id=interaction_id,
                 response=response,
-                connector_ref=self._connector_ref,
+                connector_ref=connector_ref,
                 tool_name=self.name,
                 execution_context=context,
                 executor=executor,
@@ -475,7 +543,9 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 interaction_id,
                 exc_info=True,
             )
-            return dict(_GATE_FAILURE)
+            return dict(
+                _DISPATCH_UNKNOWN if dispatch_started.is_set() else _GATE_FAILURE
+            )
         finally:
             active = False
 
@@ -493,11 +563,12 @@ class MCPApprovalGateTool(AbstractBaseTool):
 
 
 def gate_mcp_tools(
-    tools: list[AbstractBaseTool],
+    tools: Sequence[AbstractBaseTool],
     *,
-    connection: Mapping[str, Any],
+    connection: Mapping[str, Any] | None = None,
+    connector_ref: ConnectorRef | None = None,
 ) -> list[AbstractBaseTool]:
     """Wrap tools where direct and sandboxed MCP transports converge."""
 
-    ref = _connector_ref(connection)
+    ref = connector_ref or _connector_ref(connection or {})
     return [MCPApprovalGateTool(tool, connector_ref=ref) for tool in tools]

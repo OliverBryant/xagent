@@ -39,8 +39,8 @@ from xagent.core.model.chat.tool_protocol import (
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
-    GateDecision,
     GatedCall,
+    GateDecision,
     current_tool_call_execution_context,
     gate_mcp_tools,
     register_mcp_approval_gate,

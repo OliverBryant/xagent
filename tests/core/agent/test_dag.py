@@ -22,7 +22,10 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
-from xagent.core.agent.checkpoint import CheckpointPersistenceError
+from xagent.core.agent.checkpoint import (
+    CheckpointPersistenceError,
+    TraceCheckpointStore,
+)
 from xagent.core.agent.clarification import (
     ClarificationDraft,
     draft_from_waiting_request,
@@ -739,6 +742,58 @@ async def test_dag_step_does_not_convert_checkpoint_failure_into_step_failure(
     assert caught.value is failure
     assert step.status == "running"
     assert "creative" in dag.active_step_ids
+
+
+@pytest.mark.asyncio
+async def test_dag_step_preserves_state_on_raw_checkpoint_writer_failure(
+    monkeypatch,
+) -> None:
+    class FailingWriter:
+        def __init__(self) -> None:
+            self.persisted_labels: list[str] = []
+
+        async def checkpoint(self, **payload: Any) -> str:
+            if payload["label"] == "dag_child_checkpoint":
+                raise RuntimeError("database unavailable")
+            self.persisted_labels.append(payload["label"])
+            return f"checkpoint-{len(self.persisted_labels)}"
+
+    async def checkpoint_run(
+        _pattern: ReActPattern,
+        *,
+        context: Any,
+        runtime: Any,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        await runtime.checkpoint(
+            "child_checkpoint",
+            context=context,
+            pattern=_pattern,
+        )
+        raise AssertionError("checkpoint failure must stop the step")
+
+    monkeypatch.setattr(ReActPattern, "run", checkpoint_run)
+    writer = FailingWriter()
+    runtime = PatternRuntime(
+        tracer=TraceCheckpointStore(writer),
+        execution_id="dag-root",
+    )
+    dag = DAGPattern(lambda **_: build_plan())
+    step = PlanStep(id="creative", task="Create", tool_names=[])
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await dag._execute_step_impl(
+            step=step,
+            root_context=ExecutionContext(execution_id="dag-root"),
+            tools=[],
+            llm=object(),
+            runtime=runtime,
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert step.status == "running"
+    assert "creative" in dag.active_step_ids
+    assert writer.persisted_labels == ["dag_before_step"]
 
 
 @pytest.mark.asyncio

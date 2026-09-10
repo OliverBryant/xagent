@@ -506,6 +506,55 @@ def test_task_create_allows_shared_model_ids(
     assert data["model_id"] == shared_model_id
 
 
+def test_task_create_does_not_persist_inactive_owned_or_shared_model_ids(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+
+    # An owner link must not make a deactivated model runtime-available.
+    owned_data = dict(sample_model_data)
+    owned_data["model_id"] = "inactive-owned-model"
+    created_owned = client.post("/api/models/", json=owned_data, headers=user1_headers)
+    assert created_owned.status_code == 200
+
+    # A shared link must not bypass the same active gate for another user.
+    admin_login = client.post(
+        "/api/auth/login", json={"username": "admin", "password": "admin123"}
+    )
+    assert admin_login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    shared_data = dict(sample_model_data)
+    shared_data.update({"model_id": "inactive-shared-model", "share_with_users": True})
+    created_shared = client.post(
+        "/api/models/", json=shared_data, headers=admin_headers
+    )
+    assert created_shared.status_code == 200
+
+    db = next(get_db())
+    try:
+        inactive_ids = ("inactive-owned-model", "inactive-shared-model")
+        db.query(Model).filter(Model.model_id.in_(inactive_ids)).update(
+            {Model.is_active: False}, synchronize_session=False
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    for model_id in inactive_ids:
+        response = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": f"task-{model_id}",
+                "description": "desc",
+                "llm_ids": [model_id, None, None, None],
+            },
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["model_id"] != model_id
+
+
 def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     resp = client.post(
         "/api/chat/task/create",
@@ -833,6 +882,45 @@ def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
         assert ids[1] == "deleted-fast-id"
         assert ids[2] == "deleted-visual-id"
         assert ids[3] == "deleted-compact-id"
+    finally:
+        db.close()
+
+
+def test_get_task_llm_ids_drops_stored_id_when_model_is_inactive(test_db):
+    ensure_system_initialized()
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        inactive = Model(
+            model_id="inactive-persisted-model",
+            category="llm",
+            model_provider="openai",
+            model_name="gpt-4.1",
+            api_key="test-key",
+            abilities=["chat"],
+            is_active=False,
+        )
+        db.add(inactive)
+        db.flush()
+        task = Task(
+            user_id=admin.id,
+            title="inactive persisted model",
+            description="d",
+            status=TaskStatus.PENDING,
+            model_id=inactive.model_id,
+            model_name=inactive.model_name,
+        )
+        db.add(task)
+        db.commit()
+
+        ids = AgentServiceManager()._get_task_llm_ids(task, db)
+
+        assert ids[0] is None
     finally:
         db.close()
 

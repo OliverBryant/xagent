@@ -647,11 +647,14 @@ class UserAwareModelStorage:
         try:
             # Try to get by model_id first, then by model_name
             logger.info(f"Looking for model: {model_name} for user {user_id}")
-            model_config = self.core_storage.load(model_name)
             db_model = self.core_storage.get_db_model(model_name)
             if not db_model:
                 logger.warning(f"Cannot find model for id: {model_name}")
                 return None
+            if not bool(getattr(db_model, "is_active", True)):
+                logger.warning(f"Model '{model_name}' is inactive")
+                return None
+            model_config = self.core_storage.load(model_name)
             logger.info(
                 f"Found model: id={db_model.id}, model_id={db_model.model_id}, model_name={db_model.model_name}"
             )
@@ -844,6 +847,9 @@ class UserAwareModelStorage:
     ) -> Optional[BaseLLM]:
         """Create a default model, hydrating configured Auto when necessary."""
 
+        if not bool(getattr(db_model, "is_active", True)):
+            return None
+
         model_id = str(db_model.model_id)
         model_config = self.core_storage.load(model_id)
         if (
@@ -1005,6 +1011,7 @@ class UserAwareModelStorage:
                     )
                     .filter(
                         UserDefaultModel.config_type.in_(config_types),
+                        UserDefaultModel.model.has(Model.is_active),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(visible_ids),
                     )
@@ -1325,13 +1332,17 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
         if model_id:
             db_model = core_storage.get_db_model(model_id)
             if db_model:
-                return str(db_model.model_id)
+                return str(db_model.model_id) if bool(db_model.is_active) else None
             # Preserve stored identifier even if the backing model row no longer exists.
             # This avoids API inconsistencies when models are deleted/migrated.
             return str(model_id).strip() if isinstance(model_id, str) else str(model_id)
         if model_name:
             db_model = core_storage.get_db_model(str(model_name))
-            return str(db_model.model_id) if db_model else None
+            return (
+                str(db_model.model_id)
+                if db_model and bool(db_model.is_active)
+                else None
+            )
         return None
 
     return normalize_model_id

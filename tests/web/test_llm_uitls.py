@@ -26,6 +26,22 @@ def storage(mock_db, mock_core_storage):
 
 
 class TestGetLLMByNameWithAccess:
+    def test_returns_none_for_inactive_model_before_loading_config(
+        self, storage, mock_core_storage
+    ):
+        mock_core_storage.get_db_model.return_value = Mock(
+            id=1,
+            model_id="inactive-model",
+            model_name="inactive-model",
+            is_active=False,
+        )
+
+        result = storage.get_llm_by_name_with_access("inactive-model", user_id=1)
+
+        assert result is None
+        mock_core_storage.load.assert_not_called()
+        mock_core_storage.create_llm_instance.assert_not_called()
+
     def test_returns_llm_when_model_exists_no_user(self, storage, mock_core_storage):
         mock_llm = Mock()
         mock_model = Mock(

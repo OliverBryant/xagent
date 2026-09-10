@@ -1,7 +1,7 @@
 """Seed the built-in Shopify key-based MCP connector.
 
 Revision ID: 20260909_seed_shopify_mcp_app
-Revises: 20260901_seed_zendesk_mcp_app
+Revises: 370740d9125a
 """
 
 import logging
@@ -18,7 +18,7 @@ from xagent.builtin_identity import (
 logger = logging.getLogger(__name__)
 
 revision: str = "20260909_seed_shopify_mcp_app"
-down_revision: Union[str, None] = "20260901_seed_zendesk_mcp_app"
+down_revision: Union[str, None] = "370740d9125a"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

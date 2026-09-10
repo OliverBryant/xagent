@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import base64
+import inspect
+import json
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
+from xagent.core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+    ACTOR_STDIO_SHADOWED_REASON,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
 from xagent.web.models.database import Base
@@ -47,7 +54,9 @@ def db() -> Session:
     engine.dispose()
 
 
-def _seed_app(db: Session, *, app_id: str = APP_ID) -> PublicMCPApp:
+def _seed_app(
+    db: Session, *, app_id: str = APP_ID, visible: bool = True
+) -> PublicMCPApp:
     execution = get_builtin_execution_fields(app_id)
     assert execution is not None
     app = PublicMCPApp(
@@ -57,7 +66,7 @@ def _seed_app(db: Session, *, app_id: str = APP_ID) -> PublicMCPApp:
         provider_name=execution["provider_name"],
         oauth_scopes=execution["oauth_scopes"],
         launch_config=execution["launch_config"],
-        is_visible_in_connector=True,
+        is_visible_in_connector=visible,
     )
     db.add(app)
     db.flush()
@@ -199,6 +208,50 @@ def test_synthetic_config_uses_exact_lifecycle_fenced_adapter_inputs(
         "XAGENT_MCP_CALLER_ID": str(USER_ID),
     }
     assert "id" not in config
+
+
+def test_catalog_lookup_does_not_load_full_rows_for_collision_scan(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        if "public_mcp_apps" in statement:
+            statements.append(statement)
+
+    event.listen(db.bind, "before_cursor_execute", capture_statement)
+    try:
+        resolve_actor_mcp_stdio_configs(
+            db,
+            user_id=USER_ID,
+            policy=_policy(),
+            adapter=_FakeAdapter(_identity(app), _credentials()),
+            visible_servers=(),
+        )
+    finally:
+        event.remove(db.bind, "before_cursor_execute", capture_statement)
+
+    assert any(
+        "WHERE public_mcp_apps.app_id =" in statement for statement in statements
+    )
+    assert any(
+        "SELECT public_mcp_apps.app_id" in statement
+        and "public_mcp_apps.launch_config" not in statement
+        for statement in statements
+    )
+    assert not any(
+        "public_mcp_apps.launch_config" in statement and "WHERE" not in statement
+        for statement in statements
+    )
 
 
 def test_production_adapter_is_a_stateless_exact_service_wrapper(
@@ -354,6 +407,16 @@ async def test_create_default_tools_registers_production_adapter_only_for_actor_
     )
 
 
+def test_web_tool_config_actor_parameters_are_appended_after_voice() -> None:
+    parameters = list(inspect.signature(WebToolConfig.__init__).parameters)
+
+    assert parameters[-3:] == [
+        "voice",
+        "mcp_actor_stdio_connection_adapter",
+        "mcp_actor_execution_identity",
+    ]
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -461,6 +524,7 @@ def test_reserved_collision_reads_only_stable_server_identity(
 
     assert result.configs == ()
     assert result.blocked_server_ids == frozenset({73})
+    assert result.blocked_server_reasons == ((73, ACTOR_STDIO_SHADOWED_REASON),)
     assert adapter.secret_calls == []
     assert collision.forbidden_accesses == []
 
@@ -492,6 +556,49 @@ def test_policy_or_feature_off_never_falls_back_to_reserved_server(
     assert feature_off.blocked_server_ids == frozenset({73})
     assert legacy_policy.blocked_server_ids == frozenset()
     assert adapter.list_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reserved_collision_surfaces_distinct_unavailable_reason(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", raising=False)
+    collision = SimpleNamespace(id=73, name=APP_ID, description=None)
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user_id=USER_ID,
+        mcp_runtime_authorization_policy=_policy(),
+    )
+    monkeypatch.setattr(
+        config,
+        "_visible_mcp_server_query",
+        lambda _team_ids: SimpleNamespace(all=lambda: [collision]),
+    )
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.classify_actor_builtin_oauth_server",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.classify_actor_remote_oauth_server",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_user_env_overrides",
+        lambda *_args: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_shared_env_overrides",
+        lambda *_args: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_user_env_sources",
+        lambda *_args: {},
+    )
+
+    result = await config._load_mcp_server_configs()
+
+    assert result[0]["config"]["reason"] == ACTOR_STDIO_SHADOWED_REASON
 
 
 @pytest.mark.parametrize(
@@ -542,6 +649,139 @@ def test_incomplete_runtime_credentials_fail_closed(
     assert result.configs == ()
 
 
+@pytest.mark.parametrize(
+    ("field_name", "drifted_value"),
+    [
+        ("name", "Drifted PostHog"),
+        ("transport", "oauth"),
+        ("provider_name", "posthog"),
+        ("oauth_scopes", ["unexpected"]),
+        (
+            "launch_config",
+            {
+                "command": "attacker",
+                "args": ["-m", "xagent.web.tools.mcp.posthog"],
+                "required_env": ["POSTHOG_API_KEY", "POSTHOG_HOST"],
+            },
+        ),
+        (
+            "launch_config",
+            {
+                "command": "python",
+                "args": ["-m", "attacker.module"],
+                "required_env": ["POSTHOG_API_KEY", "POSTHOG_HOST"],
+            },
+        ),
+        (
+            "launch_config",
+            {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.posthog"],
+                "required_env": ["ATTACKER_SECRET"],
+            },
+        ),
+    ],
+)
+def test_catalog_execution_drift_fails_closed_before_secret_read(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    drifted_value: object,
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    adapter = _FakeAdapter(_identity(app), _credentials())
+    setattr(app, field_name, drifted_value)
+    db.flush()
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert result.configs == ()
+    assert adapter.secret_calls == []
+
+
+def test_hidden_execution_scoped_app_fails_closed_before_secret_read(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="chrome-devtools", visible=False)
+    adapter = _FakeAdapter(_identity(app), None)
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+        execution_identity=_execution_identity(),
+    )
+
+    assert result.configs == ()
+    assert result.session_identities == ()
+    assert adapter.secret_calls == []
+
+
+def test_trusted_runtime_env_collision_fails_closed(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    adapter = _FakeAdapter(_identity(app), _credentials())
+    monkeypatch.setattr(
+        "xagent.web.services.actor_mcp_runtime.caller_id_env",
+        lambda _user_id: {"POSTHOG_API_KEY": "fixed"},
+    )
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert result.configs == ()
+
+
+def test_reserved_stdio_registry_keys_are_cached(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services import actor_mcp_runtime
+
+    actor_mcp_runtime._builtin_stdio_rows.cache_clear()
+    actor_mcp_runtime._reserved_stdio_keys.cache_clear()
+    calls = 0
+    original = actor_mcp_runtime.get_builtin_public_mcp_app_rows
+
+    def counted_rows() -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(
+        actor_mcp_runtime, "get_builtin_public_mcp_app_rows", counted_rows
+    )
+    collision = _StableIdentityOnlyServer(73, APP_ID)
+    for _ in range(2):
+        resolve_actor_mcp_stdio_configs(
+            db,
+            user_id=USER_ID,
+            policy=_policy(),
+            adapter=None,
+            visible_servers=(collision,),
+        )
+
+    assert calls == 1
+    actor_mcp_runtime._builtin_stdio_rows.cache_clear()
+    actor_mcp_runtime._reserved_stdio_keys.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_web_loader_appends_synthetic_config_without_env_source_queries(
     db: Session, monkeypatch: pytest.MonkeyPatch
@@ -577,6 +817,67 @@ async def test_web_loader_appends_synthetic_config_without_env_source_queries(
     assert [item["name"] for item in result] == [APP_ID]
 
 
+@pytest.mark.asyncio
+async def test_nonempty_ordinary_env_layers_never_leak_into_actor_config(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    adapter = _FakeAdapter(_identity(app), _credentials())
+    ordinary = _StableIdentityOnlyServer(73, "ordinary-server")
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user_id=USER_ID,
+        mcp_runtime_authorization_policy=_policy(),
+        mcp_actor_stdio_connection_adapter=adapter,
+    )
+    monkeypatch.setattr(
+        config,
+        "_visible_mcp_server_query",
+        lambda _team_ids: SimpleNamespace(all=lambda: [ordinary]),
+    )
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.classify_actor_builtin_oauth_server",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.classify_actor_remote_oauth_server",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def build_ordinary(**_kwargs: object) -> dict[str, object]:
+        return {
+            "id": 73,
+            "name": "ordinary-server",
+            "transport": "stdio",
+            "config": {"command": "python", "env": {"ORDINARY": "value"}},
+        }
+
+    monkeypatch.setattr(config, "_load_mcp_server_config", build_ordinary)
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_user_env_overrides",
+        lambda *_args: {73: {"POSTHOG_API_KEY": "user-leak"}},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_shared_env_overrides",
+        lambda *_args: {73: {"POSTHOG_HOST": "shared-leak"}},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.load_user_env_sources",
+        lambda *_args: {73: "platform"},
+    )
+
+    result = await config._load_mcp_server_configs()
+
+    actor_config = next(item for item in result if item["name"] == APP_ID)
+    assert actor_config["config"]["env"] == {
+        **_credentials(),
+        "XAGENT_MCP_CALLER_ID": str(USER_ID),
+    }
+    assert ordinary.forbidden_accesses == []
+
+
 def test_execution_scoped_chrome_requires_complete_execution_identity(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -602,7 +903,9 @@ def test_execution_scoped_chrome_requires_complete_execution_identity(
 
     assert missing.configs == ()
     assert len(present.configs) == 1
-    session_identity = present.configs[0]["actor_stdio_session_identity"]
+    assert "actor_stdio_session_identity" not in present.configs[0]
+    assert json.loads(json.dumps(present.configs[0])) == present.configs[0]
+    session_identity = dict(present.session_identities)["chrome-devtools"]
     assert isinstance(session_identity, ActorMCPStdioSessionIdentity)
     assert session_identity.key == (
         91,
@@ -615,6 +918,35 @@ def test_execution_scoped_chrome_requires_complete_execution_identity(
         app.generation,
         adapter.identity.lifecycle_generation,
     )
+
+
+@pytest.mark.asyncio
+async def test_web_loader_keeps_chrome_identity_in_host_only_side_channel(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="chrome-devtools")
+    adapter = _FakeAdapter(_identity(app), None)
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user_id=USER_ID,
+        mcp_runtime_authorization_policy=_policy(),
+        mcp_actor_stdio_connection_adapter=adapter,
+        mcp_actor_execution_identity=_execution_identity(),
+    )
+    monkeypatch.setattr(
+        config,
+        "_visible_mcp_server_query",
+        lambda _team_ids: SimpleNamespace(all=lambda: []),
+    )
+
+    result = await config._load_mcp_server_configs()
+
+    assert len(result) == 1
+    assert "actor_stdio_session_identity" not in result[0]
+    identities = config.get_actor_mcp_stdio_session_identities()
+    assert identities["chrome-devtools"].connection.app_id == "chrome-devtools"
 
 
 @pytest.mark.parametrize(
@@ -662,7 +994,7 @@ def test_chrome_session_key_changes_for_retry_and_later_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_factory_threads_actor_stdio_session_identity_to_connection(
+async def test_tool_factory_keeps_actor_stdio_session_identity_out_of_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = ActorMCPStdioConnectionIdentity(
@@ -674,14 +1006,33 @@ async def test_tool_factory_threads_actor_stdio_session_identity_to_connection(
     )
     session_identity = ActorMCPStdioSessionIdentity(_execution_identity(), connection)
     captured: dict[str, object] = {}
+    owner_bytes = OWNER.encode()
 
-    async def fake_load(connections: dict[str, object], **_kwargs: object) -> object:
-        captured.update(connections)
-        return SimpleNamespace(tools=(), failures=())
+    async def forbidden_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("session-scoped config reached the per-call loader")
+
+    async def consume(**kwargs: object) -> list[object]:
+        captured.update(kwargs)
+        connection_config = kwargs["connection"]
+        serialized = json.dumps(connection_config).encode()
+        assert owner_bytes not in serialized
+        from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
+            _serialize_connection,
+        )
+
+        argv_payload = base64.b64decode(_serialize_connection(connection_config))
+        assert owner_bytes not in argv_payload
+        import cloudpickle
+
+        pickled = base64.b64decode(
+            base64.b64encode(cloudpickle.dumps(connection_config))
+        )
+        assert owner_bytes not in pickled
+        return []
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
-        fake_load,
+        forbidden_load,
     )
 
     await ToolFactory._create_mcp_tools_from_configs(
@@ -690,11 +1041,94 @@ async def test_tool_factory_threads_actor_stdio_session_identity_to_connection(
                 "name": "chrome-devtools",
                 "transport": "stdio",
                 "config": {"command": "npx", "args": [], "env": {}},
-                "actor_stdio_session_identity": session_identity,
             }
-        ]
+        ],
+        actor_stdio_session_identities={"chrome-devtools": session_identity},
+        actor_stdio_session_consumer=consume,
     )
 
-    assert (
-        captured["chrome-devtools"]["actor_stdio_session_identity"] is session_identity
-    )  # type: ignore[index]
+    assert captured["session_identity"] is session_identity
+    assert "actor_stdio_session_identity" not in captured["connection"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_session_and_per_call_tools_are_both_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = ActorMCPStdioConnectionIdentity(
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id="chrome-devtools",
+        catalog_app_generation=uuid.uuid4(),
+        lifecycle_generation=uuid.uuid4(),
+    )
+    session_tool = SimpleNamespace(name="session-tool")
+    per_call_tool = SimpleNamespace(name="per-call-tool")
+
+    async def load_per_call(
+        connections: Mapping[str, object], **_kwargs: object
+    ) -> object:
+        assert set(connections) == {"posthog"}
+        return SimpleNamespace(tools=[per_call_tool], failures=[])
+
+    async def consume(**kwargs: object) -> list[object]:
+        assert kwargs["server_name"] == "chrome-devtools"
+        return [session_tool]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        load_per_call,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "chrome-devtools",
+                "transport": "stdio",
+                "config": {"command": "npx", "args": [], "env": {}},
+            },
+            {
+                "name": "posthog",
+                "transport": "stdio",
+                "config": {"command": "npx", "args": [], "env": {}},
+            },
+        ],
+        actor_stdio_session_identities={
+            "chrome-devtools": ActorMCPStdioSessionIdentity(
+                _execution_identity(), connection
+            )
+        },
+        actor_stdio_session_consumer=consume,
+    )
+
+    assert tools == [session_tool, per_call_tool]
+
+
+@pytest.mark.asyncio
+async def test_execution_scoped_config_fails_closed_without_session_consumer() -> None:
+    connection = ActorMCPStdioConnectionIdentity(
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id="chrome-devtools",
+        catalog_app_generation=uuid.uuid4(),
+        lifecycle_generation=uuid.uuid4(),
+    )
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "chrome-devtools",
+                "transport": "stdio",
+                "config": {"command": "npx", "args": [], "env": {}},
+            }
+        ],
+        actor_stdio_session_identities={
+            "chrome-devtools": ActorMCPStdioSessionIdentity(
+                _execution_identity(), connection
+            )
+        },
+    )
+
+    assert len(tools) == 1
+    assert tools[0].unavailability_reason == (  # type: ignore[attr-defined]
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON
+    )

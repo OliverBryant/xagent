@@ -17,7 +17,7 @@ user's answer. Callback-less tools use the normal ReAct context and replan path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, get_args, runtime_checkable
 
 WAITING_FOR_USER_STATUS = "waiting_for_user"
 ToolInteractionSettlementStatus = Literal[
@@ -26,12 +26,9 @@ ToolInteractionSettlementStatus = Literal[
     "failed",
     "dispatch_unknown",
 ]
-_TOOL_INTERACTION_SETTLEMENT_STATUSES = {
-    "succeeded",
-    "rejected",
-    "failed",
-    "dispatch_unknown",
-}
+_TOOL_INTERACTION_SETTLEMENT_STATUSES = frozenset(
+    get_args(ToolInteractionSettlementStatus)
+)
 _DEFAULT_SETTLEMENT_ERRORS = {
     "rejected": "The user rejected the tool call.",
     "failed": "The resumed tool call failed.",
@@ -76,6 +73,10 @@ class ToolInteractionSettlement:
                     "A succeeded tool interaction settlement cannot carry a "
                     "failed tool result."
                 )
+        elif tool_result_waits_for_user(self.result):
+            raise ValueError(
+                "A terminal tool interaction settlement cannot wait for user input."
+            )
 
     @classmethod
     def succeeded(cls, result: Any) -> ToolInteractionSettlement:

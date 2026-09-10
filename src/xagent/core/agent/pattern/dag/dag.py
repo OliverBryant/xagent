@@ -179,9 +179,15 @@ class _DAGStepRuntime:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        active_ids_before = list(self.dag_pattern.active_step_ids)
-        contexts_before = copy.deepcopy(self.dag_pattern.active_step_contexts)
-        states_before = copy.deepcopy(self.dag_pattern.active_step_pattern_states)
+        was_active = self.step_id in self.dag_pattern.active_step_ids
+        had_context = self.step_id in self.dag_pattern.active_step_contexts
+        context_before = copy.deepcopy(
+            self.dag_pattern.active_step_contexts.get(self.step_id)
+        )
+        had_state = self.step_id in self.dag_pattern.active_step_pattern_states
+        state_before = copy.deepcopy(
+            self.dag_pattern.active_step_pattern_states.get(self.step_id)
+        )
         step_metadata = {
             "active_step_id": self.step_id,
             "child_label": label,
@@ -203,9 +209,22 @@ class _DAGStepRuntime:
                 metadata=step_metadata,
             )
         except BaseException:
-            self.dag_pattern.active_step_ids = active_ids_before
-            self.dag_pattern.active_step_contexts = contexts_before
-            self.dag_pattern.active_step_pattern_states = states_before
+            if was_active and self.step_id not in self.dag_pattern.active_step_ids:
+                self.dag_pattern.active_step_ids.append(self.step_id)
+            elif not was_active:
+                self.dag_pattern.active_step_ids = [
+                    step_id
+                    for step_id in self.dag_pattern.active_step_ids
+                    if step_id != self.step_id
+                ]
+            if had_context:
+                self.dag_pattern.active_step_contexts[self.step_id] = context_before
+            else:
+                self.dag_pattern.active_step_contexts.pop(self.step_id, None)
+            if had_state:
+                self.dag_pattern.active_step_pattern_states[self.step_id] = state_before
+            else:
+                self.dag_pattern.active_step_pattern_states.pop(self.step_id, None)
             self.dag_pattern._sync_legacy_active_step()
             raise
 

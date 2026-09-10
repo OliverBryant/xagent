@@ -718,6 +718,57 @@ async def test_dag_step_checkpoint_rolls_back_child_snapshot_on_failure() -> Non
 
 
 @pytest.mark.asyncio
+async def test_dag_step_checkpoint_rollback_preserves_concurrent_step_progress() -> (
+    None
+):
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+
+    class FailingRuntime(PatternRuntime):
+        async def checkpoint(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            checkpoint_started.set()
+            await release_checkpoint.wait()
+            raise CheckpointPersistenceError("checkpoint unavailable")
+
+    class MustNotBeCopied:
+        def __deepcopy__(self, _memo: dict[int, Any]) -> Any:
+            raise AssertionError("an unrelated step must not be deep-copied")
+
+    dag = DAGPattern(lambda **_: build_plan())
+    dag._set_active_step_context("a", {"marker": "a-old"})
+    dag._set_active_step_pattern_state("a", {"marker": "a-old"})
+    dag._set_active_step_context("b", {"marker": "b-old"})
+    dag._set_active_step_pattern_state("b", MustNotBeCopied())
+    runtime = _DAGStepRuntime(
+        parent=FailingRuntime(),
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="a",
+    )
+
+    checkpoint_task = asyncio.create_task(
+        runtime.checkpoint(
+            "child_checkpoint",
+            context=ExecutionContext(execution_id="dag-root:a"),
+            pattern=ReActPattern(),
+        )
+    )
+    await checkpoint_started.wait()
+    concurrent_state = {"marker": "b-new"}
+    dag._set_active_step_context("b", {"marker": "b-new"})
+    dag._set_active_step_pattern_state("b", concurrent_state)
+    release_checkpoint.set()
+
+    with pytest.raises(CheckpointPersistenceError, match="checkpoint unavailable"):
+        await checkpoint_task
+
+    assert dag.active_step_contexts["a"] == {"marker": "a-old"}
+    assert dag.active_step_pattern_states["a"] == {"marker": "a-old"}
+    assert dag.active_step_contexts["b"] == {"marker": "b-new"}
+    assert dag.active_step_pattern_states["b"] is concurrent_state
+
+
+@pytest.mark.asyncio
 async def test_dag_step_does_not_convert_checkpoint_failure_into_step_failure(
     monkeypatch,
 ) -> None:

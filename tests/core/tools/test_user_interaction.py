@@ -58,6 +58,15 @@ def test_successful_settlement_rejects_non_terminal_results(
         ToolInteractionSettlement.succeeded(result)
 
 
+@pytest.mark.parametrize("status", ["rejected", "failed", "dispatch_unknown"])
+def test_terminal_settlement_rejects_a_waiting_result(status: str) -> None:
+    with pytest.raises(ValueError, match="cannot wait for user input"):
+        ToolInteractionSettlement(  # type: ignore[arg-type]
+            status=status,
+            result={"status": "waiting_for_user"},
+        )
+
+
 def test_successful_settlement_uses_the_canonical_failure_classifier() -> None:
     result = {"status": " error "}
 

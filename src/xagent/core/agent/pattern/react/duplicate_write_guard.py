@@ -79,22 +79,24 @@ def build_suppression_envelope(
     tool_name: str,
     prior_tool_call_id: str,
     prior_result: Any,
+    prior_succeeded: bool = True,
 ) -> dict[str, Any]:
     """Build the model-facing envelope for a suppressed duplicate write.
 
-    ``success: True`` deliberately: the requested effect exists — it was
-    produced by the earlier call — so the loop's success accounting should
-    treat this observation like the write it stands in for.
+    A successful prior call produces a successful envelope because the effect
+    already exists. A denied or dispatch-unknown settlement stays unsuccessful
+    while still preventing the write from being executed again.
     """
+    outcome = "already succeeded" if prior_succeeded else "was denied or is uncertain"
     return {
-        "success": True,
+        "success": prior_succeeded,
         DUPLICATE_WRITE_SUPPRESSED_KEY: True,
         "tool_name": tool_name,
         "suppressed_duplicate_of": prior_tool_call_id,
         "result": prior_result,
         "message": (
             f"Duplicate write suppressed: this exact {tool_name} call "
-            "already succeeded earlier in this turn "
+            f"{outcome} earlier in this turn "
             f"(tool call {prior_tool_call_id}); it was not executed again. "
             "The previous call's result is attached under 'result' — use it "
             "instead of retrying. Repeating this write with identical "

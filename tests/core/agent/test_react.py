@@ -7067,6 +7067,10 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     assert record.status == "completed"
     assert record.settlement_status == "succeeded"
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
+    assert (
+        restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1
+    )
+    assert restored_pattern._consecutive_work_tool_call_count() == 1
     projected_messages = [
         message
         for message in restored_context.messages
@@ -7076,11 +7080,15 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     assert projected_messages[0].metadata["raw_result"] == record.result
     assert "urn:li:share:123" in str(resumed_llm.calls[0]["messages"])
     assert restored_pattern.pending_tool_interaction_responses == []
-    assert not any(
-        event["event_type"] in {"action_end_tool", "action_error_tool"}
-        and event["data"].get("tool_call_id") == "original-publish-call"
+    settlement_events = [
+        event
         for event in tracer.events
-    )
+        if event["data"].get("tool_call_id") == "original-publish-call"
+    ]
+    assert [event["event_type"] for event in settlement_events] == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
 
 
 @pytest.mark.parametrize("waiting_request", [None, [], "malformed"])
@@ -7404,27 +7412,32 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
     assert pattern.force_final_answer_next is (
         status in {"rejected", "dispatch_unknown"}
     )
-    assert not any(
-        event["event_type"] in {"action_end_tool", "action_error_tool"}
-        and event["data"].get("tool_call_id") == "call-1"
+    assert pattern._consecutive_successful_tool_group_count("approval_gate") == 0
+    assert pattern._consecutive_work_tool_call_count() == 1
+    settlement_events = [
+        event
         for event in tracer.events
-    )
+        if event["data"].get("tool_call_id") == "call-1"
+    ]
+    assert [event["event_type"] for event in settlement_events] == [
+        "action_start_tool",
+        "action_error_tool",
+    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("case", "message", "expected_calls"),
+    ("case", "reason"),
     [
-        ("missing_ledger", "without its original ledger", 0),
-        ("wrong_tool", "does not match its original ledger", 0),
-        ("not_waiting", "not waiting for user input", 0),
-        ("missing_result", "found 0", 0),
-        ("duplicate_result", "found 2", 0),
-        ("wrong_return", "must return ToolInteractionSettlement or None", 1),
+        ("missing_ledger", "invalid_settlement_target"),
+        ("wrong_tool", "invalid_settlement_target"),
+        ("not_waiting", "already_settled"),
+        ("missing_result", "invalid_settlement_target"),
+        ("duplicate_result", "invalid_settlement_target"),
     ],
 )
-async def test_resume_target_is_validated_before_callback_or_projection(
-    case: str, message: str, expected_calls: int
+async def test_invalid_resume_target_is_skipped_before_callback(
+    case: str, reason: str
 ) -> None:
     class ResumableTool:
         metadata = SimpleNamespace(
@@ -7469,14 +7482,56 @@ async def test_resume_target_is_validated_before_callback_or_projection(
             "call-1",
         )
     tool = ResumableTool()
-    with pytest.raises((RuntimeError, TypeError), match=message):
-        await pattern._deliver_pending_tool_interaction_responses(
-            tools=[tool],
-            context=context,
-            runtime=PatternRuntime(),
-        )
-    assert tool.calls == expected_calls
-    assert pattern.pending_tool_interaction_responses == [pending]
+    runtime = PatternRuntime()
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+    assert tool.calls == 0
+    assert pattern.pending_tool_interaction_responses == []
+    assert runtime.last_checkpoint["metadata"]["reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_invalid_resume_callback_result_fails_closed() -> None:
+    class ResumableTool:
+        metadata = SimpleNamespace(name="approval_gate")
+
+        async def resume_user_interaction(self, **_: str) -> Any:
+            return {"unexpected": True}
+
+    pattern = ReActPattern()
+    pending = {
+        "tool_name": "approval_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Approve",
+    }
+    pattern.pending_tool_interaction_responses = [pending]
+    pattern.tool_ledger["call-1"] = ToolCallRecord(
+        tool_call_id="call-1",
+        tool_name="approval_gate",
+        args={},
+        args_hash="stored-hash",
+        status="waiting_for_user",
+    )
+    context = ExecutionContext(execution_id="invalid-resume-return")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[ResumableTool()],
+        context=context,
+        runtime=PatternRuntime(),
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern.tool_ledger["call-1"].settlement_status == "dispatch_unknown"
+    assert pattern.settlement_final_answer_fence is True
 
 
 @pytest.mark.asyncio
@@ -7531,6 +7586,280 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
         runtime=PatternRuntime(),
     )
     assert pattern.force_final_answer_next is True
+    assert pattern.settlement_final_answer_fence is True
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_survives_tool_protocol_recovery() -> None:
+    class DeniedWriteTool:
+        non_idempotent = True
+        metadata = SimpleNamespace(name="publish", description="Publish a post.")
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, _args: dict[str, Any]) -> Any:
+            self.calls += 1
+            return {"success": True}
+
+    pattern = ReActPattern(max_iterations=2)
+    pattern.settlement_final_answer_fence = True
+    context = ExecutionContext(execution_id="settlement-fence")
+    context.add_user_message("Do not publish it.")
+    tool = DeniedWriteTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "invalid-retry",
+                        "function": {
+                            "name": "publish",
+                            "arguments": '{"expression":"publish"}',
+                        },
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The write was not retried.",'
+                                '"outcome":"blocked"}'
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+
+    result = await pattern.run(context=context, tools=[tool], llm=llm)
+
+    assert result["completion_outcome"] == "blocked"
+    assert tool.calls == 0
+    assert [
+        [schema["function"]["name"] for schema in call["tools"]] for call in llm.calls
+    ] == [["final_answer"], ["final_answer"]]
+
+
+@pytest.mark.asyncio
+async def test_settlement_fence_survives_unavailable_tool_exception_recovery() -> None:
+    class RecoveryLLM:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def chat(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise LLMToolProtocolError(
+                    provider="deepseek",
+                    code="unavailable_tool_call",
+                    message="The narrowed schema rejected a work tool.",
+                )
+            return {
+                "tool_calls": [
+                    {
+                        "id": "final-call",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The write was not retried.",'
+                                '"outcome":"blocked"}'
+                            ),
+                        },
+                    }
+                ]
+            }
+
+    pattern = ReActPattern(max_iterations=1)
+    pattern.settlement_final_answer_fence = True
+    context = ExecutionContext(execution_id="settlement-exception-fence")
+    context.add_user_message("Do not publish it.")
+    llm = RecoveryLLM()
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["completion_outcome"] == "blocked"
+    assert [
+        [schema["function"]["name"] for schema in call["tools"]] for call in llm.calls
+    ] == [["final_answer"], ["final_answer"]]
+
+
+def test_multiple_write_interactions_require_a_structured_response_map() -> None:
+    class ResumableWriteTool:
+        non_idempotent = True
+
+        def __init__(self, name: str) -> None:
+            self.metadata = SimpleNamespace(name=name)
+
+        def resume_user_interaction(self, **_: str) -> None:
+            return None
+
+    tools = [ResumableWriteTool("publish_a"), ResumableWriteTool("publish_b")]
+    waiting_request = {
+        "kind": "tool_waiting_for_user",
+        "requests": [
+            {
+                "tool_name": "publish_a",
+                "tool_call_id": "call-a",
+                "interaction_id": "approval-a",
+            },
+            {
+                "tool_name": "publish_b",
+                "tool_call_id": "call-b",
+                "interaction_id": "approval-b",
+            },
+        ],
+    }
+    pattern = ReActPattern()
+
+    assert (
+        pattern._queue_tool_interaction_responses(
+            waiting_request=waiting_request,
+            response="Approve",
+            tools=tools,
+        )
+        is False
+    )
+    assert pattern.pending_tool_interaction_responses == []
+
+    assert (
+        pattern._queue_tool_interaction_responses(
+            waiting_request=waiting_request,
+            response='{"approval-a":"Approve A","approval-b":"Reject B"}',
+            tools=tools,
+        )
+        is True
+    )
+    assert [
+        pending["response"] for pending in pattern.pending_tool_interaction_responses
+    ] == ["Approve A", "Reject B"]
+
+
+def test_multiple_writes_require_mapping_even_without_two_resume_callbacks() -> None:
+    class ResumableWriteTool:
+        non_idempotent = True
+        metadata = SimpleNamespace(name="publish_a")
+
+        def resume_user_interaction(self, **_: str) -> None:
+            return None
+
+    callback_less_write = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish_b"),
+    )
+    waiting_request = {
+        "kind": "tool_waiting_for_user",
+        "requests": [
+            {
+                "tool_name": "publish_a",
+                "tool_call_id": "call-a",
+                "interaction_id": "approval-a",
+            },
+            {
+                "tool_name": "publish_b",
+                "tool_call_id": "call-b",
+                "interaction_id": "approval-b",
+            },
+        ],
+    }
+    pattern = ReActPattern()
+
+    assert not pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response="Approve",
+        tools=[ResumableWriteTool(), callback_less_write],
+    )
+    assert pattern.pending_tool_interaction_responses == []
+
+    assert pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response='{"approval-a":"Approve A","approval-b":"Reject B"}',
+        tools=[ResumableWriteTool(), callback_less_write],
+    )
+    assert pattern.pending_tool_interaction_responses == [
+        {
+            "tool_name": "publish_a",
+            "tool_call_id": "call-a",
+            "interaction_id": "approval-a",
+            "response": "Approve A",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_multiple_write_response_remains_safely_paused() -> None:
+    class ResumableWriteTool:
+        non_idempotent = True
+
+        def __init__(self, name: str) -> None:
+            self.metadata = SimpleNamespace(name=name)
+
+        def resume_user_interaction(self, **_: str) -> None:
+            raise AssertionError("ambiguous response must not be delivered")
+
+    pattern = ReActPattern()
+    pattern.status = "waiting_for_user"
+    pattern.waiting_for_user_request = {
+        "kind": "tool_waiting_for_user",
+        "message": "Approve both writes?",
+        "message_type": "question",
+        "message_count": 0,
+        "requests": [
+            {
+                "tool_name": "publish_a",
+                "tool_call_id": "call-a",
+                "interaction_id": "approval-a",
+            },
+            {
+                "tool_name": "publish_b",
+                "tool_call_id": "call-b",
+                "interaction_id": "approval-b",
+            },
+        ],
+        "interactions": [],
+    }
+    context = ExecutionContext(execution_id="ambiguous-authorization")
+    context.add_user_message("Approve")
+    runtime = PatternRuntime()
+
+    result = await pattern._resume_waiting_for_user_if_needed(
+        context=context,
+        runtime=runtime,
+        tools=[ResumableWriteTool("publish_a"), ResumableWriteTool("publish_b")],
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert pattern.status == "waiting_for_user"
+    assert pattern.pending_tool_interaction_responses == []
+    assert pattern.waiting_for_user_request["message_count"] == 1
+    assert "mapping each interaction_id" in result["message"]
+
+
+def test_checkpoint_state_copies_pending_interaction_responses() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "publish",
+            "tool_call_id": "call-1",
+            "interaction_id": "approval-1",
+            "response": "Approve",
+        }
+    ]
+
+    state = pattern.get_state()
+    pattern.pending_tool_interaction_responses[0]["response"] = "Changed"
+
+    assert state["pending_tool_interaction_responses"][0]["response"] == "Approve"
 
 
 def test_resumed_success_guards_only_its_settlement_turn() -> None:
@@ -7561,6 +7890,36 @@ def test_resumed_success_guards_only_its_settlement_turn() -> None:
     )
     assert same_turn["duplicate_write_suppressed"] is True
     assert later_turn is None
+
+
+@pytest.mark.parametrize("settlement_status", ["rejected", "dispatch_unknown"])
+def test_denied_settlement_suppresses_the_same_write_in_its_turn(
+    settlement_status: str,
+) -> None:
+    pattern = ReActPattern()
+    args = {"text": "denied"}
+    pattern.tool_ledger["original-call"] = ToolCallRecord(
+        tool_call_id="original-call",
+        tool_name="publish",
+        args=args,
+        args_hash=pattern._args_hash(args),
+        status="failed",
+        result={"success": False, "settlement_status": settlement_status},
+        settlement_status=settlement_status,
+        settlement_turn_id="approval-turn",
+    )
+    tool = SimpleNamespace(
+        non_idempotent=True,
+        metadata=SimpleNamespace(name="publish"),
+    )
+
+    suppressed = pattern._suppressed_duplicate_write_result(
+        {"id": "retry", "name": "publish", "args": args, "turn_id": "approval-turn"},
+        [tool],
+    )
+
+    assert suppressed["success"] is False
+    assert suppressed["duplicate_write_suppressed"] is True
 
 
 @pytest.mark.asyncio

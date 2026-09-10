@@ -736,6 +736,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -868,6 +869,7 @@ async def test_startup_event_triggers_background_auto_migration(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -1002,6 +1004,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -1327,6 +1330,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -1513,6 +1517,7 @@ async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -1609,6 +1614,7 @@ async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }
@@ -1702,6 +1708,7 @@ async def test_startup_event_skips_sandbox_readiness_when_manager_is_none(
         def get_store_info(self) -> dict[str, object]:
             return {
                 "is_lancedb": True,
+                "supports_vector_search": True,
                 "embedding_model_id": "test-model",
                 "similarity_threshold": 0.5,
             }

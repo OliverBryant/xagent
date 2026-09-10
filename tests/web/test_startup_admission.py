@@ -19,6 +19,21 @@ from xagent.web.models.user import User
 from xagent.web.startup_admission import register_host_startup_admission
 
 
+def test_startup_memory_log_reports_admitted_text_only_capability(caplog) -> None:
+    with caplog.at_level("INFO"):
+        app_module._log_memory_store_info(
+            {
+                "is_lancedb": True,
+                "supports_vector_search": False,
+                "embedding_model_id": 7,
+                "similarity_threshold": 1.5,
+            }
+        )
+
+    assert "text-only search capabilities" in caplog.text
+    assert "with vector search capabilities" not in caplog.text
+
+
 def _patch_runtime_starts(
     monkeypatch: pytest.MonkeyPatch,
     events: list[str],

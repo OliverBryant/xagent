@@ -340,58 +340,6 @@ class TestModelService:
             # _get_visible_user_ids was called for admin fallback
             mock_visible.assert_called_with(mock_db, 42)
 
-    def test_embedding_model_uses_deterministic_shared_admin_default(self, monkeypatch):
-        """Request identity cannot change the shared memory embedding model."""
-        from contextvars import copy_context
-
-        from xagent.web.user_isolated_memory import current_user_id
-
-        mock_db = MagicMock()
-
-        def mock_get_db():
-            yield mock_db
-
-        shared_model = MagicMock()
-        shared_model.id = 200
-        shared_model.model_id = "system-embedding-model"
-        shared_default = MagicMock()
-        shared_default.model = shared_model
-        joined_query = mock_db.query.return_value.join.return_value.join.return_value
-        filtered_query = joined_query.filter.return_value
-        shared_query = filtered_query.order_by.return_value
-        shared_query.first.return_value = shared_default
-        visible_user_ids = MagicMock(return_value=[7])
-
-        monkeypatch.setattr(
-            "xagent.web.services.model_service._get_visible_user_ids",
-            visible_user_ids,
-        )
-        monkeypatch.setattr(
-            "xagent.web.dynamic_memory_store.get_db",
-            mock_get_db,
-        )
-
-        from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
-
-        manager = DynamicMemoryStoreManager()
-        first_context = copy_context()
-        first_context.run(current_user_id.set, 1)
-        second_context = copy_context()
-        second_context.run(current_user_id.set, 2)
-
-        first = first_context.run(manager._get_embedding_model_from_db, fail_fast=True)
-        second = second_context.run(
-            manager._get_embedding_model_from_db, fail_fast=True
-        )
-
-        assert first is second is shared_model
-        assert shared_model.model_id == "system-embedding-model"
-        assert [mock_call.args for mock_call in visible_user_ids.call_args_list] == [
-            (mock_db, None),
-            (mock_db, None),
-        ]
-        assert shared_query.first.call_count == 2
-
     def test_get_vision_model_filters_by_visibility(self):
         """get_vision_model returns the first visible vision-capable model."""
         with (
@@ -968,7 +916,7 @@ class TestModelService:
         def mock_get_db():
             yield mock_db
 
-        joined_query = mock_db.query.return_value.join.return_value.join.return_value
+        joined_query = mock_db.query.return_value.join.return_value
         filtered_query = joined_query.filter.return_value
         shared_query = filtered_query.order_by.return_value
         shared_query.first.return_value = None

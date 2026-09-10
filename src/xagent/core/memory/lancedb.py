@@ -35,6 +35,10 @@ from .scope_columns import (
 
 logger = logging.getLogger(__name__)
 
+NULL_VECTOR_SCAN_MULTIPLIER = 20
+NULL_VECTOR_SCAN_MINIMUM = 100
+NULL_VECTOR_SCAN_MAXIMUM = 10_000
+
 
 class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
@@ -738,15 +742,20 @@ class LanceDBMemoryStore(MemoryStore):
         self,
         table: Any,
         query: str,
-        filters: Optional[dict[str, Any]],
+        residual_filters: Optional[dict[str, Any]],
         *,
+        scope_where: str | None,
         null_vectors_only: bool,
+        scan_limit: int,
     ) -> list[MemoryNote]:
         scan = table.search()
+        where_terms = [f"({scope_where})"] if scope_where else []
         if null_vectors_only:
-            scan = scan.where("vector IS NULL")
-        rows = scan.limit(None).to_arrow().to_pylist()
-        other_filters = self._flat_other_filters(filters)
+            where_terms.append("vector IS NULL")
+        if where_terms:
+            scan = scan.where(" AND ".join(where_terms))
+        rows = scan.limit(scan_limit).to_arrow().to_pylist()
+        other_filters = self._flat_other_filters(residual_filters)
         needle = query.casefold()
         ranked: list[tuple[tuple[int, int, str], MemoryNote]] = []
         for row in rows:
@@ -759,7 +768,9 @@ class LanceDBMemoryStore(MemoryStore):
             except Exception as row_error:
                 logger.warning("Skipping malformed lexical memory row: %s", row_error)
                 continue
-            if filters and not self._matches_filters(note, filters, other_filters):
+            if residual_filters and not self._matches_filters(
+                note, residual_filters, other_filters
+            ):
                 continue
             match_kind = (
                 0 if folded == needle else 1 if folded.startswith(needle) else 2
@@ -918,8 +929,16 @@ class LanceDBMemoryStore(MemoryStore):
                     self._lexical_candidates(
                         table,
                         query,
-                        filters,
+                        residual_filters,
+                        scope_where=where_sql,
                         null_vectors_only=ann_search_completed,
+                        scan_limit=min(
+                            max(
+                                max(k, 1) * NULL_VECTOR_SCAN_MULTIPLIER,
+                                NULL_VECTOR_SCAN_MINIMUM,
+                            ),
+                            NULL_VECTOR_SCAN_MAXIMUM,
+                        ),
                     )
                     if len(results) < k
                     else []

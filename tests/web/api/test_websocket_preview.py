@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,10 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
 from xagent.web.schemas.connector_runtime import ConnectorRuntimeRequirementsModel
+from xagent.web.services.memory_policy import (
+    MemoryPolicyDecision,
+    set_trusted_memory_policy_resolver,
+)
 
 
 class _BlockingPreviewWebSocket:
@@ -332,6 +337,34 @@ async def test_memory_policy_uses_published_store_without_database_query(
 
     assert policy.memory is shared_store
     assert policy.memory_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_async_memory_policy_runs_trusted_resolver_off_event_loop() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_resolver(_request):
+        entered.set()
+        assert release.wait(timeout=5)
+        return MemoryPolicyDecision(enabled=True, available=True)
+
+    set_trusted_memory_policy_resolver(blocking_resolver)
+    try:
+        resolution = asyncio.create_task(
+            chat_api.resolve_agent_service_memory_policy_async(agent_config={})
+        )
+        assert await asyncio.to_thread(entered.wait, 5)
+        # This event-loop turn completes while the synchronous resolver remains
+        # blocked in its worker thread.
+        await asyncio.sleep(0)
+        assert not resolution.done()
+        release.set()
+        policy = await resolution
+        assert policy.memory_enabled is True
+    finally:
+        release.set()
+        set_trusted_memory_policy_resolver(None)
 
 
 def test_historical_file_projection_never_writes_unregistered_output(

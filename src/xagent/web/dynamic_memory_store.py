@@ -3,29 +3,50 @@
 import logging
 import os
 import threading
-from typing import Optional, Union, cast
+from contextlib import contextmanager
+from hashlib import sha256
+from typing import Any, Iterator, Optional, Union, cast
+
+from filelock import FileLock, Timeout
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
 from ..core.memory.lancedb_maintenance import (
+    DEFAULT_LOCK_TIMEOUT,
     MaintenanceStatus,
     maintain_lancedb_memory_table,
 )
 from ..core.memory.vector_compatibility import (
+    VECTOR_IDENTITY_METADATA_KEY,
     VectorCompatibility,
     canonical_embedding_identity,
     create_or_recreate_vector_capable_table,
+    open_lancedb_table_if_exists,
 )
+from ..core.model.embedding.adapter import (
+    UnsupportedEmbeddingProviderError,
+    create_embedding_adapter,
+)
+from ..core.model.embedding.base import BaseEmbedding
 from ..core.model import EmbeddingModelConfig
 from ..core.storage.manager import get_storage_root
 from ..core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .models.database import get_db
 from .models.model import Model as DBModel
-from .models.user import UserDefaultModel, UserModel
+from .models.user import UserDefaultModel
 from .services.db_runtime import is_database_pool_timeout
 from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+class MemoryAdmissionLockTimeout(RuntimeError):
+    """Raised when startup cannot acquire the cross-process admission lock."""
+
+
+class InvalidEmbeddingModelConfiguration(ValueError):
+    """Raised when persisted embedding fields cannot form a model config."""
+
 
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
@@ -33,31 +54,27 @@ MemoryStoreType = Union[
 ]
 
 
-def _embedding_model_fingerprint(model: Optional[DBModel]) -> Optional[tuple]:
-    """Identity of an embedding model config, including reconfigurations.
-
-    ``updated_at`` changes when the model row is edited (API key rotation,
-    endpoint change), so comparing the fingerprint instead of only the id
-    lets the store pick up new credentials without a backend restart.
-    """
-    if model is None:
-        return None
-    return (model.id, str(model.updated_at))
-
-
 def _embedding_model_config(model: DBModel) -> EmbeddingModelConfig:
     """Preserve the complete shared embedding configuration and credential."""
     api_key = model.api_key
-    return EmbeddingModelConfig(
-        id=str(model.model_id),
-        model_provider=str(model.model_provider),
-        model_name=str(model.model_name),
-        api_key=str(api_key) if api_key is not None else None,
-        base_url=str(model.base_url) if model.base_url else None,
-        dimension=int(model.dimension) if model.dimension is not None else None,
-        instruct=getattr(model, "instruct", None),
-        max_retries=int(model.max_retries) if model.max_retries is not None else 10,
-    )
+    try:
+        dimension = int(model.dimension) if model.dimension is not None else None
+        max_retries = int(model.max_retries) if model.max_retries is not None else 10
+    except (TypeError, ValueError) as exc:
+        raise InvalidEmbeddingModelConfiguration from exc
+    try:
+        return EmbeddingModelConfig(
+            id=str(model.model_id),
+            model_provider=str(model.model_provider),
+            model_name=str(model.model_name),
+            api_key=str(api_key) if api_key is not None else None,
+            base_url=str(model.base_url) if model.base_url else None,
+            dimension=dimension,
+            instruct=None,
+            max_retries=max_retries,
+        )
+    except ValueError as exc:
+        raise InvalidEmbeddingModelConfiguration from exc
 
 
 class DynamicMemoryStoreManager:
@@ -74,10 +91,6 @@ class DynamicMemoryStoreManager:
         self._memory_store: Optional[MemoryStoreType] = None
         self._lock = threading.RLock()
         self._last_embedding_model_id: Optional[int] = None
-        # (id, updated_at) of the embedding model the store was built with.
-        # Comparing the full fingerprint (not just the id) makes API key or
-        # endpoint rotation on the same model take effect without a restart.
-        self._last_embedding_model_fingerprint: Optional[tuple] = None
         self._is_lancedb: bool = False
 
         # Initialize with in-memory store (will be replaced with LanceDB when embedding model is configured)
@@ -90,7 +103,6 @@ class DynamicMemoryStoreManager:
             self._memory_store = UserIsolatedMemoryStore(in_memory_store)
             self._is_lancedb = False
             self._last_embedding_model_id = None
-            self._last_embedding_model_fingerprint = None
             logger.info("Initialized with in-memory store")
 
     def _get_embedding_model_from_db(
@@ -105,17 +117,11 @@ class DynamicMemoryStoreManager:
                 default = (
                     db.query(UserDefaultModel)
                     .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                    .join(
-                        UserModel,
-                        (UserModel.model_id == DBModel.id)
-                        & (UserModel.user_id == UserDefaultModel.user_id),
-                    )
                     .filter(
                         UserDefaultModel.config_type == "embedding",
                         UserDefaultModel.user_id.in_(_get_visible_user_ids(db, None)),
-                        UserModel.is_shared.is_(True),
                         DBModel.category == "embedding",
-                        DBModel.is_active,
+                        DBModel.is_active.is_(True),
                     )
                     .order_by(UserDefaultModel.user_id, UserDefaultModel.id)
                     .first()
@@ -130,9 +136,9 @@ class DynamicMemoryStoreManager:
             return None
 
     def _create_lancedb_store(
-        self, embedding_model: DBModel
+        self, embedding_model: BaseEmbedding
     ) -> UserIsolatedMemoryStore:
-        """Create LanceDB store with the given embedding model."""
+        """Create the filesystem-backed store after model admission succeeds."""
         legacy_dir = os.path.join(
             os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -149,7 +155,7 @@ class DynamicMemoryStoreManager:
 
         lancedb_store = LanceDBMemoryStore(
             db_dir=db_dir,
-            embedding_model=_embedding_model_config(embedding_model),
+            embedding_model=embedding_model,
             similarity_threshold=self._similarity_threshold or 1.5,
             initialize_schema=False,
             include_null_vector_fallback=True,
@@ -157,15 +163,80 @@ class DynamicMemoryStoreManager:
         logger.info("Created LanceDB store with shared embedding model")
         return UserIsolatedMemoryStore(lancedb_store)
 
+    @staticmethod
+    @contextmanager
+    def _lifecycle_lock(connection: Any, table_name: str) -> Iterator[None]:
+        """Serialize startup admission across processes for one local table.
+
+        This outer lock is always acquired before the maintenance lock. Keeping
+        the two lock files distinct and the acquisition order one-way avoids a
+        lock cycle while covering the re-open/classify/overwrite window.
+        """
+        uri = str(getattr(connection, "uri", "") or "")
+        if not uri or "://" in uri or not os.path.isdir(uri):
+            raise ValueError(
+                "LanceDB memory admission requires a writable local database URI"
+            )
+        digest = sha256(table_name.encode()).hexdigest()[:16]
+        lock = FileLock(
+            os.path.join(uri, f".memory-admission-{digest}.lock"),
+            timeout=DEFAULT_LOCK_TIMEOUT,
+        )
+        try:
+            lock.acquire()
+        except Timeout as exc:
+            raise MemoryAdmissionLockTimeout(
+                f"Timed out after {DEFAULT_LOCK_TIMEOUT}s acquiring memory "
+                f"admission lock for table {table_name!r}"
+            ) from exc
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _require_complete_maintenance(connection: Any, table_name: str) -> None:
+        outcome = maintain_lancedb_memory_table(connection, table_name)
+        if outcome.status is not MaintenanceStatus.COMPLETE:
+            raise RuntimeError(
+                f"memory maintenance failed: {outcome.status.value}: {outcome.detail}"
+            )
+
     def run_startup_compatibility_lifecycle(self) -> None:
         """Admit and maintain shared memory before runtime writers start."""
         with self._lock:
             model = self._get_embedding_model_from_db(fail_fast=True)
             if model is None:
                 return
-            embedding_config = _embedding_model_config(model)
-            canonical_embedding_identity(embedding_config)
-            new_store = self._create_lancedb_store(model)
+            # Model validation and adapter construction are intentionally kept
+            # ahead of every LanceDB/filesystem operation. Only definite model
+            # configuration errors degrade; backend failures still abort startup.
+            try:
+                embedding_config = _embedding_model_config(model)
+            except InvalidEmbeddingModelConfiguration:
+                logger.warning(
+                    "Configured default embedding model has invalid fields; "
+                    "preserving the current memory store"
+                )
+                return
+            try:
+                canonical_embedding_identity(embedding_config)
+            except ValueError:
+                logger.warning(
+                    "Configured default embedding model has an invalid vector "
+                    "identity; preserving the current memory store"
+                )
+                return
+            try:
+                embedding_model = create_embedding_adapter(embedding_config)
+            except UnsupportedEmbeddingProviderError:
+                logger.warning(
+                    "Configured default embedding model uses an unsupported "
+                    "provider; preserving the current memory store"
+                )
+                return
+
+            new_store = self._create_lancedb_store(embedding_model)
             base_store = new_store._base_store
             if not isinstance(base_store, LanceDBMemoryStore):
                 raise TypeError(
@@ -174,89 +245,66 @@ class DynamicMemoryStoreManager:
             connection = base_store._vector_store.get_raw_connection()
             table_name = base_store._collection_name
 
-            table = None
-            try:
+            with self._lifecycle_lock(connection, table_name):
+                table = None
+                table_existed = False
+                had_vector = False
+                missing_identity = False
                 try:
-                    table = connection.open_table(table_name)
-                except ValueError as error:
-                    if "was not found" not in str(error):
-                        raise
-                if table is not None:
-                    outcome = maintain_lancedb_memory_table(connection, table_name)
-                    if outcome.status is MaintenanceStatus.INVALID_LEGACY_DATA:
-                        base_store._embedding_model = None
-                    elif outcome.status is not MaintenanceStatus.COMPLETE:
-                        raise RuntimeError(
-                            f"memory maintenance failed: {outcome.status.value}: {outcome.detail}"
+                    table = open_lancedb_table_if_exists(connection, table_name)
+                    table_existed = table is not None
+                    if table is not None:
+                        had_vector = "vector" in table.schema.names
+                        missing_identity = (
+                            had_vector
+                            and VECTOR_IDENTITY_METADATA_KEY
+                            not in (table.schema.metadata or {})
                         )
-            finally:
-                _safe_close_table(table)
+                        outcome = maintain_lancedb_memory_table(connection, table_name)
+                        if outcome.status is MaintenanceStatus.INVALID_LEGACY_DATA:
+                            logger.warning(
+                                "Persistent memory contains invalid legacy data; "
+                                "vector admission is disabled until the reported "
+                                "rows are repaired offline: %s",
+                                outcome.detail,
+                            )
+                            base_store._embedding_model = None
+                        elif outcome.status is not MaintenanceStatus.COMPLETE:
+                            raise RuntimeError(
+                                "memory maintenance failed: "
+                                f"{outcome.status.value}: {outcome.detail}"
+                            )
+                finally:
+                    _safe_close_table(table)
 
-            if base_store._embedding_model is not None:
-                compatibility = create_or_recreate_vector_capable_table(
-                    connection, table_name, embedding_config
-                )
-                if compatibility is VectorCompatibility.MISMATCHING:
-                    base_store._embedding_model = None
-                elif table is None:
-                    outcome = maintain_lancedb_memory_table(connection, table_name)
-                    if outcome.status is not MaintenanceStatus.COMPLETE:
-                        raise RuntimeError(
-                            f"memory maintenance failed: {outcome.status.value}: {outcome.detail}"
+                if base_store._embedding_model is not None:
+                    compatibility = create_or_recreate_vector_capable_table(
+                        connection, table_name, embedding_config
+                    )
+                    if compatibility is VectorCompatibility.MISMATCHING:
+                        caveat = (
+                            " The table has no exact legacy vector identity; "
+                            "rolling back to the historical dimension or endpoint "
+                            "will not make it safe. Quiesce writers and repair or "
+                            "re-embed the table offline."
+                            if missing_identity
+                            else ""
                         )
+                        logger.warning(
+                            "Persistent memory vector identity does not match the "
+                            "configured embedding model; continuing with text-only "
+                            "search.%s",
+                            caveat,
+                        )
+                        base_store._embedding_model = None
+                    elif not table_existed or not had_vector:
+                        # Creation and vectorless overwrite both replace schema
+                        # metadata, so establish the completion marker now.
+                        self._require_complete_maintenance(connection, table_name)
 
             self._memory_store = new_store
             self._is_lancedb = True
             self._last_embedding_model_id = cast(int, model.id)
-            self._last_embedding_model_fingerprint = _embedding_model_fingerprint(model)
-
-    def _check_and_update_store(self) -> None:
-        """Check if embedding model configuration has changed and update store accordingly."""
-        with self._lock:
-            embedding_model = self._get_embedding_model_from_db()
-            current_model_id = embedding_model.id if embedding_model else None
-            current_fingerprint = _embedding_model_fingerprint(embedding_model)
-
-            # Check if we need to update the store
-            should_update = False
-
-            if embedding_model and not self._is_lancedb:
-                # We have an embedding model but using in-memory store
-                should_update = True
-                logger.info("Embedding model detected, upgrading to LanceDB store")
-            elif (
-                embedding_model
-                and self._is_lancedb
-                and current_fingerprint != self._last_embedding_model_fingerprint
-            ):
-                # Embedding model changed, or the same model was reconfigured
-                # (e.g. API key rotation) — rebuild so the new config is used.
-                should_update = True
-                logger.info(
-                    "Embedding model configuration changed, updating LanceDB store"
-                )
-            elif not embedding_model and self._is_lancedb:
-                # No embedding model available but using LanceDB (shouldn't happen normally)
-                should_update = True
-                logger.info(
-                    "No embedding model available, falling back to in-memory store"
-                )
-
-            if should_update:
-                if embedding_model:
-                    try:
-                        new_store = self._create_lancedb_store(embedding_model)
-                    except Exception as error:
-                        logger.error("Error creating LanceDB store: %s", error)
-                        return
-                    self._memory_store = new_store
-                    self._is_lancedb = True
-                    self._last_embedding_model_id = current_model_id  # type: ignore[assignment]
-                    self._last_embedding_model_fingerprint = current_fingerprint
-                    logger.info("Switched to LanceDB memory store")
-                else:
-                    self._initialize_in_memory_store()
-                    logger.info("Switched to in-memory memory store")
 
     def get_memory_store(self) -> MemoryStoreType:
         """
@@ -266,31 +314,6 @@ class DynamicMemoryStoreManager:
             Current memory store instance
         """
         return self._memory_store  # type: ignore[return-value]
-
-    def force_reinitialize(self) -> None:
-        """Force reinitialization of the memory store."""
-        with self._lock:
-            self._initialize_in_memory_store()
-            self._check_and_update_store()
-            logger.info("Force reinitialized memory store")
-
-    def check_embedding_model_change(self) -> bool:
-        """Check if embedding model configuration has changed and update if necessary.
-
-        Returns:
-            True if the store was updated, False otherwise.
-        """
-        with self._lock:
-            old_is_lancedb = self._is_lancedb
-            old_fingerprint = self._last_embedding_model_fingerprint
-
-            self._check_and_update_store()
-
-            # Return true if anything changed
-            return (
-                old_is_lancedb != self._is_lancedb
-                or old_fingerprint != self._last_embedding_model_fingerprint
-            )
 
     def get_store_info(self) -> dict:
         """
@@ -311,7 +334,11 @@ class DynamicMemoryStoreManager:
                 "is_lancedb": self._is_lancedb,
                 "embedding_model_id": self._last_embedding_model_id,
                 "similarity_threshold": self._similarity_threshold,
-                "supports_vector_search": self._is_lancedb,
+                "supports_vector_search": bool(
+                    self._is_lancedb
+                    and isinstance(base_store, LanceDBMemoryStore)
+                    and base_store._embedding_model is not None
+                ),
             }
 
 
@@ -338,9 +365,3 @@ def get_memory_store() -> MemoryStoreType:
     """Get the current memory store (for backward compatibility)."""
     manager = get_memory_store_manager()
     return manager.get_memory_store()
-
-
-def force_reinitialize_memory_store() -> None:
-    """Force reinitialization of the memory store."""
-    manager = get_memory_store_manager()
-    manager.force_reinitialize()

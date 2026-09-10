@@ -1300,6 +1300,21 @@ def run_memory_compatibility_lifecycle() -> None:
     get_memory_store_manager().run_startup_compatibility_lifecycle()
 
 
+def _log_memory_store_info(store_info: dict[str, Any]) -> None:
+    """Log the admitted store's actual persistence and vector capabilities."""
+    if store_info["supports_vector_search"]:
+        logger.info("Using LanceDB memory store with vector search capabilities")
+        logger.info("Embedding model ID: %s", store_info["embedding_model_id"])
+    elif store_info["is_lancedb"]:
+        logger.info("Using LanceDB memory store with text-only search capabilities")
+    else:
+        logger.info("Using in-memory store (no vector search capabilities)")
+    logger.info(
+        "Memory store similarity threshold: %s",
+        store_info["similarity_threshold"],
+    )
+
+
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
@@ -1407,15 +1422,7 @@ async def startup_event() -> None:
     manager = get_memory_store_manager()
     store_info = manager.get_store_info()
 
-    if store_info["is_lancedb"]:
-        logger.info("Using LanceDB memory store with vector search capabilities")
-        logger.info(f"Embedding model ID: {store_info['embedding_model_id']}")
-    else:
-        logger.info("Using in-memory store (no vector search capabilities)")
-
-    logger.info(
-        f"Memory store similarity threshold: {store_info['similarity_threshold']}"
-    )
+    _log_memory_store_info(store_info)
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)

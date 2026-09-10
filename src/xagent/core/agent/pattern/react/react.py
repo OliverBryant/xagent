@@ -1955,7 +1955,9 @@ class ReActPattern(AgentPattern):
 
             ledger_before = copy.deepcopy(self.tool_ledger)
             messages = getattr(context, "messages", None)
-            messages_before = copy.deepcopy(messages) if isinstance(messages, list) else None
+            messages_before = (
+                copy.deepcopy(messages) if isinstance(messages, list) else None
+            )
             force_final_before = self.force_final_answer_next
             popped = False
             try:
@@ -2123,7 +2125,9 @@ class ReActPattern(AgentPattern):
             tool_call_id=tool_call_id,
         )
         if not messages or messages[-1] is not replacement:
-            raise RuntimeError("Execution context did not append the replacement result.")
+            raise RuntimeError(
+                "Execution context did not append the replacement result."
+            )
         messages.pop()
         messages[matching_indexes[0]] = replacement
 
@@ -4287,9 +4291,7 @@ class ReActPattern(AgentPattern):
             settlement_turn_id=(
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
-            step_id=(
-                str(tool_call["step_id"]) if tool_call.get("step_id") else None
-            ),
+            step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
         )
 
     @staticmethod

@@ -11,9 +11,10 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
-    GateDecision,
     GatedCall,
+    GateDecision,
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
     current_mcp_approval_replay_context,
@@ -21,6 +22,7 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
 class _Args(BaseModel):
@@ -57,7 +59,9 @@ class _Target(AbstractBaseTool):
         return {"success": True, "arguments": dict(args)}
 
 
-def _context(*, task_source: str = "slack", pattern: str = "react") -> ToolCallExecutionContext:
+def _context(
+    *, task_source: str = "slack", pattern: str = "react"
+) -> ToolCallExecutionContext:
     return ToolCallExecutionContext(
         task_source=task_source,
         task_id="248032",
@@ -79,7 +83,9 @@ def registrations() -> list[Any]:
 
 
 def _register(registrations: list[Any], gate: Any, resume: Any, **kwargs: Any) -> None:
-    handle = register_mcp_approval_gate(task_source="slack", gate=gate, resume=resume, **kwargs)
+    handle = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume, **kwargs
+    )
     registrations.append(handle)
 
 
@@ -90,7 +96,7 @@ async def _unused_resume(**_: Any) -> None:
 @pytest.mark.asyncio
 async def test_no_matching_hook_preserves_legacy_execution() -> None:
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     result = await tool.run_json_async({"text": "publish"})
 
@@ -107,13 +113,70 @@ async def test_registration_only_applies_to_its_task_source(
 
     _register(registrations, gate, _unused_resume)
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context(task_source="web")):
         result = await tool.run_json_async({"text": "web call"})
 
     assert result["success"] is True
     assert target.calls == [{"text": "web call"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_source", [None, ""])
+async def test_active_registration_fails_closed_without_task_source(
+    registrations: list[Any], task_source: str | None
+) -> None:
+    async def gate(_: GatedCall) -> GateDecision:
+        raise AssertionError("missing source must fail before the hook")
+
+    _register(registrations, gate, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    with bind_tool_call_execution_context(replace(_context(), task_source=task_source)):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result["status"] == "error"
+    assert target.calls == []
+
+
+@pytest.mark.parametrize("task_source", [None, ""])
+def test_active_registration_refuses_sync_without_task_source(
+    registrations: list[Any], task_source: str | None
+) -> None:
+    _register(registrations, lambda _: None, lambda **_: None)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    with bind_tool_call_execution_context(replace(_context(), task_source=task_source)):
+        with pytest.raises(RuntimeError, match="requires async approval"):
+            tool.run_json_sync({"text": "must not publish"})
+
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_source", [None, ""])
+async def test_active_registration_fails_closed_on_resume_without_task_source(
+    registrations: list[Any], task_source: str | None
+) -> None:
+    async def resume(**_: Any) -> None:
+        raise AssertionError("missing source must fail before the resume hook")
+
+    _register(registrations, lambda _: None, resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    with bind_tool_call_execution_context(replace(_context(), task_source=task_source)):
+        settlement = await tool.resume_user_interaction(
+            interaction_id="interaction-1", response="approve"
+        )
+
+    assert settlement is not None
+    assert settlement.status == "failed"
+    assert settlement.projected_result()["status"] == "error"
+    assert target.calls == []
 
 
 @pytest.mark.asyncio
@@ -126,10 +189,10 @@ async def test_matching_gate_requires_complete_execution_and_connector_identity(
     _register(registrations, gate, _unused_resume)
     incomplete = replace(_context(), run_id=None)
 
-    for connection in ({"id": 41}, {"transport": "oauth"}):
+    for connector_ref in (ConnectorRef("mcp", 41), None):
         target = _Target()
-        (tool,) = gate_mcp_tools([target], connection=connection)
-        context = incomplete if connection.get("id") else _context()
+        (tool,) = gate_mcp_tools([target], connector_ref=connector_ref)
+        context = incomplete if connector_ref is not None else _context()
         with bind_tool_call_execution_context(context):
             result = await tool.run_json_async({"text": "must not publish"})
         assert result["status"] == "error"
@@ -149,7 +212,7 @@ async def test_approval_stops_both_transports_before_dispatch(
 
     _register(registrations, gate, _unused_resume)
     target = _Target(sandboxed=sandboxed)
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context()):
         result = await tool.run_json_async({"text": "approved text"})
@@ -177,21 +240,26 @@ async def test_canonical_snapshot_is_deep_and_drives_allowed_dispatch(
 
     _register(registrations, gate, _unused_resume)
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context()):
         await tool.run_json_async(original)
 
     canonical = '{"image":{"path":"/tmp/a.png"},"text":"内容 A"}'
     assert seen[0].canonical_arguments_json == canonical
-    assert seen[0].arguments_sha256 == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    assert (
+        seen[0].arguments_sha256
+        == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    )
     assert seen[0].arguments == json.loads(canonical)
     assert target.calls == [json.loads(canonical)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "timeout", "sync", "invalid"])
-async def test_gate_failures_never_dispatch(registrations: list[Any], failure: str) -> None:
+async def test_gate_failures_never_dispatch(
+    registrations: list[Any], failure: str
+) -> None:
     if failure == "exception":
 
         async def gate(_: GatedCall) -> GateDecision:
@@ -220,7 +288,7 @@ async def test_gate_failures_never_dispatch(registrations: list[Any], failure: s
         timeout_seconds=0.001 if failure == "timeout" else 1,
     )
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context()):
         result = await tool.run_json_async({"text": "must not publish"})
@@ -236,7 +304,7 @@ async def test_pause_is_refused_for_dag_execution(registrations: list[Any]) -> N
 
     _register(registrations, gate, _unused_resume)
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context(pattern="dag")):
         result = await tool.run_json_async({"text": "must not publish"})
@@ -246,7 +314,9 @@ async def test_pause_is_refused_for_dag_execution(registrations: list[Any]) -> N
 
 
 @pytest.mark.asyncio
-async def test_resume_uses_one_ephemeral_executor_for_host_payload(registrations: list[Any]) -> None:
+async def test_resume_uses_one_ephemeral_executor_for_host_payload(
+    registrations: list[Any],
+) -> None:
     frozen = {"text": "approved", "image": {"file_id": "file-1"}}
     second_error: list[str] = []
 
@@ -258,11 +328,11 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(registrations
         with pytest.raises(RuntimeError, match="no longer available") as exc:
             await executor(frozen)
         second_error.append(str(exc.value))
-        return result
+        return ToolInteractionSettlement.succeeded(result)
 
     _register(registrations, gate, resume)
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context()):
         paused = await tool.run_json_async({"text": "approved"})
@@ -270,7 +340,8 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(registrations
             interaction_id=paused["interaction_id"], response="approve"
         )
 
-    assert result["success"] is True
+    assert result.status == "succeeded"
+    assert result.projected_result()["success"] is True
     assert target.calls == [frozen]
     replay = target.replay_contexts[0]
     assert replay.interaction_id == "interaction-1"
@@ -289,15 +360,109 @@ async def test_resume_hook_failures_never_dispatch(registrations: list[Any]) -> 
 
     _register(registrations, gate, resume)
     target = _Target()
-    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
 
     with bind_tool_call_execution_context(_context()):
         result = await tool.resume_user_interaction(
             interaction_id="interaction-1", response="approve"
         )
 
-    assert result["status"] == "error"
+    assert result.status == "failed"
+    assert result.projected_result()["status"] == "error"
     assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_policy_timeout_stops_after_dispatch_begins(
+    registrations: list[Any],
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = False
+
+    class SlowTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            nonlocal cancelled
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return await super().run_json_async(args)
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        result = await executor({"text": "approved"})
+        return ToolInteractionSettlement.succeeded(result)
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=0.01,
+    )
+    target = SlowTarget()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    with bind_tool_call_execution_context(_context()):
+        resume_task = asyncio.create_task(
+            tool.resume_user_interaction(
+                interaction_id="interaction-1", response="approve"
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+        assert not resume_task.done()
+        assert cancelled is False
+        release.set()
+        settlement = await resume_task
+
+    assert settlement.status == "succeeded"
+    assert target.calls == [{"text": "approved"}]
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_after_dispatch_start_is_unknown(
+    registrations: list[Any],
+) -> None:
+    class FailingTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            self.calls.append(dict(args))
+            raise RuntimeError("transport result lost")
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        result = await executor({"text": "approved"})
+        return ToolInteractionSettlement.succeeded(result)
+
+    _register(registrations, lambda _: None, resume)
+    target = FailingTarget()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await tool.resume_user_interaction(
+            interaction_id="interaction-1", response="approve"
+        )
+
+    assert settlement.status == "dispatch_unknown"
+    assert target.calls == [{"text": "approved"}]
+
+
+def test_active_registration_revokes_concurrency_safety(
+    registrations: list[Any],
+) -> None:
+    class ConcurrentTarget(_Target):
+        @property
+        def metadata(self) -> Any:
+            return super().metadata.model_copy(update={"concurrency_safe": True})
+
+    target = ConcurrentTarget()
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+    assert tool.metadata.concurrency_safe is True
+
+    _register(registrations, lambda _: None, lambda **_: None)
+
+    assert tool.metadata.concurrency_safe is False
+    assert target.metadata.concurrency_safe is True
 
 
 def test_registration_is_scoped_and_not_last_writer_wins(

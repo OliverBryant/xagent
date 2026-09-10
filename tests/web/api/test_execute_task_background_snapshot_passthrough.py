@@ -220,7 +220,7 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
             await execute_task_background(
                 task_id=42,
                 user_message="hi",
-                context={},
+                context={"task_source": "spoofed", "run_id": "spoofed-run"},
                 agent_manager=agent_manager,
                 task_owner_user_id=1,
                 task_setup_snapshot=snapshot,

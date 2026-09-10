@@ -38,15 +38,16 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
-from xagent.core.tools.user_interaction import ToolInteractionSettlement
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
-    GateDecision,
     GatedCall,
+    GateDecision,
     current_tool_call_execution_context,
     gate_mcp_tools,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
+from xagent.core.tools.user_interaction import ToolInteractionSettlement
 
 
 class CalculatorArgs(BaseModel):
@@ -115,7 +116,7 @@ async def test_react_binds_exact_execution_identity_for_mcp_gate() -> None:
     try:
         target = FakeTool()
         target.name = "calculator"
-        (gated,) = gate_mcp_tools([target], connection={"id": 41})
+        (gated,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
         context = ExecutionContext(
             execution_id="task-248032",
             metadata={"task_source": "slack", "run_id": "run-1"},
@@ -7356,6 +7357,7 @@ async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds()
     settlement = ToolInteractionSettlement.succeeded(
         {"success": True, "post_urn": "urn:li:share:123"}
     )
+
     class ResumableTool:
         metadata = SimpleNamespace(
             name="approval_gate",
@@ -7559,7 +7561,9 @@ async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
             description="Resume persisted interactions.",
         )
 
-        async def resume_user_interaction(self, *, interaction_id: str, **_: str) -> Any:
+        async def resume_user_interaction(
+            self, *, interaction_id: str, **_: str
+        ) -> Any:
             if interaction_id == "interaction-1":
                 return ToolInteractionSettlement.rejected()
             return ToolInteractionSettlement.succeeded({"success": True})

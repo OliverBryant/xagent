@@ -18,6 +18,7 @@ import socket
 import stat
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ CHROME_SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DEFAULT_NPM_CACHE = "/opt/npm-cache"
 _CLI_TIMEOUT_SECONDS = 30.0
 _SOCKET_TIMEOUT_SECONDS = 60.0
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class ChromeDaemonRunnerError(RuntimeError):
@@ -92,6 +94,16 @@ def _pid_is_expected_daemon(pid: int) -> bool:
     return b"chrome-devtools-mcp" in cmdline and b"daemon.js" in cmdline
 
 
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _wait_for_exit(pid: int, timeout: float) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -131,8 +143,12 @@ def _socket_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any
                 raise ChromeDaemonRunnerError("daemon socket closed without a response")
             nul = chunk.find(b"\0")
             if nul >= 0:
+                if len(received) + nul > _MAX_RESPONSE_BYTES:
+                    raise ChromeDaemonRunnerError("daemon response exceeded size limit")
                 received.extend(chunk[:nul])
                 break
+            if len(received) + len(chunk) > _MAX_RESPONSE_BYTES:
+                raise ChromeDaemonRunnerError("daemon response exceeded size limit")
             received.extend(chunk)
     try:
         response = json.loads(received.decode("utf-8"))
@@ -167,11 +183,30 @@ def _validate_server_args(server_args: list[Any]) -> list[str]:
         "--sessionId",
         "--user-data-dir",
         "--userDataDir",
+        "--auto-connect",
+        "--autoConnect",
+        "--browser-url",
+        "--browserUrl",
+        "--executable-path",
+        "--executablePath",
+        "--ws-endpoint",
+        "--wsEndpoint",
         "--via-cli",
         "--viaCli",
     }
     if any(arg.split("=", 1)[0] in blocked for arg in server_args):
         raise ChromeDaemonRunnerError("server args override a managed isolation option")
+    nested_blocked = {"--profile-directory", "--user-data-dir"}
+    for index, arg in enumerate(server_args):
+        nested: str | None = None
+        if arg.startswith("--chrome-arg="):
+            nested = arg.split("=", 1)[1]
+        elif arg == "--chrome-arg" and index + 1 < len(server_args):
+            nested = server_args[index + 1]
+        if nested is not None and nested.split("=", 1)[0] in nested_blocked:
+            raise ChromeDaemonRunnerError(
+                "server args override the managed Chrome profile"
+            )
     if "--isolated" not in server_args or "--headless" not in server_args:
         raise ChromeDaemonRunnerError(
             "Chrome daemon requires --isolated and --headless"
@@ -179,14 +214,57 @@ def _validate_server_args(server_args: list[Any]) -> list[str]:
     return list(server_args)
 
 
-def _status_matches_managed_daemon(status: dict[str, Any]) -> bool:
+def _serialized_server_args(server_args: list[str]) -> list[str]:
+    serialized: list[str] = []
+    for arg in server_args:
+        if arg.startswith("--chrome-arg="):
+            serialized.extend(("--chrome-arg", arg.split("=", 1)[1]))
+        else:
+            serialized.append(arg)
+    return serialized
+
+
+def _status_matches_managed_daemon(
+    status: dict[str, Any], server_args: list[str]
+) -> bool:
     args = status.get("args")
-    return (
-        status.get("version") == CHROME_DEVTOOLS_PACKAGE.rsplit("@", 1)[1]
-        and isinstance(args, list)
-        and all(isinstance(arg, str) for arg in args)
-        and {"--headless", "--isolated", "--viaCli", "--experimentalStructuredContent"}
-        <= set(args)
+    if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+        return False
+    expected = Counter(
+        [
+            *_serialized_server_args(server_args),
+            "--viaCli",
+            "--experimentalStructuredContent",
+        ]
+    )
+    actual = Counter(args)
+    forbidden_direct = {
+        "--auto-connect",
+        "--autoConnect",
+        "--browser-url",
+        "--browserUrl",
+        "--executable-path",
+        "--executablePath",
+        "--user-data-dir",
+        "--userDataDir",
+        "--ws-endpoint",
+        "--wsEndpoint",
+    }
+    if any(arg.split("=", 1)[0] in forbidden_direct for arg in args):
+        return False
+    for index, arg in enumerate(args):
+        nested = None
+        if arg.startswith("--chrome-arg="):
+            nested = arg.split("=", 1)[1]
+        elif arg == "--chrome-arg" and index + 1 < len(args):
+            nested = args[index + 1]
+        if nested is not None and nested.split("=", 1)[0] in {
+            "--profile-directory",
+            "--user-data-dir",
+        }:
+            return False
+    return status.get("version") == CHROME_DEVTOOLS_PACKAGE.rsplit("@", 1)[1] and all(
+        actual[arg] >= count for arg, count in expected.items()
     )
 
 
@@ -195,7 +273,7 @@ def _start(session_id: str, server_args: list[Any]) -> dict[str, Any]:
     env, runtime_root, _profile_root = _session_environment(session_id)
     socket_path, pid_file = _runtime_paths(session_id, runtime_root)
     status = _status(socket_path)
-    if status is not None and _status_matches_managed_daemon(status):
+    if status is not None and _status_matches_managed_daemon(status, validated_args):
         return status
     if status is not None:
         raise ChromeDaemonRunnerError(
@@ -206,6 +284,10 @@ def _start(session_id: str, server_args: list[Any]) -> dict[str, Any]:
         pid = _read_pid(pid_file)
         if pid is not None and _pid_is_expected_daemon(pid):
             _terminate_expected_daemon(pid_file)
+        elif pid is not None and _pid_is_alive(pid):
+            raise ChromeDaemonRunnerError(
+                "refusing to replace an unverified live daemon pid"
+            )
         pid_file.unlink(missing_ok=True)
     socket_path.unlink(missing_ok=True)
 
@@ -236,7 +318,7 @@ def _start(session_id: str, server_args: list[Any]) -> dict[str, Any]:
     status = _status(socket_path)
     if status is None:
         raise ChromeDaemonRunnerError("daemon failed its post-start health check")
-    if not _status_matches_managed_daemon(status):
+    if not _status_matches_managed_daemon(status, validated_args):
         raise ChromeDaemonRunnerError("daemon launch does not match the pinned spec")
     return status
 
@@ -286,9 +368,12 @@ def _write_result(path: Path, result: dict[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    encoded = json.dumps(result, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > _MAX_RESPONSE_BYTES:
+        raise ChromeDaemonRunnerError("result exceeded size limit")
     fd = os.open(path, flags, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        json.dump(result, stream, separators=(",", ":"))
+        stream.write(encoded)
 
 
 def main() -> None:

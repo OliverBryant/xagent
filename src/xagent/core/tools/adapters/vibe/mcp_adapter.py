@@ -30,8 +30,9 @@ from typing import (
 )
 
 import httpx
-from mcp.types import CallToolResult, Tool as MCPTool
-from pydantic import BaseModel, Field, create_model
+from mcp.types import CallToolResult
+from mcp.types import Tool as MCPTool
+from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
@@ -49,18 +50,18 @@ from .connector_runtime import (
     connector_runtime_from_config,
     runtime_bindings_from_config,
 )
-from .sandboxed_tool.sandboxed_mcp_tool_helper import (
-    SandboxedMCPLoadResult,
-    list_tools_in_sandbox,
-    load_sandboxed_mcp_tools,
-    should_sandbox_mcp_connection,
-)
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
     ChromeExecutionSessionPool,
     ChromeSessionContractError,
     chrome_metadata_connection,
+)
+from .sandboxed_tool.sandboxed_mcp_tool_helper import (
+    SandboxedMCPLoadResult,
+    list_tools_in_sandbox,
+    load_sandboxed_mcp_tools,
+    should_sandbox_mcp_connection,
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
@@ -876,22 +877,17 @@ def _normalized_mcp_call_result(
     """Validate a wire result and render the stable agent-facing shape."""
 
     if validate_wire:
-        if not isinstance(value, Mapping):
-            raise ChromeSessionContractError("Chrome daemon returned invalid result")
-        content_value = value.get("content", [])
-        error_value = value.get("isError", False)
-        structured_value = value.get("structuredContent")
         if (
-            not isinstance(content_value, list)
-            or type(error_value) is not bool
-            or (
-                "structuredContent" in value
-                and structured_value is not None
-                and not isinstance(structured_value, Mapping)
-            )
+            not isinstance(value, Mapping)
+            or type(value.get("isError", False)) is not bool
         ):
             raise ChromeSessionContractError("Chrome daemon returned invalid result")
-        result = CallToolResult.model_validate(value)
+        try:
+            result = CallToolResult.model_validate(value)
+        except ValidationError as exc:
+            raise ChromeSessionContractError(
+                "Chrome daemon returned invalid result"
+            ) from exc
     else:
         result = value
     content = []
@@ -901,6 +897,9 @@ def _normalized_mcp_call_result(
                 content.append(content_item.model_dump())
             else:
                 content.append({"text": str(content_item)})
+    # MCP SDK 1.x and 2.x expose different Python attribute spellings, while
+    # the wire aliases remain stable. Keep aliases here and handle content
+    # separately so nested content metadata is not renamed unexpectedly.
     other_fields = result.model_dump(by_alias=True, exclude={"content"})
     return {
         "content": content,
@@ -1740,7 +1739,11 @@ class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
             self.mcp_tool.name,
             tool_args,
         )
-        return _normalized_mcp_call_result(result, validate_wire=True)
+        try:
+            return _normalized_mcp_call_result(result, validate_wire=True)
+        except ChromeSessionContractError:
+            await self._chrome_pool.close_shielded(self._chrome_scope)
+            raise
 
     async def teardown(self, task_id: Optional[str] = None) -> None:
         try:
@@ -1947,14 +1950,14 @@ def _build_execution_scoped_chrome_tool_adapter(
     )
 
 
-async def _load_execution_scoped_chrome_tools(
+async def load_execution_scoped_chrome_tools(
     server_name: str,
     connection: Connection,
     *,
     scope: ChromeExecutionScope,
-    name_prefix: str,
-    visibility: Optional[ToolVisibility],
-    allow_users: Optional[List[str]],
+    name_prefix: str = "mcp_",
+    visibility: Optional[ToolVisibility] = None,
+    allow_users: Optional[List[str]] = None,
 ) -> SandboxedMCPLoadResult:
     # Lazy web import preserves the existing core-only MCP adapter import path.
     from .....web.services.chrome_mcp_runtime import (
@@ -2312,65 +2315,7 @@ async def load_mcp_tools_as_agent_tools(
     for server_name, connection in connection_map.items():
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
-            # Only the registry-owned execution scope can select this path.
-            # The resolver validates the exact web identity type before any
-            # sandbox or process is created and returns only an opaque digest
-            # alongside the in-memory comparison key.
-            from .....web.services.chrome_mcp_runtime import (
-                consume_chrome_execution_scope,
-            )
-
-            chrome_scope, executable_connection = consume_chrome_execution_scope(
-                server_name, connection
-            )
-            if chrome_scope is not None:
-                connection = cast(Connection, executable_connection)
-                try:
-                    sandbox_result = await _load_server_tools_bounded(
-                        server_name,
-                        _load_execution_scoped_chrome_tools(
-                            server_name,
-                            connection,
-                            scope=chrome_scope,
-                            name_prefix=name_prefix,
-                            visibility=visibility,
-                            allow_users=allow_users,
-                        ),
-                        timeout_seconds,
-                    )
-                except Exception as e:
-                    failures.append(
-                        MCPServerLoadFailure(
-                            server_name=server_name,
-                            phase=MCPFailurePhase.SANDBOX_LIST_TOOLS,
-                            error_type=type(e).__name__,
-                        )
-                    )
-                    logger.error(
-                        "Failed to list execution-scoped Chrome tools from "
-                        "server %s (%s)",
-                        server_name,
-                        type(e).__name__,
-                    )
-                    continue
-                server_tools = sandbox_result.tools
-                if sandbox_result.adapter_error_types:
-                    failures.append(
-                        MCPServerLoadFailure(
-                            server_name=server_name,
-                            phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
-                            error_type=sandbox_result.adapter_error_types[0],
-                        )
-                    )
-                if not server_tools and not sandbox_result.adapter_error_types:
-                    failures.append(
-                        MCPServerLoadFailure(
-                            server_name=server_name,
-                            phase=MCPFailurePhase.NO_TOOLS_RETURNED,
-                            error_type=None,
-                        )
-                    )
-            elif sandbox is not None and should_sandbox_mcp_connection(connection):
+            if sandbox is not None and should_sandbox_mcp_connection(connection):
                 concurrency_safe, concurrent_tools = _connection_concurrency_config(
                     connection
                 )

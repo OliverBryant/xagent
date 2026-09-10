@@ -29,8 +29,10 @@ from xagent.web.services.actor_mcp_connections import (
 )
 from xagent.web.services.actor_mcp_runtime import (
     ActorMCPConnectionServiceAdapter,
+    ActorMCPRuntimeDefinitionError,
     ActorMCPStdioConnectionIdentity,
     ActorMCPStdioSessionIdentity,
+    _canonical_oauth_scopes,
     production_actor_mcp_stdio_connection_adapter,
     resolve_actor_mcp_stdio_configs,
 )
@@ -693,6 +695,107 @@ def test_catalog_execution_drift_fails_closed_before_secret_read(
     adapter = _FakeAdapter(_identity(app), _credentials())
     setattr(app, field_name, drifted_value)
     db.flush()
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert result.configs == ()
+    assert adapter.secret_calls == []
+
+
+def test_catalog_oauth_scope_order_is_ignored_but_content_drift_fails_closed(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services import actor_mcp_runtime
+
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    execution = get_builtin_execution_fields(APP_ID)
+    assert execution is not None
+    execution["oauth_scopes"] = ["scope-b", "scope-a"]
+    monkeypatch.setattr(
+        actor_mcp_runtime,
+        "_cached_builtin_stdio_execution",
+        lambda _app_id: execution,
+    )
+    app.oauth_scopes = ["scope-a", "scope-b"]
+    db.flush()
+    adapter = _FakeAdapter(_identity(app), _credentials())
+
+    reordered = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert len(reordered.configs) == 1
+    assert len(adapter.secret_calls) == 1
+
+    app.oauth_scopes = ["scope-a", "scope-c"]
+    db.flush()
+    adapter.secret_calls.clear()
+    drifted = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert drifted.configs == ()
+    assert adapter.secret_calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_scopes",
+    [
+        ["scope-a", "scope-a"],
+        ["scope-a", 7],
+        ["scope-a", ""],
+    ],
+)
+def test_oauth_scope_normalization_rejects_invalid_elements_and_duplicates(
+    invalid_scopes: list[object],
+) -> None:
+    with pytest.raises(ActorMCPRuntimeDefinitionError):
+        _canonical_oauth_scopes(invalid_scopes)
+
+
+@pytest.mark.parametrize(
+    "invalid_scopes",
+    [
+        ["scope-a", "scope-a"],
+        ["scope-a", 7],
+        ["scope-a", ""],
+    ],
+)
+def test_invalid_or_duplicate_oauth_scopes_fail_closed_before_secret_read(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_scopes: list[object],
+) -> None:
+    from xagent.web.services import actor_mcp_runtime
+
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db)
+    execution = get_builtin_execution_fields(APP_ID)
+    assert execution is not None
+    execution["oauth_scopes"] = invalid_scopes
+    monkeypatch.setattr(
+        actor_mcp_runtime,
+        "_cached_builtin_stdio_execution",
+        lambda _app_id: execution,
+    )
+    app.oauth_scopes = invalid_scopes  # type: ignore[assignment]
+    db.flush()
+    adapter = _FakeAdapter(_identity(app), _credentials())
 
     result = resolve_actor_mcp_stdio_configs(
         db,

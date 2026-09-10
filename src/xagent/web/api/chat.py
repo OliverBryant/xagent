@@ -704,10 +704,10 @@ async def create_default_tools(
         raise ValueError("Task ID is required for tool creation")
 
     # Create a WebToolConfig to properly initialize tools
-    from ..tools.config import WebToolConfig
     from ..services.actor_mcp_runtime import (
         production_actor_mcp_stdio_connection_adapter,
     )
+    from ..tools.config import WebToolConfig
     from .agents import voice_from_runtime_user
 
     db_factory = None
@@ -2977,6 +2977,7 @@ class AgentServiceManager:
                     else None,
                     connector_runtime_turn_id=connector_runtime_turn_id,
                     mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                    mcp_actor_execution_identity=mcp_actor_execution_identity,
                     force_mcp_tools=actor_marked,
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
@@ -3189,7 +3190,9 @@ class AgentServiceManager:
         identity: MCPActorExecutionIdentity | None,
     ) -> None:
         agent = self._agents.get(task_id)
-        tool_config = getattr(agent, "tool_config", None) if agent is not None else None
+        if agent is None:
+            return
+        tool_config = getattr(agent, "tool_config", None)
         if tool_config is None or not hasattr(
             tool_config, "set_mcp_actor_execution_identity"
         ):

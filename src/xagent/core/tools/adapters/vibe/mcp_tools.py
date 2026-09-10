@@ -269,9 +269,17 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     try:
         from .factory import ToolFactory
 
+        identity_getter = getattr(
+            config, "get_actor_mcp_stdio_session_identities", None
+        )
+        session_identities = identity_getter() if callable(identity_getter) else {}
+        consumer_getter = getattr(config, "get_actor_mcp_stdio_session_consumer", None)
+        session_consumer = consumer_getter() if callable(consumer_getter) else None
         tools = await ToolFactory._create_mcp_tools_from_configs(
             mcp_configs,
             sandbox=config.get_sandbox(),
+            actor_stdio_session_identities=session_identities,
+            actor_stdio_session_consumer=session_consumer,
         )
     except ConnectorRuntimeError:
         summary = _build_mcp_load_summary(

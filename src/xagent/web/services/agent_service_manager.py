@@ -2997,7 +2997,9 @@ class AgentServiceManager:
         identity: MCPActorExecutionIdentity | None,
     ) -> None:
         agent = self._agents.get(task_id)
-        tool_config = getattr(agent, "tool_config", None) if agent is not None else None
+        if agent is None:
+            return
+        tool_config = getattr(agent, "tool_config", None)
         if tool_config is None or not hasattr(
             tool_config, "set_mcp_actor_execution_identity"
         ):

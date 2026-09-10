@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import logging
+from functools import cache
 from typing import Any, Protocol, final
 from uuid import UUID
 
 from sqlalchemy.orm import Session
 
 from ... import config as xagent_config
+from ...core.tools.adapters.vibe.config import ACTOR_STDIO_SHADOWED_REASON
 from ..builtin_mcp_registry import (
     get_builtin_execution_fields,
     get_builtin_public_mcp_app_rows,
     get_builtin_stdio_session_scope,
 )
+from ..mcp_apps import normalize_catalog_key
 from ..models.public_mcp import PublicMCPApp
 from .actor_mcp_connections import (
     ActorMCPConnectionCredentialCorruptionError,
@@ -191,15 +194,11 @@ def production_actor_mcp_stdio_connection_adapter() -> ActorMCPStdioConnectionAd
 class ActorMCPStdioResolution:
     configs: tuple[dict[str, Any], ...]
     blocked_server_ids: frozenset[int]
+    blocked_server_reasons: tuple[tuple[int, str], ...] = ()
+    session_identities: tuple[tuple[str, ActorMCPStdioSessionIdentity], ...] = ()
 
 
-def _normalized_catalog_key(value: object) -> str | None:
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
-
-
+@cache
 def _builtin_stdio_rows() -> tuple[dict[str, Any], ...]:
     return tuple(
         row
@@ -208,13 +207,14 @@ def _builtin_stdio_rows() -> tuple[dict[str, Any], ...]:
     )
 
 
+@cache
 def _reserved_stdio_keys() -> frozenset[str]:
     return frozenset(
         key
         for row in _builtin_stdio_rows()
         for key in (
-            _normalized_catalog_key(row.get("app_id")),
-            _normalized_catalog_key(row.get("name")),
+            normalize_catalog_key(row.get("app_id")),
+            normalize_catalog_key(row.get("name")),
         )
         if key is not None
     )
@@ -225,33 +225,39 @@ def _blocked_visible_server_ids(visible_servers: Sequence[Any]) -> frozenset[int
     return frozenset(
         int(server.id)
         for server in visible_servers
-        if _normalized_catalog_key(getattr(server, "name", None)) in reserved
+        if normalize_catalog_key(getattr(server, "name", None)) in reserved
     )
+
+
+@cache
+def _cached_builtin_stdio_execution(app_id: str) -> dict[str, Any] | None:
+    return get_builtin_execution_fields(app_id)
 
 
 def _canonical_stdio_execution(
     db: Session,
     identity: ActorMCPStdioConnectionIdentity,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
-    execution = get_builtin_execution_fields(identity.app_id)
+    execution = _cached_builtin_stdio_execution(identity.app_id)
     if execution is None or execution.get("transport") != "stdio":
         raise ActorMCPRuntimeDefinitionError(
             "actor stdio app is absent from the builtin registry"
         )
 
-    catalog_apps = db.query(PublicMCPApp).all()
-    matches = [app for app in catalog_apps if app.app_id == identity.app_id]
-    normalized_id = _normalized_catalog_key(identity.app_id)
-    collisions = [
-        app
-        for app in catalog_apps
-        if _normalized_catalog_key(app.app_id) == normalized_id
-    ]
-    if len(matches) != 1 or len(collisions) != 1:
+    app = (
+        db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == identity.app_id)
+        .one_or_none()
+    )
+    normalized_id = normalize_catalog_key(identity.app_id)
+    collision_count = sum(
+        normalize_catalog_key(app_id) == normalized_id
+        for (app_id,) in db.query(PublicMCPApp.app_id).all()
+    )
+    if app is None or collision_count != 1:
         raise ActorMCPRuntimeDefinitionError(
             "actor stdio catalog identity is unavailable or ambiguous"
         )
-    app = matches[0]
     if (
         app.generation != identity.catalog_app_generation
         or not app.is_visible_in_connector
@@ -331,6 +337,10 @@ def resolve_actor_mcp_stdio_configs(
         return ActorMCPStdioResolution((), frozenset())
 
     blocked_server_ids = _blocked_visible_server_ids(visible_servers)
+    blocked_server_reasons = tuple(
+        (server_id, ACTOR_STDIO_SHADOWED_REASON)
+        for server_id in sorted(blocked_server_ids)
+    )
     if (
         isinstance(user_id, bool)
         or not isinstance(user_id, int)
@@ -338,7 +348,7 @@ def resolve_actor_mcp_stdio_configs(
         or not xagent_config.get_toby_personal_stdio_enabled()
         or adapter is None
     ):
-        return ActorMCPStdioResolution((), blocked_server_ids)
+        return ActorMCPStdioResolution((), blocked_server_ids, blocked_server_reasons)
 
     try:
         identities = tuple(
@@ -350,14 +360,15 @@ def resolve_actor_mcp_stdio_configs(
         )
     except _ACTOR_MCP_STORAGE_ERRORS as exc:
         logger.info("Actor stdio connection list unavailable (%s)", type(exc).__name__)
-        return ActorMCPStdioResolution((), blocked_server_ids)
+        return ActorMCPStdioResolution((), blocked_server_ids, blocked_server_reasons)
     except Exception as exc:
         logger.warning(
             "Actor stdio connection list failed unexpectedly (%s)",
             type(exc).__name__,
         )
-        return ActorMCPStdioResolution((), blocked_server_ids)
+        return ActorMCPStdioResolution((), blocked_server_ids, blocked_server_reasons)
     configs: list[dict[str, Any]] = []
+    session_identities: list[tuple[str, ActorMCPStdioSessionIdentity]] = []
     for identity in identities:
         if (
             not isinstance(identity, ActorMCPStdioConnectionIdentity)
@@ -376,11 +387,11 @@ def resolve_actor_mcp_stdio_configs(
                     connection=identity,
                 )
             app_keys = {
-                _normalized_catalog_key(identity.app_id),
-                _normalized_catalog_key(execution.get("name")),
+                normalize_catalog_key(identity.app_id),
+                normalize_catalog_key(execution.get("name")),
             }
             if any(
-                _normalized_catalog_key(getattr(server, "name", None)) in app_keys
+                normalize_catalog_key(getattr(server, "name", None)) in app_keys
                 for server in visible_servers
             ):
                 continue
@@ -407,6 +418,11 @@ def resolve_actor_mcp_stdio_configs(
                 credentials,
                 required_fields=required_fields,
             )
+            fixed_runtime_env = caller_id_env(user_id)
+            if set(env).intersection(fixed_runtime_env):
+                raise ActorMCPRuntimeDefinitionError(
+                    "actor stdio credentials overlap trusted runtime env"
+                )
         except (*_ACTOR_MCP_STORAGE_ERRORS, ActorMCPRuntimeDefinitionError) as exc:
             logger.info(
                 "Actor stdio credential read unavailable (%s)", type(exc).__name__
@@ -420,7 +436,7 @@ def resolve_actor_mcp_stdio_configs(
             continue
 
         launch = execution["launch_config"]
-        trusted_env = {**env, **caller_id_env(user_id)}
+        trusted_env = {**env, **fixed_runtime_env}
         config: dict[str, Any] = {
             "name": identity.app_id,
             "transport": "stdio",
@@ -435,7 +451,12 @@ def resolve_actor_mcp_stdio_configs(
             "user_id": str(user_id),
         }
         if session_identity is not None:
-            config["actor_stdio_session_identity"] = session_identity
+            session_identities.append((identity.app_id, session_identity))
         configs.append(config)
 
-    return ActorMCPStdioResolution(tuple(configs), blocked_server_ids)
+    return ActorMCPStdioResolution(
+        tuple(configs),
+        blocked_server_ids,
+        blocked_server_reasons,
+        tuple(session_identities),
+    )

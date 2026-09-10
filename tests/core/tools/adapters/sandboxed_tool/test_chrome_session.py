@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,11 +13,9 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
     ChromeExecutionScope,
     ChromeExecutionSession,
     ChromeExecutionSessionPool,
-    ChromeLeaseState,
     ChromeSandboxHandle,
     ChromeSessionContractError,
-    ChromeSessionReaper,
-    ChromeSessionReaperCandidate,
+    ChromeSessionTransportError,
 )
 from xagent.sandbox.base import ExecResult, Sandbox
 
@@ -56,6 +53,8 @@ def _healthy_status(*, suffix: list[str] | None = None):
     return {
         "version": "1.6.0",
         "args": [
+            "--channel",
+            "stable",
             "--headless",
             "--isolated",
             *(suffix or []),
@@ -96,6 +95,8 @@ class TestChromeDaemonLaunchSpec:
                 "command": "npx",
                 "args": ["-y", "--prefer-offline", CHROME_DEVTOOLS_PACKAGE],
             },
+            _connection(suffix=["--sessionId=unmanaged"]),
+            _connection(suffix=["--chrome-arg=--user-data-dir=/shared"]),
         ],
     )
     def test_rejects_noncanonical_or_unisolated_launches(self, connection):
@@ -109,6 +110,7 @@ class TestChromeDaemonClient:
         sandbox = _sandbox()
         sandbox.exec.side_effect = [
             ExecResult(exit_code=0, stdout="", stderr=""),
+            ExecResult(exit_code=0, stdout="16", stderr=""),
             ExecResult(exit_code=0, stdout="", stderr=""),
         ]
         sandbox.read_file.return_value = '{"running":true}'
@@ -124,7 +126,8 @@ class TestChromeDaemonClient:
             "NPM_CONFIG_CACHE": "/opt/npm-cache",
             "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
         }
-        assert sandbox.exec.await_args_list[1].args[:2] == ("rm", "-f")
+        assert sandbox.exec.await_args_list[1].args[:3] == ("stat", "-c", "%s")
+        assert sandbox.exec.await_args_list[2].args[:2] == ("rm", "-f")
 
     @pytest.mark.asyncio
     async def test_sandbox_failure_has_no_direct_process_fallback(self):
@@ -135,10 +138,26 @@ class TestChromeDaemonClient:
         ]
         client = ChromeDaemonClient(sandbox, session_id="b" * 32)
 
-        with pytest.raises(ChromeSessionContractError, match="exit code 17"):
+        with pytest.raises(ChromeSessionTransportError, match="exit code 17") as exc:
             await client.status()
 
         assert sandbox.exec.await_count == 2
+        assert "secret" not in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_result_size_is_bounded_before_reading(self):
+        sandbox = _sandbox()
+        sandbox.exec.side_effect = [
+            ExecResult(exit_code=0, stdout="", stderr=""),
+            ExecResult(exit_code=0, stdout=str(64 * 1024 * 1024 + 1), stderr=""),
+            ExecResult(exit_code=0, stdout="", stderr=""),
+        ]
+        client = ChromeDaemonClient(sandbox, session_id="b" * 32)
+
+        with pytest.raises(ChromeSessionTransportError, match="size limit"):
+            await client.status()
+
+        sandbox.read_file.assert_not_awaited()
 
     def test_rejects_untrusted_session_names(self):
         with pytest.raises(ValueError, match="lowercase hex"):
@@ -170,7 +189,7 @@ class TestChromeExecutionSession:
         assert client.invoke_tool.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_cleanup_deletes_sandbox_even_when_daemon_stop_fails(self):
+    async def test_cleanup_deletes_sandbox_even_when_daemon_stop_fails(self, caplog):
         delete = AsyncMock()
         session = ChromeExecutionSession(
             ChromeSandboxHandle(sandbox=_sandbox(), delete=delete),
@@ -187,6 +206,7 @@ class TestChromeExecutionSession:
 
         client.stop.assert_awaited_once()
         delete.assert_awaited_once()
+        assert any(record.exc_info is not None for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_cleanup_continues_after_waiter_cancellation(self):
@@ -232,6 +252,37 @@ class TestChromeExecutionSession:
             await session.invoke_tool("take_snapshot", {})
 
         client.invoke_tool.assert_not_awaited()
+
+    def test_real_daemon_status_defaults_and_serialization_are_accepted(self):
+        session = ChromeExecutionSession(
+            ChromeSandboxHandle(sandbox=_sandbox(), delete=AsyncMock()),
+            session_id="f" * 32,
+            launch=ChromeDaemonLaunchSpec.from_connection(
+                _connection(suffix=["--chrome-arg=--disable-gpu"])
+            ),
+        )
+
+        assert session._status_matches_launch(
+            _healthy_status(suffix=["--chrome-arg", "--disable-gpu"])
+        )
+
+    @pytest.mark.parametrize(
+        "unsafe_args",
+        [
+            ["--user-data-dir=/shared"],
+            ["--chrome-arg", "--profile-directory=shared"],
+        ],
+    )
+    def test_status_rejects_profile_or_connection_overrides(self, unsafe_args):
+        session = ChromeExecutionSession(
+            ChromeSandboxHandle(sandbox=_sandbox(), delete=AsyncMock()),
+            session_id="f" * 32,
+            launch=ChromeDaemonLaunchSpec.from_connection(_connection()),
+        )
+        status = _healthy_status()
+        status["args"].extend(unsafe_args)
+
+        assert not session._status_matches_launch(status)
 
 
 class TestChromeExecutionSessionPool:
@@ -366,89 +417,88 @@ class TestChromeExecutionSessionPool:
         session._client.invoke_tool.assert_not_awaited()
         delete.assert_awaited_once()
 
-
-class TestChromeSessionReaper:
-    def test_candidate_rejects_raw_lifecycle_and_lease_identifiers(self):
-        with pytest.raises(ValueError, match="opaque digests"):
-            ChromeSessionReaperCandidate(
-                "task-7-run-one-attempt-one",
-                datetime.now(timezone.utc),
-                "attempt-one",
+    @pytest.mark.asyncio
+    async def test_transport_failure_preserves_session_for_next_health_check(self):
+        delete = AsyncMock()
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(
+                return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=delete)
             )
+        )
+        scope = _scope("transport-failure")
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        session = await pool.get_or_create(scope, launch)
+        session.invoke_tool = AsyncMock(
+            side_effect=ChromeSessionTransportError("temporary timeout")
+        )
+
+        with pytest.raises(ChromeSessionTransportError, match="temporary timeout"):
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
+
+        assert pool._sessions[scope.digest][1] is session
+        delete.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_only_ttl_expired_stale_fences_reach_atomic_reclaim(self):
-        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
-        fresh = ChromeSessionReaperCandidate(_digest("fresh"), now, _digest("f1"))
-        current = ChromeSessionReaperCandidate(
-            _digest("current"), now - timedelta(hours=1), _digest("f2")
+    async def test_cancellation_removes_session_and_deletes_sandbox(self):
+        delete = AsyncMock()
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(
+                return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=delete)
+            )
         )
-        unknown = ChromeSessionReaperCandidate(
-            _digest("unknown"), now - timedelta(hours=1), _digest("f3")
-        )
-        stale = ChromeSessionReaperCandidate(
-            _digest("stale"), now - timedelta(hours=1), _digest("f4")
-        )
+        scope = _scope("cancelled-call")
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        session = await pool.get_or_create(scope, launch)
+        session.invoke_tool = AsyncMock(side_effect=asyncio.CancelledError)
 
-        async def classify(candidate):
-            return {
-                current: ChromeLeaseState.CURRENT,
-                unknown: ChromeLeaseState.UNKNOWN,
-                stale: ChromeLeaseState.STALE,
-            }[candidate]
+        with pytest.raises(asyncio.CancelledError):
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
 
-        reclaim = AsyncMock(return_value=True)
-        reaper = ChromeSessionReaper(
-            list_candidates=AsyncMock(return_value=[fresh, current, unknown, stale]),
-            classify_lease=classify,
-            reclaim_if_stale=reclaim,
-            ttl=timedelta(minutes=30),
-        )
-
-        assert await reaper.sweep(now=now) == (_digest("stale"),)
-        reclaim.assert_awaited_once_with(stale)
+        assert scope.digest not in pool._sessions
+        delete.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_classification_failure_is_fail_closed(self):
-        candidate = ChromeSessionReaperCandidate(
-            _digest("candidate"),
-            datetime.now(timezone.utc) - timedelta(hours=1),
-            _digest("fence"),
+    async def test_raw_session_failure_removes_cached_session(self):
+        delete = AsyncMock()
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(
+                return_value=ChromeSandboxHandle(sandbox=_sandbox(), delete=delete)
+            )
         )
-        reclaim = AsyncMock()
-        reaper = ChromeSessionReaper(
-            list_candidates=AsyncMock(return_value=[candidate]),
-            classify_lease=AsyncMock(side_effect=RuntimeError("database unavailable")),
-            reclaim_if_stale=reclaim,
-        )
+        scope = _scope("raw-failure")
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        session = await pool.get_or_create(scope, launch)
+        session.invoke_tool = AsyncMock(side_effect=RuntimeError("unexpected"))
 
-        assert await reaper.sweep() == ()
-        reclaim.assert_not_awaited()
+        with pytest.raises(RuntimeError, match="unexpected"):
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
+
+        assert scope.digest not in pool._sessions
+        delete.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_reclaim_failure_does_not_skip_later_orphans(self):
-        now = datetime.now(timezone.utc)
-        first = ChromeSessionReaperCandidate(
-            _digest("first"), now - timedelta(hours=1), _digest("f1")
+    async def test_cancelled_shielded_cleanup_logs_late_failure(self, caplog):
+        pool = ChromeExecutionSessionPool(AsyncMock())
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fail_late(_scope):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("delete failed")
+
+        pool.close = fail_late
+        waiter = asyncio.create_task(pool.close_shielded(_scope("late-failure")))
+        await entered.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert any(
+            record.message == "Shielded Chrome cleanup failed"
+            and record.exc_info is not None
+            for record in caplog.records
         )
-        second = ChromeSessionReaperCandidate(
-            _digest("second"), now - timedelta(hours=1), _digest("f2")
-        )
-        reclaim = AsyncMock(side_effect=[RuntimeError("delete failed"), True])
-        reaper = ChromeSessionReaper(
-            list_candidates=AsyncMock(return_value=[first, second]),
-            classify_lease=AsyncMock(return_value=ChromeLeaseState.STALE),
-            reclaim_if_stale=reclaim,
-        )
-
-        assert await reaper.sweep(now=now) == (_digest("second"),)
-        assert reclaim.await_count == 2
-
-
-def test_chrome_session_is_wired_without_replacing_generic_mcp_lifecycle():
-    import xagent.core.tools.adapters.vibe.mcp_adapter as generic_loader
-
-    source = generic_loader.__loader__.get_source(generic_loader.__name__)
-    assert source is not None
-    assert "ChromeExecutionSessionPool" in source
-    assert "async with create_session(connection) as session" in source

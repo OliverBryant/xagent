@@ -4,51 +4,29 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 
 from ...core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
+    CHROME_DEVTOOLS_APP_ID,
     CHROME_SANDBOX_LIFECYCLE_TYPE,
     ChromeExecutionScope,
     ChromeExecutionSessionPool,
     ChromeSandboxHandle,
     ChromeSessionContractError,
 )
+from ...core.tools.core.mcp.sessions import Connection
 from ..builtin_mcp_registry import get_builtin_stdio_session_scope
 from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
 from .actor_mcp_runtime import (
     ActorMCPStdioConnectionIdentity,
     ActorMCPStdioSessionIdentity,
 )
-from .mcp_runtime import (
-    CALLER_ID_ENV_VAR,
-    MCPActorAuthorizationPolicy,
-    MCPActorExecutionIdentity,
-    MCPBuiltinOAuthActorPolicyRequiredError,
-)
+from .mcp_runtime import CALLER_ID_ENV_VAR, MCPActorExecutionIdentity
 
-_ACTOR_STDIO_SESSION_IDENTITY_KEY = "actor_stdio_session_identity"
 _CHROME_SCOPE_HASH_DOMAIN = b"xagent.chrome.execution-session.v1\x00"
 _chrome_pool_manager: object | None = None
 _chrome_pool: ChromeExecutionSessionPool | None = None
-
-
-def require_chrome_builtin_stdio_policy(
-    policy: MCPActorAuthorizationPolicy | None,
-) -> MCPActorAuthorizationPolicy:
-    """Require an explicit actor capability before any Chrome stdio work.
-
-    Returning the same immutable policy lets the integration compare its
-    resource owner with the actor connection identity.  This is only an
-    authorization gate; passing it is insufficient to identify a browser
-    session and must never be used as a session key.
-    """
-
-    if policy is None or not policy.allow_builtin_stdio:
-        raise MCPBuiltinOAuthActorPolicyRequiredError(
-            "Chrome actor stdio execution requires an explicit capability"
-        )
-    return policy
 
 
 def _hash_identity_key(key: tuple[Any, ...]) -> str:
@@ -69,21 +47,26 @@ def _hash_identity_key(key: tuple[Any, ...]) -> str:
     return digest.hexdigest()
 
 
-def consume_chrome_execution_scope(
+def bind_chrome_execution_scope(
     server_name: str,
     connection: Mapping[str, Any],
-) -> tuple[ChromeExecutionScope | None, Mapping[str, Any]]:
-    """Consume the host-only identity before returning an executable config."""
+    session_identity: ActorMCPStdioSessionIdentity,
+) -> tuple[ChromeExecutionScope, Mapping[str, Any]]:
+    """Bind an exact host-only identity to a secret-free Chrome connection."""
 
-    execution_scoped = get_builtin_stdio_session_scope(server_name) == "execution"
-    if not execution_scoped:
-        if _ACTOR_STDIO_SESSION_IDENTITY_KEY in connection:
-            raise ChromeSessionContractError(
-                "non-execution MCP connection supplied a session identity"
-            )
-        return None, connection
+    if (
+        server_name != CHROME_DEVTOOLS_APP_ID
+        or get_builtin_stdio_session_scope(server_name) != "execution"
+    ):
+        raise ChromeSessionContractError(
+            "Chrome session consumer requires the canonical Chrome app"
+        )
+    if "actor_stdio_session_identity" in connection:
+        raise ChromeSessionContractError(
+            "Chrome session identity must use the host-only side channel"
+        )
     executable_connection = dict(connection)
-    identity = executable_connection.pop(_ACTOR_STDIO_SESSION_IDENTITY_KEY, None)
+    identity = session_identity
     if type(identity) is not ActorMCPStdioSessionIdentity:
         raise ChromeSessionContractError(
             "execution-scoped Chrome requires an exact session identity"
@@ -101,6 +84,13 @@ def consume_chrome_execution_scope(
         raise ChromeSessionContractError(
             "Chrome session caller identity does not match"
         )
+    child_env = dict(env)
+    child_env.pop(CALLER_ID_ENV_VAR, None)
+    if child_env:
+        raise ChromeSessionContractError(
+            "Chrome session connection contains unexpected environment"
+        )
+    executable_connection["env"] = {}
     key = identity.key
     return (
         ChromeExecutionScope(key=key, digest=_hash_identity_key(key)),
@@ -144,7 +134,49 @@ def get_chrome_execution_session_pool() -> ChromeExecutionSessionPool:
     manager = get_sandbox_manager()
     if manager is None:
         raise ChromeSessionContractError("Chrome sandbox is unavailable")
-    if _chrome_pool is None or _chrome_pool_manager is not manager:
+    if _chrome_pool is not None and _chrome_pool_manager is not manager:
+        raise ChromeSessionContractError("Chrome sandbox manager changed")
+    if _chrome_pool is None:
         _chrome_pool = ChromeExecutionSessionPool(_create_chrome_sandbox)
         _chrome_pool_manager = manager
     return _chrome_pool
+
+
+async def shutdown_chrome_execution_session_pool() -> None:
+    """Drain the process-local pool before the sandbox manager is stopped."""
+
+    global _chrome_pool, _chrome_pool_manager
+    pool = _chrome_pool
+    try:
+        if pool is not None:
+            await pool.close_all()
+    finally:
+        _chrome_pool = None
+        _chrome_pool_manager = None
+
+
+async def consume_chrome_actor_stdio_session(
+    *,
+    server_name: str,
+    connection: Mapping[str, Any],
+    session_identity: ActorMCPStdioSessionIdentity,
+    sandbox: object | None,
+) -> list[Any]:
+    """Consume one host-only identity without using the generic MCP loader."""
+
+    del sandbox  # Chrome always owns a dedicated sandbox; there is no fallback.
+    scope, executable_connection = bind_chrome_execution_scope(
+        server_name, connection, session_identity
+    )
+    from ...core.tools.adapters.vibe.mcp_adapter import (
+        load_execution_scoped_chrome_tools,
+    )
+
+    result = await load_execution_scoped_chrome_tools(
+        server_name,
+        cast(Connection, executable_connection),
+        scope=scope,
+    )
+    if result.adapter_error_types or not result.tools:
+        raise ChromeSessionContractError("Chrome session tools are unavailable")
+    return list(result.tools)

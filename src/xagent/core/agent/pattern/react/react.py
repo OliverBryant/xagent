@@ -2069,11 +2069,12 @@ class ReActPattern(AgentPattern):
                 settlement_status=settlement.status,
                 settlement_turn_id=getattr(runtime, "active_turn_id", None),
             )
-        # Recompute for every entry in a multi-interaction delivery batch.
-        self.force_final_answer_next = settlement.status in {
-            "rejected",
-            "dispatch_unknown",
-        }
+        # A rejection or an unknown dispatch anywhere in the delivery batch is
+        # an authorization boundary for the whole resumed turn. Once raised,
+        # keep the fence until the final-answer path clears it; a later success
+        # must not let the model retry the denied or potentially completed write.
+        if settlement.status in {"rejected", "dispatch_unknown"}:
+            self.force_final_answer_next = True
 
     @staticmethod
     def _replace_tool_result(

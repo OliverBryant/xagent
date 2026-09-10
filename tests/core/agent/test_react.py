@@ -7480,7 +7480,12 @@ async def test_resume_target_is_validated_before_callback_or_projection(
 
 
 @pytest.mark.asyncio
-async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
+@pytest.mark.parametrize("terminal_status", ["rejected", "dispatch_unknown"])
+@pytest.mark.parametrize("terminal_first", [True, False])
+async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
+    terminal_status: str,
+    terminal_first: bool,
+) -> None:
     class ResumableTool:
         metadata = SimpleNamespace(
             name="approval_gate",
@@ -7490,18 +7495,21 @@ async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
         async def resume_user_interaction(
             self, *, interaction_id: str, **_: str
         ) -> Any:
-            if interaction_id == "interaction-1":
-                return ToolInteractionSettlement.rejected()
+            if interaction_id == "terminal":
+                return ToolInteractionSettlement(status=terminal_status)  # type: ignore[arg-type]
             return ToolInteractionSettlement.succeeded({"success": True})
 
     pattern = ReActPattern()
     context = ExecutionContext(execution_id="settlement-batch")
-    for index in (1, 2):
+    interaction_ids = (
+        ["terminal", "succeeded"] if terminal_first else ["succeeded", "terminal"]
+    )
+    for index, interaction_id in enumerate(interaction_ids, 1):
         pattern.pending_tool_interaction_responses.append(
             {
                 "tool_name": "approval_gate",
                 "tool_call_id": f"call-{index}",
-                "interaction_id": f"interaction-{index}",
+                "interaction_id": interaction_id,
                 "response": "Approve",
             }
         )
@@ -7522,7 +7530,7 @@ async def test_later_success_clears_an_earlier_terminal_batch_fence() -> None:
         context=context,
         runtime=PatternRuntime(),
     )
-    assert pattern.force_final_answer_next is False
+    assert pattern.force_final_answer_next is True
 
 
 def test_resumed_success_guards_only_its_settlement_turn() -> None:

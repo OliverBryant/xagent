@@ -42,6 +42,7 @@ from ...core.agent.result import (
     normalize_tool_failure_code,
 )
 from ...core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -61,6 +62,10 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
+from ..services.actor_mcp_runtime import (
+    ActorMCPStdioSessionIdentity,
+    resolve_actor_mcp_stdio_configs,
+)
 from ..services.mcp_runtime import (
     MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
@@ -99,6 +104,7 @@ _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
 MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "authorization_required",
+        ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
         "insufficient_scope",
@@ -1685,12 +1691,12 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
-        mcp_actor_stdio_connection_adapter: Any = None,
         # Appended after every pre-existing parameter (not inserted
         # alongside its closest siblings above) so a caller still using
         # positional arguments for anything after agent_call_stack keeps
         # binding the same values it always did.
         voice: Optional[str] = None,
+        mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
@@ -1724,6 +1730,9 @@ class WebToolConfig(BaseToolConfig):
         # actor and lifecycle identity on every secret read.
         self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
         self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_actor_stdio_session_identities: dict[
+            str, ActorMCPStdioSessionIdentity
+        ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -2063,6 +2072,13 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def get_actor_mcp_stdio_session_identities(
+        self,
+    ) -> Dict[str, ActorMCPStdioSessionIdentity]:
+        """Return host-only identities that must never enter MCP configs."""
+
+        return dict(self._mcp_actor_stdio_session_identities)
 
     def _serialize_mcp_user_id(self) -> str:
         """Return the explicit identity used to isolate an MCP config."""
@@ -4043,6 +4059,7 @@ class WebToolConfig(BaseToolConfig):
         env_source_by_id: Mapping[int, Any],
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
         actor_builtin = bool(
@@ -4051,7 +4068,7 @@ class WebToolConfig(BaseToolConfig):
         )
         if actor_builtin_invalid:
             policy_diagnostic = {
-                "code": "config_load_failed",
+                "code": actor_builtin_invalid_reason,
                 "message": "MCP server configuration is unavailable",
                 "server_id": int(server.id),
                 "server_name": server.name,
@@ -4059,7 +4076,7 @@ class WebToolConfig(BaseToolConfig):
             self._mcp_oauth_diagnostics.append(policy_diagnostic)
             return self._build_unavailable_mcp_config(
                 server=server,
-                reason="config_load_failed",
+                reason=actor_builtin_invalid_reason,
                 diagnostic=policy_diagnostic,
             )
 
@@ -4523,6 +4540,7 @@ class WebToolConfig(BaseToolConfig):
         env_source_by_id: Mapping[int, Any],
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -4533,6 +4551,7 @@ class WebToolConfig(BaseToolConfig):
                 env_source_by_id=env_source_by_id,
                 actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
+                actor_builtin_invalid_reason=actor_builtin_invalid_reason,
             )
         except ConnectorRuntimeError:
             raise
@@ -4574,6 +4593,7 @@ class WebToolConfig(BaseToolConfig):
         of leaving the shared layer keyed on the run owner's personal
         shared-env hook answer."""
         self._mcp_oauth_diagnostics = []
+        self._mcp_actor_stdio_session_identities = {}
         self._reset_mcp_config_load_cache_state()
 
         # Resolved before the guarded region below: that region reports
@@ -4651,8 +4671,6 @@ class WebToolConfig(BaseToolConfig):
                     ):
                         actor_classifications[int(visible_server.id)] = (None, True)
 
-            from ..services.actor_mcp_runtime import resolve_actor_mcp_stdio_configs
-
             actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
                 self.db,
                 user_id=(int(self._user_id) if isinstance(self._user_id, int) else 0),
@@ -4663,6 +4681,12 @@ class WebToolConfig(BaseToolConfig):
             )
             for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
                 actor_classifications[blocked_server_id] = (None, True)
+            actor_stdio_block_reasons = dict(
+                actor_stdio_resolution.blocked_server_reasons
+            )
+            self._mcp_actor_stdio_session_identities = dict(
+                actor_stdio_resolution.session_identities
+            )
 
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
@@ -4752,6 +4776,9 @@ class WebToolConfig(BaseToolConfig):
                 actor_builtin_invalid=actor_classifications.get(
                     int(server.id), (None, False)
                 )[1],
+                actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
+                    int(server.id), "config_load_failed"
+                ),
             )
             for server in servers
         ]

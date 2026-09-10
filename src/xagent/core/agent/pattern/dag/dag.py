@@ -218,10 +218,12 @@ class _DAGStepRuntime:
                     if step_id != self.step_id
                 ]
             if had_context:
+                assert context_before is not None
                 self.dag_pattern.active_step_contexts[self.step_id] = context_before
             else:
                 self.dag_pattern.active_step_contexts.pop(self.step_id, None)
             if had_state:
+                assert state_before is not None
                 self.dag_pattern.active_step_pattern_states[self.step_id] = state_before
             else:
                 self.dag_pattern.active_step_pattern_states.pop(self.step_id, None)

@@ -71,7 +71,6 @@ from xagent.config import (
     PUBLIC_API_BASE_URL,
     REDIS_URL,
     S2S_API_BASE_URL,
-    CHROME_SESSION_TTL_SECONDS,
     SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -182,7 +181,6 @@ from xagent.config import (
     get_public_api_base_url,
     get_redis_url,
     get_s2s_api_base_url,
-    get_chrome_session_ttl_seconds,
     get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -2620,19 +2618,6 @@ class TestGetSandboxIdleTtl:
         for value in ("nan", "NaN", "inf", "-inf"):
             monkeypatch.setenv(SANDBOX_IDLE_TTL, value)
             assert get_sandbox_idle_ttl() is None
-
-
-class TestGetChromeReaperThreshold:
-    def test_default_and_valid_override(self, monkeypatch):
-        monkeypatch.delenv(CHROME_SESSION_TTL_SECONDS, raising=False)
-        assert get_chrome_session_ttl_seconds() == 1800.0
-        monkeypatch.setenv(CHROME_SESSION_TTL_SECONDS, "45.5")
-        assert get_chrome_session_ttl_seconds() == 45.5
-
-    @pytest.mark.parametrize("value", ["", "invalid", "0", "-1", "nan", "inf"])
-    def test_invalid_values_keep_component_default(self, monkeypatch, value):
-        monkeypatch.setenv(CHROME_SESSION_TTL_SECONDS, value)
-        assert get_chrome_session_ttl_seconds() == 1800.0
 
 
 class TestGetSandboxSweepInterval:

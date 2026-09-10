@@ -15,14 +15,12 @@ import logging
 import posixpath
 import re
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any, AsyncIterator, cast
 
-from ......config import get_chrome_session_ttl_seconds
 from ......sandbox.base import Sandbox
 from ....core.mcp.sessions import Connection
 from .chrome_daemon_runner import CHROME_DEVTOOLS_PACKAGE
@@ -41,6 +39,7 @@ _SCOPE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_FILE_PREFIX = "/tmp/xagent_chrome_daemon_"
 _RUNNER_TIMEOUT_SECONDS = 75.0
 _RUNNER_MAX_OUTPUT_BYTES = 64 * 1024
+_RUNNER_MAX_RESULT_BYTES = 64 * 1024 * 1024
 _CHROME_SANDBOX_ENV = {
     "NPM_CONFIG_CACHE": "/opt/npm-cache",
     "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1",
@@ -72,6 +71,10 @@ def chrome_metadata_connection(connection: Connection) -> Connection:
 
 class ChromeSessionContractError(RuntimeError):
     """An execution-scoped Chrome session violated its fail-closed contract."""
+
+
+class ChromeSessionTransportError(RuntimeError):
+    """A sandbox or daemon transport failed without proving contract drift."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,39 @@ class ChromeDaemonLaunchSpec:
             raise ChromeSessionContractError(
                 "Chrome daemon requires canonical headless isolated flags"
             )
+        blocked = {
+            "--auto-connect",
+            "--autoConnect",
+            "--browser-url",
+            "--browserUrl",
+            "--executable-path",
+            "--executablePath",
+            "--session-id",
+            "--sessionId",
+            "--user-data-dir",
+            "--userDataDir",
+            "--via-cli",
+            "--viaCli",
+            "--ws-endpoint",
+            "--wsEndpoint",
+        }
+        if any(arg.split("=", 1)[0] in blocked for arg in server_args):
+            raise ChromeSessionContractError(
+                "Chrome daemon args override managed isolation"
+            )
+        for index, arg in enumerate(server_args):
+            nested = None
+            if arg.startswith("--chrome-arg="):
+                nested = arg.split("=", 1)[1]
+            elif arg == "--chrome-arg" and index + 1 < len(server_args):
+                nested = server_args[index + 1]
+            if nested is not None and nested.split("=", 1)[0] in {
+                "--profile-directory",
+                "--user-data-dir",
+            }:
+                raise ChromeSessionContractError(
+                    "Chrome daemon args override managed profile"
+                )
         return cls(server_args=server_args)
 
 
@@ -173,19 +209,61 @@ class ChromeDaemonClient:
                     timeout=_RUNNER_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError as exc:
-                raise ChromeSessionContractError(
+                raise ChromeSessionTransportError(
                     f"sandbox Chrome {operation} timed out"
                 ) from exc
+            except Exception as exc:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} transport failed"
+                ) from exc
             if execution.exit_code != 0:
-                raise ChromeSessionContractError(
+                raise ChromeSessionTransportError(
                     f"sandbox Chrome {operation} failed with exit code "
                     f"{execution.exit_code}"
                 )
             try:
-                payload = json.loads(await self._sandbox.read_file(result_file))
-            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                stat_result = await asyncio.wait_for(
+                    self._sandbox.exec(
+                        "stat",
+                        "-c",
+                        "%s",
+                        result_file,
+                        max_output_bytes=128,
+                    ),
+                    timeout=_RUNNER_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} result stat failed"
+                ) from exc
+            size_text = stat_result.stdout.strip()
+            if (
+                stat_result.exit_code != 0
+                or not size_text.isascii()
+                or not size_text.isdigit()
+            ):
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} returned no result"
+                )
+            if int(size_text) > _RUNNER_MAX_RESULT_BYTES:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} result exceeded size limit"
+                )
+            try:
+                payload_text = await self._sandbox.read_file(result_file)
+            except Exception as exc:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} result read failed"
+                ) from exc
+            if len(payload_text.encode("utf-8")) > _RUNNER_MAX_RESULT_BYTES:
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} result exceeded size limit"
+                )
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError as exc:
                 raise ChromeSessionContractError(
-                    f"sandbox Chrome {operation} returned no valid result"
+                    f"sandbox Chrome {operation} returned invalid JSON"
                 ) from exc
             if not isinstance(payload, dict):
                 raise ChromeSessionContractError(
@@ -256,14 +334,46 @@ class ChromeExecutionSession:
         if not isinstance(status, Mapping):
             return False
         args = status.get("args")
-        expected_args = [
-            *self._launch.server_args,
-            "--viaCli",
-            "--experimentalStructuredContent",
-        ]
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            return False
+        expected_args: list[str] = []
+        for arg in self._launch.server_args:
+            if arg.startswith("--chrome-arg="):
+                expected_args.extend(("--chrome-arg", arg.split("=", 1)[1]))
+            else:
+                expected_args.append(arg)
+        expected_args.extend(("--viaCli", "--experimentalStructuredContent"))
+        actual_counts = Counter(args)
+        expected_counts = Counter(expected_args)
+        forbidden = {
+            "--auto-connect",
+            "--autoConnect",
+            "--browser-url",
+            "--browserUrl",
+            "--executable-path",
+            "--executablePath",
+            "--user-data-dir",
+            "--userDataDir",
+            "--ws-endpoint",
+            "--wsEndpoint",
+        }
+        for index, arg in enumerate(args):
+            nested = None
+            if arg.startswith("--chrome-arg="):
+                nested = arg.split("=", 1)[1]
+            elif arg == "--chrome-arg" and index + 1 < len(args):
+                nested = args[index + 1]
+            if nested is not None and nested.split("=", 1)[0] in {
+                "--profile-directory",
+                "--user-data-dir",
+            }:
+                return False
         return (
             status.get("version") == CHROME_DEVTOOLS_PACKAGE.rsplit("@", 1)[1]
-            and args == expected_args
+            and not any(arg.split("=", 1)[0] in forbidden for arg in args)
+            and all(
+                actual_counts[arg] >= count for arg, count in expected_counts.items()
+            )
         )
 
     async def _ensure_started_locked(self) -> None:
@@ -295,14 +405,21 @@ class ChromeExecutionSession:
             if self._closed:
                 return
             self._closed = True
+            cancelled: asyncio.CancelledError | None = None
             try:
                 if self._started:
                     await self._client.stop()
-            except BaseException:
-                logger.warning("Chrome daemon stop failed; deleting its sandbox")
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception:
+                logger.warning(
+                    "Chrome daemon stop failed; deleting its sandbox", exc_info=True
+                )
             finally:
                 self._started = False
                 await self._handle.delete()
+            if cancelled is not None:
+                raise cancelled
 
     async def close(self) -> None:
         if self._cleanup_task is None:
@@ -385,7 +502,17 @@ class ChromeExecutionSessionPool:
         session = await self.get_or_create(scope, launch)
         try:
             return await session.invoke_tool(tool_name, arguments)
+        except asyncio.CancelledError:
+            await self.close_shielded(scope)
+            raise
+        except ChromeSessionTransportError:
+            # A timeout does not prove daemon or browser state was lost. The
+            # next call performs the normal status check before reuse.
+            raise
         except ChromeSessionContractError:
+            await self.close_shielded(scope)
+            raise
+        except Exception:
             await self.close_shielded(scope)
             raise
 
@@ -410,8 +537,18 @@ class ChromeExecutionSessionPool:
         cleanup = asyncio.create_task(self.close(scope))
 
         def consume(task: asyncio.Task[None]) -> None:
-            if not task.cancelled():
-                task.exception()
+            if task.cancelled():
+                return
+            exception = task.exception()
+            if exception is not None:
+                logger.error(
+                    "Shielded Chrome cleanup failed",
+                    exc_info=(
+                        type(exception),
+                        exception,
+                        exception.__traceback__,
+                    ),
+                )
 
         try:
             await asyncio.shield(cleanup)
@@ -435,87 +572,3 @@ class ChromeExecutionSessionPool:
                 )
         if cancelled is not None:
             raise cancelled
-
-
-class ChromeLeaseState(Enum):
-    CURRENT = "current"
-    STALE = "stale"
-    UNKNOWN = "unknown"
-
-
-@dataclass(frozen=True)
-class ChromeSessionReaperCandidate:
-    """Opaque durable lifecycle record supplied by the future runtime adapter."""
-
-    lifecycle_id: str
-    created_at: datetime
-    lease_fence: str
-
-    def __post_init__(self) -> None:
-        if (
-            _SCOPE_DIGEST_RE.fullmatch(self.lifecycle_id) is None
-            or _SCOPE_DIGEST_RE.fullmatch(self.lease_fence) is None
-        ):
-            raise ValueError("Chrome lifecycle and lease fence must be opaque digests")
-        if self.created_at.tzinfo is None:
-            raise ValueError("created_at must be timezone-aware")
-
-
-class ChromeSessionReaper:
-    """Unwired TTL gate plus fail-closed lease fencing for orphan cleanup.
-
-    ``reclaim_if_stale`` must perform the final fence comparison atomically
-    with claiming/deleting the lifecycle.  The pre-classification avoids
-    unnecessary destructive calls; it is not itself the race-proof delete.
-    No production candidate store or startup/periodic sweep constructs this
-    component yet, so this class does not currently enforce a hard TTL.
-    """
-
-    def __init__(
-        self,
-        *,
-        list_candidates: Callable[
-            [], Awaitable[Sequence[ChromeSessionReaperCandidate]]
-        ],
-        classify_lease: Callable[
-            [ChromeSessionReaperCandidate], Awaitable[ChromeLeaseState]
-        ],
-        reclaim_if_stale: Callable[[ChromeSessionReaperCandidate], Awaitable[bool]],
-        ttl: timedelta | None = None,
-    ) -> None:
-        if ttl is None:
-            ttl = timedelta(seconds=get_chrome_session_ttl_seconds())
-        if ttl <= timedelta(0):
-            raise ValueError("Chrome session TTL must be positive")
-        self._list_candidates = list_candidates
-        self._classify_lease = classify_lease
-        self._reclaim_if_stale = reclaim_if_stale
-        self._ttl = ttl
-
-    async def sweep(self, *, now: datetime | None = None) -> tuple[str, ...]:
-        current_time = now or datetime.now(timezone.utc)
-        if current_time.tzinfo is None:
-            raise ValueError("now must be timezone-aware")
-        reclaimed: list[str] = []
-        for candidate in await self._list_candidates():
-            if current_time - candidate.created_at < self._ttl:
-                continue
-            try:
-                state = await self._classify_lease(candidate)
-            except Exception:
-                logger.warning(
-                    "Chrome lease classification failed for one lifecycle",
-                    exc_info=True,
-                )
-                continue
-            if state is not ChromeLeaseState.STALE:
-                continue
-            try:
-                if await self._reclaim_if_stale(candidate):
-                    reclaimed.append(candidate.lifecycle_id)
-            except Exception:
-                logger.warning(
-                    "Chrome fenced reclaim failed for one lifecycle",
-                    exc_info=True,
-                )
-        return tuple(reclaimed)

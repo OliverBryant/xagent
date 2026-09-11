@@ -367,9 +367,14 @@ def _stop(session_id: str) -> dict[str, bool]:
         if pid is not None and not _wait_for_exit(pid, 10.0):
             _terminate_expected_daemon(pid_file)
     finally:
-        socket_path.unlink(missing_ok=True)
-        pid_file.unlink(missing_ok=True)
-        shutil.rmtree(profile_root, ignore_errors=True)
+        try:
+            shutil.rmtree(socket_path.parent)
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(profile_root)
+        except OSError:
+            pass
     return {"stopped": True}
 
 

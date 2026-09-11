@@ -222,13 +222,16 @@ def test_start_refuses_to_replace_ambiguous_live_pid(tmp_path):
     run.assert_not_called()
 
 
-def test_stop_removes_private_profile_even_without_live_daemon(tmp_path):
+def test_stop_removes_daemon_home_and_private_profile_without_live_daemon(tmp_path):
     runtime = tmp_path / "runtime"
     profile = tmp_path / "profile"
     runtime.mkdir()
     profile.mkdir()
     (profile / "history").write_text("private")
     socket_path, pid_file = chrome_daemon_runner._runtime_paths("a" * 32, runtime)
+    socket_path.parent.mkdir()
+    socket_path.write_text("socket")
+    pid_file.write_text("pid")
 
     with (
         patch.object(
@@ -241,8 +244,64 @@ def test_stop_removes_private_profile_even_without_live_daemon(tmp_path):
         assert chrome_daemon_runner._stop("a" * 32) == {"stopped": True}
 
     assert not profile.exists()
-    assert not socket_path.exists()
-    assert not pid_file.exists()
+    assert not socket_path.parent.exists()
+
+
+@pytest.mark.parametrize("failed_tree", ["daemon_home", "profile"])
+def test_stop_cleanup_oserror_does_not_block_other_tree(tmp_path, failed_tree):
+    runtime = tmp_path / "runtime"
+    profile = tmp_path / "profile"
+    runtime.mkdir()
+    profile.mkdir()
+    socket_path, _pid_file = chrome_daemon_runner._runtime_paths("a" * 32, runtime)
+    daemon_home = socket_path.parent
+    daemon_home.mkdir()
+    original_rmtree = chrome_daemon_runner.shutil.rmtree
+    failed_path = daemon_home if failed_tree == "daemon_home" else profile
+    cleaned_path = profile if failed_tree == "daemon_home" else daemon_home
+
+    def remove_tree(path):
+        if path == failed_path:
+            raise OSError("injected cleanup failure")
+        original_rmtree(path)
+
+    with (
+        patch.object(
+            chrome_daemon_runner,
+            "_session_environment",
+            return_value=({}, runtime, profile),
+        ),
+        patch.object(chrome_daemon_runner, "_status", return_value=None),
+        patch.object(chrome_daemon_runner.shutil, "rmtree", side_effect=remove_tree),
+    ):
+        assert chrome_daemon_runner._stop("a" * 32) == {"stopped": True}
+
+    assert failed_path.exists()
+    assert not cleaned_path.exists()
+
+
+def test_stop_cleanup_does_not_swallow_base_exception(tmp_path):
+    runtime = tmp_path / "runtime"
+    profile = tmp_path / "profile"
+    runtime.mkdir()
+    profile.mkdir()
+    socket_path, _pid_file = chrome_daemon_runner._runtime_paths("a" * 32, runtime)
+
+    with (
+        patch.object(
+            chrome_daemon_runner,
+            "_session_environment",
+            return_value=({}, runtime, profile),
+        ),
+        patch.object(chrome_daemon_runner, "_status", return_value=None),
+        patch.object(
+            chrome_daemon_runner.shutil,
+            "rmtree",
+            side_effect=KeyboardInterrupt("stop cleanup"),
+        ),
+        pytest.raises(KeyboardInterrupt, match="stop cleanup"),
+    ):
+        chrome_daemon_runner._stop("a" * 32)
 
 
 def test_private_dir_rejects_symlink(tmp_path):

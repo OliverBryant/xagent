@@ -7,8 +7,6 @@ import pyarrow as pa  # type: ignore
 import pytest
 from filelock import FileLock, Timeout
 
-from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-
 from xagent.core.memory import vector_compatibility
 from xagent.core.memory.lancedb_maintenance import (
     MAINTENANCE_METADATA_KEY,
@@ -24,6 +22,7 @@ from xagent.core.memory.storage_admission import (
     admit_lancedb_memory_storage,
 )
 from xagent.core.memory.vector_compatibility import EmbeddingIdentity
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 IDENTITY = EmbeddingIdentity(
     "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None

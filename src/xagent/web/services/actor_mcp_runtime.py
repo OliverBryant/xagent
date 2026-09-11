@@ -10,13 +10,14 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from ... import config as xagent_config
+from ...builtin_identity import builtin_provenance_identity
 from ...core.tools.adapters.vibe.config import ACTOR_STDIO_SHADOWED_REASON
+from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
 from ..builtin_mcp_registry import (
     get_builtin_execution_fields,
     get_builtin_public_mcp_app_rows,
     get_builtin_stdio_session_scope,
 )
-from ..mcp_apps import normalize_catalog_key
 from ..models.public_mcp import PublicMCPApp
 from .actor_mcp_connections import (
     ActorMCPConnectionCredentialCorruptionError,
@@ -44,6 +45,15 @@ _ACTOR_MCP_STORAGE_ERRORS = (
 
 class ActorMCPRuntimeDefinitionError(ValueError):
     """An actor stdio identity or its canonical definition is unavailable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        drift_fields: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.drift_fields = drift_fields
 
 
 @dataclass(frozen=True)
@@ -213,11 +223,17 @@ def _reserved_stdio_keys() -> frozenset[str]:
         key
         for row in _builtin_stdio_rows()
         for key in (
-            normalize_catalog_key(row.get("app_id")),
-            normalize_catalog_key(row.get("name")),
+            _dispatch_server_key(row.get("app_id")),
+            _dispatch_server_key(row.get("name")),
         )
         if key is not None
     )
+
+
+def _dispatch_server_key(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return normalize_mcp_server_name(value)
 
 
 def _blocked_visible_server_ids(visible_servers: Sequence[Any]) -> frozenset[int]:
@@ -225,11 +241,10 @@ def _blocked_visible_server_ids(visible_servers: Sequence[Any]) -> frozenset[int
     return frozenset(
         int(server.id)
         for server in visible_servers
-        if normalize_catalog_key(getattr(server, "name", None)) in reserved
+        if _dispatch_server_key(getattr(server, "name", None)) in reserved
     )
 
 
-@cache
 def _cached_builtin_stdio_execution(app_id: str) -> dict[str, Any] | None:
     return get_builtin_execution_fields(app_id)
 
@@ -248,6 +263,20 @@ def _canonical_oauth_scopes(value: object) -> tuple[str, ...]:
     return tuple(sorted(value))
 
 
+def _trusted_launch_fingerprint(value: object) -> dict[str, Any] | None:
+    """Normalize only provenance version while retaining all trusted fields."""
+
+    if not isinstance(value, Mapping):
+        return None
+    fingerprint = dict(value)
+    if "builtin_provenance" in fingerprint:
+        identity = builtin_provenance_identity(fingerprint["builtin_provenance"])
+        if identity is None:
+            return None
+        fingerprint["builtin_provenance"] = identity
+    return fingerprint
+
+
 def _canonical_stdio_execution(
     db: Session,
     identity: ActorMCPStdioConnectionIdentity,
@@ -263,9 +292,9 @@ def _canonical_stdio_execution(
         .filter(PublicMCPApp.app_id == identity.app_id)
         .one_or_none()
     )
-    normalized_id = normalize_catalog_key(identity.app_id)
+    normalized_id = _dispatch_server_key(identity.app_id)
     collision_count = sum(
-        normalize_catalog_key(app_id) == normalized_id
+        _dispatch_server_key(app_id) == normalized_id
         for (app_id,) in db.query(PublicMCPApp.app_id).all()
     )
     if app is None or collision_count != 1:
@@ -285,18 +314,30 @@ def _canonical_stdio_execution(
         "transport": app.transport,
         "provider_name": app.provider_name,
         "oauth_scopes": _canonical_oauth_scopes(app.oauth_scopes),
-        "launch_config": app.launch_config or {},
+        "launch_config": _trusted_launch_fingerprint(app.launch_config or {}),
     }
     expected_execution = {
         "name": execution["name"],
         "transport": execution["transport"],
         "provider_name": execution["provider_name"],
         "oauth_scopes": _canonical_oauth_scopes(execution["oauth_scopes"]),
-        "launch_config": execution["launch_config"],
+        "launch_config": _trusted_launch_fingerprint(execution["launch_config"]),
     }
     if persisted_execution != expected_execution:
+        drift_fields = tuple(
+            field_name
+            for field_name in (
+                "name",
+                "transport",
+                "provider_name",
+                "oauth_scopes",
+                "launch_config",
+            )
+            if persisted_execution[field_name] != expected_execution[field_name]
+        )
         raise ActorMCPRuntimeDefinitionError(
-            "actor stdio persisted catalog definition has drifted"
+            "actor stdio persisted catalog definition has drifted",
+            drift_fields=drift_fields,
         )
 
     launch = execution.get("launch_config")
@@ -345,7 +386,12 @@ def resolve_actor_mcp_stdio_configs(
     visible_servers: Sequence[Any],
     execution_identity: MCPActorExecutionIdentity | None = None,
 ) -> ActorMCPStdioResolution:
-    """Build actor configs without consulting any persisted MCP server definition."""
+    """Build actor configs without consulting persisted server definitions.
+
+    Reserved dispatch identities remain blocked when the rollout feature is off.
+    The flag gates synthetic execution, not protection against custom-server
+    shadowing of a trusted builtin identity.
+    """
 
     if policy is None or not policy.allow_builtin_stdio:
         return ActorMCPStdioResolution((), frozenset())
@@ -401,16 +447,20 @@ def resolve_actor_mcp_stdio_configs(
                     connection=identity,
                 )
             app_keys = {
-                normalize_catalog_key(identity.app_id),
-                normalize_catalog_key(execution.get("name")),
+                _dispatch_server_key(identity.app_id),
+                _dispatch_server_key(execution.get("name")),
             }
             if any(
-                normalize_catalog_key(getattr(server, "name", None)) in app_keys
+                _dispatch_server_key(getattr(server, "name", None)) in app_keys
                 for server in visible_servers
             ):
                 continue
         except ActorMCPRuntimeDefinitionError as exc:
-            logger.info("Actor stdio definition unavailable (%s)", type(exc).__name__)
+            logger.info(
+                "Actor stdio definition unavailable (%s; drift_fields=%s)",
+                type(exc).__name__,
+                ",".join(exc.drift_fields) or "none",
+            )
             continue
         except Exception as exc:
             logger.warning(

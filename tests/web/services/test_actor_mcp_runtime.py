@@ -6,6 +6,7 @@ import json
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,7 @@ from xagent.web.services.actor_mcp_runtime import (
     ActorMCPRuntimeDefinitionError,
     ActorMCPStdioConnectionIdentity,
     ActorMCPStdioSessionIdentity,
+    _cached_builtin_stdio_execution,
     _canonical_oauth_scopes,
     production_actor_mcp_stdio_connection_adapter,
     resolve_actor_mcp_stdio_configs,
@@ -147,6 +149,15 @@ def _credentials() -> dict[str, str]:
     return {
         "POSTHOG_API_KEY": "actor-api-key",
         "POSTHOG_HOST": "https://actor.example.test",
+    }
+
+
+def _credentials_for(app_id: str, *, suffix: str = "value") -> dict[str, str]:
+    execution = get_builtin_execution_fields(app_id)
+    assert execution is not None
+    return {
+        field_name: f"{field_name.lower()}-{suffix}"
+        for field_name in execution["launch_config"].get("required_env", [])
     }
 
 
@@ -370,11 +381,80 @@ def test_production_adapter_resolves_credentials_from_storage_service(
     }
 
 
+def test_production_adapter_isolates_two_real_owner_rows(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    _seed_app(db)
+    other_user_id = USER_ID
+    other_owner = "toby:slack:T2:U2"
+    first_credentials = _credentials_for(APP_ID, suffix="first")
+    second_credentials = _credentials_for(APP_ID, suffix="second")
+    create_actor_mcp_connection(
+        db,
+        user_id=USER_ID,
+        resource_owner_key=OWNER,
+        app_id=APP_ID,
+        credentials=first_credentials,
+    )
+    create_actor_mcp_connection(
+        db,
+        user_id=other_user_id,
+        resource_owner_key=other_owner,
+        app_id=APP_ID,
+        credentials=second_credentials,
+    )
+    adapter = production_actor_mcp_stdio_connection_adapter()
+    assert [
+        identity.resource_owner_key
+        for identity in adapter.list_connection_identities(
+            db,
+            user_id=USER_ID,
+            resource_owner_key=OWNER,
+        )
+    ] == [OWNER]
+    assert [
+        identity.resource_owner_key
+        for identity in adapter.list_connection_identities(
+            db,
+            user_id=other_user_id,
+            resource_owner_key=other_owner,
+        )
+    ] == [other_owner]
+
+    first = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+    second = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=other_user_id,
+        policy=MCPActorAuthorizationPolicy(
+            resource_owner_key=other_owner,
+            allow_builtin_stdio=True,
+        ),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert first.configs[0]["config"]["env"] == {
+        **first_credentials,
+        "XAGENT_MCP_CALLER_ID": str(USER_ID),
+    }
+    assert second.configs[0]["config"]["env"] == {
+        **second_credentials,
+        "XAGENT_MCP_CALLER_ID": str(other_user_id),
+    }
+
+
 @pytest.mark.asyncio
 async def test_create_default_tools_registers_production_adapter_only_for_actor_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     captured: list[dict[str, object]] = []
 
@@ -527,6 +607,63 @@ def test_reserved_collision_reads_only_stable_server_identity(
     assert result.configs == ()
     assert result.blocked_server_ids == frozenset({73})
     assert result.blocked_server_reasons == ((73, ACTOR_STDIO_SHADOWED_REASON),)
+    assert adapter.secret_calls == []
+    assert collision.forbidden_accesses == []
+
+
+@pytest.mark.parametrize(
+    "visible_name",
+    ["google-maps", "google_maps", "google maps", "  GOOGLE_maps  "],
+)
+def test_reserved_collision_uses_dispatch_name_normalization(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    visible_name: str,
+) -> None:
+    monkeypatch.delenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", raising=False)
+    collision = _StableIdentityOnlyServer(73, visible_name)
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=None,
+        visible_servers=(collision,),
+    )
+
+    assert result.blocked_server_ids == frozenset({73})
+    assert collision.forbidden_accesses == []
+
+
+def test_per_identity_collision_uses_dispatch_name_normalization(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services import actor_mcp_runtime
+
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="google-maps")
+    adapter = _FakeAdapter(
+        _identity(app),
+        _credentials_for("google-maps"),
+    )
+    collision = _StableIdentityOnlyServer(73, "google_maps")
+    # Isolate the second collision gate: even if the aggregate blocker is
+    # accidentally bypassed, per-identity admission must still fail closed.
+    monkeypatch.setattr(
+        actor_mcp_runtime,
+        "_blocked_visible_server_ids",
+        lambda _visible_servers: frozenset(),
+    )
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(collision,),
+    )
+
+    assert result.configs == ()
     assert adapter.secret_calls == []
     assert collision.forbidden_accesses == []
 
@@ -706,6 +843,80 @@ def test_catalog_execution_drift_fails_closed_before_secret_read(
 
     assert result.configs == ()
     assert adapter.secret_calls == []
+
+
+def test_builtin_provenance_version_drift_does_not_disable_actor_stdio(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="shopify")
+    launch = deepcopy(app.launch_config)
+    launch["builtin_provenance"]["version"] = 999
+    app.launch_config = launch
+    db.flush()
+    adapter = _FakeAdapter(_identity(app), _credentials_for("shopify"))
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert len(result.configs) == 1
+    assert len(adapter.secret_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "drifted_value"),
+    [
+        ("command", "attacker"),
+        ("args", ["-m", "attacker.module"]),
+        ("required_env", ["ATTACKER_SECRET"]),
+        ("credential_scope", "shared"),
+        ("required_admin_scopes", ["read_products"]),
+        ("optional_admin_scopes", ["write_customers"]),
+        (
+            "builtin_provenance",
+            {"registry": "attacker", "app_id": "shopify", "version": 1},
+        ),
+    ],
+)
+def test_trusted_launch_fingerprint_drift_fails_closed_before_secret_read(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    drifted_value: object,
+) -> None:
+    monkeypatch.setenv("XAGENT_TOBY_PERSONAL_STDIO_ENABLED", "true")
+    app = _seed_app(db, app_id="shopify")
+    launch = deepcopy(app.launch_config)
+    launch[field_name] = drifted_value
+    app.launch_config = launch
+    db.flush()
+    adapter = _FakeAdapter(_identity(app), _credentials_for("shopify"))
+
+    result = resolve_actor_mcp_stdio_configs(
+        db,
+        user_id=USER_ID,
+        policy=_policy(),
+        adapter=adapter,
+        visible_servers=(),
+    )
+
+    assert result.configs == ()
+    assert adapter.secret_calls == []
+
+
+def test_builtin_execution_reads_return_independent_mutable_objects() -> None:
+    first = _cached_builtin_stdio_execution(APP_ID)
+    second = _cached_builtin_stdio_execution(APP_ID)
+    assert first is not None and second is not None
+
+    first["launch_config"]["command"] = "mutated"
+
+    assert second["launch_config"]["command"] != "mutated"
 
 
 def test_catalog_oauth_scope_order_is_ignored_but_content_drift_fails_closed(

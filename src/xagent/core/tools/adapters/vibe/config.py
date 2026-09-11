@@ -70,6 +70,8 @@ async def run_with_tool_runtime_cleanup(
 
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+        ACTOR_STDIO_SHADOWED_REASON,
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",

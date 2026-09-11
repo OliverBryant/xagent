@@ -503,18 +503,29 @@ class ChromeExecutionSessionPool:
         try:
             return await session.invoke_tool(tool_name, arguments)
         except asyncio.CancelledError:
-            await self.close_shielded(scope)
+            await self._close_preserving_primary_failure(scope)
             raise
         except ChromeSessionTransportError:
             # A timeout does not prove daemon or browser state was lost. The
             # next call performs the normal status check before reuse.
             raise
         except ChromeSessionContractError:
-            await self.close_shielded(scope)
+            await self._close_preserving_primary_failure(scope)
             raise
         except Exception:
-            await self.close_shielded(scope)
+            await self._close_preserving_primary_failure(scope)
             raise
+
+    async def _close_preserving_primary_failure(
+        self, scope: ChromeExecutionScope
+    ) -> None:
+        try:
+            await self.close_shielded(scope)
+        except BaseException:
+            logger.error(
+                "Chrome cleanup failed while preserving the primary failure",
+                exc_info=True,
+            )
 
     async def close(self, scope: ChromeExecutionScope) -> None:
         scope_digest = scope.digest

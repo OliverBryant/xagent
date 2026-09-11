@@ -28,6 +28,7 @@ DEFAULT_NPM_CACHE = "/opt/npm-cache"
 _CLI_TIMEOUT_SECONDS = 30.0
 _SOCKET_TIMEOUT_SECONDS = 60.0
 _MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+_kill_process = os.kill
 
 
 class ChromeDaemonRunnerError(RuntimeError):
@@ -117,15 +118,25 @@ def _wait_for_exit(pid: int, timeout: float) -> bool:
     return False
 
 
+def _signal_process(pid: int, signal_number: int) -> bool:
+    try:
+        _kill_process(pid, signal_number)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _terminate_expected_daemon(pid_file: Path) -> None:
     pid = _read_pid(pid_file)
     if pid is None:
         return
     if not _pid_is_expected_daemon(pid):
         raise ChromeDaemonRunnerError("refusing to signal an unverified daemon pid")
-    os.kill(pid, signal.SIGTERM)
+    if not _signal_process(pid, signal.SIGTERM):
+        return
     if not _wait_for_exit(pid, 3.0):
-        os.kill(pid, signal.SIGKILL)
+        if not _signal_process(pid, signal.SIGKILL):
+            return
         if not _wait_for_exit(pid, 2.0):
             raise ChromeDaemonRunnerError("daemon did not exit after SIGKILL")
 

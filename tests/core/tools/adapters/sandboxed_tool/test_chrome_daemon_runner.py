@@ -263,6 +263,65 @@ def test_terminate_refuses_unverified_pid(tmp_path):
         chrome_daemon_runner._terminate_expected_daemon(pid_file)
 
 
+def test_terminate_treats_process_exit_before_sigterm_as_success():
+    with (
+        patch.object(chrome_daemon_runner, "_read_pid", return_value=12345),
+        patch.object(
+            chrome_daemon_runner, "_pid_is_expected_daemon", return_value=True
+        ),
+        patch.object(
+            chrome_daemon_runner,
+            "_kill_process",
+            side_effect=ProcessLookupError("already exited"),
+        ) as kill,
+        patch.object(chrome_daemon_runner, "_wait_for_exit") as wait_for_exit,
+    ):
+        chrome_daemon_runner._terminate_expected_daemon(Path("unused"))
+
+    kill.assert_called_once_with(12345, chrome_daemon_runner.signal.SIGTERM)
+    wait_for_exit.assert_not_called()
+
+
+def test_terminate_treats_process_exit_before_sigkill_as_success():
+    with (
+        patch.object(chrome_daemon_runner, "_read_pid", return_value=12345),
+        patch.object(
+            chrome_daemon_runner, "_pid_is_expected_daemon", return_value=True
+        ),
+        patch.object(
+            chrome_daemon_runner,
+            "_kill_process",
+            side_effect=[None, ProcessLookupError("already exited")],
+        ) as kill,
+        patch.object(
+            chrome_daemon_runner, "_wait_for_exit", return_value=False
+        ) as wait_for_exit,
+    ):
+        chrome_daemon_runner._terminate_expected_daemon(Path("unused"))
+
+    assert kill.call_args_list == [
+        ((12345, chrome_daemon_runner.signal.SIGTERM),),
+        ((12345, chrome_daemon_runner.signal.SIGKILL),),
+    ]
+    wait_for_exit.assert_called_once_with(12345, 3.0)
+
+
+def test_terminate_propagates_signal_errors_other_than_missing_process():
+    with (
+        patch.object(chrome_daemon_runner, "_read_pid", return_value=12345),
+        patch.object(
+            chrome_daemon_runner, "_pid_is_expected_daemon", return_value=True
+        ),
+        patch.object(
+            chrome_daemon_runner,
+            "_kill_process",
+            side_effect=PermissionError("denied"),
+        ),
+    ):
+        with pytest.raises(PermissionError, match="denied"):
+            chrome_daemon_runner._terminate_expected_daemon(Path("unused"))
+
+
 @pytest.mark.parametrize(
     ("value", "expected_type", "expected"),
     [

@@ -477,6 +477,40 @@ class TestChromeExecutionSessionPool:
         delete.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "primary_failure",
+        [
+            asyncio.CancelledError("cancelled"),
+            ChromeSessionContractError("contract failure"),
+            RuntimeError("tool failure"),
+        ],
+    )
+    async def test_cleanup_failure_never_replaces_primary_failure(
+        self, primary_failure, caplog
+    ):
+        pool = ChromeExecutionSessionPool(AsyncMock())
+        scope = _scope(type(primary_failure).__name__)
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        session = AsyncMock()
+        session.invoke_tool.side_effect = primary_failure
+        pool.get_or_create = AsyncMock(return_value=session)
+        cleanup_failure = RuntimeError("cleanup failure")
+        pool.close_shielded = AsyncMock(side_effect=cleanup_failure)
+
+        with pytest.raises(type(primary_failure)) as caught:
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
+
+        assert caught.value is primary_failure
+        pool.close_shielded.assert_awaited_once_with(scope)
+        assert any(
+            record.message
+            == "Chrome cleanup failed while preserving the primary failure"
+            and record.exc_info is not None
+            and record.exc_info[1] is cleanup_failure
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_cancelled_shielded_cleanup_logs_late_failure(self, caplog):
         pool = ChromeExecutionSessionPool(AsyncMock())
         entered = asyncio.Event()

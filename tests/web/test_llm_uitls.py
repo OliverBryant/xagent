@@ -203,6 +203,66 @@ class TestGetLLMByNameWithAccess:
 
 
 class TestGetConfiguredDefaults:
+    def test_inactive_model_is_rejected_by_default_creation_boundary(
+        self, storage, mock_core_storage
+    ):
+        inactive = Mock(model_id="inactive-default", is_active=False)
+
+        assert storage._create_default_model(inactive, user_id=1) is None
+        mock_core_storage.load.assert_not_called()
+        mock_core_storage.create_llm_instance.assert_not_called()
+
+    def test_missing_general_falls_back_without_discarding_explicit_slots(
+        self, storage
+    ):
+        explicit = {
+            name: Mock(model_name=name)
+            for name in ("active-fast", "active-vision", "active-compact")
+        }
+        fallback_general = Mock(model_name="fallback-general")
+
+        with (
+            patch.object(
+                storage,
+                "get_llm_by_name_with_access",
+                side_effect=lambda name, user_id: explicit[name],
+            ),
+            patch.object(
+                storage,
+                "get_configured_defaults",
+                return_value=(fallback_general, None, None, None),
+            ) as get_defaults,
+        ):
+            result = storage.resolve_llms_from_names(
+                [None, "active-fast", "active-vision", "active-compact"],
+                user_id=7,
+            )
+
+        assert result == (
+            fallback_general,
+            explicit["active-fast"],
+            explicit["active-vision"],
+            explicit["active-compact"],
+        )
+        get_defaults.assert_called_once_with(7, config_types=("general",))
+
+    def test_missing_optional_slots_use_their_configured_defaults(self, storage):
+        general = Mock(model_name="explicit-general")
+        defaults = tuple(
+            Mock(model_name=name)
+            for name in ("unused", "default-fast", "default-vision", "default-compact")
+        )
+
+        with (
+            patch.object(storage, "get_llm_by_name_with_access", return_value=general),
+            patch.object(storage, "get_configured_defaults", return_value=defaults),
+        ):
+            result = storage.resolve_llms_from_names(
+                ["explicit-general", None, None, None], user_id=7
+            )
+
+        assert result == (general, *defaults[1:])
+
     def test_returns_user_specific_defaults(self, storage, mock_db, mock_core_storage):
         """Test that user-specific defaults are returned when available"""
         mock_llm = Mock()

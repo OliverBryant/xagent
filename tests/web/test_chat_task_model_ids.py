@@ -148,6 +148,22 @@ def sample_model_data():
     }
 
 
+def create_test_models(headers, template, specs, *, shared=False):
+    for model_id, model_name in specs:
+        payload = dict(template)
+        payload.update(
+            {
+                "model_id": model_id,
+                "model_name": model_name,
+                "share_with_users": shared,
+            }
+        )
+        assert (
+            client.post("/api/models/", json=payload, headers=headers).status_code
+            == 200
+        )
+
+
 class DummyLLM(BaseLLM):
     def __init__(self, name: str):
         self._name = name
@@ -553,6 +569,198 @@ def test_task_create_does_not_persist_inactive_owned_or_shared_model_ids(
         )
         assert response.status_code == 200, response.text
         assert response.json()["model_id"] != model_id
+
+
+def test_task_create_falls_back_general_without_replacing_active_explicit_slots(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.user import User, UserDefaultModel
+
+    model_specs = [
+        ("fallback-general-id", "fallback-general"),
+        ("inactive-general-id", "inactive-general"),
+        ("active-fast-id", "active-fast"),
+        ("active-vision-id", "active-vision"),
+        ("active-compact-id", "active-compact"),
+    ]
+    create_test_models(user1_headers, sample_model_data, model_specs)
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        fallback = db.query(Model).filter(Model.model_id == "fallback-general-id").one()
+        inactive = db.query(Model).filter(Model.model_id == "inactive-general-id").one()
+        inactive.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=user.id,
+                model_id=fallback.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "slot-wise-create",
+            "description": "desc",
+            "llm_ids": [
+                "inactive-general-id",
+                "active-fast-id",
+                "active-vision-id",
+                "active-compact-id",
+            ],
+        },
+        headers=user1_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert [
+        data["model_id"],
+        data["small_fast_model_id"],
+        data["visual_model_id"],
+        data["compact_model_id"],
+    ] == [
+        "fallback-general-id",
+        "active-fast-id",
+        "active-vision-id",
+        "active-compact-id",
+    ]
+    assert [
+        data["model_name"],
+        data["small_fast_model_name"],
+        data["visual_model_name"],
+        data["compact_model_name"],
+    ] == ["fallback-general", "active-fast", "active-vision", "active-compact"]
+
+
+def test_persisted_task_falls_back_general_without_replacing_active_slots(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User, UserDefaultModel
+    from xagent.web.services.llm_utils import resolve_task_runtime_config_core
+
+    model_specs = [
+        ("resume-fallback-id", "resume-fallback"),
+        ("resume-general-id", "resume-general"),
+        ("resume-fast-id", "resume-fast"),
+        ("resume-vision-id", "resume-vision"),
+        ("resume-compact-id", "resume-compact"),
+    ]
+    create_test_models(user1_headers, sample_model_data, model_specs)
+
+    created = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "slot-wise-resume",
+            "description": "desc",
+            "llm_ids": [
+                "resume-general-id",
+                "resume-fast-id",
+                "resume-vision-id",
+                "resume-compact-id",
+            ],
+        },
+        headers=user1_headers,
+    )
+    assert created.status_code == 200, created.text
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        fallback = db.query(Model).filter(Model.model_id == "resume-fallback-id").one()
+        general = db.query(Model).filter(Model.model_id == "resume-general-id").one()
+        general.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=user.id,
+                model_id=fallback.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+
+        task = db.get(Task, created.json()["task_id"])
+        runtime = resolve_task_runtime_config_core(task, db, user_id=user.id)
+
+        assert [llm.model_name if llm else None for llm in runtime.llms] == [
+            "resume-fallback",
+            "resume-fast",
+            "resume-vision",
+            "resume-compact",
+        ]
+    finally:
+        db.close()
+
+
+def test_task_create_shared_default_skips_inactive_and_accepts_active(
+    test_db, user1_headers, sample_model_data
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.model import Model
+    from xagent.web.models.user import User, UserDefaultModel
+
+    admin_login = client.post(
+        "/api/auth/login", json={"username": "admin", "password": "admin123"}
+    )
+    assert admin_login.status_code == 200
+    admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+    create_test_models(
+        admin_headers,
+        sample_model_data,
+        [("shared-default-id", "shared-default")],
+        shared=True,
+    )
+
+    db = next(get_db())
+    try:
+        admin = db.query(User).filter(User.username == "admin").one()
+        model = db.query(Model).filter(Model.model_id == "shared-default-id").one()
+        model.is_active = False
+        db.add(
+            UserDefaultModel(
+                user_id=admin.id,
+                model_id=model.id,
+                config_type="general",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    inactive_response = client.post(
+        "/api/chat/task/create",
+        json={"title": "inactive-shared-default", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert inactive_response.status_code == 200, inactive_response.text
+    assert inactive_response.json()["model_id"] != "shared-default-id"
+
+    db = next(get_db())
+    try:
+        model = db.query(Model).filter(Model.model_id == "shared-default-id").one()
+        model.is_active = True
+        db.commit()
+    finally:
+        db.close()
+
+    active_response = client.post(
+        "/api/chat/task/create",
+        json={"title": "active-shared-default", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert active_response.status_code == 200, active_response.text
+    assert active_response.json()["model_id"] == "shared-default-id"
+    assert active_response.json()["model_name"] == "shared-default"
 
 
 def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):

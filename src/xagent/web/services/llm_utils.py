@@ -1105,18 +1105,22 @@ class UserAwareModelStorage:
         vision_name = llm_names[2]
         compact_name = llm_names[3]
 
-        # Get default LLM (required)
-        if not default_name:
-            logger.error(
-                "Default model name is required but not provided. Using configured defaults."
-            )
-            return self.get_configured_defaults(user_id)
-
-        default_llm = self.get_llm_by_name_with_access(default_name, user_id)
+        # Resolve the required general slot independently. A missing or unavailable
+        # general model must not discard valid explicit models in the other slots.
+        default_llm = (
+            self.get_llm_by_name_with_access(default_name, user_id)
+            if default_name
+            else None
+        )
         if not default_llm:
-            logger.warning(
-                f"Default LLM '{default_name}' not found or no access, falling back to configured default"
-            )
+            if default_name:
+                logger.warning(
+                    f"Default LLM '{default_name}' not found or no access, falling back to configured default"
+                )
+            else:
+                logger.warning(
+                    "Default model name is not available; using configured default"
+                )
             default_llm, _, _, _ = self.get_configured_defaults(
                 user_id, config_types=("general",)
             )
@@ -1143,8 +1147,8 @@ class UserAwareModelStorage:
         missing_defaults = tuple(
             kind
             for kind, needed in (
-                ("small_fast", bool(fast_name) and fast_llm is None),
-                ("visual", bool(vision_name) and vision_llm is None),
+                ("small_fast", fast_llm is None),
+                ("visual", vision_llm is None),
                 ("compact", compact_llm is None),
             )
             if needed
@@ -1156,16 +1160,18 @@ class UserAwareModelStorage:
                 )
             )
 
-        if fast_name and not fast_llm:
-            logger.warning(
-                f"Fast LLM '{fast_name}' not found or no access, using configured fast default"
-            )
+        if not fast_llm:
+            if fast_name:
+                logger.warning(
+                    f"Fast LLM '{fast_name}' not found or no access, using configured fast default"
+                )
             fast_llm = default_fast_llm
 
-        if vision_name and not vision_llm:
-            logger.warning(
-                f"Vision LLM '{vision_name}' not found or no access, using configured vision default"
-            )
+        if not vision_llm:
+            if vision_name:
+                logger.warning(
+                    f"Vision LLM '{vision_name}' not found or no access, using configured vision default"
+                )
             vision_llm = default_vision_llm
 
         if compact_name:

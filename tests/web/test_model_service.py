@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserDefaultModel, UserModel
+from xagent.web.services.llm_utils import UserAwareModelStorage
 from xagent.web.services.model_service import (
     _create_default_llm_instance,
     _is_model_visible_to_user,
@@ -33,7 +34,6 @@ from xagent.web.services.model_service import (
     get_tts_models,
     get_vision_model,
 )
-from xagent.web.services.llm_utils import UserAwareModelStorage
 
 # Test database setup - use in-memory database
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"

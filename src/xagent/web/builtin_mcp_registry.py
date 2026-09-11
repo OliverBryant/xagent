@@ -1004,10 +1004,6 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Productivity",
             "oauth_scopes": None,
-            # Runtime-only metadata. This is intentionally outside
-            # launch_config so enabling execution-scoped session handling does
-            # not create persisted PublicMCPApp execution drift.
-            "stdio_session_scope": "execution",
             # Hidden until the runtime supports execution-scoped (persistent)
             # stdio MCP sessions: today every tool call spawns a fresh
             # chrome-devtools-mcp process (mcp_adapter._execute_mcp_call ->
@@ -1550,6 +1546,11 @@ _BUILTIN_EXECUTION_FIELD_NAMES = (
     "launch_config",
 )
 
+# Runtime policy must not become part of the persisted PublicMCPApp catalog
+# descriptor. Keeping this allowlist separate also preserves frozen migration
+# rows while making execution-scoped admission code-owned and fail-closed.
+_EXECUTION_SCOPED_STDIO_APP_IDS = frozenset({"chrome-devtools"})
+
 
 def _matches_builtin_provenance(
     canonical_row: dict[str, Any], persisted_launch_config: Any
@@ -1610,7 +1611,7 @@ def get_builtin_stdio_session_scope(
     """Return code-owned stdio session scope; ordinary apps are per-call."""
 
     row = get_builtin_public_mcp_app(app_id)
-    if row is not None and row.get("stdio_session_scope") == "execution":
+    if row is not None and app_id in _EXECUTION_SCOPED_STDIO_APP_IDS:
         return "execution"
     return "per_call"
 

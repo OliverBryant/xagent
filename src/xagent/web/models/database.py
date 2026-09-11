@@ -329,6 +329,7 @@ def init_db(db_url: str | None = None) -> None:
         AutoModelConfig,
         BackgroundJob,
         GmailWatchState,
+        GlobalMemoryEmbeddingAuthority,
         KBIngestTarget,
         MCPServer,
         Model,

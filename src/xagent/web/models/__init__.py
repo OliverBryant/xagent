@@ -9,6 +9,7 @@ from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
 from .gmail_watch import GmailWatchState
+from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
 from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
@@ -95,6 +96,7 @@ __all__ = [
     "BackgroundJobStatus",
     "BackgroundJobType",
     "GmailWatchState",
+    "GlobalMemoryEmbeddingAuthority",
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",

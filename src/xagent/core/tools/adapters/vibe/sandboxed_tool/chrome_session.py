@@ -436,8 +436,13 @@ class ChromeExecutionSession:
                     self._closed = True
                     self._started = False
                     if self._cleanup_task is None:
-                        self._cleanup_task = asyncio.create_task(self._handle.delete())
+                        self._cleanup_task = asyncio.create_task(
+                            self._delete_unusable_sandbox()
+                        )
                 raise
+
+    async def _delete_unusable_sandbox(self) -> None:
+        await self._handle.delete()
 
     @property
     def reusable(self) -> bool:

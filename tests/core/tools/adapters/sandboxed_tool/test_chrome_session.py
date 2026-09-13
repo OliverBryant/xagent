@@ -162,9 +162,7 @@ class TestChromeDaemonClient:
         sandbox.read_file.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_result_cleanup_timeout_marks_client_unusable(
-        self, monkeypatch
-    ):
+    async def test_result_cleanup_timeout_marks_client_unusable(self, monkeypatch):
         cleanup_started = asyncio.Event()
 
         async def exec_command(command, *args, **kwargs):

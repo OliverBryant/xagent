@@ -38,6 +38,7 @@ _CHROME_RUNNER_PATH = (
 _SCOPE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _RESULT_FILE_PREFIX = "/tmp/xagent_chrome_daemon_"
 _RUNNER_TIMEOUT_SECONDS = 75.0
+_RESULT_CLEANUP_TIMEOUT_SECONDS = 5.0
 _RUNNER_MAX_OUTPUT_BYTES = 64 * 1024
 _RUNNER_MAX_RESULT_BYTES = 64 * 1024 * 1024
 _CHROME_SANDBOX_ENV = {
@@ -179,6 +180,13 @@ class ChromeDaemonClient:
             raise ValueError("session_id must be 32 lowercase hex characters")
         self._sandbox = sandbox
         self._session_id = session_id
+        self._result_cleanup_failed = False
+
+    @property
+    def result_cleanup_failed(self) -> bool:
+        """Return whether result cleanup left this daemon unsafe to reuse."""
+
+        return self._result_cleanup_failed
 
     @staticmethod
     def _encoded_json(value: Any) -> str:
@@ -188,6 +196,7 @@ class ChromeDaemonClient:
 
     async def _run(self, operation: str, *args: str) -> dict[str, Any]:
         result_file = f"{_RESULT_FILE_PREFIX}{uuid.uuid4().hex}.json"
+        primary_failure: BaseException | None = None
         command_args = [
             _CHROME_RUNNER_PATH,
             operation,
@@ -270,11 +279,33 @@ class ChromeDaemonClient:
                     f"sandbox Chrome {operation} returned a non-object result"
                 )
             return payload
+        except BaseException as exc:
+            primary_failure = exc
+            raise
         finally:
             try:
-                await self._sandbox.exec("rm", "-f", result_file)
-            except Exception:
-                logger.debug("Chrome runner result cleanup failed", exc_info=True)
+                cleanup = await asyncio.wait_for(
+                    self._sandbox.exec("rm", "-f", result_file),
+                    timeout=_RESULT_CLEANUP_TIMEOUT_SECONDS,
+                )
+                if cleanup.exit_code != 0:
+                    raise ChromeSessionTransportError(
+                        f"sandbox Chrome {operation} result cleanup failed"
+                    )
+            except BaseException as exc:
+                self._result_cleanup_failed = True
+                if primary_failure is not None:
+                    logger.warning(
+                        "Chrome result cleanup failed while preserving the "
+                        "primary failure",
+                        exc_info=True,
+                    )
+                elif isinstance(exc, Exception):
+                    raise ChromeSessionTransportError(
+                        f"sandbox Chrome {operation} result cleanup failed"
+                    ) from exc
+                else:
+                    raise
 
     async def start(self, launch: ChromeDaemonLaunchSpec) -> dict[str, Any]:
         return await self._run(
@@ -397,8 +428,22 @@ class ChromeExecutionSession:
         self, tool_name: str, arguments: Mapping[str, Any]
     ) -> dict[str, Any]:
         async with self._lock:
-            await self._ensure_started_locked()
-            return await self._client.invoke_tool(tool_name, arguments)
+            try:
+                await self._ensure_started_locked()
+                return await self._client.invoke_tool(tool_name, arguments)
+            except BaseException:
+                if self._client.result_cleanup_failed is True:
+                    self._closed = True
+                    self._started = False
+                    if self._cleanup_task is None:
+                        self._cleanup_task = asyncio.create_task(self._handle.delete())
+                raise
+
+    @property
+    def reusable(self) -> bool:
+        """Return whether another operation may safely use this session."""
+
+        return not self._closed and self._client.result_cleanup_failed is not True
 
     async def _cleanup(self) -> None:
         async with self._lock:
@@ -506,8 +551,12 @@ class ChromeExecutionSessionPool:
             await self._close_preserving_primary_failure(scope)
             raise
         except ChromeSessionTransportError:
-            # A timeout does not prove daemon or browser state was lost. The
-            # next call performs the normal status check before reuse.
+            # Most transport failures do not prove daemon or browser state was
+            # lost, so the next call performs the normal health check. Result
+            # cleanup failure is different: a cancelled Docker exec may still
+            # be running, so that session is deleted instead of being reused.
+            if not session.reusable:
+                await self._close_preserving_primary_failure(scope)
             raise
         except ChromeSessionContractError:
             await self._close_preserving_primary_failure(scope)

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.sandboxed_tool import chrome_session
 from xagent.core.tools.adapters.vibe.sandboxed_tool.chrome_session import (
     CHROME_DEVTOOLS_PACKAGE,
     ChromeDaemonClient,
@@ -159,6 +161,32 @@ class TestChromeDaemonClient:
 
         sandbox.read_file.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_result_cleanup_timeout_marks_client_unusable(
+        self, monkeypatch
+    ):
+        cleanup_started = asyncio.Event()
+
+        async def exec_command(command, *args, **kwargs):
+            if command == "python":
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if command == "stat":
+                return ExecResult(exit_code=0, stdout="16", stderr="")
+            cleanup_started.set()
+            await asyncio.Event().wait()
+
+        sandbox = _sandbox()
+        sandbox.exec.side_effect = exec_command
+        sandbox.read_file.return_value = '{"running":true}'
+        client = ChromeDaemonClient(sandbox, session_id="b" * 32)
+        monkeypatch.setattr(chrome_session, "_RESULT_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+        with pytest.raises(ChromeSessionTransportError, match="cleanup failed"):
+            await client.status()
+
+        assert cleanup_started.is_set()
+        assert client.result_cleanup_failed is True
+
     def test_rejects_untrusted_session_names(self):
         with pytest.raises(ValueError, match="lowercase hex"):
             ChromeDaemonClient(_sandbox(), session_id="../../shared")
@@ -231,6 +259,34 @@ class TestChromeExecutionSession:
             await waiter
         release.set()
         await asyncio.wait_for(deleted.wait(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_result_cleanup_timeout_deletes_session_instead_of_reusing_it(
+        self, monkeypatch
+    ):
+        async def exec_command(command, *args, **kwargs):
+            if command == "python":
+                return ExecResult(exit_code=0, stdout="", stderr="")
+            if command == "stat":
+                return ExecResult(exit_code=0, stdout="16", stderr="")
+            await asyncio.Event().wait()
+
+        sandbox = _sandbox()
+        sandbox.exec.side_effect = exec_command
+        sandbox.read_file.return_value = json.dumps(_healthy_status())
+        delete = AsyncMock()
+        pool = ChromeExecutionSessionPool(
+            AsyncMock(return_value=ChromeSandboxHandle(sandbox, delete))
+        )
+        scope = _scope("cleanup-timeout")
+        launch = ChromeDaemonLaunchSpec.from_connection(_connection())
+        monkeypatch.setattr(chrome_session, "_RESULT_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+        with pytest.raises(ChromeSessionTransportError, match="cleanup failed"):
+            await pool.invoke_tool(scope, launch, "take_snapshot", {})
+
+        assert scope.digest not in pool._sessions
+        delete.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_status_mismatch_fails_closed(self):

@@ -1774,10 +1774,13 @@ async def startup_event() -> None:
             await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
 
-        from .services.chrome_mcp_runtime import start_chrome_lifecycle_recovery
+        if not os.getenv("PYTEST_CURRENT_TEST"):
+            from .services.chrome_mcp_runtime import start_chrome_lifecycle_recovery
 
-        with _startup_phase("durable Chrome recovery"):
-            await start_chrome_lifecycle_recovery(app)
+            with _startup_phase("durable Chrome recovery"):
+                await start_chrome_lifecycle_recovery(app)
+        else:
+            logger.info("Skipping durable Chrome recovery loop (test environment)")
 
         from ..config import get_sandbox_idle_ttl
 

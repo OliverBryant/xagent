@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import func
@@ -16,6 +18,7 @@ from ...core.model.providers import canonical_provider_name
 from ...core.utils.encryption import (
     EncryptionDecodeError,
     decrypt_value_strict,
+    derive_secret_hmac,
     get_cipher,
 )
 from ..models.global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
@@ -26,6 +29,11 @@ _DEFAULT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1/embeddings",
     "xinference": "http://localhost:9997",
 }
+_CREDENTIAL_IDENTITY_DOMAIN = b"xagent:global-memory-credential-identity:v1\0"
+# This table is introduced by the current unmerged migration, so there is no
+# production bare-digest backfill. Unknown/legacy versions deliberately fail closed.
+_CREDENTIAL_VERIFIER_PREFIX = "hmac-sha256$v1$"
+_CREDENTIAL_VERIFIER_PURPOSE = b"global-memory-embedding-authority:credential:v1"
 
 
 class AuthorityCredentialUnavailable(RuntimeError):
@@ -78,7 +86,7 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
     if provider not in _DEFAULT_ENDPOINTS:
         raise ValueError("Unsupported global memory embedding provider")
     model_name = config.model_name.strip()
-    endpoint = (config.endpoint or _DEFAULT_ENDPOINTS[provider]).strip().rstrip("/")
+    endpoint = _canonical_endpoint(config.endpoint or _DEFAULT_ENDPOINTS[provider])
     if provider == "openai" and endpoint.endswith("/v1"):
         endpoint += "/embeddings"
     instruct = config.instruct.strip() if config.instruct else None
@@ -99,8 +107,59 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
     )
 
 
-def _credential_digest(api_key: str) -> str:
-    return hashlib.sha256(api_key.encode()).hexdigest()
+def _canonical_endpoint(value: str) -> str:
+    endpoint = value.strip()
+    if any(
+        character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
+        for character in endpoint
+    ):
+        raise ValueError("Global memory embedding endpoint is invalid")
+    try:
+        parsed = urlsplit(endpoint)
+        _ = parsed.port
+    except ValueError:
+        raise ValueError("Global memory embedding endpoint is invalid") from None
+    if parsed.scheme.lower() not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError("Global memory embedding endpoint must be absolute HTTP(S)")
+    hostname = parsed.hostname
+    try:
+        if ":" in hostname:
+            ipaddress.IPv6Address(hostname)
+        elif hostname.replace(".", "").isdigit():
+            ipaddress.IPv4Address(hostname)
+        else:
+            ascii_hostname = hostname.encode("idna").decode("ascii")
+            labels = ascii_hostname.rstrip(".").split(".")
+            if len(ascii_hostname) > 253 or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or not all(
+                    character.isalnum() or character == "-" for character in label
+                )
+                for label in labels
+            ):
+                raise ValueError
+    except (UnicodeError, ValueError):
+        raise ValueError("Global memory embedding endpoint is invalid") from None
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Global memory embedding endpoint must be credential-free")
+    return endpoint.rstrip("/")
+
+
+def _credential_identity(api_key: str) -> str:
+    return hashlib.sha256(_CREDENTIAL_IDENTITY_DOMAIN + api_key.encode()).hexdigest()
+
+
+def _credential_verifier(api_key: str) -> str:
+    digest = derive_secret_hmac(api_key, purpose=_CREDENTIAL_VERIFIER_PURPOSE)
+    return f"{_CREDENTIAL_VERIFIER_PREFIX}{digest}"
 
 
 class GlobalMemoryEmbeddingAuthorityService:
@@ -130,7 +189,7 @@ class GlobalMemoryEmbeddingAuthorityService:
             "instruct": normalized.instruct,
             "max_retries": normalized.max_retries,
             "api_key_encrypted": encrypted,
-            "credential_digest": _credential_digest(secret),
+            "credential_verifier": _credential_verifier(secret),
             "configured_by_actor_subject": actor_subject,
         }
         bind = self.db.get_bind()
@@ -175,9 +234,9 @@ class GlobalMemoryEmbeddingAuthorityService:
             raise AuthorityCredentialUnavailable(
                 "Global memory embedding credential is unavailable"
             ) from None
-        digest = _credential_digest(secret)
-        stored_digest = str(row.credential_digest).encode(errors="surrogatepass")
-        if not secret or not hmac.compare_digest(digest.encode(), stored_digest):
+        verifier = _credential_verifier(secret)
+        stored_verifier = str(row.credential_verifier).encode(errors="surrogatepass")
+        if not secret or not hmac.compare_digest(verifier.encode(), stored_verifier):
             raise AuthorityCredentialUnavailable(
                 "Global memory embedding credential is unavailable"
             )
@@ -189,7 +248,7 @@ class GlobalMemoryEmbeddingAuthorityService:
             instruct=str(row.instruct) if row.instruct is not None else None,
             max_retries=int(row.max_retries),
             api_key=SecretStr(secret),
-            credential_identity=digest,
+            credential_identity=_credential_identity(secret),
         )
 
     def credential_status(self) -> str:

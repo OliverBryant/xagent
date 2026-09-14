@@ -20,7 +20,7 @@ class GlobalMemoryEmbeddingAuthority(Base):  # type: ignore[no-any-unimported]
     instruct = Column(Text, nullable=True)
     max_retries = Column(Integer, nullable=False, default=10, server_default="10")
     api_key_encrypted = Column(Text, nullable=False)
-    credential_digest = Column(String(64), nullable=False)
+    credential_verifier = Column(String(96), nullable=False)
     configured_by_actor_subject = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(

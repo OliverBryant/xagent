@@ -1,5 +1,5 @@
 """Add explicit global memory embedding authority.
-Revision ID: 20260911_global_memory_authority; Revises: 20260912_shared_task_execution
+Revision ID: 20260911_global_memory_authority; Revises: 20260914_add_hubspot_deals_write_scope
 """
 
 from typing import Sequence, Union
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260911_global_memory_authority"
-down_revision: Union[str, None] = "20260912_shared_task_execution"
+down_revision: Union[str, None] = "20260914_add_hubspot_deals_write_scope"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -30,7 +30,7 @@ def upgrade() -> None:
         sa.Column("instruct", sa.Text(), nullable=True),
         sa.Column("max_retries", sa.Integer(), nullable=False, server_default="10"),
         sa.Column("api_key_encrypted", sa.Text(), nullable=False),
-        sa.Column("credential_digest", sa.String(64), nullable=False),
+        sa.Column("credential_verifier", sa.String(96), nullable=False),
         sa.Column("configured_by_actor_subject", sa.String(64), nullable=False),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()

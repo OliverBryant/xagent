@@ -1,5 +1,5 @@
 """Add explicit global memory embedding authority.
-Revision ID: 20260911_global_memory_authority; Revises: 20260911_assistant_source_event
+Revision ID: 20260911_global_memory_authority; Revises: 20260912_shared_task_execution
 """
 
 from typing import Sequence, Union
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260911_global_memory_authority"
-down_revision: Union[str, None] = "20260911_assistant_source_event"
+down_revision: Union[str, None] = "20260912_shared_task_execution"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

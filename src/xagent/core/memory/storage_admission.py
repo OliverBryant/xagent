@@ -14,6 +14,7 @@ from .lancedb_maintenance import (
 from .vector_compatibility import (
     EmbeddingIdentity,
     VectorCompatibility,
+    _lancedb_table_exists,
     canonical_embedding_identity,
     inspect_lancedb_vector_compatibility,
     prepare_lancedb_memory_table,
@@ -27,11 +28,21 @@ QUIESCENCE_REQUIRED_DETAIL = "Persistent memory requires writer quiescence."
 class StorageAdmissionState(str, Enum):
     DORMANT = "dormant"
     ADMITTED = "admitted"
+    ABSENT = "absent"
+    QUIESCENCE_REQUIRED = "quiescence_required"
+    RETRYABLE_UNAVAILABLE = "retryable_unavailable"
+    MAINTENANCE_INCOMPLETE = "maintenance_incomplete"
     BLOCKED_REPAIR = "blocked_repair"
+
+
+class MemoryStorageMode(str, Enum):
+    VECTOR = "vector"
+    TEXT_ONLY = "text_only"
 
 
 @dataclass(frozen=True)
 class MemoryStorageCapabilities:
+    mode: MemoryStorageMode
     readable: bool
     writable: bool
     vector_search: bool
@@ -72,6 +83,17 @@ def _blocked(
     )
 
 
+def _unavailable(
+    state: StorageAdmissionState,
+    dormant: DormantLanceDBMemoryHandle,
+    detail: str,
+    maintenance: MaintenanceOutcome | None = None,
+) -> StorageAdmissionOutcome:
+    return StorageAdmissionOutcome(
+        state, dormant, maintenance=maintenance, detail=detail
+    )
+
+
 def admit_lancedb_memory_storage(
     dormant: DormantLanceDBMemoryHandle,
     expected_identity: EmbeddingIdentity | dict[str, Any],
@@ -81,9 +103,15 @@ def admit_lancedb_memory_storage(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
 ) -> StorageAdmissionOutcome:
     if writers_quiesced is not True:
-        return _blocked(dormant, QUIESCENCE_REQUIRED_DETAIL)
+        return _unavailable(
+            StorageAdmissionState.QUIESCENCE_REQUIRED,
+            dormant,
+            QUIESCENCE_REQUIRED_DETAIL,
+        )
     try:
         identity = canonical_embedding_identity(expected_identity)
+        if not _lancedb_table_exists(dormant.connection, dormant.table_name):
+            return StorageAdmissionOutcome(StorageAdmissionState.ABSENT, dormant)
         with FileLock(
             lancedb_lock_path(dormant.connection, dormant.table_name, "admission"),
             timeout=lock_timeout,
@@ -95,17 +123,52 @@ def admit_lancedb_memory_storage(
                 batch_size=batch_size,
                 lock_timeout=lock_timeout,
             )
-            if maintenance.status is not MaintenanceStatus.COMPLETE:
+            if maintenance.status is MaintenanceStatus.ABSENT:
+                return StorageAdmissionOutcome(
+                    StorageAdmissionState.ABSENT, dormant, maintenance=maintenance
+                )
+            if maintenance.status in {
+                MaintenanceStatus.INVALID_LEGACY_DATA,
+                MaintenanceStatus.INCOMPATIBLE_SCHEMA,
+            }:
                 return _blocked(dormant, REPAIR_REQUIRED_DETAIL, maintenance)
+            if maintenance.status is MaintenanceStatus.INCOMPLETE:
+                return _unavailable(
+                    StorageAdmissionState.MAINTENANCE_INCOMPLETE,
+                    dormant,
+                    ADMISSION_FAILED_DETAIL,
+                    maintenance,
+                )
+            if maintenance.status is not MaintenanceStatus.COMPLETE:
+                return _unavailable(
+                    StorageAdmissionState.RETRYABLE_UNAVAILABLE,
+                    dormant,
+                    ADMISSION_FAILED_DETAIL,
+                    maintenance,
+                )
             compatibility = inspect_lancedb_vector_compatibility(
                 dormant.connection, dormant.table_name, identity
             )
     except Timeout:
-        return _blocked(dormant, ADMISSION_FAILED_DETAIL)
+        return _unavailable(
+            StorageAdmissionState.RETRYABLE_UNAVAILABLE,
+            dormant,
+            ADMISSION_FAILED_DETAIL,
+        )
     except Exception:
-        return _blocked(dormant, ADMISSION_FAILED_DETAIL)
+        return _unavailable(
+            StorageAdmissionState.RETRYABLE_UNAVAILABLE,
+            dormant,
+            ADMISSION_FAILED_DETAIL,
+        )
 
+    mode = (
+        MemoryStorageMode.TEXT_ONLY
+        if compatibility is VectorCompatibility.MISMATCHING
+        else MemoryStorageMode.VECTOR
+    )
     capabilities = MemoryStorageCapabilities(
+        mode=mode,
         readable=True,
         writable=True,
         vector_search=compatibility is not VectorCompatibility.MISMATCHING,

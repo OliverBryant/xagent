@@ -1,4 +1,3 @@
-import importlib.metadata
 import json
 from pathlib import Path
 
@@ -12,12 +11,15 @@ from xagent.core.memory.lancedb_maintenance import (
     MAINTENANCE_METADATA_KEY,
     MAINTENANCE_TABLE_VERSION_KEY,
     MAINTENANCE_VERSION,
+    MaintenanceOutcome,
+    MaintenanceStatus,
     lancedb_lock_path,
 )
 from xagent.core.memory.storage_admission import (
     ADMISSION_FAILED_DETAIL,
     REPAIR_REQUIRED_DETAIL,
     DormantLanceDBMemoryHandle,
+    MemoryStorageMode,
     StorageAdmissionState,
     admit_lancedb_memory_storage,
 )
@@ -70,11 +72,12 @@ def _admit(connection, **kwargs):
 def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
     tmp_path, monkeypatch
 ):
-    assert importlib.metadata.version("lancedb") in {"0.24.2", "0.29.2", "0.37.1"}
     connection = _connection(tmp_path)
     before_version = _snapshot(connection)[0]
     scanned = []
+    null_types = []
     original = vector_compatibility._checkpoint
+    original_nulls = vector_compatibility.pa.nulls
 
     def observe(stage, batch=None):
         if stage == "scan_batch":
@@ -82,16 +85,24 @@ def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
         original(stage, batch)
 
     monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+
+    def observe_nulls(size, type):
+        null_types.append(type)
+        return original_nulls(size, type)
+
+    monkeypatch.setattr(vector_compatibility.pa, "nulls", observe_nulls)
     outcome = _admit(connection)
     table = connection.open_table("memories")
     field = table.schema.field("user_id")
     assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.VECTOR
     assert outcome.admitted.capabilities.vector_search is True
     assert table.version == before_version + 1
     assert field.metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
     assert field.metadata[MAINTENANCE_TABLE_VERSION_KEY] == str(table.version).encode()
     assert table.schema.field("vector").type == pa.list_(pa.float32(), 4)
     assert table.to_arrow()["vector"].to_pylist() == [None] * 5
+    assert null_types == [pa.list_(pa.float32(), 4)] * 3
     assert scanned == [2, 2, 1]
     scanned.clear()
     assert _admit(connection).state is StorageAdmissionState.ADMITTED
@@ -105,6 +116,18 @@ def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monke
     assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
     assert outcome.detail == REPAIR_REQUIRED_DETAIL
     assert _snapshot(invalid) == before
+    assert not list((tmp_path / "invalid").glob(".memory-stage-*"))
+    assert not list((tmp_path / "invalid").glob(".memory-seen-*"))
+
+    incompatible = lancedb.connect(tmp_path / "incompatible")
+    table = incompatible.create_table(
+        "memories",
+        pa.table({"id": [1], "text": ["text"], "metadata": ["{}"]}),
+    )
+    _safe_close_table(table)
+    before = _snapshot(incompatible)
+    assert _admit(incompatible).state is StorageAdmissionState.BLOCKED_REPAIR
+    assert _snapshot(incompatible) == before
 
     connection = _connection(tmp_path / "failure")
     before = _snapshot(connection)
@@ -115,10 +138,119 @@ def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monke
 
     monkeypatch.setattr(vector_compatibility, "_checkpoint", fail)
     outcome = _admit(connection)
-    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
     assert outcome.detail == ADMISSION_FAILED_DETAIL
     assert "secret" not in outcome.detail
     assert _snapshot(connection) == before
+
+
+def test_absent_is_read_only_and_pagination_finds_late_table(tmp_path):
+    absent_path = tmp_path / "absent"
+    connection = lancedb.connect(absent_path)
+    before = set(absent_path.iterdir())
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ABSENT
+    assert set(absent_path.iterdir()) == before
+    assert list(connection.table_names(limit=100)) == []
+
+    paged = lancedb.connect(tmp_path / "paged")
+    for index in range(11):
+        table = paged.create_table(
+            f"decoy-{index:02d}", schema=pa.schema([("x", pa.string())])
+        )
+        _safe_close_table(table)
+    table = paged.create_table(
+        "memories",
+        pa.table({"id": ["kept"], "text": ["text"], "metadata": ["{}"]}),
+    )
+    _safe_close_table(table)
+    assert _admit(paged).state is StorageAdmissionState.ADMITTED
+
+
+def test_typed_unavailable_states_and_safe_details(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    dormant = DormantLanceDBMemoryHandle(connection, "memories")
+    outcome = admit_lancedb_memory_storage(dormant, IDENTITY, writers_quiesced=False)
+    assert outcome.state is StorageAdmissionState.QUIESCENCE_REQUIRED
+
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    with FileLock(admission_path):
+        outcome = _admit(connection, lock_timeout=0)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+    monkeypatch.setattr(
+        "xagent.core.memory.storage_admission.prepare_lancedb_memory_table",
+        lambda *_args, **_kwargs: MaintenanceOutcome(MaintenanceStatus.INCOMPLETE),
+    )
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.MAINTENANCE_INCOMPLETE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+    def fail_discovery(*_args, **_kwargs):
+        raise OSError("credential at /private/backend")
+
+    monkeypatch.setattr(
+        "xagent.core.memory.storage_admission._lancedb_table_exists", fail_discovery
+    )
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
+
+
+def test_mismatching_vectors_have_typed_text_only_capability(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["legacy"],
+                "text": ["text"],
+                "metadata": ["{}"],
+                "vector": pa.array([[1.0] * 4], pa.list_(pa.float32(), 4)),
+            }
+        ),
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.TEXT_ONLY
+    assert outcome.admitted.capabilities.vector_search is False
+
+
+def test_distant_duplicate_is_rejected_without_mutation(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["duplicate", "middle", "duplicate"],
+                "text": ["a", "b", "c"],
+                "metadata": ["{}", "{}", "{}"],
+            }
+        ),
+    )
+    _safe_close_table(table)
+    before = _snapshot(connection)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert _snapshot(connection) == before
+
+
+def test_post_commit_cleanup_failure_keeps_success(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    original = vector_compatibility.os.unlink
+
+    def fail_cleanup(path):
+        if ".memory-" in Path(path).name:
+            raise PermissionError("private path must not escape")
+        original(path)
+
+    monkeypatch.setattr(vector_compatibility.os, "unlink", fail_cleanup)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.detail is None
+    assert _snapshot(connection)[0] == 2
 
 
 def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
@@ -143,6 +275,6 @@ def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
         path
         for path in source_root.rglob("*.py")
         if path.name != "__init__.py"
-        and "admit_lancedb_memory_storage(" in path.read_text()
+        and "admit_lancedb_memory_storage(" in path.read_text(encoding="utf-8")
     ]
     assert callers == [source_root / "core" / "memory" / "storage_admission.py"]

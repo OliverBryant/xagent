@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -14,7 +15,6 @@ from filelock import FileLock
 
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from ..tools.core.RAG_tools.utils.lancedb_query_utils import list_table_names
 from . import lancedb_maintenance as maintenance
 from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, derive_scope_columns
 
@@ -188,17 +188,55 @@ def inspect_lancedb_vector_compatibility(
         _safe_close_table(table)
 
 
-def _validated_rows(batch: Any, seen: set[str]) -> list[tuple[int | None, list[str]]]:
+def _lancedb_table_exists(connection: Any, table_name: str) -> bool:
+    """Find a table through every supported metadata page without materializing all."""
+    legacy = getattr(connection, "table_names", None)
+    if legacy is not None:
+        page_token = None
+        while True:
+            page = [str(name) for name in legacy(page_token=page_token, limit=10)]
+            if table_name in page:
+                return True
+            if len(page) < 10:
+                return False
+            next_token = page[-1]
+            if next_token == page_token:
+                raise RuntimeError("LanceDB table pagination did not advance")
+            page_token = next_token
+
+    modern = getattr(connection, "list_tables", None)
+    if modern is None:
+        return False
+    page_token = None
+    while True:
+        response = modern(page_token=page_token, limit=10)
+        raw = response.tables if hasattr(response, "tables") else response
+        if isinstance(raw, str):
+            raw = [raw]
+        if table_name in {str(name) for name in raw}:
+            return True
+        next_token = getattr(response, "page_token", None)
+        if not next_token:
+            return False
+        if next_token == page_token:
+            raise RuntimeError("LanceDB table pagination did not advance")
+        page_token = next_token
+
+
+def _validated_rows(
+    batch: Any, seen: sqlite3.Connection
+) -> list[tuple[int | None, list[str]]]:
     derived = []
     for row in batch.select(["id", "metadata"]).to_pylist():
         identity, metadata = row["id"], row["metadata"]
         if not isinstance(identity, str) or not identity:
             raise ValueError("legacy IDs must be non-empty strings")
-        if identity in seen:
+        try:
+            seen.execute("INSERT INTO seen_ids VALUES (?)", (identity,))
+        except sqlite3.IntegrityError:
             raise ValueError("legacy IDs must be unique")
         if metadata is not None and not isinstance(metadata, str):
             raise ValueError("legacy metadata must be a string or SQL NULL")
-        seen.add(identity)
         scope = derive_scope_columns(metadata)
         if scope[0] is not None and not -(2**63) <= scope[0] < 2**63:
             raise ValueError("legacy user_id must fit signed int64")
@@ -236,29 +274,43 @@ def _prepared_schema(schema: Any, identity: EmbeddingIdentity, version: int) -> 
 
 
 def _stage_batches(
-    table: Any, schema: Any, batch_size: int, path: str, stats: dict[str, int]
+    table: Any,
+    schema: Any,
+    batch_size: int,
+    path: str,
+    seen_path: str,
+    stats: dict[str, int],
 ) -> None:
-    seen: set[str] = set()
-    with pa.OSFile(path, "wb") as sink, pa.ipc.new_file(sink, schema) as writer:
-        for batch in table.search().to_batches(batch_size=batch_size):
-            _checkpoint("scan_batch", batch.num_rows)
-            derived = _validated_rows(batch, seen)
-            arrays = []
-            for field in schema:
-                if field.name == USER_ID_COLUMN:
-                    arrays.append(pa.array([value[0] for value in derived], pa.int64()))
-                elif field.name == SCOPE_DIMS_COLUMN:
-                    arrays.append(
-                        pa.array([value[1] for value in derived], pa.list_(pa.string()))
-                    )
-                elif field.name == "vector" and "vector" not in batch.schema.names:
-                    arrays.append(pa.nulls(batch.num_rows, field.type))
-                else:
-                    arrays.append(
-                        batch.column(batch.schema.get_field_index(field.name))
-                    )
-            stats["rows"] += batch.num_rows
-            writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
+    seen = sqlite3.connect(seen_path)
+    try:
+        seen.execute("CREATE TABLE seen_ids (id TEXT PRIMARY KEY) WITHOUT ROWID")
+        with pa.OSFile(path, "wb") as sink, pa.ipc.new_file(sink, schema) as writer:
+            for batch in table.search().to_batches(batch_size=batch_size):
+                _checkpoint("scan_batch", batch.num_rows)
+                derived = _validated_rows(batch, seen)
+                arrays = []
+                for field in schema:
+                    if field.name == USER_ID_COLUMN:
+                        arrays.append(
+                            pa.array([value[0] for value in derived], pa.int64())
+                        )
+                    elif field.name == SCOPE_DIMS_COLUMN:
+                        arrays.append(
+                            pa.array(
+                                [value[1] for value in derived], pa.list_(pa.string())
+                            )
+                        )
+                    elif field.name == "vector" and "vector" not in batch.schema.names:
+                        arrays.append(pa.nulls(batch.num_rows, field.type))
+                    else:
+                        arrays.append(
+                            batch.column(batch.schema.get_field_index(field.name))
+                        )
+                stats["rows"] += batch.num_rows
+                writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
+                seen.commit()
+    finally:
+        seen.close()
 
 
 def prepare_lancedb_memory_table(
@@ -271,33 +323,16 @@ def prepare_lancedb_memory_table(
 ) -> maintenance.MaintenanceOutcome:
     """Atomically add scope/vector columns using one bounded-memory scan."""
     identity = canonical_embedding_identity(expected_identity)
+    if not _lancedb_table_exists(connection, table_name):
+        return maintenance.MaintenanceOutcome(maintenance.MaintenanceStatus.ABSENT)
     lock_path = maintenance.lancedb_lock_path(connection, table_name, "maintenance")
     with FileLock(lock_path, timeout=lock_timeout):
-        if table_name not in list_table_names(connection):
-            schema = _prepared_schema(
-                pa.schema(
-                    [
-                        ("id", pa.string()),
-                        ("text", pa.string()),
-                        ("metadata", pa.string()),
-                    ]
-                ),
-                identity,
-                1,
-            )
-            created = connection.create_table(table_name, schema=schema)
-            try:
-                status = (
-                    maintenance.MaintenanceStatus.COMPLETE
-                    if int(created.version) == 1
-                    else maintenance.MaintenanceStatus.INCOMPLETE
-                )
-            finally:
-                _safe_close_table(created)
-            return maintenance.MaintenanceOutcome(status, batches_committed=1)
+        if not _lancedb_table_exists(connection, table_name):
+            return maintenance.MaintenanceOutcome(maintenance.MaintenanceStatus.ABSENT)
 
         table = connection.open_table(table_name)
         staged_path = ""
+        seen_path = ""
         try:
             if maintenance._is_complete(table) and "vector" in table.schema.names:
                 return maintenance.MaintenanceOutcome(
@@ -331,9 +366,16 @@ def prepare_lancedb_memory_table(
                 delete=False,
             ) as staged:
                 staged_path = staged.name
+            with tempfile.NamedTemporaryFile(
+                dir=os.path.dirname(lock_path),
+                prefix=".memory-seen-",
+                suffix=".sqlite",
+                delete=False,
+            ) as seen_file:
+                seen_path = seen_file.name
             stats = {"rows": 0}
             try:
-                _stage_batches(table, schema, batch_size, staged_path, stats)
+                _stage_batches(table, schema, batch_size, staged_path, seen_path, stats)
             except ValueError as exc:
                 return maintenance.MaintenanceOutcome(
                     maintenance.MaintenanceStatus.INVALID_LEGACY_DATA,
@@ -371,8 +413,12 @@ def prepare_lancedb_memory_table(
             )
         finally:
             _safe_close_table(table)
-            if staged_path:
-                os.unlink(staged_path)
+            for path in (staged_path, seen_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
 
 def create_or_recreate_vector_capable_table(
@@ -393,6 +439,27 @@ def create_or_recreate_vector_capable_table(
     )
 
     identity = canonical_embedding_identity(expected_identity)
+    admission_path = maintenance.lancedb_lock_path(connection, table_name, "admission")
+    with FileLock(admission_path, timeout=DEFAULT_LOCK_TIMEOUT):
+        if not _lancedb_table_exists(connection, table_name):
+            schema = _prepared_schema(
+                pa.schema(
+                    [
+                        ("id", pa.string()),
+                        ("text", pa.string()),
+                        ("metadata", pa.string()),
+                    ]
+                ),
+                identity,
+                1,
+            )
+            created = connection.create_table(table_name, schema=schema)
+            try:
+                if int(created.version) != 1:
+                    raise RuntimeError("created memory table has an unexpected version")
+            finally:
+                _safe_close_table(created)
+            return VectorCompatibility.MATCHING
     outcome = prepare_lancedb_memory_table(
         connection,
         table_name,

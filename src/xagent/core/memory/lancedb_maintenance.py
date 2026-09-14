@@ -29,6 +29,7 @@ _INT64_MAX = 2**63 - 1
 
 
 class MaintenanceStatus(str, Enum):
+    ABSENT = "absent"
     COMPLETE = "complete"
     INCOMPLETE = "incomplete"
     INVALID_LEGACY_DATA = "invalid_legacy_data"

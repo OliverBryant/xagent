@@ -14,9 +14,9 @@ from .lancedb_maintenance import (
 from .vector_compatibility import (
     EmbeddingIdentity,
     VectorCompatibility,
+    _inspect_lancedb_vector_state,
     _lancedb_table_exists,
     canonical_embedding_identity,
-    inspect_lancedb_vector_compatibility,
     prepare_lancedb_memory_table,
 )
 
@@ -110,12 +110,15 @@ def admit_lancedb_memory_storage(
         )
     try:
         identity = canonical_embedding_identity(expected_identity)
-        if not _lancedb_table_exists(dormant.connection, dormant.table_name):
-            return StorageAdmissionOutcome(StorageAdmissionState.ABSENT, dormant)
         with FileLock(
             lancedb_lock_path(dormant.connection, dormant.table_name, "admission"),
             timeout=lock_timeout,
         ):
+            if not _lancedb_table_exists(dormant.connection, dormant.table_name):
+                return StorageAdmissionOutcome(StorageAdmissionState.ABSENT, dormant)
+            had_vector, compatibility = _inspect_lancedb_vector_state(
+                dormant.connection, dormant.table_name, identity
+            )
             maintenance = prepare_lancedb_memory_table(
                 dormant.connection,
                 dormant.table_name,
@@ -146,9 +149,8 @@ def admit_lancedb_memory_storage(
                     ADMISSION_FAILED_DETAIL,
                     maintenance,
                 )
-            compatibility = inspect_lancedb_vector_compatibility(
-                dormant.connection, dormant.table_name, identity
-            )
+            if not had_vector:
+                compatibility = VectorCompatibility.MATCHING
     except Timeout:
         return _unavailable(
             StorageAdmissionState.RETRYABLE_UNAVAILABLE,

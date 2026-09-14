@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import tempfile
@@ -181,9 +182,21 @@ def inspect_lancedb_vector_compatibility(
     expected_identity: EmbeddingIdentity | EmbeddingModelConfig | Mapping[str, Any],
 ) -> VectorCompatibility:
     """Inspect one existing LanceDB table using only its Arrow schema metadata."""
+    return _inspect_lancedb_vector_state(connection, table_name, expected_identity)[1]
+
+
+def _inspect_lancedb_vector_state(
+    connection: Any,
+    table_name: str,
+    expected_identity: EmbeddingIdentity | EmbeddingModelConfig | Mapping[str, Any],
+) -> tuple[bool, VectorCompatibility]:
+    """Return vector presence and compatibility from one schema read."""
     table = connection.open_table(table_name)
     try:
-        return classify_vector_compatibility(table.schema, expected_identity)
+        return (
+            "vector" in table.schema.names,
+            classify_vector_compatibility(table.schema, expected_identity),
+        )
     finally:
         _safe_close_table(table)
 
@@ -237,11 +250,30 @@ def _validated_rows(
             raise ValueError("legacy IDs must be unique")
         if metadata is not None and not isinstance(metadata, str):
             raise ValueError("legacy metadata must be a string or SQL NULL")
-        scope = derive_scope_columns(metadata)
+        try:
+            scope = derive_scope_columns(metadata)
+        except OverflowError as exc:
+            raise ValueError(
+                "legacy user_id must be finite and fit signed int64"
+            ) from exc
         if scope[0] is not None and not -(2**63) <= scope[0] < 2**63:
             raise ValueError("legacy user_id must fit signed int64")
         derived.append(scope)
     return derived
+
+
+def _validate_existing_vectors(batch: Any, vector_type: _ArrowDataType) -> None:
+    """Reject malformed persisted vectors before the atomic overwrite."""
+    vectors = batch.column(batch.schema.get_field_index("vector")).to_pylist()
+    for vector in vectors:
+        if vector is None:
+            continue
+        if len(vector) != vector_type.list_size or any(
+            value is None or not math.isfinite(value) for value in vector
+        ):
+            raise ValueError(
+                "legacy vectors must match their declared dimension and be finite"
+            )
 
 
 def _prepared_schema(schema: Any, identity: EmbeddingIdentity, version: int) -> Any:
@@ -287,6 +319,8 @@ def _stage_batches(
         with pa.OSFile(path, "wb") as sink, pa.ipc.new_file(sink, schema) as writer:
             for batch in table.search().to_batches(batch_size=batch_size):
                 _checkpoint("scan_batch", batch.num_rows)
+                if "vector" in batch.schema.names:
+                    _validate_existing_vectors(batch, schema.field("vector").type)
                 derived = _validated_rows(batch, seen)
                 arrays = []
                 for field in schema:
@@ -357,6 +391,15 @@ def prepare_lancedb_memory_table(
                 return maintenance.MaintenanceOutcome(
                     maintenance.MaintenanceStatus.INCOMPATIBLE_SCHEMA
                 )
+            if "vector" in table.schema.names:
+                vector_type = table.schema.field("vector").type
+                if not (
+                    pa.types.is_fixed_size_list(vector_type)
+                    and vector_type.value_type == pa.float32()
+                ):
+                    return maintenance.MaintenanceOutcome(
+                        maintenance.MaintenanceStatus.INCOMPATIBLE_SCHEMA
+                    )
             expected_version = int(table.version) + 1
             schema = _prepared_schema(table.schema, identity, expected_version)
             with tempfile.NamedTemporaryFile(

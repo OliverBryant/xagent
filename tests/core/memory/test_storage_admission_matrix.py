@@ -1,4 +1,6 @@
 import json
+import math
+import multiprocessing
 from pathlib import Path
 
 import lancedb  # type: ignore
@@ -6,7 +8,7 @@ import pyarrow as pa  # type: ignore
 import pytest
 from filelock import FileLock, Timeout
 
-from xagent.core.memory import vector_compatibility
+from xagent.core.memory import storage_admission, vector_compatibility
 from xagent.core.memory.lancedb_maintenance import (
     MAINTENANCE_METADATA_KEY,
     MAINTENANCE_TABLE_VERSION_KEY,
@@ -67,6 +69,24 @@ def _admit(connection, **kwargs):
         batch_size=2,
         **kwargs,
     )
+
+
+def _admit_after_lock_attempt(database_path, attempted, results):
+    original_lock = storage_admission.FileLock
+
+    class SignalingLock:
+        def __init__(self, *args, **kwargs):
+            self._lock = original_lock(*args, **kwargs)
+
+        def __enter__(self):
+            attempted.set()
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+    storage_admission.FileLock = SignalingLock
+    results.put(_admit(lancedb.connect(database_path)).state.value)
 
 
 def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
@@ -144,13 +164,14 @@ def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monke
     assert _snapshot(connection) == before
 
 
-def test_absent_is_read_only_and_pagination_finds_late_table(tmp_path):
+def test_absent_leaves_only_coordination_lock_and_pagination_finds_late_table(tmp_path):
     absent_path = tmp_path / "absent"
     connection = lancedb.connect(absent_path)
     before = set(absent_path.iterdir())
+    admission_path = Path(lancedb_lock_path(connection, "memories", "admission"))
     outcome = _admit(connection)
     assert outcome.state is StorageAdmissionState.ABSENT
-    assert set(absent_path.iterdir()) == before
+    assert set(absent_path.iterdir()) == before | {admission_path}
     assert list(connection.table_names(limit=100)) == []
 
     paged = lancedb.connect(tmp_path / "paged")
@@ -165,6 +186,34 @@ def test_absent_is_read_only_and_pagination_finds_late_table(tmp_path):
     )
     _safe_close_table(table)
     assert _admit(paged).state is StorageAdmissionState.ADMITTED
+
+
+def test_absent_admission_waits_for_lifecycle_lock(tmp_path):
+    database_path = tmp_path / "lifecycle-race"
+    connection = lancedb.connect(database_path)
+    admission_path = lancedb_lock_path(connection, "memories", "admission")
+    context = multiprocessing.get_context("spawn")
+    attempted = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_admit_after_lock_attempt,
+        args=(str(database_path), attempted, results),
+    )
+
+    with FileLock(admission_path):
+        process.start()
+        assert attempted.wait(10)
+        table = connection.create_table(
+            "memories",
+            pa.table({"id": ["created"], "text": ["text"], "metadata": ["{}"]}),
+        )
+        _safe_close_table(table)
+    process.join(20)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+    assert process.exitcode == 0
+    assert results.get(timeout=5) == StorageAdmissionState.ADMITTED.value
 
 
 def test_typed_unavailable_states_and_safe_details(tmp_path, monkeypatch):
@@ -216,6 +265,101 @@ def test_mismatching_vectors_have_typed_text_only_capability(tmp_path):
     assert outcome.state is StorageAdmissionState.ADMITTED
     assert outcome.admitted.capabilities.mode is MemoryStorageMode.TEXT_ONLY
     assert outcome.admitted.capabilities.vector_search is False
+
+
+@pytest.mark.parametrize("case", ["nan", "wrong_length"])
+def test_malformed_existing_vectors_are_blocked_without_mutation(tmp_path, case):
+    connection = lancedb.connect(tmp_path)
+    vectors = [[math.nan, 0.0, 0.0, 0.0]]
+    vector_type = pa.list_(pa.float32(), 4)
+    if case == "wrong_length":
+        vectors = [[1.0, 2.0, 3.0, 4.0], [1.0, 2.0]]
+        vector_type = pa.list_(pa.float32())
+    rows = len(vectors)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": [f"note-{index}" for index in range(rows)],
+                "text": ["text"] * rows,
+                "metadata": ["{}"] * rows,
+                "badvec": pa.array(vectors, type=vector_type),
+            }
+        ),
+    )
+    table.alter_columns({"path": "badvec", "rename": "vector"})
+    _safe_close_table(table)
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+    after = _snapshot(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert after[:2] == before[:2]
+    if case == "nan":
+        assert math.isnan(after[2][0]["vector"][0])
+    else:
+        assert after[2] == before[2]
+
+
+def test_existing_null_vectors_are_preserved(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    vector_type = pa.list_(pa.float32(), 4)
+    table = connection.create_table(
+        "memories",
+        pa.table(
+            {
+                "id": ["null", "valid"],
+                "text": ["a", "b"],
+                "metadata": ["{}", "{}"],
+                "vector": pa.array([None, [1.0, 2.0, 3.0, 4.0]], vector_type),
+            }
+        ),
+        on_bad_vectors="null",
+    )
+    _safe_close_table(table)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert _snapshot(connection)[2][0]["vector"] is None
+
+
+def test_compatibility_is_not_reinspected_after_commit(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    original = storage_admission._inspect_lancedb_vector_state
+    inspected_versions = []
+
+    def fail_after_commit(*args, **kwargs):
+        table = connection.open_table("memories")
+        try:
+            inspected_versions.append(int(table.version))
+            if int(table.version) > 1:
+                raise OSError("post-commit inspection failed")
+        finally:
+            _safe_close_table(table)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        storage_admission, "_inspect_lancedb_vector_state", fail_after_commit
+    )
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert inspected_versions == [1]
+    assert _snapshot(connection)[0] == 2
+
+
+@pytest.mark.parametrize("metadata", ['{"user_id":1e309}', '{"user_id":Infinity}'])
+def test_nonfinite_legacy_user_id_requires_repair(tmp_path, metadata):
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        "memories",
+        pa.table({"id": ["bad"], "text": ["text"], "metadata": [metadata]}),
+    )
+    _safe_close_table(table)
+    before = _snapshot(connection)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert _snapshot(connection) == before
 
 
 def test_distant_duplicate_is_rejected_without_mutation(tmp_path):

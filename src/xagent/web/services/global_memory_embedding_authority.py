@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -175,7 +176,8 @@ class GlobalMemoryEmbeddingAuthorityService:
                 "Global memory embedding credential is unavailable"
             ) from None
         digest = _credential_digest(secret)
-        if not secret or digest != row.credential_digest:
+        stored_digest = str(row.credential_digest).encode(errors="surrogatepass")
+        if not secret or not hmac.compare_digest(digest.encode(), stored_digest):
             raise AuthorityCredentialUnavailable(
                 "Global memory embedding credential is unavailable"
             )

@@ -1,6 +1,5 @@
 """Add explicit global memory embedding authority.
-Revision ID: 20260911_global_memory_authority
-Revises: 20260911_assistant_source_event
+Revision ID: 20260911_global_memory_authority; Revises: 20260911_assistant_source_event
 """
 
 from typing import Sequence, Union
@@ -29,7 +28,7 @@ def upgrade() -> None:
         sa.Column("base_url", sa.String(500), nullable=False),
         sa.Column("dimension", sa.Integer(), nullable=False),
         sa.Column("instruct", sa.Text(), nullable=True),
-        sa.Column("max_retries", sa.Integer(), nullable=False),
+        sa.Column("max_retries", sa.Integer(), nullable=False, server_default="10"),
         sa.Column("api_key_encrypted", sa.Text(), nullable=False),
         sa.Column("credential_digest", sa.String(64), nullable=False),
         sa.Column("configured_by_actor_subject", sa.String(64), nullable=False),

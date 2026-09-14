@@ -18,7 +18,7 @@ class GlobalMemoryEmbeddingAuthority(Base):  # type: ignore[no-any-unimported]
     base_url = Column(String(500), nullable=False)
     dimension = Column(Integer, nullable=False)
     instruct = Column(Text, nullable=True)
-    max_retries = Column(Integer, nullable=False, default=10)
+    max_retries = Column(Integer, nullable=False, default=10, server_default="10")
     api_key_encrypted = Column(Text, nullable=False)
     credential_digest = Column(String(64), nullable=False)
     configured_by_actor_subject = Column(String(64), nullable=False)

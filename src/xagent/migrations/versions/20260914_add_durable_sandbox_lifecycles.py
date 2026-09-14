@@ -1,7 +1,7 @@
 """Add the dormant durable sandbox lifecycle substrate.
 
 Revision ID: 20260914_durable_sandbox_lifecycles
-Revises: 20260912_shared_task_execution
+Revises: 20260914_add_hubspot_deals_write_scope
 
 No rows are backfilled.  Existing sandboxes remain outside this protocol and
 Chrome remains hidden/default-off until the separate consumer stack lands.
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260914_durable_sandbox_lifecycles"
-down_revision = "20260912_shared_task_execution"
+down_revision = "20260914_add_hubspot_deals_write_scope"
 branch_labels = None
 depends_on = None
 

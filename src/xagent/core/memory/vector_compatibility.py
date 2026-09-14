@@ -215,12 +215,12 @@ def _lancedb_table_exists(connection: Any, table_name: str) -> bool:
             raw = [raw]
         if table_name in {str(name) for name in raw}:
             return True
-        next_token = getattr(response, "page_token", None)
-        if not next_token:
+        modern_next_token = getattr(response, "page_token", None)
+        if not modern_next_token:
             return False
-        if next_token == page_token:
+        if modern_next_token == page_token:
             raise RuntimeError("LanceDB table pagination did not advance")
-        page_token = next_token
+        page_token = modern_next_token
 
 
 def _validated_rows(

@@ -177,6 +177,19 @@ async def _create_chrome_sandbox(scope: ChromeExecutionScope) -> ChromeSandboxHa
             raise cancellation
 
     try:
+        await lifecycle.renew()
+    except BaseException as exc:
+        try:
+            await drain_compensation()
+        except asyncio.CancelledError as cancellation:
+            raise cancellation from exc
+        if not isinstance(exc, Exception):
+            raise
+        raise ChromeSessionContractError(
+            "Chrome lifecycle pre-create fence failed"
+        ) from exc
+
+    try:
         provider = await asyncio.wait_for(
             manager.get_or_create_lease_provider(
                 CHROME_SANDBOX_LIFECYCLE_TYPE,

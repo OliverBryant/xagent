@@ -87,8 +87,8 @@ class ChromeLifecycleLease:
         """Revalidate the exact task attempt and extend this owner's fence."""
 
         async with self._lock:
-            if self._fence.state != "ready":
-                raise DurableLifecycleConflict("Chrome lifecycle is not ready")
+            if self._fence.state not in {"registered", "ready"}:
+                raise DurableLifecycleConflict("Chrome lifecycle is not renewable")
             now = self._coordinator.now()
             updated = await self._coordinator._db(
                 lambda: self._coordinator.service.renew(
@@ -200,7 +200,14 @@ class ChromeLifecycleCoordinator:
                 timeout=CHROME_BACKEND_OPERATION_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
-            await self._backoff(fence)
+            try:
+                await self._backoff(fence)
+            except Exception:
+                logger.warning(
+                    "Chrome lifecycle cancellation backoff failed for backend %s",
+                    fence.backend_lifecycle_digest,
+                    exc_info=True,
+                )
             raise
         except Exception:
             await self._backoff(fence)

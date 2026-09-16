@@ -169,7 +169,7 @@ async def test_dedicated_sandbox_uses_only_opaque_scope_and_attaches(monkeypatch
     lifecycle = SimpleNamespace(
         backend_lifecycle_digest="b" * 64,
         mark_ready=AsyncMock(side_effect=lambda: events.append("ready")),
-        renew=AsyncMock(),
+        renew=AsyncMock(side_effect=lambda: events.append("renew")),
         delete=AsyncMock(),
         defer_unknown_create=AsyncMock(),
     )
@@ -206,9 +206,42 @@ async def test_dedicated_sandbox_uses_only_opaque_scope_and_attaches(monkeypatch
         "chrome-execution", "b" * 64, provider
     )
     lifecycle.mark_ready.assert_awaited_once()
-    lifecycle.renew.assert_awaited_once()
+    assert lifecycle.renew.await_count == 2
     lifecycle.delete.assert_awaited_once()
-    assert events == ["register", "backend-create", "ready"]
+    assert events == ["register", "renew", "backend-create", "ready", "renew"]
+
+
+@pytest.mark.asyncio
+async def test_precreate_fence_failure_tombstones_without_backend_create(monkeypatch):
+    manager = SimpleNamespace(
+        get_or_create_lease_provider=AsyncMock(),
+        attach_provider=AsyncMock(),
+    )
+    lifecycle = SimpleNamespace(
+        backend_lifecycle_digest="b" * 64,
+        mark_ready=AsyncMock(),
+        renew=AsyncMock(side_effect=RuntimeError("database unknown")),
+        delete=AsyncMock(),
+        defer_unknown_create=AsyncMock(),
+    )
+    coordinator = SimpleNamespace(register=AsyncMock(return_value=lifecycle))
+    monkeypatch.setattr(chrome_mcp_runtime, "get_sandbox_manager", lambda: manager)
+    monkeypatch.setattr(
+        chrome_mcp_runtime,
+        "get_chrome_lifecycle_coordinator",
+        lambda: coordinator,
+    )
+    scope, _ = bind_chrome_execution_scope(
+        "chrome-devtools", _connection(), _identity()
+    )
+
+    with pytest.raises(ChromeSessionContractError, match="pre-create fence failed"):
+        await _create_chrome_sandbox(scope)
+
+    lifecycle.delete.assert_awaited_once()
+    lifecycle.defer_unknown_create.assert_not_awaited()
+    manager.get_or_create_lease_provider.assert_not_awaited()
+    manager.attach_provider.assert_not_awaited()
 
 
 @pytest.mark.asyncio

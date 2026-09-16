@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from xagent.web.services.chrome_lifecycle import (
     CHROME_DELETE_CLAIM_TTL,
@@ -117,6 +119,33 @@ async def test_transient_delete_failure_keeps_retryable_tombstone():
 
 
 @pytest.mark.asyncio
+async def test_cancellation_backoff_database_error_preserves_original_cancellation():
+    delete_started = asyncio.Event()
+
+    async def delete(_lifecycle_id):
+        delete_started.set()
+        await asyncio.Event().wait()
+
+    service = MagicMock()
+    service.backoff_delete.side_effect = OperationalError(
+        "UPDATE durable_sandbox_lifecycles",
+        {},
+        RuntimeError("database unavailable"),
+    )
+    backend = MagicMock()
+    backend.delete_durable_sandbox_strict = AsyncMock(side_effect=delete)
+    coordinator = ChromeLifecycleCoordinator(service, backend, now=lambda: NOW)
+
+    task = asyncio.create_task(coordinator._delete_claim(_fence(state="deleting")))
+    await delete_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    service.backoff_delete.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_unknown_create_is_tombstoned_and_quarantined_without_backend_delete():
     service = MagicMock()
     deleting = replace(
@@ -183,22 +212,28 @@ async def test_stale_owner_cannot_delete_a_successor_generation():
 async def test_ready_and_renew_extend_owner_beyond_backend_deadline():
     service = MagicMock()
     registered = _fence(state="registered", version=1)
-    ready = replace(
+    registered_renewed = replace(
         registered,
-        state="ready",
         version=2,
+        owner_lease_expires_at=NOW + CHROME_OWNER_GRACE,
+    )
+    ready = replace(
+        registered_renewed,
+        state="ready",
+        version=3,
         owner_lease_expires_at=NOW + CHROME_OWNER_GRACE,
     )
     renewed = replace(
         ready,
-        version=3,
+        version=4,
         owner_lease_expires_at=NOW + CHROME_OWNER_GRACE,
     )
     service.mark_ready.return_value = ready
-    service.renew.return_value = renewed
+    service.renew.side_effect = [registered_renewed, renewed]
     coordinator = ChromeLifecycleCoordinator(service, MagicMock(), now=lambda: NOW)
     lease = ChromeLifecycleLease(coordinator, registered)
 
+    await lease.renew()
     await lease.mark_ready()
     await lease.renew()
 
@@ -206,6 +241,7 @@ async def test_ready_and_renew_extend_owner_beyond_backend_deadline():
     assert service.mark_ready.call_args.kwargs["owner_lease_expires_at"] == (
         NOW + CHROME_OWNER_GRACE
     )
+    assert service.renew.call_count == 2
     assert service.renew.call_args.kwargs["owner_lease_expires_at"] == (
         NOW + CHROME_OWNER_GRACE
     )

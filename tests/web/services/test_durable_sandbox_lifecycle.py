@@ -9,6 +9,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
+from xagent.web.services import chrome_lifecycle as chrome_lifecycle_module
 from xagent.web.models.sandbox import DurableSandboxLifecycle
 from xagent.web.services.chrome_lifecycle import ChromeLifecycleCoordinator
 from xagent.web.services.durable_sandbox_lifecycle import (
@@ -55,10 +56,10 @@ def sessions(tmp_path):
         engine.dispose()
 
 
-def _request(scope: str = "a" * 64) -> RegisterLifecycle:
+def _request(scope: str = "a" * 64, *, task_id: int = 7) -> RegisterLifecycle:
     return RegisterLifecycle(
         scope_digest=scope,
-        task_id=7,
+        task_id=task_id,
         run_id="run-1",
         lease_attempt_id="attempt-1",
         turn_digest=digest_turn_identifier("raw-turn-1"),
@@ -147,6 +148,14 @@ def test_ready_and_renew_require_the_exact_active_attempt(sessions) -> None:
         registered = repo.register(_request())
         _set_task(db, active=True, attempt="successor-attempt")
         assert (
+            repo.renew(
+                registered,
+                now=NOW,
+                owner_lease_expires_at=NOW + timedelta(minutes=1),
+            )
+            is None
+        )
+        assert (
             repo.mark_ready(
                 registered,
                 now=NOW,
@@ -155,14 +164,30 @@ def test_ready_and_renew_require_the_exact_active_attempt(sessions) -> None:
             is None
         )
         _set_task(db, active=True)
-        ready = repo.mark_ready(
+        registered_renewed = repo.renew(
             registered,
+            now=NOW,
+            owner_lease_expires_at=NOW + timedelta(minutes=1),
+        )
+        assert registered_renewed is not None
+        assert registered_renewed.state == "registered"
+        assert registered_renewed.version == registered.version + 1
+        assert (
+            repo.renew(
+                registered,
+                now=NOW,
+                owner_lease_expires_at=NOW + timedelta(minutes=1),
+            )
+            is None
+        )
+        ready = repo.mark_ready(
+            registered_renewed,
             now=NOW,
             owner_lease_expires_at=NOW + timedelta(minutes=1),
         )
         assert ready is not None
         assert ready.state == "ready"
-        assert ready.version == 2
+        assert ready.version == registered_renewed.version + 1
         _set_task(db, active=True, attempt="successor-attempt")
         assert (
             repo.renew(
@@ -297,6 +322,33 @@ def test_final_claim_dml_rechecks_a_racing_successor_attempt(sessions) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_active_oldest_hint_does_not_starve_later_inactive_orphan(
+    sessions, monkeypatch
+) -> None:
+    service = DurableSandboxLifecycleService(sessions)
+    active = service.register(_request())
+    inactive = service.register(_request(scope="f" * 64, task_id=8))
+    with sessions() as db:
+        _set_task(db, active=True)
+        db.commit()
+    backend = _SharedBackend()
+    backend.present.update(
+        {active.backend_lifecycle_digest, inactive.backend_lifecycle_digest}
+    )
+    coordinator = ChromeLifecycleCoordinator(service, backend, now=lambda: NOW)
+    monkeypatch.setattr(
+        chrome_lifecycle_module,
+        "get_chrome_lifecycle_sweep_batch_size",
+        lambda: 1,
+    )
+
+    assert await coordinator.sweep_once() == 1
+    assert backend.deleted == [inactive.backend_lifecycle_digest]
+    assert service.get_by_scope(active.scope_digest) is not None
+    assert service.get_by_scope(inactive.scope_digest) is None
+
+
 def test_generation_digest_prevents_stale_deleter_aba(sessions) -> None:
     with sessions() as db:
         repo = DurableSandboxLifecycleRepository(db)
@@ -422,3 +474,31 @@ async def test_sweeper_settles_crash_after_physical_delete_idempotently(
     assert await coordinator.sweep_once() == 1
     assert backend.deleted == [registered.backend_lifecycle_digest]
     assert service.get_by_scope(registered.scope_digest) is None
+
+
+@pytest.mark.asyncio
+async def test_sweeper_reclaims_deleting_tombstone_while_attempt_remains_active(
+    sessions,
+) -> None:
+    service = DurableSandboxLifecycleService(sessions)
+    registered = service.register(_request())
+    with sessions() as db:
+        _set_task(db, active=True)
+        db.commit()
+    deleting = service.mark_deleting(
+        registered,
+        now=NOW,
+        claim_ttl=timedelta(seconds=1),
+    )
+    assert deleting is not None
+    backend = _SharedBackend()
+    backend.present.add(deleting.backend_lifecycle_digest)
+    coordinator = ChromeLifecycleCoordinator(
+        service,
+        backend,
+        now=lambda: NOW + timedelta(seconds=2),
+    )
+
+    assert await coordinator.sweep_once() == 1
+    assert backend.deleted == [deleting.backend_lifecycle_digest]
+    assert service.get_by_scope(deleting.scope_digest) is None

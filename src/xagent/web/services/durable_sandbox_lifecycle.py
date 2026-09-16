@@ -337,7 +337,6 @@ class DurableSandboxLifecycleRepository:
                     DurableSandboxLifecycle.retry_at.is_(None),
                     DurableSandboxLifecycle.retry_at <= now,
                 ),
-                ~_exact_attempt_is_active(DurableSandboxLifecycle, now),
             )
             .values(
                 owner_token=claim_owner,
@@ -405,6 +404,7 @@ class DurableSandboxLifecycleRepository:
                         DurableSandboxLifecycle.state.in_(("registered", "ready")),
                         DurableSandboxLifecycle.eligible_at <= now,
                         DurableSandboxLifecycle.owner_lease_expires_at <= now,
+                        ~_exact_attempt_is_active(DurableSandboxLifecycle, now),
                     ),
                     and_(
                         DurableSandboxLifecycle.state == "deleting",

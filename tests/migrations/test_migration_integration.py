@@ -768,10 +768,10 @@ class TestMigrations:
         assert winners[0].delete_attempts == 1
 
     @pytest.mark.postgresql
-    def test_postgresql_durable_lifecycle_allows_quarantine_and_one_successor(
+    def test_postgresql_durable_lifecycle_supports_owned_close_and_late_completion(
         self, postgresql_tester
     ):
-        """The nullable active key has identical PostgreSQL semantics."""
+        """Owned close and quarantined completion match SQLite semantics."""
         from datetime import datetime, timedelta, timezone
 
         from xagent.web.models.database import Base
@@ -798,15 +798,47 @@ class TestMigrations:
         with session_factory() as session:
             repo = DurableSandboxLifecycleRepository(session)
             first = repo.register(request)
-            quarantined = repo.claim_for_delete(
+            closed = repo.mark_deleting_owned(
                 first, now=now, claim_ttl=timedelta(minutes=1)
             )
-            assert quarantined is not None
+            assert closed is not None
             successor = repo.register(request)
             assert successor.active_scope_digest == request.scope_digest
-            assert quarantined.active_scope_digest is None
+            assert closed.active_scope_digest is None
             with pytest.raises(DurableLifecycleConflict):
                 repo.register(request)
+            session.commit()
+
+        late_request = RegisterLifecycle(
+            scope_digest="d" * 64,
+            task_id=45,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        with session_factory() as session:
+            repo = DurableSandboxLifecycleRepository(session)
+            creating = repo.register(late_request)
+            session.execute(
+                text(
+                    "UPDATE durable_sandbox_lifecycles "
+                    "SET create_phase = 'may_publish' WHERE id = :row_id"
+                ),
+                {"row_id": creating.id},
+            )
+            quarantined = repo.quarantine_create(
+                creating, now=now, claim_ttl=timedelta(minutes=1)
+            )
+            assert quarantined is not None
+            late_success = repo.complete_quarantined_create(
+                creating, now=now, outcome="success"
+            )
+            assert late_success is not None
+            assert late_success.state == "deleting"
+            assert late_success.create_phase == "terminal"
+            assert late_success.version == quarantined.version + 1
             session.rollback()
 
     @pytest.mark.postgresql

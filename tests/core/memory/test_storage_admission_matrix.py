@@ -33,11 +33,19 @@ from xagent.core.memory.vector_compatibility import (
     FULL_ADMISSION_VERSION,
     VECTOR_IDENTITY_METADATA_KEY,
     EmbeddingIdentity,
+    VectorCompatibility,
+    create_or_recreate_vector_capable_table,
+    prepare_lancedb_memory_table,
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 IDENTITY = EmbeddingIdentity(
     "openai", "text-embedding-3-small", "https://api.openai.com/v1/embeddings", 4, None
+)
+# Same dimension as IDENTITY, so only the stored identity distinguishes the two
+# vector spaces; a dimension check alone would not catch a mix-up.
+FOREIGN_IDENTITY = EmbeddingIdentity(
+    "openai", "text-embedding-3-large", "https://api.openai.com/v1/embeddings", 4, None
 )
 
 
@@ -340,28 +348,35 @@ def test_existing_null_vectors_are_preserved(tmp_path):
     assert _snapshot(connection)[2][0]["vector"] is None
 
 
-def test_compatibility_is_not_reinspected_after_commit(tmp_path, monkeypatch):
+def test_compatibility_is_classified_from_the_committed_table(tmp_path, monkeypatch):
     connection = _connection(tmp_path)
     original = storage_admission._inspect_lancedb_vector_state
     inspected_versions = []
 
-    def fail_after_commit(*args, **kwargs):
+    def record(*args, **kwargs):
         table = connection.open_table("memories")
         try:
             inspected_versions.append(int(table.version))
-            if int(table.version) > 1:
-                raise OSError("post-commit inspection failed")
         finally:
             _safe_close_table(table)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(
-        storage_admission, "_inspect_lancedb_vector_state", fail_after_commit
-    )
+    monkeypatch.setattr(storage_admission, "_inspect_lancedb_vector_state", record)
     outcome = _admit(connection)
     assert outcome.state is StorageAdmissionState.ADMITTED
-    assert inspected_versions == [1]
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    # Classified once, from the commit maintenance produced -- never from a
+    # snapshot taken before it, which a concurrent writer could have invalidated.
+    assert inspected_versions == [2]
     assert _snapshot(connection)[0] == 2
+
+    def fail(*_args, **_kwargs):
+        raise OSError("post-commit inspection failed at /private/backend")
+
+    monkeypatch.setattr(storage_admission, "_inspect_lancedb_vector_state", fail)
+    outcome = _admit(connection)
+    assert outcome.state is StorageAdmissionState.RETRYABLE_UNAVAILABLE
+    assert outcome.detail == ADMISSION_FAILED_DETAIL
 
 
 @pytest.mark.parametrize("metadata", ['{"user_id":1e309}', '{"user_id":Infinity}'])
@@ -431,6 +446,14 @@ def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
     )
     assert _admit(connection).state is StorageAdmissionState.ADMITTED
 
+    # The legacy recreation entry point holds the same lock across the same span,
+    # so it cannot publish a vector space another admission is already reading.
+    monkeypatch.setattr(vector_compatibility, "prepare_lancedb_memory_table", guarded)
+    assert (
+        create_or_recreate_vector_capable_table(connection, "memories", IDENTITY)
+        is VectorCompatibility.MATCHING
+    )
+
     source_root = Path(__file__).parents[3] / "src" / "xagent"
     callers = [
         path
@@ -492,3 +515,74 @@ def test_scope_only_marker_never_certifies_admission(tmp_path, case):
         assert math.isnan(after[2][0]["vector"][0])
     else:
         assert after[2] == before[2]
+
+
+def _admit_foreign_identity_after_snapshot(path, snapshotted, committed, results):
+    original = storage_admission.prepare_lancedb_memory_table
+
+    def wait_for_foreign_commit(*args, **kwargs):
+        # Park where a pre-maintenance snapshot would have been taken, so the
+        # other vector space lands before this admission classifies anything.
+        snapshotted.set()
+        assert committed.wait(30)
+        return original(*args, **kwargs)
+
+    storage_admission.prepare_lancedb_memory_table = wait_for_foreign_commit
+    outcome = admit_lancedb_memory_storage(
+        DormantLanceDBMemoryHandle(lancedb.connect(path), "memories"),
+        FOREIGN_IDENTITY,
+        writers_quiesced=True,
+        batch_size=2,
+    )
+    admitted = outcome.admitted
+    results.put(
+        (
+            outcome.state.value,
+            None if admitted is None else admitted.capabilities.mode.value,
+            None if admitted is None else admitted.vector_compatibility.value,
+        )
+    )
+
+
+def test_interleaved_recreation_never_certifies_a_foreign_vector_space(tmp_path):
+    connection = _connection(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    snapshotted, committed = context.Event(), context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_admit_foreign_identity_after_snapshot,
+        args=(str(tmp_path), snapshotted, committed, results),
+    )
+
+    process.start()
+    try:
+        assert snapshotted.wait(30)
+        # The local identity commits its own vectors mid-flight.
+        assert (
+            prepare_lancedb_memory_table(
+                connection, "memories", IDENTITY, batch_size=2, lock_timeout=10
+            ).status
+            is MaintenanceStatus.COMPLETE
+        )
+        version, schema, _rows = _snapshot(connection)
+        committed.set()
+        process.join(60)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+    assert process.exitcode == 0
+
+    # The other caller is told the truth about the space it would read, and it
+    # neither certifies itself over those vectors nor rewrites them.
+    assert results.get(timeout=5) == (
+        StorageAdmissionState.ADMITTED.value,
+        MemoryStorageMode.TEXT_ONLY.value,
+        VectorCompatibility.MISMATCHING.value,
+    )
+    after_version, after_schema, _after_rows = _snapshot(connection)
+    assert after_version == version
+    assert (
+        after_schema.metadata[VECTOR_IDENTITY_METADATA_KEY]
+        == (schema.metadata[VECTOR_IDENTITY_METADATA_KEY])
+    )

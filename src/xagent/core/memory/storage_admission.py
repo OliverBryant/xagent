@@ -116,9 +116,6 @@ def admit_lancedb_memory_storage(
         ):
             if not _lancedb_table_exists(dormant.connection, dormant.table_name):
                 return StorageAdmissionOutcome(StorageAdmissionState.ABSENT, dormant)
-            had_vector, compatibility = _inspect_lancedb_vector_state(
-                dormant.connection, dormant.table_name, identity
-            )
             maintenance = prepare_lancedb_memory_table(
                 dormant.connection,
                 dormant.table_name,
@@ -149,8 +146,14 @@ def admit_lancedb_memory_storage(
                     ADMISSION_FAILED_DETAIL,
                     maintenance,
                 )
-            if not had_vector:
-                compatibility = VectorCompatibility.MATCHING
+            # The persisted vector space is read back from the committed table,
+            # never inferred from a snapshot taken before maintenance ran. A
+            # concurrent recreation may have installed another identity's
+            # vectors, and only this read under the still-held admission lock
+            # reports the space the caller would actually be admitted over.
+            _has_vector, compatibility = _inspect_lancedb_vector_state(
+                dormant.connection, dormant.table_name, identity
+            )
     except Timeout:
         return _unavailable(
             StorageAdmissionState.RETRYABLE_UNAVAILABLE,

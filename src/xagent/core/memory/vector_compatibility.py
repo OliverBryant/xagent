@@ -541,18 +541,22 @@ def create_or_recreate_vector_capable_table(
             finally:
                 _safe_close_table(created)
             return VectorCompatibility.MATCHING
-    outcome = prepare_lancedb_memory_table(
-        connection,
-        table_name,
-        identity,
-        batch_size=DEFAULT_BATCH_SIZE,
-        lock_timeout=DEFAULT_LOCK_TIMEOUT,
-    )
-    if outcome.status is not MaintenanceStatus.COMPLETE:
-        raise ValueError(outcome.detail or outcome.status.value)
-    compatibility = inspect_lancedb_vector_compatibility(
-        connection, table_name, identity
-    )
-    if compatibility is not VectorCompatibility.MATCHING:
-        raise RuntimeError("created memory table failed vector compatibility")
-    return compatibility
+        # Preparation and its verification stay under the admission lock, in the
+        # admission-then-maintenance order the admission primitive already uses.
+        # Releasing here would let a concurrent admission observe this table
+        # mid-recreation and certify it against a different vector space.
+        outcome = prepare_lancedb_memory_table(
+            connection,
+            table_name,
+            identity,
+            batch_size=DEFAULT_BATCH_SIZE,
+            lock_timeout=DEFAULT_LOCK_TIMEOUT,
+        )
+        if outcome.status is not MaintenanceStatus.COMPLETE:
+            raise ValueError(outcome.detail or outcome.status.value)
+        compatibility = inspect_lancedb_vector_compatibility(
+            connection, table_name, identity
+        )
+        if compatibility is not VectorCompatibility.MATCHING:
+            raise RuntimeError("created memory table failed vector compatibility")
+        return compatibility

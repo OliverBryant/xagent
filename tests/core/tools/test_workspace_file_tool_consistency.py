@@ -403,6 +403,7 @@ class TestWorkspaceFileToolConsistency:
         registered_file = tmp_path / "registered.txt"
         registered_file.write_text("content")
         workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
 
         class BoundSession:
             def query(self, *_args):

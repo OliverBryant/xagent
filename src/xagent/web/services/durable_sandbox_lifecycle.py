@@ -366,6 +366,54 @@ class DurableSandboxLifecycleRepository:
         row = self._db.execute(stmt).scalar_one_or_none()
         return None if row is None else LifecycleFence.from_row(row)
 
+    def mark_deleting_owned(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        claim_ttl: timedelta,
+    ) -> LifecycleFence | None:
+        """Tombstone a non-ambiguous generation while its owner is active.
+
+        This is the normal close/attach-failure path.  ``may_publish`` is
+        deliberately excluded because an ambiguous create must instead use
+        :meth:`quarantine_create` and retain its probe-before-delete policy.
+        """
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
+        claim_owner = new_opaque_token()
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.backend_lifecycle_digest
+                == fence.backend_lifecycle_digest,
+                DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.version == fence.version,
+                DurableSandboxLifecycle.state.in_(("registered", "ready")),
+                DurableSandboxLifecycle.create_phase.in_(
+                    ("not_started", "terminal", "observed")
+                ),
+            )
+            .values(
+                state="deleting",
+                active_scope_digest=None,
+                owner_token=claim_owner,
+                version=DurableSandboxLifecycle.version + 1,
+                deleting_at=now,
+                delete_claim_expires_at=now + claim_ttl,
+                retry_at=None,
+                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
+                updated_at=now,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
     def quarantine_create(
         self,
         fence: LifecycleFence,
@@ -405,6 +453,44 @@ class DurableSandboxLifecycleRepository:
                 delete_claim_expires_at=now + claim_ttl,
                 retry_at=None,
                 delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
+                updated_at=now,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
+    def complete_quarantined_create(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        outcome: CreateCompletion,
+    ) -> LifecycleFence | None:
+        """Record a late proven completion after owner handoff to cleanup.
+
+        The create worker's owner/version became stale at quarantine time, so
+        this CAS uses only immutable generation and operation identity.  Its
+        version increment invalidates any delete fence read by a concurrent
+        sweeper and returns the current delete owner fence to the caller.
+        """
+        if outcome not in ("success", "terminal_absent"):
+            raise ValueError("unsupported create completion outcome")
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.backend_lifecycle_digest
+                == fence.backend_lifecycle_digest,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.state == "deleting",
+                DurableSandboxLifecycle.create_phase == "may_publish",
+            )
+            .values(
+                create_phase="terminal",
+                version=DurableSandboxLifecycle.version + 1,
                 updated_at=now,
             )
             .returning(DurableSandboxLifecycle)
@@ -623,12 +709,32 @@ class DurableSandboxLifecycleService:
                 fence, now=now, claim_ttl=claim_ttl
             )
 
+    def mark_deleting_owned(
+        self, fence: LifecycleFence, *, now: datetime, claim_ttl: timedelta
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).mark_deleting_owned(
+                fence, now=now, claim_ttl=claim_ttl
+            )
+
     def quarantine_create(
         self, fence: LifecycleFence, *, now: datetime, claim_ttl: timedelta
     ) -> LifecycleFence | None:
         with self._session_factory() as db, db.begin():
             return DurableSandboxLifecycleRepository(db).quarantine_create(
                 fence, now=now, claim_ttl=claim_ttl
+            )
+
+    def complete_quarantined_create(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        outcome: CreateCompletion,
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).complete_quarantined_create(
+                fence, now=now, outcome=outcome
             )
 
     def reclaim_delete(

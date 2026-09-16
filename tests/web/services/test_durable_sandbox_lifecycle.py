@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -280,6 +281,114 @@ def test_lost_attempt_can_be_claimed_and_tombstone_is_retryable(sessions) -> Non
         assert reclaimed.delete_attempts == 2
 
 
+def test_active_owner_can_tombstone_ready_terminal_generation(sessions) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+        begun = repo.begin_create(registered, now=NOW)
+        assert begun is not None
+        completed = repo.complete_create(begun, now=NOW, outcome="success")
+        assert completed is not None
+        ready = repo.mark_ready(
+            completed,
+            now=NOW,
+            owner_lease_expires_at=NOW + timedelta(minutes=1),
+        )
+        assert ready is not None
+
+        deleting = repo.mark_deleting_owned(
+            ready, now=NOW, claim_ttl=timedelta(minutes=1)
+        )
+
+        assert deleting is not None
+        assert deleting.state == "deleting"
+        assert deleting.create_phase == "terminal"
+        assert deleting.active_scope_digest is None
+        assert deleting.owner_token != ready.owner_token
+        assert deleting.version == ready.version + 1
+        assert deleting.delete_attempts == 1
+
+
+def test_active_owner_can_tombstone_registered_terminal_attach_failure(
+    sessions,
+) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+        begun = repo.begin_create(registered, now=NOW)
+        assert begun is not None
+        completed = repo.complete_create(begun, now=NOW, outcome="success")
+        assert completed is not None
+
+        deleting = repo.mark_deleting_owned(
+            completed, now=NOW, claim_ttl=timedelta(minutes=1)
+        )
+
+        assert deleting is not None
+        assert deleting.state == "deleting"
+        assert deleting.create_phase == "terminal"
+
+
+@pytest.mark.parametrize("phase", ["not_started", "observed"])
+def test_active_owner_can_tombstone_other_non_ambiguous_phases(sessions, phase) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        if phase == "observed":
+            db.execute(
+                sa.update(DurableSandboxLifecycle)
+                .where(DurableSandboxLifecycle.id == registered.id)
+                .values(create_phase="observed")
+            )
+
+        deleting = repo.mark_deleting_owned(
+            registered, now=NOW, claim_ttl=timedelta(minutes=1)
+        )
+
+        assert deleting is not None
+        assert deleting.state == "deleting"
+        assert deleting.create_phase == phase
+
+
+def test_owned_tombstone_rejects_ambiguous_and_stale_fences(sessions) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+        begun = repo.begin_create(registered, now=NOW)
+        assert begun is not None
+        assert (
+            repo.mark_deleting_owned(begun, now=NOW, claim_ttl=timedelta(minutes=1))
+            is None
+        )
+
+        terminal = repo.complete_create(begun, now=NOW, outcome="success")
+        assert terminal is not None
+        corruptions = (
+            replace(terminal, owner_token="f" * 64),
+            replace(terminal, version=terminal.version + 1),
+            replace(terminal, create_operation_token="e" * 64),
+            replace(terminal, lifecycle_token="d" * 64),
+            replace(terminal, backend_lifecycle_digest="c" * 64),
+        )
+        for stale in corruptions:
+            assert (
+                repo.mark_deleting_owned(stale, now=NOW, claim_ttl=timedelta(minutes=1))
+                is None
+            )
+
+        deleting = repo.mark_deleting_owned(
+            terminal, now=NOW, claim_ttl=timedelta(minutes=1)
+        )
+        assert deleting is not None
+        assert (
+            repo.mark_deleting_owned(deleting, now=NOW, claim_ttl=timedelta(minutes=1))
+            is None
+        )
+
+
 def test_two_real_sessions_allow_only_one_delete_claim(sessions) -> None:
     with sessions() as db:
         fence = DurableSandboxLifecycleRepository(db).register(_request())
@@ -366,6 +475,176 @@ def test_two_real_sessions_allow_only_one_owner_quarantine(sessions) -> None:
         ),
     )
     assert sum(outcome is not None for outcome in outcomes) == 1
+
+
+@pytest.mark.parametrize("outcome", ["success", "terminal_absent"])
+def test_late_completion_monotonically_completes_quarantined_create(
+    sessions, outcome
+) -> None:
+    service, quarantined = _claimed_may_publish(sessions)
+    stale_create_fence = replace(
+        quarantined,
+        owner_token="f" * 64,
+        version=1,
+    )
+
+    completed = service.complete_quarantined_create(
+        stale_create_fence, now=NOW, outcome=outcome
+    )
+
+    assert completed is not None
+    assert completed.state == "deleting"
+    assert completed.create_phase == "terminal"
+    assert completed.owner_token == quarantined.owner_token
+    assert completed.version == quarantined.version + 1
+    assert (
+        service.complete_quarantined_create(
+            stale_create_fence, now=NOW, outcome=outcome
+        )
+        is None
+    )
+
+
+def test_quarantined_completion_requires_exact_operation_generation_and_phase(
+    sessions,
+) -> None:
+    service = DurableSandboxLifecycleService(sessions)
+    registered = service.register(_request())
+    with sessions() as db:
+        _set_task(db, active=True)
+        db.commit()
+    begun = service.begin_create(registered, now=NOW)
+    assert begun is not None
+
+    assert (
+        service.complete_quarantined_create(begun, now=NOW, outcome="success") is None
+    )
+    quarantined = service.quarantine_create(
+        begun, now=NOW, claim_ttl=timedelta(minutes=1)
+    )
+    assert quarantined is not None
+    corruptions = (
+        replace(begun, create_operation_token="f" * 64),
+        replace(begun, lifecycle_token="e" * 64),
+        replace(begun, backend_lifecycle_digest="d" * 64),
+    )
+    for stale in corruptions:
+        assert (
+            service.complete_quarantined_create(stale, now=NOW, outcome="success")
+            is None
+        )
+
+    observed = service.observe_create(quarantined, now=NOW)
+    assert observed is not None
+    assert (
+        service.complete_quarantined_create(begun, now=NOW, outcome="success") is None
+    )
+    with pytest.raises(ValueError, match="unsupported create completion outcome"):
+        service.complete_quarantined_create(  # type: ignore[arg-type]
+            begun, now=NOW, outcome="unknown"
+        )
+
+
+def test_late_completion_invalidates_sweeper_fence_and_returns_current_claim(
+    sessions,
+) -> None:
+    service, quarantined = _claimed_may_publish(sessions)
+
+    completed = service.complete_quarantined_create(
+        quarantined, now=NOW, outcome="success"
+    )
+
+    assert completed is not None
+    assert (
+        service.backoff_delete(
+            quarantined,
+            now=NOW,
+            retry_at=NOW + timedelta(minutes=1),
+        )
+        is None
+    )
+    current = service.list_by_scope(quarantined.scope_digest)[0]
+    assert current == completed
+    backed_off = service.backoff_delete(
+        current,
+        now=NOW,
+        retry_at=NOW + timedelta(minutes=1),
+    )
+    assert backed_off is not None
+
+
+def test_late_completion_racing_sweeper_leaves_only_current_terminal_fence(
+    sessions,
+) -> None:
+    service, quarantined = _claimed_may_publish(sessions)
+    barrier = threading.Barrier(2)
+
+    def complete():
+        with sessions() as db:
+            barrier.wait(timeout=5)
+            result = DurableSandboxLifecycleRepository(db).complete_quarantined_create(
+                quarantined, now=NOW, outcome="success"
+            )
+            db.commit()
+            return result
+
+    def backoff():
+        with sessions() as db:
+            barrier.wait(timeout=5)
+            result = DurableSandboxLifecycleRepository(db).backoff_delete(
+                quarantined,
+                now=NOW,
+                retry_at=NOW + timedelta(minutes=1),
+            )
+            db.commit()
+            return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completion_future = executor.submit(complete)
+        backoff_future = executor.submit(backoff)
+        completed = completion_future.result(timeout=10)
+        swept = backoff_future.result(timeout=10)
+
+    assert completed is not None
+    current = service.list_by_scope(quarantined.scope_digest)[0]
+    assert current.create_phase == "terminal"
+    assert current.version >= completed.version
+    assert (
+        service.backoff_delete(
+            quarantined,
+            now=NOW,
+            retry_at=NOW + timedelta(minutes=2),
+        )
+        is None
+    )
+    if swept is not None:
+        assert (
+            service.backoff_delete(
+                swept,
+                now=NOW,
+                retry_at=NOW + timedelta(minutes=2),
+            )
+            is None
+        )
+
+
+def test_old_late_completion_cannot_touch_successor_generation(sessions) -> None:
+    service, quarantined = _claimed_may_publish(sessions)
+    successor = service.register(_request(quarantined.scope_digest))
+
+    completed = service.complete_quarantined_create(
+        quarantined, now=NOW, outcome="terminal_absent"
+    )
+
+    assert completed is not None
+    generations = service.list_by_scope(quarantined.scope_digest)
+    assert generations[0].id == quarantined.id
+    assert generations[0].create_phase == "terminal"
+    assert generations[1].id == successor.id
+    assert generations[1].lifecycle_token == successor.lifecycle_token
+    assert generations[1].create_operation_token == successor.create_operation_token
+    assert generations[1].state == "registered"
+    assert generations[1].create_phase == "not_started"
 
 
 def test_final_claim_dml_rechecks_a_racing_successor_attempt(sessions) -> None:

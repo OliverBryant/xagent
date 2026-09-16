@@ -4,11 +4,14 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -29,6 +32,14 @@ _DEFAULT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1/embeddings",
     "xinference": "http://localhost:9997",
 }
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+_MAX_ENDPOINT_LENGTH = 500
+_MAX_MODEL_NAME_LENGTH = 100
+_MAX_DIMENSION = 65536
+_MAX_RETRIES = 100
+_HOSTNAME = re.compile(
+    r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*"
+)
 _CREDENTIAL_IDENTITY_DOMAIN = b"xagent:global-memory-credential-identity:v1\0"
 # This table is introduced by the current unmerged migration, so there is no
 # production bare-digest backfill. Unknown/legacy versions deliberately fail closed.
@@ -40,30 +51,71 @@ class AuthorityCredentialUnavailable(RuntimeError):
     pass
 
 
+class CredentialSource(str, Enum):
+    """Who owns the credential: an explicit fact, never inferred from the
+    configuring actor's admin rights or subject."""
+
+    APPLICATION_OWNED = "application_owned"
+    ORGANIZATION_OWNED = "organization_owned"
+    PERSONAL = "personal"
+    UNKNOWN = "unknown"
+
+
+GLOBALLY_SHAREABLE_CREDENTIAL_SOURCES = frozenset(
+    {CredentialSource.APPLICATION_OWNED, CredentialSource.ORGANIZATION_OWNED}
+)
+
+
 class AuthorityConfiguration(BaseModel):
+    """Admin-supplied authority request, deliberately unconstrained here.
+
+    A pydantic failure is rendered by the shared ``/api`` validation handler,
+    which echoes the raw ``input`` into the 422 body and logs it -- and for a
+    missing field that input is the whole body, credential included. Domain
+    rules live in :func:`_canonicalize`, which raises only sanitized errors.
+    """
+
     model_config = ConfigDict(frozen=True)
 
-    provider: str = Field(min_length=1, max_length=50)
-    model_name: str = Field(min_length=1, max_length=100)
-    endpoint: str | None = Field(default=None, max_length=500)
-    dimension: int = Field(gt=0)
+    provider: str = ""
+    model_name: str = ""
+    endpoint: str | None = None
+    dimension: int = 0
     instruct: str | None = None
-    max_retries: int = Field(default=10, ge=0)
-    api_key: SecretStr
+    max_retries: int = 10
+    credential_source: CredentialSource = CredentialSource.UNKNOWN
+    global_sharing_consent: bool = False
+    api_key: SecretStr = SecretStr("")
 
 
-@dataclass(frozen=True)
-class GlobalMemoryEmbeddingAuthoritySnapshot:
+@dataclass(frozen=True, kw_only=True)
+class GlobalMemoryEmbeddingAuthorityRecord:
+    """Secret-free view of the authority, materialized before ``COMMIT`` so a
+    writer never re-reads a row a concurrent delete may already have taken."""
+
     provider: str
     model_name: str
     endpoint: str
     dimension: int
     instruct: str | None
     max_retries: int
+    credential_source: CredentialSource
+    global_sharing_consent: bool
+    consented_by_actor_subject: str
+    consented_at: datetime
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class GlobalMemoryEmbeddingAuthoritySnapshot(GlobalMemoryEmbeddingAuthorityRecord):
     api_key: SecretStr = field(repr=False, compare=False)
     credential_identity: str = field(repr=False)
 
     def semantic_fingerprint(self) -> str:
+        """Identity of the embedding space, deliberately free of governance
+        facts: re-approving an unchanged configuration under a different actor
+        must not invalidate the vectors already stored under it."""
         payload = (
             self.provider,
             self.model_name,
@@ -92,23 +144,54 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
     instruct = config.instruct.strip() if config.instruct else None
     if provider != "dashscope":
         instruct = None
-    if not model_name or not endpoint:
+    if not model_name or len(model_name) > _MAX_MODEL_NAME_LENGTH:
         raise ValueError("Global memory embedding identity is incomplete")
+    if not 0 < config.dimension <= _MAX_DIMENSION:
+        raise ValueError("Global memory embedding dimension is out of range")
+    if not 0 <= config.max_retries <= _MAX_RETRIES:
+        raise ValueError("Global memory embedding retry budget is out of range")
+    if config.credential_source not in GLOBALLY_SHAREABLE_CREDENTIAL_SOURCES:
+        raise ValueError("Global memory embedding credential is not shareable")
+    if config.global_sharing_consent is not True:
+        raise ValueError("Global memory embedding sharing consent is required")
     if not config.api_key.get_secret_value().strip():
         raise ValueError("Global memory embedding credential is required")
-    return AuthorityConfiguration(
-        provider=provider,
-        model_name=model_name,
-        endpoint=endpoint,
-        dimension=config.dimension,
-        instruct=instruct,
-        max_retries=config.max_retries,
-        api_key=config.api_key,
+    return config.model_copy(
+        update={
+            "provider": provider,
+            "model_name": model_name,
+            "endpoint": endpoint,
+            "instruct": instruct,
+        }
     )
 
 
+def _canonical_host(hostname: str) -> str:
+    """Wire-canonical host: IDNA ASCII or IP literal, no terminal DNS dot."""
+    host = hostname.rstrip(".")
+    try:
+        if ":" in host:
+            return f"[{ipaddress.IPv6Address(host).compressed}]"
+        if host.replace(".", "").isdigit():
+            return ipaddress.IPv4Address(host).compressed
+        ascii_host = host.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        raise ValueError("Global memory embedding endpoint is invalid") from None
+    if len(ascii_host) > 253 or not _HOSTNAME.fullmatch(ascii_host):
+        raise ValueError("Global memory embedding endpoint is invalid")
+    return ascii_host
+
+
 def _canonical_endpoint(value: str) -> str:
+    """Rebuild the endpoint from canonical components.
+
+    The length bound lives here, not on the request field, so an overlong --
+    possibly credential-bearing -- endpoint is rejected by a sanitized error
+    instead of echoed into the 422 body and the server log by pydantic.
+    """
     endpoint = value.strip()
+    if len(endpoint) > _MAX_ENDPOINT_LENGTH:
+        raise ValueError("Global memory embedding endpoint is invalid")
     if any(
         character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F
         for character in endpoint
@@ -116,33 +199,12 @@ def _canonical_endpoint(value: str) -> str:
         raise ValueError("Global memory embedding endpoint is invalid")
     try:
         parsed = urlsplit(endpoint)
-        _ = parsed.port
+        port = parsed.port
     except ValueError:
         raise ValueError("Global memory embedding endpoint is invalid") from None
-    if parsed.scheme.lower() not in {"http", "https"} or parsed.hostname is None:
+    scheme = parsed.scheme.lower()
+    if scheme not in _DEFAULT_PORTS or parsed.hostname is None:
         raise ValueError("Global memory embedding endpoint must be absolute HTTP(S)")
-    hostname = parsed.hostname
-    try:
-        if ":" in hostname:
-            ipaddress.IPv6Address(hostname)
-        elif hostname.replace(".", "").isdigit():
-            ipaddress.IPv4Address(hostname)
-        else:
-            ascii_hostname = hostname.encode("idna").decode("ascii")
-            labels = ascii_hostname.rstrip(".").split(".")
-            if len(ascii_hostname) > 253 or any(
-                not label
-                or len(label) > 63
-                or label.startswith("-")
-                or label.endswith("-")
-                or not all(
-                    character.isalnum() or character == "-" for character in label
-                )
-                for label in labels
-            ):
-                raise ValueError
-    except (UnicodeError, ValueError):
-        raise ValueError("Global memory embedding endpoint is invalid") from None
     if (
         parsed.username is not None
         or parsed.password is not None
@@ -150,7 +212,12 @@ def _canonical_endpoint(value: str) -> str:
         or parsed.fragment
     ):
         raise ValueError("Global memory embedding endpoint must be credential-free")
-    return endpoint.rstrip("/")
+    host = _canonical_host(parsed.hostname)
+    netloc = host if port in (None, _DEFAULT_PORTS[scheme]) else f"{host}:{port}"
+    canonical = f"{scheme}://{netloc}{parsed.path}".rstrip("/")
+    if len(canonical) > _MAX_ENDPOINT_LENGTH:
+        raise ValueError("Global memory embedding endpoint is invalid")
+    return canonical
 
 
 def _credential_identity(api_key: str) -> str:
@@ -171,7 +238,7 @@ class GlobalMemoryEmbeddingAuthorityService:
 
     def set(
         self, config: AuthorityConfiguration, *, actor_subject: str
-    ) -> GlobalMemoryEmbeddingAuthority:
+    ) -> GlobalMemoryEmbeddingAuthorityRecord:
         normalized = _canonicalize(config)
         secret = normalized.api_key.get_secret_value()
         try:
@@ -180,6 +247,9 @@ class GlobalMemoryEmbeddingAuthorityService:
             raise AuthorityCredentialUnavailable(
                 "Global memory embedding credential is unavailable"
             ) from None
+        # Provenance comes from the authenticated actor and the server clock;
+        # the request body never gets to state who consented.
+        consented_at = datetime.now(timezone.utc)
         values: dict[str, Any] = {
             "authority_key": AUTHORITY_KEY,
             "model_provider": normalized.provider,
@@ -190,7 +260,11 @@ class GlobalMemoryEmbeddingAuthorityService:
             "max_retries": normalized.max_retries,
             "api_key_encrypted": encrypted,
             "credential_verifier": _credential_verifier(secret),
+            "credential_source": normalized.credential_source.value,
+            "global_sharing_consent": True,
             "configured_by_actor_subject": actor_subject,
+            "consented_by_actor_subject": actor_subject,
+            "consented_at": consented_at,
         }
         bind = self.db.get_bind()
         dialect = bind.dialect.name if bind is not None else ""
@@ -210,15 +284,30 @@ class GlobalMemoryEmbeddingAuthorityService:
             key: value for key, value in values.items() if key != "authority_key"
         }
         update_values["updated_at"] = func.now()
-        self.db.execute(
+        table = GlobalMemoryEmbeddingAuthority.__table__
+        written = self.db.execute(
             stmt.on_conflict_do_update(
                 index_elements=["authority_key"], set_=update_values
-            )
+            ).returning(table.c.created_at, table.c.updated_at)
+        ).one()
+        # Built before COMMIT: a concurrent delete may win the row the moment
+        # the transaction lands, and must not fail this durable write.
+        record = GlobalMemoryEmbeddingAuthorityRecord(
+            provider=normalized.provider,
+            model_name=normalized.model_name,
+            endpoint=normalized.endpoint or "",
+            dimension=normalized.dimension,
+            instruct=normalized.instruct,
+            max_retries=normalized.max_retries,
+            credential_source=normalized.credential_source,
+            global_sharing_consent=True,
+            consented_by_actor_subject=actor_subject,
+            consented_at=consented_at,
+            created_at=written.created_at,
+            updated_at=written.updated_at,
         )
         self.db.commit()
-        row = self.get_row()
-        assert row is not None
-        return row
+        return record
 
     def delete(self) -> None:
         self.db.query(GlobalMemoryEmbeddingAuthority).delete()
@@ -247,6 +336,10 @@ class GlobalMemoryEmbeddingAuthorityService:
             dimension=int(row.dimension),
             instruct=str(row.instruct) if row.instruct is not None else None,
             max_retries=int(row.max_retries),
+            credential_source=CredentialSource(str(row.credential_source)),
+            global_sharing_consent=bool(row.global_sharing_consent),
+            consented_by_actor_subject=str(row.consented_by_actor_subject),
+            consented_at=cast(datetime, row.consented_at),
             api_key=SecretStr(secret),
             credential_identity=_credential_identity(secret),
         )

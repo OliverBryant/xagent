@@ -1,5 +1,5 @@
 """Add explicit global memory embedding authority.
-Revision ID: 20260911_global_memory_authority; Revises: 20260914_add_hubspot_deals_write_scope
+Revision ID: 20260911_global_memory_authority; Revises: 20260909_seed_whatsapp_mcp_app
 """
 
 from typing import Sequence, Union
@@ -9,7 +9,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20260911_global_memory_authority"
-down_revision: Union[str, None] = "20260914_add_hubspot_deals_write_scope"
+down_revision: Union[str, None] = "20260909_seed_whatsapp_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -31,7 +31,11 @@ def upgrade() -> None:
         sa.Column("max_retries", sa.Integer(), nullable=False, server_default="10"),
         sa.Column("api_key_encrypted", sa.Text(), nullable=False),
         sa.Column("credential_verifier", sa.String(96), nullable=False),
+        sa.Column("credential_source", sa.String(32), nullable=False),
+        sa.Column("global_sharing_consent", sa.Boolean(), nullable=False),
         sa.Column("configured_by_actor_subject", sa.String(64), nullable=False),
+        sa.Column("consented_by_actor_subject", sa.String(64), nullable=False),
+        sa.Column("consented_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now()
         ),
@@ -40,6 +44,13 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "authority_key = 'global'", name="ck_global_memory_authority_key"
+        ),
+        sa.CheckConstraint(
+            "credential_source IN ('application_owned', 'organization_owned')",
+            name="ck_global_memory_authority_credential_source",
+        ),
+        sa.CheckConstraint(
+            "global_sharing_consent", name="ck_global_memory_authority_consent"
         ),
     )
 

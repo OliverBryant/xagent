@@ -1,12 +1,15 @@
 import hashlib
+import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import get_cipher
 from xagent.web.api.admin_memory_embedding_authority import router
@@ -18,18 +21,45 @@ from xagent.web.models.global_memory_embedding_authority import (
 from xagent.web.services.global_memory_embedding_authority import (
     AuthorityConfiguration,
     AuthorityCredentialUnavailable,
+    CredentialSource,
     GlobalMemoryEmbeddingAuthorityService,
 )
 
 SECRET = "application-owned-secret"
+URL = "/api/admin/memory/embedding-authority"
+TABLE = GlobalMemoryEmbeddingAuthority.__tablename__
 PAYLOAD = {
     "provider": "openai",
     "model_name": "text-embedding-3-small",
     "endpoint": "https://api.openai.com/v1",
     "dimension": 1536,
     "max_retries": 10,
+    "credential_source": "application_owned",
+    "global_sharing_consent": True,
     "api_key": SECRET,
 }
+
+
+def _delete_row_once(sessions, armed):
+    """An ``after_commit`` hook racing a delete into the committed write."""
+
+    def hook(_session):
+        if armed:
+            return
+        armed.append(True)
+        with sessions() as other:
+            other.query(GlobalMemoryEmbeddingAuthority).delete()
+            other.commit()
+
+    return hook
+
+
+def _row_state(sessions):
+    with sessions() as db:
+        row = db.get(GlobalMemoryEmbeddingAuthority, "global")
+        if row is None:
+            return None
+        return tuple(getattr(row, column.name) for column in row.__table__.columns)
 
 
 @pytest.fixture
@@ -108,37 +138,13 @@ def test_invalid_endpoint_is_rejected_without_changing_state(
     authority_harness, endpoint
 ):
     client, sessions, _actor, _engine = authority_harness
-    assert (
-        client.put("/api/admin/memory/embedding-authority", json=PAYLOAD).status_code
-        == 200
-    )
-    with sessions() as db:
-        row = db.get(GlobalMemoryEmbeddingAuthority, "global")
-        before = (row.base_url, row.api_key_encrypted, row.credential_verifier)
-    response = client.put(
-        "/api/admin/memory/embedding-authority", json=dict(PAYLOAD, endpoint=endpoint)
-    )
+    assert client.put(URL, json=PAYLOAD).status_code == 200
+    before = _row_state(sessions)
+    response = client.put(URL, json=dict(PAYLOAD, endpoint=endpoint))
     assert response.status_code == 400
     assert endpoint not in response.text
-    state = client.get("/api/admin/memory/embedding-authority").json()
-    assert state["endpoint"] == "https://api.openai.com/v1/embeddings"
-    with sessions() as db:
-        row = db.get(GlobalMemoryEmbeddingAuthority, "global")
-        assert (row.base_url, row.api_key_encrypted, row.credential_verifier) == before
-
-
-def test_endpoint_validation_preserves_localhost_and_paths(authority_harness):
-    _client, sessions, _actor, _engine = authority_harness
-    with sessions() as db:
-        service = GlobalMemoryEmbeddingAuthorityService(db)
-        config = dict(
-            PAYLOAD, provider="xinference", endpoint="http://localhost:9997/v1/"
-        )
-        service.set(AuthorityConfiguration(**config), actor_subject="actor-1")
-        assert service.load_snapshot().endpoint == "http://localhost:9997/v1"
-        config["endpoint"] = "http://[::1]:9997/v1/"
-        service.set(AuthorityConfiguration(**config), actor_subject="actor-1")
-        assert service.load_snapshot().endpoint == "http://[::1]:9997/v1"
+    assert client.get(URL).json()["endpoint"] == "https://api.openai.com/v1/embeddings"
+    assert _row_state(sessions) == before
 
 
 def test_equivalent_updates_keep_one_semantic_identity(authority_harness):
@@ -218,3 +224,165 @@ def test_unavailable_encryption_key_fails_closed(authority_harness, monkeypatch)
             assert service.credential_status() == "unavailable"
         finally:
             get_cipher.cache_clear()
+
+
+def test_overlong_credential_bearing_endpoint_is_rejected_without_leaking(
+    authority_harness, caplog
+):
+    """A length bound on the request field would publish the endpoint: the
+    shared ``/api`` validation handler echoes the raw ``input`` into the 422
+    body and logs it, so the bound belongs to the canonicalizer instead."""
+    client, sessions, _actor, _engine = authority_harness
+    assert client.put(URL, json=PAYLOAD).status_code == 200
+    before = _row_state(sessions)
+    marker = "leaked-endpoint-userinfo-marker"
+    overlong = f"https://admin:{marker}@{'a' * 520}.example.com/v1"
+    with caplog.at_level(logging.DEBUG):
+        response = client.put(URL, json=dict(PAYLOAD, endpoint=overlong))
+    assert len(overlong) > 500
+    assert response.status_code == 400
+    assert marker not in response.text and marker not in caplog.text
+    assert _row_state(sessions) == before
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"credential_source": None},
+        {"credential_source": "personal"},
+        {"credential_source": "unknown"},
+        {"global_sharing_consent": None},
+        {"global_sharing_consent": False},
+    ],
+)
+def test_unowned_or_unconsented_credential_is_rejected(authority_harness, overrides):
+    """Ownership and consent are explicit facts, never inferred from admin rights."""
+    client, sessions, _actor, _engine = authority_harness
+    payload = {k: v for k, v in dict(PAYLOAD, **overrides).items() if v is not None}
+    response = client.put(URL, json=payload)
+    assert response.status_code == 400
+    assert SECRET not in response.text
+    assert client.get(URL).json()["configured"] is False
+    assert _row_state(sessions) is None
+
+
+def test_consent_provenance_is_server_side_and_outside_the_fingerprint(
+    authority_harness,
+):
+    client, sessions, _actor, _engine = authority_harness
+    before = datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None)
+    body = client.put(
+        URL, json=dict(PAYLOAD, consented_by_actor_subject="spoofed-actor")
+    ).json()
+    assert body["credential_source"] == "application_owned"
+    assert body["global_sharing_consent"] is True
+    assert body["consented_by_actor_subject"] == "actor-1"
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        first = service.load_snapshot()
+        assert first.credential_source is CredentialSource.APPLICATION_OWNED
+        assert first.global_sharing_consent is True
+        assert first.consented_by_actor_subject == "actor-1"
+        assert first.consented_at.replace(tzinfo=None) >= before
+        service.set(AuthorityConfiguration(**PAYLOAD), actor_subject="actor-2")
+        second = service.load_snapshot()
+        assert second.consented_by_actor_subject == "actor-2"
+        assert first.semantic_fingerprint() == second.semantic_fingerprint()
+
+
+@pytest.mark.parametrize(
+    "assignment", ["credential_source = 'personal'", "global_sharing_consent = 0"]
+)
+def test_ownership_and_consent_are_enforced_at_rest(authority_harness, assignment):
+    """A row written around the service cannot claim the global authority."""
+    client, sessions, _actor, _engine = authority_harness
+    assert client.put(URL, json=PAYLOAD).status_code == 200
+    with sessions() as db, pytest.raises(IntegrityError):
+        db.execute(text(f"UPDATE {TABLE} SET {assignment}"))
+        db.commit()
+
+
+# Scheme/host case, an explicit default port, a terminal DNS dot, a trailing
+# slash and Unicode-vs-IDNA spellings all name the same endpoint.
+@pytest.mark.parametrize(
+    "provider, spellings, expected",
+    [
+        (
+            "openai",
+            "https://api.openai.com/v1 https://API.OpenAI.COM/v1"
+            " https://api.openai.com.:443/v1 HTTPS://api.openai.com:443/v1/",
+            "https://api.openai.com/v1/embeddings",
+        ),
+        (
+            "xinference",
+            "http://bücher.example/v1 http://xn--bcher-kva.example/v1"
+            " http://BÜCHER.Example.:80/v1/",
+            "http://xn--bcher-kva.example/v1",
+        ),
+        (
+            "xinference",
+            "http://[0:0:0:0:0:0:0:1]:9997/v1 http://[::1]:9997/v1/",
+            "http://[::1]:9997/v1",
+        ),
+        (
+            "xinference",
+            "http://localhost:9997/v1/ http://LocalHost:9997/v1",
+            "http://localhost:9997/v1",
+        ),
+    ],
+)
+def test_equivalent_endpoint_spellings_share_one_identity(
+    authority_harness, provider, spellings, expected
+):
+    _client, sessions, _actor, _engine = authority_harness
+    fingerprints = set()
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        for spelling in spellings.split():
+            config = dict(PAYLOAD, provider=provider, endpoint=spelling)
+            record = service.set(AuthorityConfiguration(**config), actor_subject="a")
+            assert record.endpoint == expected
+            assert service.get_row().base_url == expected
+            fingerprints.add(service.load_snapshot().semantic_fingerprint())
+        # A genuinely different host, port or path is a different identity.
+        for other in ("http://127.0.0.1:1/v1", "http://127.0.0.1:2/v1", "http://a.io"):
+            config = dict(PAYLOAD, provider="xinference", endpoint=other)
+            service.set(AuthorityConfiguration(**config), actor_subject="a")
+            fingerprints.add(service.load_snapshot().semantic_fingerprint())
+    assert len(fingerprints) == 4
+
+
+def test_put_returns_written_state_when_a_delete_races_the_commit(authority_harness):
+    """A delete landing right after COMMIT must not fail a durable write."""
+    client, sessions, _actor, _engine = authority_harness
+    hook = _delete_row_once(sessions, [])
+    event.listen(Session, "after_commit", hook)
+    try:
+        response = client.put(URL, json=PAYLOAD)
+    finally:
+        event.remove(Session, "after_commit", hook)
+    body = response.json()
+    assert response.status_code == 200
+    assert body["configured"] is True
+    assert body["endpoint"] == "https://api.openai.com/v1/embeddings"
+    assert body["credential_status"] == "configured"
+    assert SECRET not in response.text
+    assert client.get(URL).json()["configured"] is False
+
+
+def test_service_set_returns_written_state_when_a_delete_races_the_commit(
+    authority_harness,
+):
+    _client, sessions, _actor, _engine = authority_harness
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        hook = _delete_row_once(sessions, [])
+        event.listen(db, "after_commit", hook)
+        try:
+            record = service.set(AuthorityConfiguration(**PAYLOAD), actor_subject="a1")
+        finally:
+            event.remove(db, "after_commit", hook)
+        assert record.endpoint == "https://api.openai.com/v1/embeddings"
+        assert record.credential_source is CredentialSource.APPLICATION_OWNED
+        assert record.consented_by_actor_subject == "a1"
+        assert service.get_row() is None

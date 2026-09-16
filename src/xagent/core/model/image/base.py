@@ -56,6 +56,18 @@ class BaseImageModel(ABC):
         """
         pass
 
+    @property
+    def supports_transparent_background(self) -> bool:
+        """Whether the provider itself can return an image with an alpha channel.
+
+        False for every provider that only emits flat RGB, which is most of
+        them. Callers needing transparency from those fall back to keying a flat
+        chroma background out locally (see ``.transparency``), so this is
+        deliberately about the provider's own capability rather than about
+        whether a transparent result is reachable at all.
+        """
+        return False
+
     def has_ability(self, ability: str) -> bool:
         """
         Check if this image model implementation supports a specific ability.

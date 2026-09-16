@@ -18,6 +18,10 @@ import aiohttp
 
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
+from ...model.image.transparency import (
+    ensure_transparent_background,
+    transparency_prompt_instructions,
+)
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -82,9 +86,15 @@ When given a user request, rewrite and enrich the prompt into a **professional i
   request needs. Do not blanket-ban whole families of imagery such as people,
   crowds, skylines, glow, or 3D as a routine list; that strips legitimate
   content and flattens the result.
+- Transparent background: pass transparent_background=true whenever the
+  deliverable is a cutout rather than a full frame -- a logo, icon, sticker,
+  badge, product shot, or any asset meant to sit on top of another design.
+  Asking for "transparent background" in the prompt alone does NOT produce an
+  alpha channel; without the parameter the file comes back opaque.
 - For general concepts: describe the visual representation (e.g., "2M downloads text", "million counter")
 
-Available models (⭐[DEFAULT] marks the configured default model):
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks native
+transparent-background support):
 {}
 
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
@@ -98,7 +108,21 @@ Parameters:
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
+- transparent_background (optional): save a PNG with a real alpha channel instead of an opaque background
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+
+**IMPORTANT NOTES ON TRANSPARENT BACKGROUNDS:**
+- Models marked ◻ produce the alpha channel themselves.
+- Every other model cannot, so transparency is produced locally instead: the
+  request asks for the subject on a flat magenta background and that background
+  is keyed out after generation. This works, but it constrains the image --
+  drop shadows, reflections, glows, and any scenery behind the subject are not
+  available, and magenta, hot pink, and purple must stay out of the subject.
+  Do not request transparency for a full-frame design such as a poster, ad, or
+  banner where the background is part of the artwork.
+- The result carries a `transparency` field. Read it before reporting success:
+  `mode` is `native`, `keyed`, or `failed`, and a `warning` means the saved file
+  is still opaque. Never describe an image as transparent without checking it.
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
@@ -145,7 +169,8 @@ reference material from any other origin, and never take one from the user's
 other tasks. A plausible-looking search result is not proof that an asset is the
 brand's; when nothing verifiable is available, ask the user for it.
 
-Available models (⭐[DEFAULT] marks the configured default model):
+Available models (⭐[DEFAULT] marks the configured default model, ◻ marks native
+transparent-background support):
 {}
 
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
@@ -154,12 +179,26 @@ Parameters:
 - image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
+- transparent_background (optional): save a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene
 - size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
+
+**IMPORTANT NOTES ON TRANSPARENT BACKGROUNDS:**
+- Models marked ◻ produce the alpha channel themselves.
+- Every other model cannot, so transparency is produced locally instead: the
+  request asks for the subject on a flat magenta background and that background
+  is keyed out after generation. This works, but it constrains the image --
+  drop shadows, reflections, glows, and any scenery behind the subject are not
+  available, and magenta, hot pink, and purple must stay out of the subject.
+  Do not request transparency for a full-frame design such as a poster, ad, or
+  banner where the background is part of the artwork.
+- The result carries a `transparency` field. Read it before reporting success:
+  `mode` is `native`, `keyed`, or `failed`, and a `warning` means the saved file
+  is still opaque. Never describe an image as transparent without checking it.
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
@@ -259,13 +298,17 @@ Images are automatically saved to workspace.
             if self._has_ability(model, "generate"):
                 description = self._model_descriptions.get(model_id, "")
                 edit_marker = " ✎" if self._has_ability(model, "edit") else ""
+                transparency_marker = (
+                    " ◻" if self._has_native_transparency(model) else ""
+                )
+                markers = f"{edit_marker}{transparency_marker}"
                 is_default = model_id == default_generate_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
 
                 if description:
-                    line = f"- {model_id}: {description}{edit_marker}{default_marker}"
+                    line = f"- {model_id}: {description}{markers}{default_marker}"
                 else:
-                    line = f"- {model_id}: No description available{edit_marker}{default_marker}"
+                    line = f"- {model_id}: No description available{markers}{default_marker}"
 
                 if is_default:
                     default_model_lines.append(line)
@@ -289,11 +332,16 @@ Images are automatically saved to workspace.
                 description = self._model_descriptions.get(model_id, "")
                 is_default = model_id == default_edit_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
+                # Same legend as the generate listing, or EDIT_IMAGE_DESCRIPTION
+                # explains a marker that never appears.
+                transparency_marker = (
+                    " ◻" if self._has_native_transparency(model) else ""
+                )
 
                 if description:
-                    line = f"- {model_id}: {description}{default_marker}"
+                    line = f"- {model_id}: {description}{transparency_marker}{default_marker}"
                 else:
-                    line = f"- {model_id}: No description available{default_marker}"
+                    line = f"- {model_id}: No description available{transparency_marker}{default_marker}"
 
                 if is_default:
                     default_edit_lines.append(line)
@@ -373,6 +421,29 @@ Images are automatically saved to workspace.
         """Capable only when the model itself declares the ability."""
         has_ability = getattr(model, "has_ability", None)
         return callable(has_ability) and bool(has_ability(ability))
+
+    @staticmethod
+    def _has_native_transparency(model: Any) -> bool:
+        """Whether the provider emits alpha itself, rather than needing keying.
+
+        Read defensively through getattr for the same reason the abilities probe
+        is: models arrive wrapped in the retry proxy, and a provider class
+        written before this property existed must degrade to the keying path
+        rather than raising.
+
+        Compared against True rather than coerced with bool() because the two
+        errors are not symmetric: a false negative just keys the background out
+        locally, while a false positive forwards ``transparent_background`` to a
+        provider that splices unknown fields into its payload and fails the whole
+        request. Anything that is not literally True takes the safe path.
+        """
+        return getattr(model, "supports_transparent_background", False) is True
+
+    @staticmethod
+    def _transparent_filename(prefix: str) -> str:
+        """Force a .png name so a JPEG-answering provider still lands on a path
+        that can hold the alpha channel keying is about to build."""
+        return f"{prefix}_{uuid.uuid4().hex[:8]}.png"
 
     def _available_models_summary(self) -> str:
         entries = []
@@ -606,6 +677,7 @@ Images are automatically saved to workspace.
         resolution: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
         images: str | list[str] | None = None,
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -621,6 +693,10 @@ Images are automatically saved to workspace.
             resolution: Image resolution (e.g., "1920x1080")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             images: Optional source/reference image(s). When provided, delegate to edit_image.
+            transparent_background: Save a PNG with a transparent background
+                instead of an opaque one. Served natively where the provider
+                supports it, otherwise by asking for a flat chroma background
+                and keying it out locally.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -638,6 +714,7 @@ Images are automatically saved to workspace.
                     height=height,
                     resolution=resolution,
                     aspect_ratio=aspect_ratio,
+                    transparent_background=transparent_background,
                     **kwargs,
                 )
 
@@ -651,12 +728,26 @@ Images are automatically saved to workspace.
                     "image_path": None,
                 }
 
+            # Transparency is served one of two ways, and the prompt has to be
+            # built for whichever one applies before the request goes out.
+            native_transparency = transparent_background and (
+                self._has_native_transparency(image_model)
+            )
+            effective_prompt = prompt
+            if transparent_background and not native_transparency:
+                effective_prompt = f"{prompt}\n\n{transparency_prompt_instructions()}"
+
             # Build parameters for image generation
             generate_params: dict[str, Any] = {
-                "prompt": prompt,
+                "prompt": effective_prompt,
                 "size": size,
                 "negative_prompt": negative_prompt,
             }
+            if native_transparency:
+                # Only forwarded to a provider that declares the capability:
+                # dashscope and xinference splice unknown kwargs straight into
+                # their request payloads, where an unexpected field is an error.
+                generate_params["transparent_background"] = True
 
             # Add optional parameters if provided
             if width is not None:
@@ -682,11 +773,25 @@ Images are automatically saved to workspace.
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
+            transparency: Optional[dict[str, Any]] = None
+
             # Download image to workspace if workspace is available
             if image_url and self._workspace:
                 try:
                     with self._workspace.auto_register_files():
-                        image_path = await self._download_image(image_url)
+                        image_path = await self._download_image(
+                            image_url,
+                            self._transparent_filename("generated_image")
+                            if transparent_background
+                            else None,
+                        )
+                        # Inside the registration block so the keyed PNG, not the
+                        # opaque download it replaces, is what gets registered.
+                        if image_path and transparent_background:
+                            transparency = ensure_transparent_background(
+                                image_path,
+                                allow_keying=not native_transparency,
+                            )
                     if image_path:
                         try:
                             file_ref = build_workspace_file_ref(
@@ -719,6 +824,8 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if transparency is not None:
+                response["transparency"] = transparency
             return response
 
         except Exception as e:
@@ -745,6 +852,7 @@ Images are automatically saved to workspace.
         height: Optional[int] = None,
         resolution: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        transparent_background: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -760,6 +868,10 @@ Images are automatically saved to workspace.
             height: Image height in pixels (alternative to size)
             resolution: Image resolution (e.g., "1920x1080")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
+            transparent_background: Save a PNG with a transparent background
+                instead of an opaque one. Served natively where the provider
+                supports it, otherwise by asking for a flat chroma background
+                and keying it out locally.
             **kwargs: Additional model-specific parameters
 
         Returns:
@@ -784,15 +896,25 @@ Images are automatically saved to workspace.
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
             )
 
+            native_transparency = transparent_background and (
+                self._has_native_transparency(image_model)
+            )
+            effective_prompt = prompt
+            if transparent_background and not native_transparency:
+                effective_prompt = f"{prompt}\n\n{transparency_prompt_instructions()}"
+
             # Build parameters for image editing
             edit_params: dict[str, Any] = {
                 "image_url": resolved_image_paths[0]
                 if len(resolved_image_paths) == 1
                 else resolved_image_paths,
-                "prompt": prompt,
+                "prompt": effective_prompt,
                 "size": size,
                 "negative_prompt": negative_prompt,
             }
+            if native_transparency:
+                # See generate_image: forwarded only where it is understood.
+                edit_params["transparent_background"] = True
 
             # Add optional parameters if provided
             if width is not None:
@@ -818,6 +940,8 @@ Images are automatically saved to workspace.
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
+            transparency: Optional[dict[str, Any]] = None
+
             # Download image to workspace if workspace is available
             if edited_image_url and self._workspace:
                 try:
@@ -827,6 +951,13 @@ Images are automatically saved to workspace.
                         image_path = await self._download_image(
                             edited_image_url, filename
                         )
+                        # Inside the registration block so the keyed PNG, not the
+                        # opaque download it replaces, is what gets registered.
+                        if image_path and transparent_background:
+                            transparency = ensure_transparent_background(
+                                image_path,
+                                allow_keying=not native_transparency,
+                            )
                     if image_path:
                         try:
                             file_ref = build_workspace_file_ref(
@@ -847,7 +978,7 @@ Images are automatically saved to workspace.
             elif edited_image_url and not self._workspace:
                 logger.warning("No workspace available, edited image not saved locally")
 
-            return {
+            response: Dict[str, Any] = {
                 "success": True,
                 "image_path": image_path,
                 "file_id": image_file_id,
@@ -859,6 +990,9 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if transparency is not None:
+                response["transparency"] = transparency
+            return response
 
         except Exception as e:
             logger.error(f"Image editing failed: {e}")
@@ -896,6 +1030,13 @@ Images are automatically saved to workspace.
                     "available": bool(abilities),
                     "abilities": abilities,
                     "description": self._model_descriptions.get(model_id, ""),
+                    # False does not mean transparency is unreachable, only that
+                    # it would be produced by local keying rather than by the
+                    # provider. Named for the provider capability so it cannot be
+                    # read as "transparent_background is rejected here".
+                    "native_transparent_background": self._has_native_transparency(
+                        model
+                    ),
                 }
                 models_info.append(model_info)
 

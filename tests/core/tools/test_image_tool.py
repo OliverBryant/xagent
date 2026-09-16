@@ -973,6 +973,9 @@ class TestImageToolCapabilityGating:
             "available": True,
             "abilities": ["edit"],
             "description": "",
+            # A mock is not literally True here, so this reports the safe
+            # answer: transparency would be keyed locally, not served natively.
+            "native_transparent_background": False,
         }
 
     def test_a_model_without_has_ability_is_not_trusted(self, mock_workspace):

@@ -732,3 +732,194 @@ class TestImageGenerationToolCore:
         call_kwargs = mock_image_models["model1"].edit_image.call_args.kwargs
         assert "size" in call_kwargs
         assert call_kwargs["size"] == "1024*1024"
+
+
+def _keyable_png(path):
+    """Flat magenta frame with a solid subject block, as the prompt asks for."""
+    from PIL import Image
+
+    image = Image.new("RGB", (40, 40), (255, 0, 255))
+    for x in range(10, 30):
+        for y in range(10, 30):
+            image.putpixel((x, y), (20, 130, 200))
+    image.save(path)
+    return str(path)
+
+
+def _transparency_tool(mock_workspace, *, native: bool, ability="generate"):
+    """Single-model tool whose provider either emits alpha itself or does not."""
+    model = Mock(spec=BaseImageModel)
+    model.generate_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.edit_image = AsyncMock(
+        return_value={"image_url": "https://example.com/out.png", "usage": {}}
+    )
+    model.has_ability = Mock(return_value=True)
+    # Explicit because Mock(spec=...) would otherwise answer this property with a
+    # truthy Mock and silently take the native path.
+    model.supports_transparent_background = native
+    tool = ImageGenerationToolCore({"m": model}, {"m": "Test model"}, mock_workspace)
+    return tool, model
+
+
+class TestTransparentBackground:
+    """Transparency is served natively where possible, keyed locally otherwise."""
+
+    def test_descriptions_explain_the_parameter_and_the_report(self):
+        for description in (
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+            ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+        ):
+            assert "transparent_background" in description
+            # Prompt wording alone never produces an alpha channel, and the
+            # model has to know that or it will keep asking in prose.
+            assert "◻" in description
+            # Reporting success without reading the report is the failure mode
+            # this whole feature exists to stop.
+            assert "`transparency` field" in description
+
+    async def test_keying_path_augments_prompt_and_reports_keyed(
+        self, mock_workspace, tmp_path
+    ):
+        tool, model = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            assert filename is not None and filename.endswith(".png")
+            return _keyable_png(tmp_path / filename)
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.generate_image(
+                prompt="a rocket icon", transparent_background=True
+            )
+
+        sent = model.generate_image.call_args.kwargs
+        assert sent["prompt"].startswith("a rocket icon")
+        assert "#FF00FF" in sent["prompt"]
+        # dashscope and xinference splice unknown kwargs into their payloads, so
+        # the flag must not reach a provider that cannot read it.
+        assert "transparent_background" not in sent
+
+        assert result["success"] is True
+        assert result["transparency"]["mode"] == "keyed"
+        assert result["transparency"]["transparent"] is True
+
+    async def test_native_path_forwards_flag_and_leaves_prompt_alone(
+        self, mock_workspace, tmp_path
+    ):
+        tool, model = _transparency_tool(mock_workspace, native=True)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            from PIL import Image
+
+            path = tmp_path / (filename or "out.png")
+            image = Image.new("RGBA", (10, 10), (20, 130, 200, 255))
+            image.putpixel((0, 0), (0, 0, 0, 0))
+            image.save(path)
+            return str(path)
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.generate_image(
+                prompt="a rocket icon", transparent_background=True
+            )
+
+        sent = model.generate_image.call_args.kwargs
+        assert sent["prompt"] == "a rocket icon"
+        assert sent["transparent_background"] is True
+        assert result["transparency"]["mode"] == "native"
+
+    async def test_flat_background_missing_is_reported_not_hidden(
+        self, mock_workspace, tmp_path
+    ):
+        tool, _ = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            from PIL import Image
+
+            path = tmp_path / (filename or "out.png")
+            Image.new("RGB", (20, 20), (240, 240, 240)).save(path)
+            return str(path)
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.generate_image(
+                prompt="a rocket icon", transparent_background=True
+            )
+
+        # The call succeeded, but the file is opaque and the caller must say so.
+        assert result["success"] is True
+        assert result["transparency"]["mode"] == "failed"
+        assert result["transparency"]["transparent"] is False
+        assert "warning" in result["transparency"]
+
+    async def test_no_transparency_key_when_not_requested(
+        self, mock_workspace, tmp_path
+    ):
+        tool, model = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            assert filename is None
+            return _keyable_png(tmp_path / "out.png")
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.generate_image(prompt="a rocket icon")
+
+        assert "transparency" not in result
+        assert model.generate_image.call_args.kwargs["prompt"] == "a rocket icon"
+
+    async def test_edit_path_keys_locally_too(self, mock_workspace, tmp_path):
+        tool, model = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            return _keyable_png(tmp_path / (filename or "out.png"))
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.edit_image(
+                prompt="cut out the product",
+                image_url="https://example.com/in.png",
+                transparent_background=True,
+            )
+
+        sent = model.edit_image.call_args.kwargs
+        assert "#FF00FF" in sent["prompt"]
+        assert "transparent_background" not in sent
+        assert result["transparency"]["mode"] == "keyed"
+
+    async def test_reference_images_carry_the_request_into_editing(
+        self, mock_workspace, tmp_path
+    ):
+        tool, model = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            return _keyable_png(tmp_path / (filename or "out.png"))
+
+        with patch.object(tool, "_download_image", side_effect=fake_download):
+            result = await tool.generate_image(
+                prompt="cut this out",
+                images="https://example.com/ref.png",
+                transparent_background=True,
+            )
+
+        # generate_image delegates to edit_image when references are supplied;
+        # dropping the flag there would silently return an opaque image.
+        assert "#FF00FF" in model.edit_image.call_args.kwargs["prompt"]
+        assert result["transparency"]["mode"] == "keyed"
+
+    def test_model_listing_reports_provider_capability(self, mock_workspace):
+        native_tool, _ = _transparency_tool(mock_workspace, native=True)
+        keying_tool, _ = _transparency_tool(mock_workspace, native=False)
+
+        assert (
+            native_tool.list_available_models()["models"][0][
+                "native_transparent_background"
+            ]
+            is True
+        )
+        assert (
+            keying_tool.list_available_models()["models"][0][
+                "native_transparent_background"
+            ]
+            is False
+        )
+        # The legend the descriptions explain has to actually appear.
+        assert "◻" in native_tool._model_info_text
+        assert "◻" not in keying_tool._model_info_text

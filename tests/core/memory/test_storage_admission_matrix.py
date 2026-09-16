@@ -16,7 +16,9 @@ from xagent.core.memory.lancedb_maintenance import (
     MaintenanceOutcome,
     MaintenanceStatus,
     lancedb_lock_path,
+    maintain_lancedb_memory_table,
 )
+from xagent.core.memory.scope_columns import USER_ID_COLUMN
 from xagent.core.memory.storage_admission import (
     ADMISSION_FAILED_DETAIL,
     REPAIR_REQUIRED_DETAIL,
@@ -25,7 +27,13 @@ from xagent.core.memory.storage_admission import (
     StorageAdmissionState,
     admit_lancedb_memory_storage,
 )
-from xagent.core.memory.vector_compatibility import EmbeddingIdentity
+from xagent.core.memory.vector_compatibility import (
+    FULL_ADMISSION_METADATA_KEY,
+    FULL_ADMISSION_TABLE_VERSION_KEY,
+    FULL_ADMISSION_VERSION,
+    VECTOR_IDENTITY_METADATA_KEY,
+    EmbeddingIdentity,
+)
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 
 IDENTITY = EmbeddingIdentity(
@@ -120,6 +128,9 @@ def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
     assert table.version == before_version + 1
     assert field.metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
     assert field.metadata[MAINTENANCE_TABLE_VERSION_KEY] == str(table.version).encode()
+    assert field.metadata[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    version_key = field.metadata[FULL_ADMISSION_TABLE_VERSION_KEY]
+    assert version_key == str(table.version).encode()
     assert table.schema.field("vector").type == pa.list_(pa.float32(), 4)
     assert table.to_arrow()["vector"].to_pylist() == [None] * 5
     assert null_types == [pa.list_(pa.float32(), 4)] * 3
@@ -127,6 +138,12 @@ def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
     scanned.clear()
     assert _admit(connection).state is StorageAdmissionState.ADMITTED
     assert scanned == []
+    # Any later commit moves the version the marker is bound to, so the next
+    # admission revalidates the table instead of trusting the stale marker.
+    table.delete("id = 'note-0'")
+    _safe_close_table(table)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    assert scanned == [2, 2]
 
 
 def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monkeypatch):
@@ -422,3 +439,56 @@ def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
         and "admit_lancedb_memory_storage(" in path.read_text(encoding="utf-8")
     ]
     assert callers == [source_root / "core" / "memory" / "storage_admission.py"]
+
+
+def _scope_maintained_connection(tmp_path, *, drop_text, vector):
+    """Seed a table whose only completion marker is the scope-only one."""
+    connection = lancedb.connect(tmp_path)
+    row = {"id": "note-0", "text": "text-0", "metadata": json.dumps({"user_id": 3})}
+    fields = [("id", pa.string()), ("text", pa.string()), ("metadata", pa.string())]
+    if drop_text:
+        del row["text"], fields[1]
+    # LanceDB refuses to write NaNs into a column named "vector", so the legacy
+    # values are staged under another name and renamed into place.
+    row["badvec"] = vector
+    fields.append(("badvec", pa.list_(pa.float32(), 4)))
+    identity = json.dumps(IDENTITY.as_dict(), sort_keys=True, separators=(",", ":"))
+    schema = pa.schema(
+        fields, metadata={VECTOR_IDENTITY_METADATA_KEY: identity.encode()}
+    )
+    table = connection.create_table(
+        "memories", pa.Table.from_pylist([row], schema=schema)
+    )
+    table.alter_columns({"path": "badvec", "rename": "vector"})
+    _safe_close_table(table)
+
+    assert (
+        maintain_lancedb_memory_table(connection, "memories").status
+        is MaintenanceStatus.COMPLETE
+    )
+    metadata = _snapshot(connection)[1].field(USER_ID_COLUMN).metadata
+    assert metadata[MAINTENANCE_METADATA_KEY] == MAINTENANCE_VERSION
+    assert FULL_ADMISSION_METADATA_KEY not in metadata
+    return connection
+
+
+@pytest.mark.parametrize("case", ["missing_text", "nan_vector"])
+def test_scope_only_marker_never_certifies_admission(tmp_path, case):
+    nan_case = case == "nan_vector"
+    connection = _scope_maintained_connection(
+        tmp_path,
+        drop_text=not nan_case,
+        vector=[math.nan, 0.0, 0.0, 0.0] if nan_case else [1.0, 2.0, 3.0, 4.0],
+    )
+    before = _snapshot(connection)
+
+    outcome = _admit(connection)
+    after = _snapshot(connection)
+    assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    assert outcome.detail == REPAIR_REQUIRED_DETAIL
+    assert after[:2] == before[:2]
+    if nan_case:
+        # The rejected table keeps its own bytes; admission never "repairs" it.
+        assert math.isnan(after[2][0]["vector"][0])
+    else:
+        assert after[2] == before[2]

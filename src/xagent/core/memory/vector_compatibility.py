@@ -20,6 +20,12 @@ from . import lancedb_maintenance as maintenance
 from .scope_columns import SCOPE_DIMS_COLUMN, USER_ID_COLUMN, derive_scope_columns
 
 VECTOR_IDENTITY_METADATA_KEY = b"xagent.memory.vector_space"
+# Deliberately a different namespace from the scope-only maintenance marker in
+# ``lancedb_maintenance``: that marker certifies scope invariants alone and must
+# never certify admission. Only the full validation below writes this one.
+FULL_ADMISSION_METADATA_KEY = b"xagent.memory.full_admission"
+FULL_ADMISSION_TABLE_VERSION_KEY = b"xagent.memory.full_admission_table_version"
+FULL_ADMISSION_VERSION = b"1"
 DASHSCOPE_DEFAULT_ENDPOINT = (
     "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
     "text-embedding/text-embedding"
@@ -276,6 +282,36 @@ def _validate_existing_vectors(batch: Any, vector_type: _ArrowDataType) -> None:
             )
 
 
+def _is_fully_admitted(table: Any) -> bool:
+    """Report whether this exact table version carries a full-admission marker.
+
+    The marker is written only after one scan validated the required schema, the
+    scope column types, the vector structure, ID/metadata/scope validity and every
+    persisted vector value. Any later commit moves the version it is bound to, so
+    neither a scope-only marker nor a stale one can short-circuit revalidation.
+    """
+    schema = table.schema
+    names = set(schema.names)
+    expected = _REQUIRED_SCHEMA | {
+        USER_ID_COLUMN: pa.int64(),
+        SCOPE_DIMS_COLUMN: pa.list_(pa.string()),
+    }
+    if "vector" not in names or any(
+        name not in names or schema.field(name).type != kind
+        for name, kind in expected.items()
+    ):
+        return False
+    vector_type = schema.field("vector").type
+    metadata = schema.field(USER_ID_COLUMN).metadata or {}
+    return (
+        pa.types.is_fixed_size_list(vector_type)
+        and vector_type.value_type == pa.float32()
+        and metadata.get(FULL_ADMISSION_METADATA_KEY) == FULL_ADMISSION_VERSION
+        and metadata.get(FULL_ADMISSION_TABLE_VERSION_KEY)
+        == str(table.version).encode()
+    )
+
+
 def _prepared_schema(schema: Any, identity: EmbeddingIdentity, version: int) -> Any:
     fields = [
         field
@@ -287,6 +323,8 @@ def _prepared_schema(schema: Any, identity: EmbeddingIdentity, version: int) -> 
     marker = {
         maintenance.MAINTENANCE_METADATA_KEY: maintenance.MAINTENANCE_VERSION,
         maintenance.MAINTENANCE_TABLE_VERSION_KEY: str(version).encode(),
+        FULL_ADMISSION_METADATA_KEY: FULL_ADMISSION_VERSION,
+        FULL_ADMISSION_TABLE_VERSION_KEY: str(version).encode(),
     }
     previous = (
         schema.field(USER_ID_COLUMN).metadata
@@ -368,7 +406,7 @@ def prepare_lancedb_memory_table(
         staged_path = ""
         seen_path = ""
         try:
-            if maintenance._is_complete(table) and "vector" in table.schema.names:
+            if _is_fully_admitted(table):
                 return maintenance.MaintenanceOutcome(
                     maintenance.MaintenanceStatus.COMPLETE
                 )

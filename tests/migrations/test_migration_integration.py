@@ -767,6 +767,94 @@ class TestMigrations:
         assert len(winners) == 1
         assert winners[0].delete_attempts == 1
 
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_allows_quarantine_and_one_successor(
+        self, postgresql_tester
+    ):
+        """The nullable active key has identical PostgreSQL semantics."""
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableLifecycleConflict,
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        request = RegisterLifecycle(
+            scope_digest="e" * 64,
+            task_id=43,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        with session_factory() as session:
+            repo = DurableSandboxLifecycleRepository(session)
+            first = repo.register(request)
+            quarantined = repo.claim_for_delete(
+                first, now=now, claim_ttl=timedelta(minutes=1)
+            )
+            assert quarantined is not None
+            successor = repo.register(request)
+            assert successor.active_scope_digest == request.scope_digest
+            assert quarantined.active_scope_digest is None
+            with pytest.raises(DurableLifecycleConflict):
+                repo.register(request)
+            session.rollback()
+
+    @pytest.mark.postgresql
+    def test_postgresql_durable_lifecycle_has_one_concurrent_active_winner(
+        self, postgresql_tester
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        from xagent.web.models.database import Base
+        from xagent.web.services.durable_sandbox_lifecycle import (
+            DurableLifecycleConflict,
+            DurableSandboxLifecycleRepository,
+            RegisterLifecycle,
+        )
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        session_factory = sessionmaker(
+            bind=postgresql_tester.engine, expire_on_commit=False
+        )
+        now = datetime.now(timezone.utc)
+        request = RegisterLifecycle(
+            scope_digest="f" * 64,
+            task_id=44,
+            run_id="run",
+            lease_attempt_id="attempt",
+            turn_digest=None,
+            eligible_at=now - timedelta(minutes=2),
+            owner_lease_expires_at=now - timedelta(minutes=1),
+        )
+        barrier = threading.Barrier(2)
+
+        def register(_index):
+            with session_factory() as session:
+                barrier.wait(timeout=10)
+                try:
+                    result = DurableSandboxLifecycleRepository(session).register(
+                        request
+                    )
+                    session.commit()
+                    return result
+                except DurableLifecycleConflict:
+                    session.rollback()
+                    return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(register, range(2)))
+        assert sum(outcome is not None for outcome in outcomes) == 1
+
     def test_sqlite_incremental_upgrade(self, sqlite_tester):
         """Test incremental upgrades from b9d890ed31b5 to head on SQLite.
 

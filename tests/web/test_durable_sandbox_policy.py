@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from xagent.sandbox.base import (
+    ExactGenerationProbe,
     SandboxConfig,
     SandboxContractError,
     SandboxInfo,
@@ -107,3 +108,47 @@ async def test_strict_delete_removes_workers_before_primary() -> None:
         worker.name,
         NAME,
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sandboxes", "expected"),
+    [
+        ([], ExactGenerationProbe.ABSENT),
+        ([_info()], ExactGenerationProbe.PRESENT),
+        (
+            [_info().model_copy(update={"name": f"{NAME}::worker::2"})],
+            ExactGenerationProbe.PRESENT,
+        ),
+        (
+            [_info().model_copy(update={"name": "chrome-execution::" + "e" * 64})],
+            ExactGenerationProbe.ABSENT,
+        ),
+    ],
+)
+async def test_strict_generation_probe_is_exact(sandboxes, expected) -> None:
+    service = _service()
+    service.list_sandboxes.return_value = sandboxes
+    assert (
+        await SandboxManager(service).probe_durable_sandbox_strict(DIGEST) is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_generation_probe_fails_closed_on_backend_error() -> None:
+    service = _service()
+    service.list_sandboxes.side_effect = RuntimeError("backend unavailable")
+    assert (
+        await SandboxManager(service).probe_durable_sandbox_strict(DIGEST)
+        is ExactGenerationProbe.UNKNOWN
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_generation_probe_fails_closed_on_malformed_name() -> None:
+    service = _service()
+    service.list_sandboxes.return_value = [_info().model_copy(update={"name": None})]
+    assert (
+        await SandboxManager(service).probe_durable_sandbox_strict(DIGEST)
+        is ExactGenerationProbe.UNKNOWN
+    )

@@ -1,9 +1,10 @@
 """Dormant durable lifecycle protocol for execution-scoped sandboxes.
 
 All state transitions are synchronous database operations.  A future consumer
-must commit a delete claim, end that transaction, await the backend through
-``SandboxManager.delete_durable_sandbox_strict()``, and only then open a new
-transaction to settle or back off the tombstone.
+must commit ``begin_create`` before backend create, and commit a delete claim
+before probing or deleting an exact backend generation.  The coordinator in
+this module deliberately ends each transaction before backend I/O and opens a
+new fenced transaction for observe, settle, or backoff.
 """
 
 from __future__ import annotations
@@ -13,17 +14,20 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Protocol
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from ...sandbox.base import ExactGenerationProbe
 from ..models.sandbox import DurableSandboxLifecycle
 from ..models.task import Task, TaskStatus
 
 LifecycleState = Literal["registered", "ready", "deleting"]
+CreatePhase = Literal["not_started", "may_publish", "terminal", "observed"]
+CreateCompletion = Literal["success", "terminal_absent"]
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _BACKEND_LIFECYCLE_DOMAIN = b"xagent.durable-sandbox.backend-lifecycle.v1\x00"
@@ -38,9 +42,12 @@ class DurableLifecycleConflict(RuntimeError):
 class LifecycleFence:
     id: int
     scope_digest: str
+    active_scope_digest: str | None
     lifecycle_token: str
     backend_lifecycle_digest: str
     owner_token: str
+    create_operation_token: str
+    create_phase: CreatePhase
     version: int
     state: LifecycleState
     task_id: int
@@ -58,9 +65,12 @@ class LifecycleFence:
         return cls(
             id=row.id,
             scope_digest=row.scope_digest,
+            active_scope_digest=row.active_scope_digest,
             lifecycle_token=row.lifecycle_token,
             backend_lifecycle_digest=row.backend_lifecycle_digest,
             owner_token=row.owner_token,
+            create_operation_token=row.create_operation_token,
+            create_phase=row.create_phase,
             version=row.version,
             state=row.state,
             task_id=row.task_id,
@@ -152,11 +162,14 @@ class DurableSandboxLifecycleRepository:
         lifecycle_token = new_opaque_token()
         row = DurableSandboxLifecycle(
             scope_digest=request.scope_digest,
+            active_scope_digest=request.scope_digest,
             lifecycle_token=lifecycle_token,
             backend_lifecycle_digest=backend_lifecycle_digest(
                 request.scope_digest, lifecycle_token
             ),
             owner_token=new_opaque_token(),
+            create_operation_token=new_opaque_token(),
+            create_phase="not_started",
             version=1,
             state="registered",
             task_id=request.task_id,
@@ -172,17 +185,91 @@ class DurableSandboxLifecycleRepository:
             self._db.flush()
         except IntegrityError as exc:
             raise DurableLifecycleConflict(
-                "lifecycle scope is already registered"
+                "lifecycle scope already has an active generation"
             ) from exc
         return LifecycleFence.from_row(row)
 
     def get_by_scope(self, scope_digest: str) -> LifecycleFence | None:
+        """Return the one active generation for a logical scope, if any."""
         _validate_digest("scope_digest", scope_digest)
         row = self._db.execute(
             select(DurableSandboxLifecycle).where(
-                DurableSandboxLifecycle.scope_digest == scope_digest
+                DurableSandboxLifecycle.active_scope_digest == scope_digest
             )
         ).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
+    def list_by_scope(self, scope_digest: str) -> list[LifecycleFence]:
+        """Return active and quarantined generations without adopting either."""
+        _validate_digest("scope_digest", scope_digest)
+        rows = self._db.execute(
+            select(DurableSandboxLifecycle)
+            .where(DurableSandboxLifecycle.scope_digest == scope_digest)
+            .order_by(DurableSandboxLifecycle.id)
+        ).scalars()
+        return [LifecycleFence.from_row(row) for row in rows]
+
+    def begin_create(
+        self, fence: LifecycleFence, *, now: datetime
+    ) -> LifecycleFence | None:
+        """Commit the may-publish fence before invoking a backend create."""
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.version == fence.version,
+                DurableSandboxLifecycle.state == "registered",
+                DurableSandboxLifecycle.create_phase == "not_started",
+                _exact_attempt_is_active(DurableSandboxLifecycle, now),
+            )
+            .values(
+                create_phase="may_publish",
+                updated_at=now,
+                version=DurableSandboxLifecycle.version + 1,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
+    def complete_create(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        outcome: CreateCompletion,
+    ) -> LifecycleFence | None:
+        """Record a proven create completion or terminal-absent outcome.
+
+        Callers must not invoke this for timeouts, disconnects, cancellation,
+        or any other outcome that leaves backend publication ambiguous.
+        """
+        if outcome not in ("success", "terminal_absent"):
+            raise ValueError("unsupported create completion outcome")
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.version == fence.version,
+                DurableSandboxLifecycle.state == "registered",
+                DurableSandboxLifecycle.create_phase == "may_publish",
+            )
+            .values(
+                create_phase="terminal",
+                updated_at=now,
+                version=DurableSandboxLifecycle.version + 1,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
         return None if row is None else LifecycleFence.from_row(row)
 
     def mark_ready(
@@ -194,8 +281,11 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.id == fence.id,
                 DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
                 DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
                 DurableSandboxLifecycle.version == fence.version,
                 DurableSandboxLifecycle.state == "registered",
+                DurableSandboxLifecycle.create_phase == "terminal",
                 _exact_attempt_is_active(DurableSandboxLifecycle, now),
             )
             .values(
@@ -219,6 +309,8 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.id == fence.id,
                 DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
                 DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
                 DurableSandboxLifecycle.version == fence.version,
                 DurableSandboxLifecycle.state.in_(("registered", "ready")),
                 _exact_attempt_is_active(DurableSandboxLifecycle, now),
@@ -250,6 +342,8 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.id == fence.id,
                 DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
                 DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
                 DurableSandboxLifecycle.version == fence.version,
                 DurableSandboxLifecycle.state.in_(("registered", "ready")),
                 DurableSandboxLifecycle.eligible_at <= now,
@@ -258,6 +352,53 @@ class DurableSandboxLifecycleRepository:
             )
             .values(
                 state="deleting",
+                active_scope_digest=None,
+                owner_token=claim_owner,
+                version=DurableSandboxLifecycle.version + 1,
+                deleting_at=now,
+                delete_claim_expires_at=now + claim_ttl,
+                retry_at=None,
+                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
+                updated_at=now,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
+
+    def quarantine_create(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        claim_ttl: timedelta,
+    ) -> LifecycleFence | None:
+        """Owner-fenced handoff of an ambiguous create to durable cleanup.
+
+        Unlike stale-attempt reclamation, this transition intentionally does
+        not require the task attempt to be inactive.  The current owner uses
+        it after a bounded timeout/unknown outcome so the old generation keeps
+        its durable backend digest while releasing the logical active slot for
+        an immediate successor.
+        """
+        if claim_ttl <= timedelta(0):
+            raise ValueError("claim_ttl must be positive")
+        claim_owner = new_opaque_token()
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                DurableSandboxLifecycle.id == fence.id,
+                DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
+                DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.version == fence.version,
+                DurableSandboxLifecycle.state == "registered",
+                DurableSandboxLifecycle.create_phase == "may_publish",
+            )
+            .values(
+                state="deleting",
+                active_scope_digest=None,
                 owner_token=claim_owner,
                 version=DurableSandboxLifecycle.version + 1,
                 deleting_at=now,
@@ -288,6 +429,8 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.id == fence.id,
                 DurableSandboxLifecycle.lifecycle_token == fence.lifecycle_token,
                 DurableSandboxLifecycle.owner_token == fence.owner_token,
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
                 DurableSandboxLifecycle.version == fence.version,
                 DurableSandboxLifecycle.state == "deleting",
                 DurableSandboxLifecycle.delete_claim_expires_at <= now,
@@ -331,9 +474,36 @@ class DurableSandboxLifecycleRepository:
 
     def settle_delete(self, fence: LifecycleFence) -> bool:
         result: Any = self._db.execute(
-            delete(DurableSandboxLifecycle).where(*self._delete_fence(fence))
+            delete(DurableSandboxLifecycle).where(
+                *self._delete_fence(fence),
+                DurableSandboxLifecycle.create_phase.in_(
+                    ("not_started", "terminal", "observed")
+                ),
+            )
         )
         return int(result.rowcount or 0) == 1
+
+    def observe_create(
+        self, fence: LifecycleFence, *, now: datetime
+    ) -> LifecycleFence | None:
+        """Persist PRESENT before any strict deletion of an ambiguous create."""
+        stmt = (
+            update(DurableSandboxLifecycle)
+            .where(
+                *self._delete_fence(fence),
+                DurableSandboxLifecycle.create_operation_token
+                == fence.create_operation_token,
+                DurableSandboxLifecycle.create_phase == "may_publish",
+            )
+            .values(
+                create_phase="observed",
+                version=DurableSandboxLifecycle.version + 1,
+                updated_at=now,
+            )
+            .returning(DurableSandboxLifecycle)
+        )
+        row = self._db.execute(stmt).scalar_one_or_none()
+        return None if row is None else LifecycleFence.from_row(row)
 
     @staticmethod
     def _delete_fence(
@@ -345,6 +515,8 @@ class DurableSandboxLifecycleRepository:
             DurableSandboxLifecycle.backend_lifecycle_digest
             == fence.backend_lifecycle_digest,
             DurableSandboxLifecycle.owner_token == fence.owner_token,
+            DurableSandboxLifecycle.create_operation_token
+            == fence.create_operation_token,
             DurableSandboxLifecycle.version == fence.version,
             DurableSandboxLifecycle.state == "deleting",
         )
@@ -401,6 +573,32 @@ class DurableSandboxLifecycleService:
         with self._session_factory() as db, db.begin():
             return DurableSandboxLifecycleRepository(db).register(request)
 
+    def get_by_scope(self, scope_digest: str) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).get_by_scope(scope_digest)
+
+    def list_by_scope(self, scope_digest: str) -> list[LifecycleFence]:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).list_by_scope(scope_digest)
+
+    def begin_create(
+        self, fence: LifecycleFence, *, now: datetime
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).begin_create(fence, now=now)
+
+    def complete_create(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        outcome: CreateCompletion,
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).complete_create(
+                fence, now=now, outcome=outcome
+            )
+
     def mark_ready(
         self, fence: LifecycleFence, *, now: datetime, owner_lease_expires_at: datetime
     ) -> LifecycleFence | None:
@@ -425,6 +623,14 @@ class DurableSandboxLifecycleService:
                 fence, now=now, claim_ttl=claim_ttl
             )
 
+    def quarantine_create(
+        self, fence: LifecycleFence, *, now: datetime, claim_ttl: timedelta
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).quarantine_create(
+                fence, now=now, claim_ttl=claim_ttl
+            )
+
     def reclaim_delete(
         self, fence: LifecycleFence, *, now: datetime, claim_ttl: timedelta
     ) -> LifecycleFence | None:
@@ -445,6 +651,12 @@ class DurableSandboxLifecycleService:
         with self._session_factory() as db, db.begin():
             return DurableSandboxLifecycleRepository(db).settle_delete(fence)
 
+    def observe_create(
+        self, fence: LifecycleFence, *, now: datetime
+    ) -> LifecycleFence | None:
+        with self._session_factory() as db, db.begin():
+            return DurableSandboxLifecycleRepository(db).observe_create(fence, now=now)
+
     def list_reclaimable(
         self, *, now: datetime, limit: int = 100
     ) -> list[LifecycleFence]:
@@ -452,3 +664,67 @@ class DurableSandboxLifecycleService:
             return DurableSandboxLifecycleRepository(db).list_reclaimable(
                 now=now, limit=limit
             )
+
+
+class DurableSandboxBackend(Protocol):
+    """Backend seam used by the dormant create-operation reclaimer."""
+
+    async def probe_durable_sandbox_strict(
+        self, lifecycle_id: str
+    ) -> ExactGenerationProbe: ...
+
+    async def delete_durable_sandbox_strict(self, lifecycle_id: str) -> None: ...
+
+
+class DurableSandboxDeleteCoordinator:
+    """No-transaction-across-I/O coordinator for one claimed tombstone."""
+
+    def __init__(
+        self,
+        lifecycles: DurableSandboxLifecycleService,
+        backend: DurableSandboxBackend,
+    ) -> None:
+        self._lifecycles = lifecycles
+        self._backend = backend
+
+    async def delete_claimed(
+        self,
+        fence: LifecycleFence,
+        *,
+        now: datetime,
+        retry_at: datetime,
+    ) -> bool:
+        """Try one cleanup; return True only after durable settlement.
+
+        ``may_publish`` is the ambiguity quarantine.  ABSENT and UNKNOWN are
+        intentionally indistinguishable for safety and only schedule another
+        probe.  PRESENT is committed as ``observed`` before deletion so a
+        crash can never forget that absence has become actionable.
+        """
+        if fence.state != "deleting":
+            raise ValueError("delete_claimed requires a deleting fence")
+
+        current = fence
+        if current.create_phase == "may_publish":
+            try:
+                presence = await self._backend.probe_durable_sandbox_strict(
+                    current.backend_lifecycle_digest
+                )
+            except Exception:
+                presence = ExactGenerationProbe.UNKNOWN
+            if presence is not ExactGenerationProbe.PRESENT:
+                self._lifecycles.backoff_delete(current, now=now, retry_at=retry_at)
+                return False
+            observed = self._lifecycles.observe_create(current, now=now)
+            if observed is None:
+                return False
+            current = observed
+
+        try:
+            await self._backend.delete_durable_sandbox_strict(
+                current.backend_lifecycle_digest
+            )
+        except Exception:
+            self._lifecycles.backoff_delete(current, now=now, retry_at=retry_at)
+            return False
+        return self._lifecycles.settle_delete(current)

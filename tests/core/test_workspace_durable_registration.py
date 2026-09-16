@@ -454,6 +454,7 @@ def test_durable_binding_enforces_owner_before_materialization(
     )
     db.commit()
 
+    assert workspace.resolve_file_id("foreign-local-id") is None
     assert workspace.resolve_file_binding_detached("foreign-local-id") is None
     assert workspace.resolve_file_binding_detached("foreign-durable-id") is None
     binding = workspace.resolve_file_binding_detached("owner-durable-id")
@@ -478,7 +479,7 @@ def test_persisted_binding_without_workspace_owner_fails_closed(
         UploadedFile(
             file_id="ownerless-file-id",
             user_id=int(user.id),
-            task_id=9027,
+            task_id=None,
             filename="foreign.pdf",
             storage_path=str(source),
             storage_status="available",
@@ -490,9 +491,8 @@ def test_persisted_binding_without_workspace_owner_fails_closed(
     db.rollback()
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
     workspace = TaskWorkspace(
-        id="agent_1_ownerless",
+        id="preview_ownerless",
         base_dir=str(tmp_path / "workspaces"),
-        db_task_id=9027,
     )
 
     assert workspace.resolve_file_binding_detached("ownerless-file-id") is None

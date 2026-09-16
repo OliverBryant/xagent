@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import Mock
@@ -3084,21 +3085,34 @@ def test_upload_file_rejects_empty_file(monkeypatch, tmp_path, bind_workspace_up
     files.create.assert_not_called()
 
 
-def test_upload_file_returns_error_payload_on_api_failure(
-    monkeypatch, tmp_path, bind_workspace_upload
+@pytest.mark.parametrize("failure_stage", ["media", "execute"])
+def test_upload_file_redacts_upload_failures(
+    monkeypatch, tmp_path, bind_workspace_upload, caplog, failure_stage
 ):
     local_file = tmp_path / "report.pdf"
     local_file.write_bytes(b"content")
     file_id = bind_workspace_upload(local_file, mime_type="application/pdf")
+    leaked_path = str(tmp_path / "private" / "secret.pdf")
 
     files = Mock()
-    files.create.return_value.execute.side_effect = RuntimeError("boom")
+    if failure_stage == "media":
+        monkeypatch.setattr(
+            google_drive,
+            "MediaIoBaseUpload",
+            Mock(side_effect=OSError(5, "Input/output error", leaked_path)),
+        )
+    else:
+        files.create.return_value.execute.side_effect = OSError(
+            5, "Input/output error", leaked_path
+        )
     _mock_drive_service_with_files(monkeypatch, files)
 
-    result = json.loads(google_drive.google_drive_upload_file(file_id))
+    with caplog.at_level(logging.ERROR):
+        result = json.loads(google_drive.google_drive_upload_file(file_id))
 
-    assert result["status"] == "error"
-    assert "boom" in result["message"]
+    assert result == {"status": "error", "message": "Google Drive upload failed"}
+    assert leaked_path not in caplog.text
+    assert "Input/output error" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

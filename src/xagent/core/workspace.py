@@ -1318,6 +1318,9 @@ class TaskWorkspace:
         upload records. Scoped workspaces additionally require the record to
         live below the active scope subtree.
         """
+        if not self._file_record_owner_matches_workspace(record):
+            return False
+
         if path is not None:
             workspace_abs = self.workspace_dir.resolve()
             resolved_path = path.resolve()
@@ -1325,14 +1328,6 @@ class TaskWorkspace:
                 workspace_abs
             ):
                 return True
-
-        owner_user_id = self.owner_user_id
-        if owner_user_id is None:
-            return True
-
-        record_user_id = getattr(record, "user_id", None)
-        if record_user_id != owner_user_id:
-            return False
 
         # For a scoped workspace, an owner match is not sufficient: the record
         # must also live under this workspace's scope subtree. Otherwise a task
@@ -1349,6 +1344,14 @@ class TaskWorkspace:
         return (
             self.current_task_id is not None and record_task_id == self.current_task_id
         )
+
+    def _file_record_owner_matches_workspace(self, record: Any) -> bool:
+        """Require an authoritative workspace owner for persisted file records."""
+
+        owner_user_id = self.owner_user_id
+        if owner_user_id is None:
+            return False
+        return getattr(record, "user_id", None) == owner_user_id
 
     def _record_in_scope_subtree(
         self, record: Any, path: Optional[Path] = None
@@ -1428,15 +1431,15 @@ class TaskWorkspace:
         path: Optional[Path] = None
         # Non-persistent executions (for example REST preview) have no Task or
         # UploadedFile row. Their opaque IDs are authoritative only in this
-        # exact shared workspace instance, so consult that cache before any DB
-        # access. Persisted tasks still load registered metadata from the DB.
-        if self.current_task_id is None:
-            with self._registration_lock:
-                ephemeral_snapshot = self._ephemeral_file_snapshots.get(canonical_id)
-            path = self._resolve_file_id(
-                canonical_id,
-                use_bound_db_session=False,
-            )
+        # exact shared workspace instance. Never route an absent snapshot
+        # through the general resolver: that could turn an ownerless preview
+        # into a database-backed upload capability.
+        with self._registration_lock:
+            ephemeral_snapshot = self._ephemeral_file_snapshots.get(canonical_id)
+        if ephemeral_snapshot is not None:
+            path = ephemeral_snapshot.path
+        else:
+            path = self._resolve_internal_file_id(canonical_id)
         if path is None and not canonical_id.startswith("internal-"):
             from ..web.models.uploaded_file import UploadedFile
             from .storage.manager import create_db_session
@@ -1480,13 +1483,8 @@ class TaskWorkspace:
         # detached snapshot is the only record state allowed past this point.
         if record_snapshot is not None:
             # Persisted upload bindings are an external-write capability. A
-            # workspace without an authoritative owner must never resolve one,
-            # even though older general-purpose resolvers retain ownerless
-            # compatibility for workspace-local files.
-            if (
-                self.owner_user_id is None
-                or record_snapshot.user_id != self.owner_user_id
-            ):
+            # workspace without an authoritative owner must never resolve one.
+            if not self._file_record_owner_matches_workspace(record_snapshot):
                 return None
             storage_path = Path(record_snapshot.storage_path)
             if storage_path.exists() and storage_path.is_file():
@@ -1505,8 +1503,6 @@ class TaskWorkspace:
 
                 path = ManagedFileRef(record_snapshot).materialize()
 
-        if path is None and record_snapshot is None:
-            path = self._resolve_file_id(canonical_id, use_bound_db_session=False)
         if path is None:
             return None
         try:

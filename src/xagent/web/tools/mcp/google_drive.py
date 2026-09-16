@@ -1317,19 +1317,30 @@ def google_drive_upload_file(file_id: str, parent_id: str | None = None) -> str:
                 # rejects.
                 raise ValueError("Workspace file is empty")
 
-            media = MediaIoBaseUpload(fh, mimetype=resolved_mime_type, resumable=True)
-
-            create_request = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                supportsAllDrives=True,
-                fields="id, name, webViewLink, mimeType, size",
-            )
-            if resolved_parent_id is not None:
-                _attach_resource_key(
-                    create_request, resolved_parent_id, parent_resource_key
+            try:
+                media = MediaIoBaseUpload(
+                    fh, mimetype=resolved_mime_type, resumable=True
                 )
-            file = create_request.execute()
+
+                create_request = service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id, name, webViewLink, mimeType, size",
+                )
+                if resolved_parent_id is not None:
+                    _attach_resource_key(
+                        create_request, resolved_parent_id, parent_resource_key
+                    )
+                file = create_request.execute()
+            except Exception as e:
+                # Google client/media exceptions can include local paths,
+                # credentials, or response bodies. Preserve only the type in
+                # host logs and return a stable credential-free tool error.
+                logger.error(
+                    "Google Drive workspace upload failed (%s)", type(e).__name__
+                )
+                raise RuntimeError("Google Drive upload failed") from e
 
         return json.dumps(
             {

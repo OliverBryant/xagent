@@ -45,6 +45,7 @@ from xagent.core.tools.adapters.vibe.tool_naming_limits import (
 )
 from xagent.core.tools.core.mcp import tools as mcp_tools_module
 from xagent.core.tools.core.mcp.tools import _tools_with_raw_annotations
+from xagent.core.workspace import TaskWorkspace
 
 
 def _http_status_error(
@@ -4430,12 +4431,27 @@ async def test_workspace_upload_adapter_environment_reaches_real_drive_consumer(
 
 
 @pytest.mark.asyncio
-async def test_workspace_upload_unknown_and_path_ids_fail_closed(monkeypatch):
+async def test_workspace_upload_unknown_and_path_ids_fail_closed(monkeypatch, tmp_path):
+    class _EmptyQuery:
+        def filter(self, *_args):
+            return self
+
+        def first(self):
+            return None
+
+    class _EmptySession:
+        def query(self, *_args):
+            return _EmptyQuery()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", _EmptySession)
     create_session_mock = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
 
+    workspace = TaskWorkspace(id="preview_path_boundary", base_dir=str(tmp_path))
     for raw_id in ("unknown-id", "/etc/passwd"):
-        workspace = SimpleNamespace(resolve_file_binding_detached=lambda _file_id: None)
         result = await _workspace_upload_adapter(workspace).run_json_async(
             {"file_id": raw_id}
         )

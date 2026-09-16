@@ -1,5 +1,13 @@
 # Deployment changes
 
+## LanceDB memory compatibility
+
+The declared LanceDB dependency range is the one in `pyproject.toml`; this
+section does not restate it. CI exercises three representatives of that range:
+the declared minimum, the version pinned in `uv.lock`, and the newest minor
+tested so far. It does not claim that every intervening release is tested
+individually.
+
 ## 2026-08-11 — New public-task File Operation isolation
 
 ### Deployment impact
@@ -329,11 +337,3 @@ Valid only until step 8 restarts the writers. Until that point a v17 server has 
 Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
 
 After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.
-
-## LanceDB memory compatibility
-
-The declared LanceDB dependency range is the one in `pyproject.toml`; this
-section does not restate it. CI exercises three representatives of that range:
-the declared minimum, the version pinned in `uv.lock`, and the newest minor
-tested so far. It does not claim that every intervening release is tested
-individually.

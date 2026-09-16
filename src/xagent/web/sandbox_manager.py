@@ -39,6 +39,7 @@ from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
 from ..sandbox.base import (
+    ExactGenerationProbe,
     ResolvedSandboxRuntimeSpec,
     Sandbox,
     SandboxAlreadyExistsError,
@@ -2068,6 +2069,38 @@ class SandboxManager:
             self._lease_providers.pop(name, None)
             self._activity.pop(name, None)
         self._reconcile_budget.pop(primary, None)
+
+    async def probe_durable_sandbox_strict(
+        self, lifecycle_id: str
+    ) -> ExactGenerationProbe:
+        """Probe one generation without collapsing backend failures to absence.
+
+        The lifecycle digest is embedded in every primary/worker sandbox name,
+        so a successful backend listing is exact-generation evidence.  Docker,
+        Boxlite, and test services all use this same seam; any listing or
+        decoding failure is UNKNOWN and therefore cannot settle ownership.
+        """
+        if re.fullmatch(r"[0-9a-f]{64}", lifecycle_id) is None:
+            raise ValueError("durable lifecycle id must be a lowercase digest")
+        primary = self.make_sandbox_name(DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id)
+        worker_prefix = self._worker_sandbox_prefix(
+            DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id
+        )
+        try:
+            listed = await self._service.list_sandboxes()
+            for sandbox in listed or []:
+                if not isinstance(sandbox.name, str):
+                    return ExactGenerationProbe.UNKNOWN
+                if sandbox.name == primary or sandbox.name.startswith(worker_prefix):
+                    return ExactGenerationProbe.PRESENT
+        except Exception as exc:
+            logger.warning(
+                "Durable sandbox generation probe failed closed for %s: %s",
+                lifecycle_id,
+                exc,
+            )
+            return ExactGenerationProbe.UNKNOWN
+        return ExactGenerationProbe.ABSENT
 
     async def _find_lifecycle_sandbox_names(
         self,

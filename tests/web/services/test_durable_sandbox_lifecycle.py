@@ -9,8 +9,8 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-from xagent.web.models.sandbox import DurableSandboxLifecycle
 from xagent.sandbox.base import ExactGenerationProbe
+from xagent.web.models.sandbox import DurableSandboxLifecycle
 from xagent.web.services.durable_sandbox_lifecycle import (
     DurableLifecycleConflict,
     DurableSandboxDeleteCoordinator,

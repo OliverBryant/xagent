@@ -9,8 +9,8 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-from xagent.web.services import chrome_lifecycle as chrome_lifecycle_module
 from xagent.web.models.sandbox import DurableSandboxLifecycle
+from xagent.web.services import chrome_lifecycle as chrome_lifecycle_module
 from xagent.web.services.chrome_lifecycle import ChromeLifecycleCoordinator
 from xagent.web.services.durable_sandbox_lifecycle import (
     DurableLifecycleConflict,

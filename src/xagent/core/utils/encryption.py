@@ -40,10 +40,11 @@ def derive_secret_hmac(value: str, *, purpose: bytes) -> str:
     """Return a deterministic HMAC under a purpose-derived protected subkey."""
     if not purpose:
         raise ValueError("Secret HMAC purpose must not be empty")
-    cipher = get_cipher()
-    # Use the cached cipher's exact live key, including when tests or operators
-    # have changed the environment without restarting the process.
-    master_key = cipher._signing_key + cipher._encryption_key
+    # Read the configured key through the module's own public path rather than
+    # a Fernet instance's private attributes, which carry no compatibility
+    # guarantee across cryptography releases. The bytes are the same: a Fernet
+    # key is the concatenated signing and encryption halves.
+    master_key = base64.urlsafe_b64decode(_get_encryption_key())
     subkey = hmac.digest(master_key, _SECRET_HMAC_KDF_DOMAIN + purpose, "sha256")
     return hmac.new(subkey, value.encode(), hashlib.sha256).hexdigest()
 

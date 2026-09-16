@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,8 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
 
 
 class AuthorityState(BaseModel):
+    """Public view of the authority. Actor subjects are deliberately absent."""
+
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     configured: bool = True
@@ -38,65 +40,65 @@ class AuthorityState(BaseModel):
     max_retries: int | None = None
     credential_source: CredentialSource | None = None
     global_sharing_consent: bool | None = None
-    consented_by_actor_subject: str | None = None
     consented_at: datetime | None = None
     credential_status: str | None = None
     configured_at: datetime | None = Field(default=None, validation_alias="created_at")
     updated_at: datetime | None = None
 
 
-def _public_state(service: GlobalMemoryEmbeddingAuthorityService) -> AuthorityState:
-    row = service.get_row()
-    if row is None:
+def _state(record: GlobalMemoryEmbeddingAuthorityRecord | None) -> AuthorityState:
+    """The one renderer for both routes. A record carries the status its own
+    path established -- the read path from the stored row, the write path from
+    the ciphertext it just encrypted -- so neither hardcodes nor re-reads."""
+    if record is None:
         return AuthorityState(configured=False)
-    return AuthorityState(
-        configured=True,
-        provider=str(row.model_provider),
-        model_name=str(row.model_name),
-        endpoint=str(row.base_url),
-        dimension=int(row.dimension),
-        instruct=str(row.instruct) if row.instruct is not None else None,
-        max_retries=int(row.max_retries),
-        credential_source=CredentialSource(str(row.credential_source)),
-        global_sharing_consent=bool(row.global_sharing_consent),
-        consented_by_actor_subject=str(row.consented_by_actor_subject),
-        consented_at=row.consented_at,
-        credential_status=service.credential_status(),
-        configured_at=row.created_at,
-        updated_at=row.updated_at,
-    )
-
-
-def _written_state(record: GlobalMemoryEmbeddingAuthorityRecord) -> AuthorityState:
-    """Render the write's own detached result instead of re-reading the row.
-
-    A delete landing right after the commit must not turn a durable write into
-    an error, and the credential was encrypted inside that same transaction.
-    """
-    return AuthorityState.model_validate(record).model_copy(
-        update={"credential_status": "configured"}
-    )
+    return AuthorityState.model_validate(record)
 
 
 @router.get("", response_model=AuthorityState)
 def get_authority(
     _admin: User = Depends(require_admin), db: Session = Depends(get_db)
 ) -> AuthorityState:
-    return _public_state(GlobalMemoryEmbeddingAuthorityService(db))
+    return _state(GlobalMemoryEmbeddingAuthorityService(db).read_record())
 
 
-@router.put("", response_model=AuthorityState)
-def set_authority(
-    request: AuthorityConfiguration,
+# Declared, not inferred: the route reads the body itself.
+_REQUEST_BODY = {
+    "required": True,
+    "content": {
+        "application/json": {"schema": AuthorityConfiguration.model_json_schema()}
+    },
+}
+
+
+@router.put(
+    "", response_model=AuthorityState, openapi_extra={"requestBody": _REQUEST_BODY}
+)
+async def set_authority(
+    request: Request,
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> AuthorityState:
+    """Parse and validate the body here instead of through the framework.
+
+    The shared ``/api`` ``RequestValidationError`` handler echoes each error's
+    raw ``input`` into the 422 body and logs it, and here that input is
+    credential bearing: an ``api_key`` sent as a list or object comes back
+    verbatim. Parsing here keeps every malformed body -- undecodable JSON
+    included -- on the sanitized 400 path, which names no request value.
+    """
     actor_subject = str(admin.actor_subject or "")
     if not actor_subject:
         raise HTTPException(409, detail="Admin actor identity is unavailable")
+    try:
+        config = AuthorityConfiguration.model_validate_json(await request.body())
+    except ValueError:
+        raise HTTPException(
+            400, detail="Global memory embedding authority request is invalid"
+        ) from None
     service = GlobalMemoryEmbeddingAuthorityService(db)
     try:
-        record = service.set(request, actor_subject=actor_subject)
+        record = service.set(config, actor_subject=actor_subject)
     except ValueError as exc:
         db.rollback()
         raise HTTPException(400, detail=str(exc)) from exc
@@ -105,7 +107,7 @@ def set_authority(
         raise HTTPException(
             503, detail="Global memory embedding authority could not be stored"
         ) from None
-    return _written_state(record)
+    return _state(record)
 
 
 @router.delete("", status_code=status.HTTP_204_NO_CONTENT)

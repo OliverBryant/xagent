@@ -1,11 +1,15 @@
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from cryptography.fernet import Fernet
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +30,7 @@ from xagent.web.services.global_memory_embedding_authority import (
 )
 
 SECRET = "application-owned-secret"
+MARKER = "leaked-credential-marker"
 URL = "/api/admin/memory/embedding-authority"
 TABLE = GlobalMemoryEmbeddingAuthority.__tablename__
 PAYLOAD = {
@@ -54,6 +59,11 @@ def _delete_row_once(sessions, armed):
     return hook
 
 
+def _identities(service):
+    snapshot = service.load_snapshot()
+    return snapshot.authority_fingerprint(), snapshot.vector_space_fingerprint()
+
+
 def _row_state(sessions):
     with sessions() as db:
         row = db.get(GlobalMemoryEmbeddingAuthority, "global")
@@ -70,6 +80,12 @@ def authority_harness(tmp_path):
     actor = SimpleNamespace(is_admin=True, actor_subject="actor-1")
     app = FastAPI()
     app.include_router(router)
+
+    @app.exception_handler(RequestValidationError)
+    async def echo(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        """Mirror of the shared ``/api`` handler: logs and echoes ``input``."""
+        logging.getLogger("xagent.web.app").error("Validation error: %s", exc)
+        return JSONResponse(422, jsonable_encoder({"detail": exc.errors()}))
 
     def current_user():
         return actor
@@ -131,6 +147,7 @@ def test_authority_crud_is_public_safe_and_ignores_personal_models(authority_har
         "https://bad_host/v1",
         "https://[::1/v1",
         "https://example.com:99999/v1",
+        "https://example.com:0/v1",
         "https://exa\nmple.com/v1",
     ],
 )
@@ -159,14 +176,9 @@ def test_equivalent_updates_keep_one_semantic_identity(authority_harness):
         service.set(AuthorityConfiguration(**equivalent), actor_subject="actor-2")
         second = service.load_snapshot()
         assert db.query(GlobalMemoryEmbeddingAuthority).count() == 1
-        assert first.semantic_fingerprint() == second.semantic_fingerprint()
+        assert first.authority_fingerprint() == second.authority_fingerprint()
+        assert first.vector_space_fingerprint() == second.vector_space_fingerprint()
         assert SECRET not in repr(second)
-        changed = dict(PAYLOAD, api_key="replacement-secret")
-        service.set(AuthorityConfiguration(**changed), actor_subject="actor-2")
-        assert (
-            second.semantic_fingerprint()
-            != service.load_snapshot().semantic_fingerprint()
-        )
 
 
 def test_malformed_credential_is_safely_classified(authority_harness):
@@ -276,7 +288,8 @@ def test_consent_provenance_is_server_side_and_outside_the_fingerprint(
     ).json()
     assert body["credential_source"] == "application_owned"
     assert body["global_sharing_consent"] is True
-    assert body["consented_by_actor_subject"] == "actor-1"
+    assert "consented_by_actor_subject" not in body
+    assert "actor-1" not in str(body) and "actor-1" not in client.get(URL).text
     with sessions() as db:
         service = GlobalMemoryEmbeddingAuthorityService(db)
         first = service.load_snapshot()
@@ -287,7 +300,8 @@ def test_consent_provenance_is_server_side_and_outside_the_fingerprint(
         service.set(AuthorityConfiguration(**PAYLOAD), actor_subject="actor-2")
         second = service.load_snapshot()
         assert second.consented_by_actor_subject == "actor-2"
-        assert first.semantic_fingerprint() == second.semantic_fingerprint()
+        assert first.authority_fingerprint() == second.authority_fingerprint()
+        assert first.vector_space_fingerprint() == second.vector_space_fingerprint()
 
 
 @pytest.mark.parametrize(
@@ -343,12 +357,12 @@ def test_equivalent_endpoint_spellings_share_one_identity(
             record = service.set(AuthorityConfiguration(**config), actor_subject="a")
             assert record.endpoint == expected
             assert service.get_row().base_url == expected
-            fingerprints.add(service.load_snapshot().semantic_fingerprint())
+            fingerprints.add(_identities(service))
         # A genuinely different host, port or path is a different identity.
         for other in ("http://127.0.0.1:1/v1", "http://127.0.0.1:2/v1", "http://a.io"):
             config = dict(PAYLOAD, provider="xinference", endpoint=other)
             service.set(AuthorityConfiguration(**config), actor_subject="a")
-            fingerprints.add(service.load_snapshot().semantic_fingerprint())
+            fingerprints.add(_identities(service))
     assert len(fingerprints) == 4
 
 
@@ -386,3 +400,69 @@ def test_service_set_returns_written_state_when_a_delete_races_the_commit(
         assert record.credential_source is CredentialSource.APPLICATION_OWNED
         assert record.consented_by_actor_subject == "a1"
         assert service.get_row() is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps(dict(PAYLOAD, api_key=[MARKER])).encode(),
+        json.dumps(dict(PAYLOAD, api_key={"value": MARKER})).encode(),
+        b'{"api_key": "' + MARKER.encode() + b'", "provider": "openai",',
+    ],
+    ids=["api_key-list", "api_key-object", "malformed-json"],
+)
+def test_credential_bearing_body_never_reaches_the_shared_handler(
+    authority_harness, caplog, body
+):
+    """The route parses the body itself, so no framework 422 can echo it: the
+    shared ``/api`` handler reports each error's raw ``input`` and logs the
+    exception, and for a non-string credential that input is the secret."""
+    client, sessions, _actor, _engine = authority_harness
+    assert client.put(URL, json=PAYLOAD).status_code == 200
+    before = _row_state(sessions)
+    with caplog.at_level(logging.DEBUG):
+        response = client.put(
+            URL, content=body, headers={"Content-Type": "application/json"}
+        )
+    assert response.status_code == 400
+    assert MARKER not in response.text and MARKER not in caplog.text
+    assert _row_state(sessions) == before
+
+
+def test_endpoint_overflowing_after_the_openai_rewrite_is_rejected(authority_harness):
+    """``base_url`` is ``String(500)`` and ``/v1`` is rewritten after parsing."""
+    client, sessions, _actor, _engine = authority_harness
+    overflows = "https://example.com/" + "p" * 477 + "/v1"
+    assert len(overflows) == 500
+    assert client.put(URL, json=dict(PAYLOAD, endpoint=overflows)).status_code == 400
+    assert _row_state(sessions) is None
+    fits = "https://example.com/" + "p" * 457 + "/v1"
+    stored = client.put(URL, json=dict(PAYLOAD, endpoint=fits)).json()["endpoint"]
+    assert stored == fits + "/embeddings" and len(stored) <= 500
+
+
+@pytest.mark.parametrize(
+    "overrides, vector_space_moves",
+    [
+        ({"api_key": "rotated-secret"}, False),
+        ({"max_retries": 3}, False),
+        ({"dimension": 512}, True),
+    ],
+)
+def test_authority_identity_covers_more_than_the_vector_space(
+    authority_harness, overrides, vector_space_moves
+):
+    """Key rotation and retry changes move the authority identity only."""
+    _client, sessions, _actor, _engine = authority_harness
+    with sessions() as db:
+        service = GlobalMemoryEmbeddingAuthorityService(db)
+        service.set(AuthorityConfiguration(**PAYLOAD), actor_subject="a")
+        before = service.load_snapshot()
+        service.set(
+            AuthorityConfiguration(**dict(PAYLOAD, **overrides)), actor_subject="a"
+        )
+        after = service.load_snapshot()
+        assert after.authority_fingerprint() != before.authority_fingerprint()
+        assert (
+            after.vector_space_fingerprint() != before.vector_space_fingerprint()
+        ) is vector_space_moves

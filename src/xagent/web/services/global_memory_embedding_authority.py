@@ -5,7 +5,7 @@ import hmac
 import ipaddress
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, cast
@@ -33,6 +33,8 @@ _DEFAULT_ENDPOINTS = {
     "xinference": "http://localhost:9997",
 }
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+CREDENTIAL_CONFIGURED = "configured"
+CREDENTIAL_UNAVAILABLE = "unavailable"
 _MAX_ENDPOINT_LENGTH = 500
 _MAX_MODEL_NAME_LENGTH = 100
 _MAX_DIMENSION = 65536
@@ -40,7 +42,9 @@ _MAX_RETRIES = 100
 _HOSTNAME = re.compile(
     r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*"
 )
-_CREDENTIAL_IDENTITY_DOMAIN = b"xagent:global-memory-credential-identity:v1\0"
+_CREDENTIAL_IDENTITY_PURPOSE = (
+    b"global-memory-embedding-authority:credential-identity:v1"
+)
 # This table is introduced by the current unmerged migration, so there is no
 # production bare-digest backfill. Unknown/legacy versions deliberately fail closed.
 _CREDENTIAL_VERIFIER_PREFIX = "hmac-sha256$v1$"
@@ -105,6 +109,7 @@ class GlobalMemoryEmbeddingAuthorityRecord:
     consented_at: datetime
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    credential_status: str = CREDENTIAL_UNAVAILABLE
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -112,21 +117,55 @@ class GlobalMemoryEmbeddingAuthoritySnapshot(GlobalMemoryEmbeddingAuthorityRecor
     api_key: SecretStr = field(repr=False, compare=False)
     credential_identity: str = field(repr=False)
 
-    def semantic_fingerprint(self) -> str:
-        """Identity of the embedding space, deliberately free of governance
-        facts: re-approving an unchanged configuration under a different actor
-        must not invalidate the vectors already stored under it."""
-        payload = (
+    def _vector_space_inputs(self) -> tuple[Any, ...]:
+        return (
             self.provider,
             self.model_name,
             self.endpoint,
             self.dimension,
             self.instruct,
-            self.max_retries,
-            self.credential_identity,
         )
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def authority_fingerprint(self) -> str:
+        """Identity of the authority as a whole, including how it calls out.
+
+        Rotating the credential or changing the retry budget moves this value
+        and never moves :meth:`vector_space_fingerprint`; governance facts
+        stay out, because a clerical re-approval is not a change."""
+        return _fingerprint(
+            (*self._vector_space_inputs(), self.max_retries, self.credential_identity)
+        )
+
+    def vector_space_fingerprint(self) -> str:
+        """Identity of the embedding space alone: only the inputs that decide
+        what a vector means. Key rotation and retry changes move
+        :meth:`authority_fingerprint` but never this value, so vectors already
+        stored under it stay comparable."""
+        return _fingerprint(self._vector_space_inputs())
+
+
+def _record_from_row(
+    row: GlobalMemoryEmbeddingAuthority,
+) -> GlobalMemoryEmbeddingAuthorityRecord:
+    return GlobalMemoryEmbeddingAuthorityRecord(
+        provider=str(row.model_provider),
+        model_name=str(row.model_name),
+        endpoint=str(row.base_url),
+        dimension=int(row.dimension),
+        instruct=str(row.instruct) if row.instruct is not None else None,
+        max_retries=int(row.max_retries),
+        credential_source=CredentialSource(str(row.credential_source)),
+        global_sharing_consent=bool(row.global_sharing_consent),
+        consented_by_actor_subject=str(row.consented_by_actor_subject),
+        consented_at=cast(datetime, row.consented_at),
+        created_at=cast("datetime | None", row.created_at),
+        updated_at=cast("datetime | None", row.updated_at),
+    )
+
+
+def _fingerprint(payload: tuple[Any, ...]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
@@ -141,6 +180,10 @@ def _canonicalize(config: AuthorityConfiguration) -> AuthorityConfiguration:
     endpoint = _canonical_endpoint(config.endpoint or _DEFAULT_ENDPOINTS[provider])
     if provider == "openai" and endpoint.endswith("/v1"):
         endpoint += "/embeddings"
+    # The rewrite happens after _canonical_endpoint's own bound, so the value
+    # that actually reaches base_url = String(500) is re-checked here.
+    if len(endpoint) > _MAX_ENDPOINT_LENGTH:
+        raise ValueError("Global memory embedding endpoint is invalid")
     instruct = config.instruct.strip() if config.instruct else None
     if provider != "dashscope":
         instruct = None
@@ -205,6 +248,8 @@ def _canonical_endpoint(value: str) -> str:
     scheme = parsed.scheme.lower()
     if scheme not in _DEFAULT_PORTS or parsed.hostname is None:
         raise ValueError("Global memory embedding endpoint must be absolute HTTP(S)")
+    if port == 0:
+        raise ValueError("Global memory embedding endpoint is invalid")
     if (
         parsed.username is not None
         or parsed.password is not None
@@ -221,7 +266,9 @@ def _canonical_endpoint(value: str) -> str:
 
 
 def _credential_identity(api_key: str) -> str:
-    return hashlib.sha256(_CREDENTIAL_IDENTITY_DOMAIN + api_key.encode()).hexdigest()
+    """Keyed, in-memory-only identity: not brute-forceable back to the key
+    without the deployment secret, and never persisted or shown in a repr."""
+    return derive_secret_hmac(api_key, purpose=_CREDENTIAL_IDENTITY_PURPOSE)
 
 
 def _credential_verifier(api_key: str) -> str:
@@ -243,7 +290,10 @@ class GlobalMemoryEmbeddingAuthorityService:
         secret = normalized.api_key.get_secret_value()
         try:
             encrypted = get_cipher().encrypt(secret.encode()).decode()
-        except ValueError:
+            # Decided in-transaction from the ciphertext actually written, so
+            # the write's own result never has to guess or re-read the row.
+            round_trips = decrypt_value_strict(encrypted) == secret
+        except (EncryptionDecodeError, ValueError):
             raise AuthorityCredentialUnavailable(
                 "Global memory embedding credential is unavailable"
             ) from None
@@ -305,6 +355,9 @@ class GlobalMemoryEmbeddingAuthorityService:
             consented_at=consented_at,
             created_at=written.created_at,
             updated_at=written.updated_at,
+            credential_status=CREDENTIAL_CONFIGURED
+            if round_trips
+            else CREDENTIAL_UNAVAILABLE,
         )
         self.db.commit()
         return record
@@ -312,6 +365,14 @@ class GlobalMemoryEmbeddingAuthorityService:
     def delete(self) -> None:
         self.db.query(GlobalMemoryEmbeddingAuthority).delete()
         self.db.commit()
+
+    def read_record(self) -> GlobalMemoryEmbeddingAuthorityRecord | None:
+        """The stored authority as the API renders it, credential status included."""
+        row = self.get_row()
+        if row is None:
+            return None
+        record = _record_from_row(row)
+        return replace(record, credential_status=self.credential_status())
 
     def load_snapshot(self) -> GlobalMemoryEmbeddingAuthoritySnapshot | None:
         row = self.get_row()
@@ -330,22 +391,16 @@ class GlobalMemoryEmbeddingAuthorityService:
                 "Global memory embedding credential is unavailable"
             )
         return GlobalMemoryEmbeddingAuthoritySnapshot(
-            provider=str(row.model_provider),
-            model_name=str(row.model_name),
-            endpoint=str(row.base_url),
-            dimension=int(row.dimension),
-            instruct=str(row.instruct) if row.instruct is not None else None,
-            max_retries=int(row.max_retries),
-            credential_source=CredentialSource(str(row.credential_source)),
-            global_sharing_consent=bool(row.global_sharing_consent),
-            consented_by_actor_subject=str(row.consented_by_actor_subject),
-            consented_at=cast(datetime, row.consented_at),
+            **dict(
+                asdict(_record_from_row(row)), credential_status=CREDENTIAL_CONFIGURED
+            ),
             api_key=SecretStr(secret),
             credential_identity=_credential_identity(secret),
         )
 
     def credential_status(self) -> str:
         try:
-            return "configured" if self.load_snapshot() is not None else "unavailable"
+            snapshot = self.load_snapshot()
         except AuthorityCredentialUnavailable:
-            return "unavailable"
+            return CREDENTIAL_UNAVAILABLE
+        return CREDENTIAL_CONFIGURED if snapshot else CREDENTIAL_UNAVAILABLE

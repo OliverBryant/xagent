@@ -805,9 +805,12 @@ class TestMigrations:
             successor = repo.register(request)
             assert successor.active_scope_digest == request.scope_digest
             assert closed.active_scope_digest is None
-            with pytest.raises(DurableLifecycleConflict):
-                repo.register(request)
             session.commit()
+
+        with session_factory() as session:
+            with pytest.raises(DurableLifecycleConflict):
+                DurableSandboxLifecycleRepository(session).register(request)
+            session.rollback()
 
         late_request = RegisterLifecycle(
             scope_digest="d" * 64,

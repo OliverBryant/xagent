@@ -1312,6 +1312,12 @@ class TaskWorkspace:
     def _file_record_allowed_for_workspace(
         self, record: Any, path: Optional[Path] = None
     ) -> bool:
+        """Apply the workspace's legacy ownership and task compatibility policy.
+
+        Unscoped workspaces intentionally retain owner-only access for taskless
+        upload records. Scoped workspaces additionally require the record to
+        live below the active scope subtree.
+        """
         if path is not None:
             workspace_abs = self.workspace_dir.resolve()
             resolved_path = path.resolve()
@@ -1473,6 +1479,15 @@ class TaskWorkspace:
         # filesystem stat, checksum, or durable-storage materialization. The
         # detached snapshot is the only record state allowed past this point.
         if record_snapshot is not None:
+            # Persisted upload bindings are an external-write capability. A
+            # workspace without an authoritative owner must never resolve one,
+            # even though older general-purpose resolvers retain ownerless
+            # compatibility for workspace-local files.
+            if (
+                self.owner_user_id is None
+                or record_snapshot.user_id != self.owner_user_id
+            ):
+                return None
             storage_path = Path(record_snapshot.storage_path)
             if storage_path.exists() and storage_path.is_file():
                 if not self._file_record_allowed_for_workspace(
@@ -2265,7 +2280,6 @@ class TaskWorkspace:
     def auto_register_files(
         self,
         *,
-        mime_type: Optional[str] = None,
         mime_types: Optional[Mapping[str | Path, str]] = None,
     ) -> "Iterator[TaskWorkspace]":
         """
@@ -2280,8 +2294,7 @@ class TaskWorkspace:
         This is safer than relying on manual register_file() calls.
 
         ``mime_types`` applies trusted producer metadata only to its exact
-        paths. The legacy singular ``mime_type`` applies only to newly created
-        files so it cannot relabel unrelated existing registrations.
+        paths.
         """
         self._release_registration_session_if_clean(self.db_session)
         files_before = self._scan_all_files()
@@ -2316,8 +2329,6 @@ class TaskWorkspace:
                         target_mime_type = target_mime_types.get(
                             str(file_path.resolve())
                         )
-                        if target_mime_type is None and file_path not in files_before:
-                            target_mime_type = mime_type
                         file_id = self.register_file(
                             str(file_path),
                             db_session=self.db_session,

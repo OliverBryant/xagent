@@ -2699,6 +2699,24 @@ def test_upload_file_rejects_unbound_path_shaped_file_id(monkeypatch, tmp_path):
     files.create.assert_not_called()
 
 
+def test_upload_file_rejects_file_id_that_disagrees_with_live_binding(
+    monkeypatch, tmp_path, bind_workspace_upload
+):
+    local_file = tmp_path / "report.pdf"
+    local_file.write_bytes(b"%PDF-1.7 bound bytes")
+    bind_workspace_upload(local_file, file_id="bound-file-id")
+    files = Mock()
+    _mock_drive_service_with_files(monkeypatch, files)
+
+    result = json.loads(google_drive.google_drive_upload_file("different-file-id"))
+
+    assert result == {
+        "status": "error",
+        "message": "Workspace file is unavailable for this task",
+    }
+    files.create.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("filename", "expected_mime", "content"),
     [

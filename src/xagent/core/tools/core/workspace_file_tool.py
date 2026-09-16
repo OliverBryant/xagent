@@ -498,7 +498,19 @@ class WorkspaceFileOperations:
     def _refresh_registered_file(self, file_path: Path) -> None:
         refresh = getattr(self.workspace, "refresh_file_registration", None)
         if callable(refresh):
-            refresh(str(file_path))
+            try:
+                refresh(str(file_path))
+            except Exception as exc:
+                # The content mutation has already succeeded. Surfacing a
+                # metadata refresh failure as a mutation failure invites an
+                # agent retry, which can duplicate appends or edits. Keep the
+                # log credential-free and let later binding resolution fail
+                # closed if its recorded metadata is stale.
+                logger.warning(
+                    "Workspace file metadata refresh failed after a successful "
+                    "mutation (%s)",
+                    type(exc).__name__,
+                )
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""

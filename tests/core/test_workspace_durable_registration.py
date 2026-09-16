@@ -383,6 +383,121 @@ def test_workspace_binding_releases_pool_before_durable_materialization(
     assert binding.mime_type == "application/pdf"
 
 
+def test_durable_binding_enforces_owner_before_materialization(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+):
+    del mock_workspace_db
+    _engine, SessionLocal, db = constrained_workspace_db
+    owner = _seed_workspace_task(db, task_id=9025, username="workspace-binding-owner")
+    owner_id = int(owner.id)
+    foreign = _seed_workspace_task(
+        db, task_id=9026, username="workspace-binding-foreign"
+    )
+    foreign_id = int(foreign.id)
+    content = b"authorized durable bytes"
+    for file_id, user_id, task_id in (
+        ("owner-durable-id", owner_id, 9025),
+        ("foreign-durable-id", foreign_id, None),
+    ):
+        db.add(
+            UploadedFile(
+                file_id=file_id,
+                user_id=user_id,
+                task_id=task_id,
+                filename="report.pdf",
+                storage_path=str(tmp_path / "missing" / file_id / "report.pdf"),
+                storage_key=f"users/{user_id}/uploads/{file_id}/report.pdf",
+                storage_status="available",
+                mime_type="application/pdf",
+                file_size=len(content),
+            )
+        )
+    db.commit()
+    db.rollback()
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    materialized_ids = []
+
+    def materialize(self):
+        materialized_ids.append(self.record.file_id)
+        assert self.record.file_id == "owner-durable-id"
+        target = tmp_path / "materialized" / self.record.file_id / "report.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        return target
+
+    monkeypatch.setattr(
+        "xagent.web.services.managed_file_ref.ManagedFileRef.materialize",
+        materialize,
+    )
+    workspace = TaskWorkspace(
+        id="web_task_9025",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=9025,
+    )
+    workspace.owner_user_id = owner_id
+    foreign_local_path = workspace.output_dir / "foreign-local.pdf"
+    foreign_local_path.write_bytes(content)
+    db.add(
+        UploadedFile(
+            file_id="foreign-local-id",
+            user_id=foreign_id,
+            task_id=None,
+            filename="foreign-local.pdf",
+            storage_path=str(foreign_local_path),
+            storage_status="available",
+            mime_type="application/pdf",
+            file_size=len(content),
+        )
+    )
+    db.commit()
+
+    assert workspace.resolve_file_binding_detached("foreign-local-id") is None
+    assert workspace.resolve_file_binding_detached("foreign-durable-id") is None
+    binding = workspace.resolve_file_binding_detached("owner-durable-id")
+
+    assert materialized_ids == ["owner-durable-id"]
+    assert binding is not None
+    assert binding.path.read_bytes() == content
+
+
+def test_persisted_binding_without_workspace_owner_fails_closed(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+):
+    del mock_workspace_db
+    _engine, SessionLocal, db = constrained_workspace_db
+    user = _seed_workspace_task(db, task_id=9027, username="ownerless-binding")
+    source = tmp_path / "foreign.pdf"
+    source.write_bytes(b"foreign bytes")
+    db.add(
+        UploadedFile(
+            file_id="ownerless-file-id",
+            user_id=int(user.id),
+            task_id=9027,
+            filename="foreign.pdf",
+            storage_path=str(source),
+            storage_status="available",
+            mime_type="application/pdf",
+            file_size=source.stat().st_size,
+        )
+    )
+    db.commit()
+    db.rollback()
+    monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
+    workspace = TaskWorkspace(
+        id="agent_1_ownerless",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=9027,
+    )
+
+    assert workspace.resolve_file_binding_detached("ownerless-file-id") is None
+
+
 @pytest.mark.parametrize("filename", ["capture", "capture.jpg"])
 def test_auto_register_files_preserves_explicit_producer_mime(
     monkeypatch,
@@ -393,7 +508,7 @@ def test_auto_register_files_preserves_explicit_producer_mime(
 ):
     del mock_workspace_db
     _engine, SessionLocal, db = constrained_workspace_db
-    _seed_workspace_task(
+    owner = _seed_workspace_task(
         db,
         task_id=9022,
         username=f"workspace-explicit-mime-{filename}",
@@ -410,6 +525,7 @@ def test_auto_register_files_preserves_explicit_producer_mime(
         base_dir=str(tmp_path / "workspaces"),
         db_task_id=9022,
     )
+    workspace.owner_user_id = int(owner.id)
     workspace.db_session = db
     output_path = workspace.output_dir / filename
 
@@ -508,7 +624,9 @@ def test_registered_mutations_refresh_same_file_generation(
 ):
     del mock_workspace_db
     _engine, SessionLocal, db = constrained_workspace_db
-    _seed_workspace_task(db, task_id=9024, username=f"workspace-mutation-{operation}")
+    owner = _seed_workspace_task(
+        db, task_id=9024, username=f"workspace-mutation-{operation}"
+    )
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     get_unscoped_file_storage.cache_clear()
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
@@ -521,6 +639,7 @@ def test_registered_mutations_refresh_same_file_generation(
         base_dir=str(tmp_path / "workspaces"),
         db_task_id=9024,
     )
+    workspace.owner_user_id = int(owner.id)
     workspace.db_session = db
     output_path = workspace.output_dir / "note.txt"
     output_path.write_text("alpha\n", encoding="utf-8")
@@ -564,6 +683,44 @@ def test_registered_mutations_refresh_same_file_generation(
     assert binding is not None
     assert binding.file_id == file_id
     assert binding.path.read_bytes() == expected
+
+
+@pytest.mark.parametrize("operation", ["append", "edit", "replace"])
+def test_successful_mutation_is_not_failed_by_registration_refresh(
+    monkeypatch, tmp_path, caplog, operation
+):
+    workspace = TaskWorkspace(id="preview_refresh_failure", base_dir=str(tmp_path))
+    output_path = workspace.output_dir / "note.txt"
+    output_path.write_text("alpha\n", encoding="utf-8")
+    file_id = workspace.register_file(str(output_path), mime_type="text/plain")
+    refresh_calls = []
+
+    def fail_refresh(file_path):
+        refresh_calls.append(file_path)
+        raise RuntimeError("credential-bearing provider detail")
+
+    monkeypatch.setattr(workspace, "refresh_file_registration", fail_refresh)
+    operations = WorkspaceFileOperations(workspace)
+
+    if operation == "append":
+        assert operations.append_file(file_id, "omega") is True
+        expected = "alpha\nomega"
+    elif operation == "edit":
+        result = operations.edit_file(
+            file_id,
+            [{"operation_type": "replace", "line_number": 1, "content": "bravo"}],
+        )
+        assert result.success is True
+        expected = "bravo\n"
+    else:
+        result = operations.find_and_replace(file_id, "alpha", "bravo")
+        assert result.success is True
+        expected = "bravo\n"
+
+    assert output_path.read_text(encoding="utf-8") == expected
+    assert refresh_calls == [str(output_path.resolve())]
+    assert "credential-bearing provider detail" not in caplog.text
+    assert str(output_path) not in caplog.text
 
 
 def test_workspace_registration_commit_survives_caller_rollback(

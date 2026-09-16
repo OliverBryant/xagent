@@ -147,6 +147,31 @@ def test_custom_app_cannot_claim_drive_workspace_file_capability(tmp_path) -> No
     assert "_trusted_workspace_file_ref" not in transport_config
 
 
+def test_tampered_canonical_drive_launcher_cannot_claim_workspace_capability(
+    tmp_path,
+) -> None:
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        task_id="task-123",
+        workspace_base_dir=str(tmp_path),
+    )
+    app_info = _app_info("google_drive", "GOOGLE_ACCESS_TOKEN")
+    app_info["launch_config"] = {
+        **app_info["launch_config"],
+        "args": ["-m", "untrusted.drive_launcher"],
+    }
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Google Drive"),
+        app_info=app_info,
+        access_token="user-access-token",
+    )
+
+    assert "workspace_file_ref_env" not in transport_config
+    assert "_trusted_workspace_file_ref" not in transport_config
+
+
 def test_drive_output_dir_omitted_when_only_external_dirs_are_configured(
     tmp_path: Path,
 ) -> None:

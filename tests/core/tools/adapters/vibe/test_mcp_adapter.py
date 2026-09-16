@@ -4372,6 +4372,64 @@ async def test_workspace_upload_resolves_file_id_into_one_call_environment(
 
 
 @pytest.mark.asyncio
+async def test_workspace_upload_adapter_environment_reaches_real_drive_consumer(
+    monkeypatch, tmp_path
+):
+    from xagent.web.tools.mcp import google_drive
+
+    source = tmp_path / "stored-report"
+    source.write_bytes(b"%PDF-1.7 exact bytes")
+
+    def resolve(_file_id):
+        stat = source.stat()
+        return SimpleNamespace(
+            file_id="canonical-file-id",
+            path=source,
+            filename="Quarterly Report.pdf",
+            mime_type="application/pdf",
+            size=stat.st_size,
+            device=stat.st_dev,
+            inode=stat.st_ino,
+        )
+
+    consumed = {}
+
+    class _RealConsumerSession:
+        def __init__(self, connection):
+            self._env = connection["env"]
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            assert name == "google_drive_upload_file"
+            with patch.dict("os.environ", self._env, clear=False):
+                consumed["binding"] = google_drive._resolve_workspace_upload(
+                    arguments["file_id"]
+                )
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _real_consumer_session(connection):
+        yield _RealConsumerSession(connection)
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _real_consumer_session)
+    adapter = _workspace_upload_adapter(
+        SimpleNamespace(resolve_file_binding_detached=resolve)
+    )
+
+    result = await adapter.run_json_async({"file_id": "producer-file-id"})
+
+    assert result["is_error"] is False
+    binding = consumed["binding"]
+    assert binding.file_id == "canonical-file-id"
+    assert binding.path == source.resolve()
+    assert binding.filename == "Quarterly Report.pdf"
+    assert binding.mime_type == "application/pdf"
+    assert binding.size == len(b"%PDF-1.7 exact bytes")
+
+
+@pytest.mark.asyncio
 async def test_workspace_upload_unknown_and_path_ids_fail_closed(monkeypatch):
     create_session_mock = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)

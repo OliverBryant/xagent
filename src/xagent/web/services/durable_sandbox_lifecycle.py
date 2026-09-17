@@ -9,7 +9,9 @@ new fenced transaction for observe, settle, or backoff.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import re
 import secrets
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _BACKEND_LIFECYCLE_DOMAIN = b"xagent.durable-sandbox.backend-lifecycle.v1\x00"
 _TURN_DOMAIN = b"xagent.durable-sandbox.turn.v1\x00"
 
+logger = logging.getLogger(__name__)
+
 
 class DurableLifecycleConflict(RuntimeError):
     """A lifecycle registration or CAS transition lost its fence."""
@@ -48,6 +52,7 @@ class LifecycleFence:
     owner_token: str
     create_operation_token: str
     create_phase: CreatePhase
+    create_terminal_outcome: CreateCompletion | None
     version: int
     state: LifecycleState
     task_id: int
@@ -71,6 +76,7 @@ class LifecycleFence:
             owner_token=row.owner_token,
             create_operation_token=row.create_operation_token,
             create_phase=row.create_phase,
+            create_terminal_outcome=row.create_terminal_outcome,
             version=row.version,
             state=row.state,
             task_id=row.task_id,
@@ -136,6 +142,22 @@ def _validate_registration(request: RegisterLifecycle) -> None:
         raise ValueError("lease_attempt_id must be 1..64 characters")
 
 
+def _tombstone_values(*, now: datetime, claim_ttl: timedelta) -> dict[str, Any]:
+    if claim_ttl <= timedelta(0):
+        raise ValueError("claim_ttl must be positive")
+    return {
+        "state": "deleting",
+        "active_scope_digest": None,
+        "owner_token": new_opaque_token(),
+        "version": DurableSandboxLifecycle.version + 1,
+        "deleting_at": now,
+        "delete_claim_expires_at": now + claim_ttl,
+        "retry_at": None,
+        "delete_attempts": DurableSandboxLifecycle.delete_attempts + 1,
+        "updated_at": now,
+    }
+
+
 def _exact_attempt_is_active(row: Any, now: datetime) -> ColumnElement[bool]:
     return exists(
         select(Task.id).where(
@@ -170,6 +192,7 @@ class DurableSandboxLifecycleRepository:
             owner_token=new_opaque_token(),
             create_operation_token=new_opaque_token(),
             create_phase="not_started",
+            create_terminal_outcome=None,
             version=1,
             state="registered",
             task_id=request.task_id,
@@ -264,6 +287,7 @@ class DurableSandboxLifecycleRepository:
             )
             .values(
                 create_phase="terminal",
+                create_terminal_outcome=outcome,
                 updated_at=now,
                 version=DurableSandboxLifecycle.version + 1,
             )
@@ -286,6 +310,7 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.version == fence.version,
                 DurableSandboxLifecycle.state == "registered",
                 DurableSandboxLifecycle.create_phase == "terminal",
+                DurableSandboxLifecycle.create_terminal_outcome == "success",
                 _exact_attempt_is_active(DurableSandboxLifecycle, now),
             )
             .values(
@@ -333,9 +358,6 @@ class DurableSandboxLifecycleRepository:
         claim_ttl: timedelta,
     ) -> LifecycleFence | None:
         """Classify and tombstone an eligible registered/ready row atomically."""
-        if claim_ttl <= timedelta(0):
-            raise ValueError("claim_ttl must be positive")
-        claim_owner = new_opaque_token()
         stmt = (
             update(DurableSandboxLifecycle)
             .where(
@@ -350,17 +372,7 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.owner_lease_expires_at <= now,
                 ~_exact_attempt_is_active(DurableSandboxLifecycle, now),
             )
-            .values(
-                state="deleting",
-                active_scope_digest=None,
-                owner_token=claim_owner,
-                version=DurableSandboxLifecycle.version + 1,
-                deleting_at=now,
-                delete_claim_expires_at=now + claim_ttl,
-                retry_at=None,
-                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
-                updated_at=now,
-            )
+            .values(**_tombstone_values(now=now, claim_ttl=claim_ttl))
             .returning(DurableSandboxLifecycle)
         )
         row = self._db.execute(stmt).scalar_one_or_none()
@@ -379,9 +391,6 @@ class DurableSandboxLifecycleRepository:
         deliberately excluded because an ambiguous create must instead use
         :meth:`quarantine_create` and retain its probe-before-delete policy.
         """
-        if claim_ttl <= timedelta(0):
-            raise ValueError("claim_ttl must be positive")
-        claim_owner = new_opaque_token()
         stmt = (
             update(DurableSandboxLifecycle)
             .where(
@@ -398,17 +407,7 @@ class DurableSandboxLifecycleRepository:
                     ("not_started", "terminal", "observed")
                 ),
             )
-            .values(
-                state="deleting",
-                active_scope_digest=None,
-                owner_token=claim_owner,
-                version=DurableSandboxLifecycle.version + 1,
-                deleting_at=now,
-                delete_claim_expires_at=now + claim_ttl,
-                retry_at=None,
-                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
-                updated_at=now,
-            )
+            .values(**_tombstone_values(now=now, claim_ttl=claim_ttl))
             .returning(DurableSandboxLifecycle)
         )
         row = self._db.execute(stmt).scalar_one_or_none()
@@ -429,9 +428,6 @@ class DurableSandboxLifecycleRepository:
         its durable backend digest while releasing the logical active slot for
         an immediate successor.
         """
-        if claim_ttl <= timedelta(0):
-            raise ValueError("claim_ttl must be positive")
-        claim_owner = new_opaque_token()
         stmt = (
             update(DurableSandboxLifecycle)
             .where(
@@ -444,17 +440,7 @@ class DurableSandboxLifecycleRepository:
                 DurableSandboxLifecycle.state == "registered",
                 DurableSandboxLifecycle.create_phase == "may_publish",
             )
-            .values(
-                state="deleting",
-                active_scope_digest=None,
-                owner_token=claim_owner,
-                version=DurableSandboxLifecycle.version + 1,
-                deleting_at=now,
-                delete_claim_expires_at=now + claim_ttl,
-                retry_at=None,
-                delete_attempts=DurableSandboxLifecycle.delete_attempts + 1,
-                updated_at=now,
-            )
+            .values(**_tombstone_values(now=now, claim_ttl=claim_ttl))
             .returning(DurableSandboxLifecycle)
         )
         row = self._db.execute(stmt).scalar_one_or_none()
@@ -490,6 +476,7 @@ class DurableSandboxLifecycleRepository:
             )
             .values(
                 create_phase="terminal",
+                create_terminal_outcome=outcome,
                 version=DurableSandboxLifecycle.version + 1,
                 updated_at=now,
             )
@@ -524,7 +511,6 @@ class DurableSandboxLifecycleRepository:
                     DurableSandboxLifecycle.retry_at.is_(None),
                     DurableSandboxLifecycle.retry_at <= now,
                 ),
-                ~_exact_attempt_is_active(DurableSandboxLifecycle, now),
             )
             .values(
                 owner_token=claim_owner,
@@ -809,6 +795,8 @@ class DurableSandboxDeleteCoordinator:
         """
         if fence.state != "deleting":
             raise ValueError("delete_claimed requires a deleting fence")
+        if retry_at <= now:
+            raise ValueError("retry_at must be in the future")
 
         current = fence
         if current.create_phase == "may_publish":
@@ -817,11 +805,23 @@ class DurableSandboxDeleteCoordinator:
                     current.backend_lifecycle_digest
                 )
             except Exception:
+                logger.warning(
+                    "Durable sandbox generation probe failed closed for %s",
+                    current.backend_lifecycle_digest,
+                    exc_info=True,
+                )
                 presence = ExactGenerationProbe.UNKNOWN
             if presence is not ExactGenerationProbe.PRESENT:
-                self._lifecycles.backoff_delete(current, now=now, retry_at=retry_at)
+                await asyncio.to_thread(
+                    self._lifecycles.backoff_delete,
+                    current,
+                    now=now,
+                    retry_at=retry_at,
+                )
                 return False
-            observed = self._lifecycles.observe_create(current, now=now)
+            observed = await asyncio.to_thread(
+                self._lifecycles.observe_create, current, now=now
+            )
             if observed is None:
                 return False
             current = observed
@@ -831,6 +831,16 @@ class DurableSandboxDeleteCoordinator:
                 current.backend_lifecycle_digest
             )
         except Exception:
-            self._lifecycles.backoff_delete(current, now=now, retry_at=retry_at)
+            logger.warning(
+                "Durable sandbox generation deletion failed for %s",
+                current.backend_lifecycle_digest,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                self._lifecycles.backoff_delete,
+                current,
+                now=now,
+                retry_at=retry_at,
+            )
             return False
-        return self._lifecycles.settle_delete(current)
+        return await asyncio.to_thread(self._lifecycles.settle_delete, current)

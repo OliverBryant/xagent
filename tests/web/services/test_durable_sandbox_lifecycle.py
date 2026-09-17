@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,7 @@ def test_register_is_durable_before_create_and_contains_only_opaque_identity(
     assert fence.state == "registered"
     assert fence.active_scope_digest == fence.scope_digest
     assert fence.create_phase == "not_started"
+    assert fence.create_terminal_outcome is None
     assert len(fence.create_operation_token) == 64
     assert fence.version == 1
     assert fence.backend_lifecycle_digest == backend_lifecycle_digest(
@@ -209,6 +211,7 @@ def test_begin_and_complete_create_are_exact_monotonic_cas_transitions(
         completed = repo.complete_create(begun, now=NOW, outcome="success")
         assert completed is not None
         assert completed.create_phase == "terminal"
+        assert completed.create_terminal_outcome == "success"
         assert repo.complete_create(begun, now=NOW, outcome="success") is None
 
 
@@ -225,6 +228,66 @@ def test_ready_requires_terminal_create_phase(sessions) -> None:
             )
             is None
         )
+
+
+def test_terminal_absent_create_cannot_be_marked_ready(sessions) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+        begun = repo.begin_create(registered, now=NOW)
+        assert begun is not None
+        absent = repo.complete_create(begun, now=NOW, outcome="terminal_absent")
+        assert absent is not None
+        assert absent.create_terminal_outcome == "terminal_absent"
+        assert (
+            repo.mark_ready(
+                absent,
+                now=NOW,
+                owner_lease_expires_at=NOW + timedelta(minutes=1),
+            )
+            is None
+        )
+
+
+def test_create_phase_and_state_guards_reject_current_version_fences(sessions) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        registered = repo.register(_request())
+        _set_task(db, active=True)
+
+        # Removing quarantine_create's may_publish guard makes this succeed.
+        assert (
+            repo.quarantine_create(registered, now=NOW, claim_ttl=timedelta(minutes=1))
+            is None
+        )
+
+        begun = repo.begin_create(registered, now=NOW)
+        assert begun is not None
+        db.execute(
+            sa.update(DurableSandboxLifecycle)
+            .where(DurableSandboxLifecycle.id == begun.id)
+            .values(
+                state="deleting",
+                active_scope_digest=None,
+                deleting_at=NOW,
+                delete_claim_expires_at=NOW + timedelta(minutes=1),
+            )
+        )
+        # The fence still has the current owner/version; only state rejects it.
+        assert repo.complete_create(begun, now=NOW, outcome="success") is None
+
+        db.execute(
+            sa.update(DurableSandboxLifecycle)
+            .where(DurableSandboxLifecycle.id == begun.id)
+            .values(
+                create_phase="terminal",
+                create_terminal_outcome="success",
+            )
+        )
+        current = repo.list_by_scope(begun.scope_digest)[0]
+        # Removing observe_create's may_publish guard makes this succeed.
+        assert repo.observe_create(current, now=NOW) is None
 
 
 def test_age_only_never_reclaims_an_exact_active_attempt(sessions) -> None:
@@ -714,6 +777,33 @@ def test_quarantined_may_publish_generation_does_not_block_successor(sessions) -
     )
 
 
+def test_expired_quarantine_is_reclaimable_while_successor_attempt_is_active(
+    sessions,
+) -> None:
+    with sessions() as db:
+        repo = DurableSandboxLifecycleRepository(db)
+        first = repo.register(_request())
+        _set_task(db, active=True)
+        begun = repo.begin_create(first, now=NOW)
+        assert begun is not None
+        quarantined = repo.quarantine_create(
+            begun, now=NOW, claim_ttl=timedelta(seconds=1)
+        )
+        assert quarantined is not None
+        successor = repo.register(_request())
+        reclaimed = repo.reclaim_delete(
+            quarantined,
+            now=NOW + timedelta(seconds=2),
+            claim_ttl=timedelta(minutes=1),
+        )
+        assert reclaimed is not None
+        assert reclaimed.id == quarantined.id
+        assert reclaimed.version == quarantined.version + 1
+        active = repo.get_by_scope(successor.scope_digest)
+        assert active is not None
+        assert active.id == successor.id
+
+
 def test_crashed_may_publish_owner_is_quarantined_by_stale_reclaimer(sessions) -> None:
     with sessions() as db:
         repo = DurableSandboxLifecycleRepository(db)
@@ -824,6 +914,79 @@ def test_ambiguous_create_absent_or_unknown_only_backs_off(sessions, presence) -
     assert len(rows) == 1
     assert rows[0].create_phase == "may_publish"
     assert rows[0].retry_at.replace(tzinfo=timezone.utc) == NOW + timedelta(minutes=1)
+
+
+def test_coordinator_logs_backend_failure_without_losing_backoff_error(
+    sessions, caplog
+) -> None:
+    service, claimed = _claimed_may_publish(sessions)
+
+    def fail_backoff(*_args, **_kwargs):
+        raise RuntimeError("durable backoff failed")
+
+    service.backoff_delete = fail_backoff  # type: ignore[method-assign]
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError, match="durable backoff failed"):
+            asyncio.run(
+                DurableSandboxDeleteCoordinator(
+                    service, _Backend(RuntimeError("backend probe failed"))
+                ).delete_claimed(
+                    claimed,
+                    now=NOW,
+                    retry_at=NOW + timedelta(minutes=1),
+                )
+            )
+    assert claimed.backend_lifecycle_digest in caplog.text
+    assert "backend probe failed" in caplog.text
+
+
+def test_coordinator_database_transition_does_not_block_event_loop(sessions) -> None:
+    service, claimed = _claimed_may_publish(sessions)
+    original = service.backoff_delete
+    release = threading.Event()
+
+    def blocking_backoff(*args, **kwargs):
+        release.wait(timeout=1)
+        return original(*args, **kwargs)
+
+    service.backoff_delete = blocking_backoff  # type: ignore[method-assign]
+
+    async def run() -> None:
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+        started = time.monotonic()
+        task = asyncio.create_task(
+            DurableSandboxDeleteCoordinator(service, _Backend()).delete_claimed(
+                claimed,
+                now=NOW,
+                retry_at=NOW + timedelta(minutes=1),
+            )
+        )
+        await asyncio.sleep(0.02)
+        elapsed = time.monotonic() - started
+        release.set()
+        assert not await task
+        timer.cancel()
+        assert elapsed < 0.15
+
+    asyncio.run(run())
+
+
+def test_invalid_retry_time_fails_before_backend_or_database_io(sessions) -> None:
+    service, claimed = _claimed_may_publish(sessions)
+    backend = _Backend(ExactGenerationProbe.PRESENT)
+    with pytest.raises(ValueError, match="retry_at must be in the future"):
+        asyncio.run(
+            DurableSandboxDeleteCoordinator(service, backend).delete_claimed(
+                claimed,
+                now=NOW,
+                retry_at=NOW,
+            )
+        )
+    assert backend.probes == []
+    current = service.list_by_scope(claimed.scope_digest)[0]
+    assert current.version == claimed.version
+    assert current.retry_at is None
 
 
 def test_present_is_observed_before_delete_and_settlement(sessions) -> None:

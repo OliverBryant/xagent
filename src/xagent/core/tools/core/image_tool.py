@@ -5,6 +5,7 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -445,6 +446,54 @@ Images are automatically saved to workspace.
         that can hold the alpha channel keying is about to build."""
         return f"{prefix}_{uuid.uuid4().hex[:8]}.png"
 
+    def _prepare_transparency_request(
+        self, model: Any, prompt: str, transparent_background: bool
+    ) -> tuple[bool, str]:
+        """Decide how transparency will be served and build the prompt for it.
+
+        Returns whether the provider serves it natively, and the prompt to send.
+        A provider without native support gets the flat-chroma background rules
+        appended, because the keying step afterwards has nothing to key
+        otherwise. Shared by generation and editing so the two cannot drift.
+        """
+        native = transparent_background and self._has_native_transparency(model)
+        if transparent_background and not native:
+            return native, f"{prompt}\n\n{transparency_prompt_instructions()}"
+        return native, prompt
+
+    @staticmethod
+    async def _apply_transparency(
+        image_path: str, *, native_transparency: bool
+    ) -> dict[str, Any]:
+        """Run the keying/inspection pass off the event loop, never raising.
+
+        ``ensure_transparent_background`` is synchronous Pillow work measured in
+        tenths of a second. The web entry point runs a single uvicorn worker, so
+        calling it inline would stall every other in-flight request for that
+        long.
+
+        Failures are turned into a ``failed`` report rather than propagated: the
+        image itself is fine and worth returning, and the tool description
+        promises this field is present whenever transparency was requested.
+        """
+        try:
+            return await asyncio.to_thread(
+                ensure_transparent_background,
+                image_path,
+                allow_keying=not native_transparency,
+            )
+        except Exception as exc:
+            logger.warning("Transparency post-processing failed: %s", exc)
+            return {
+                "mode": "failed",
+                "transparent": False,
+                "transparent_ratio": 0.0,
+                "warning": (
+                    "Transparency post-processing failed, so the saved image "
+                    f"still has an opaque background: {exc}"
+                ),
+            }
+
     def _available_models_summary(self) -> str:
         entries = []
         for model_id, model in self._image_models.items():
@@ -730,12 +779,9 @@ Images are automatically saved to workspace.
 
             # Transparency is served one of two ways, and the prompt has to be
             # built for whichever one applies before the request goes out.
-            native_transparency = transparent_background and (
-                self._has_native_transparency(image_model)
+            native_transparency, effective_prompt = self._prepare_transparency_request(
+                image_model, prompt, transparent_background
             )
-            effective_prompt = prompt
-            if transparent_background and not native_transparency:
-                effective_prompt = f"{prompt}\n\n{transparency_prompt_instructions()}"
 
             # Build parameters for image generation
             generate_params: dict[str, Any] = {
@@ -788,9 +834,9 @@ Images are automatically saved to workspace.
                         # Inside the registration block so the keyed PNG, not the
                         # opaque download it replaces, is what gets registered.
                         if image_path and transparent_background:
-                            transparency = ensure_transparent_background(
+                            transparency = await self._apply_transparency(
                                 image_path,
-                                allow_keying=not native_transparency,
+                                native_transparency=native_transparency,
                             )
                     if image_path:
                         try:
@@ -896,12 +942,9 @@ Images are automatically saved to workspace.
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
             )
 
-            native_transparency = transparent_background and (
-                self._has_native_transparency(image_model)
+            native_transparency, effective_prompt = self._prepare_transparency_request(
+                image_model, prompt, transparent_background
             )
-            effective_prompt = prompt
-            if transparent_background and not native_transparency:
-                effective_prompt = f"{prompt}\n\n{transparency_prompt_instructions()}"
 
             # Build parameters for image editing
             edit_params: dict[str, Any] = {
@@ -954,9 +997,9 @@ Images are automatically saved to workspace.
                         # Inside the registration block so the keyed PNG, not the
                         # opaque download it replaces, is what gets registered.
                         if image_path and transparent_background:
-                            transparency = ensure_transparent_background(
+                            transparency = await self._apply_transparency(
                                 image_path,
-                                allow_keying=not native_transparency,
+                                native_transparency=native_transparency,
                             )
                     if image_path:
                         try:

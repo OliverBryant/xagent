@@ -2,6 +2,7 @@
 Tests for ImageGenerationToolCore class
 """
 
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -923,3 +924,59 @@ class TestTransparentBackground:
         # The legend the descriptions explain has to actually appear.
         assert "◻" in native_tool._model_info_text
         assert "◻" not in keying_tool._model_info_text
+
+
+class TestTransparencyFailureIsolation:
+    """A keying failure must not be mistaken for a download failure."""
+
+    async def test_keying_error_is_reported_not_swallowed(
+        self, mock_workspace, tmp_path
+    ):
+        tool, _ = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            return _keyable_png(tmp_path / (filename or "out.png"))
+
+        # The call used to sit inside the download try/except, whose handler
+        # only logs "Failed to download image to workspace". A Pillow error
+        # therefore skipped file registration and dropped the transparency key
+        # entirely, while the tool description promises it is always present.
+        with (
+            patch.object(tool, "_download_image", side_effect=fake_download),
+            patch(
+                "xagent.core.tools.core.image_tool.ensure_transparent_background",
+                side_effect=OSError("cannot identify image file"),
+            ),
+        ):
+            result = await tool.generate_image(
+                prompt="a rocket icon", transparent_background=True
+            )
+
+        assert result["success"] is True
+        assert result["image_path"] is not None, "the image itself is still fine"
+        assert result["transparency"]["mode"] == "failed"
+        assert result["transparency"]["transparent"] is False
+        assert "warning" in result["transparency"]
+
+    async def test_keying_runs_off_the_event_loop(self, mock_workspace, tmp_path):
+        tool, _ = _transparency_tool(mock_workspace, native=False)
+
+        async def fake_download(image_url, filename=None, timeout=30):
+            return _keyable_png(tmp_path / (filename or "out.png"))
+
+        # Pillow keying is ~0.1-0.7s of synchronous CPU work and the web entry
+        # point runs a single uvicorn worker, so calling it inline stalls every
+        # other in-flight request.
+        with (
+            patch.object(tool, "_download_image", side_effect=fake_download),
+            patch(
+                "xagent.core.tools.core.image_tool.asyncio.to_thread",
+                wraps=asyncio.to_thread,
+            ) as to_thread,
+        ):
+            result = await tool.generate_image(
+                prompt="a rocket icon", transparent_background=True
+            )
+
+        assert result["transparency"]["mode"] == "keyed"
+        assert to_thread.await_count == 1

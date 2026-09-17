@@ -85,7 +85,12 @@ class OpenAIImageModel(BaseImageModel):
                 timeout=self.timeout,
             )
 
-    def _normalize_size(self, size: str) -> str:
+    def _normalize_size(self, size: Optional[str]) -> str:
+        # Tolerates None because callers forward an unset size explicitly rather
+        # than omitting it: image_tool always puts "size" in its params dict, and
+        # a parameter default only covers a missing key, never an explicit None.
+        if not size:
+            return "1024x1024"
         if "*" in size:
             return size.replace("*", "x")
         return size
@@ -226,7 +231,7 @@ class OpenAIImageModel(BaseImageModel):
             image_paths.append(image_path)
 
         response_format = kwargs.pop("response_format", None)
-        size = self._normalize_size(kwargs.pop("size", "1024*1024"))
+        size = self._normalize_size(kwargs.pop("size", None))
         request_kwargs: dict[str, Any] = dict(kwargs)
         self._apply_response_format(request_kwargs, response_format)
         if transparent_background:

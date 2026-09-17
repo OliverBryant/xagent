@@ -133,3 +133,27 @@ class TestEditRequestShape:
         await model.edit_image(image_url=str(source), prompt="tweak", size="512*512")
 
         assert client.images.edit.call_args.kwargs["size"] == "512x512"
+
+
+class TestSizeDefaulting:
+    """An explicitly forwarded None is not the same as a missing key."""
+
+    @pytest.mark.asyncio
+    async def test_generate_falls_back_when_size_is_none(self):
+        # image_tool always puts "size" in its params dict, so an unset size
+        # arrives as an explicit None that a parameter default never covers.
+        model, client = _model("gpt-image-1")
+
+        await model.generate_image(prompt="a logo", size=None)
+
+        assert client.images.generate.call_args.kwargs["size"] == "1024x1024"
+
+    @pytest.mark.asyncio
+    async def test_edit_falls_back_when_size_is_none(self, tmp_path):
+        source = tmp_path / "in.png"
+        source.write_bytes(b"stub")
+        model, client = _model("gpt-image-1")
+
+        await model.edit_image(image_url=str(source), prompt="tweak", size=None)
+
+        assert client.images.edit.call_args.kwargs["size"] == "1024x1024"

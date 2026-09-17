@@ -32,6 +32,7 @@ def upgrade() -> None:
     with op.batch_alter_table(TABLE) as batch:
         batch.add_column(sa.Column("active_scope_digest", sa.String(64)))
         batch.add_column(sa.Column("create_operation_token", sa.String(64)))
+        batch.add_column(sa.Column("create_terminal_outcome", sa.String(16)))
         batch.add_column(
             sa.Column(
                 "create_phase",
@@ -64,6 +65,7 @@ def upgrade() -> None:
         batch.create_unique_constraint(
             "uq_dsl_create_operation_token", ["create_operation_token"]
         )
+        batch.create_index("ix_dsl_scope_digest", ["scope_digest"], unique=False)
         batch.create_check_constraint(
             "ck_dsl_active_scope_digest",
             "active_scope_digest IS NULL OR length(active_scope_digest) = 64",
@@ -75,6 +77,12 @@ def upgrade() -> None:
         batch.create_check_constraint(
             "ck_dsl_create_phase",
             "create_phase IN ('not_started', 'may_publish', 'terminal', 'observed')",
+        )
+        batch.create_check_constraint(
+            "ck_dsl_create_terminal_outcome",
+            "(create_phase = 'terminal' AND create_terminal_outcome IS NOT NULL AND "
+            "create_terminal_outcome IN ('success', 'terminal_absent')) OR "
+            "(create_phase != 'terminal' AND create_terminal_outcome IS NULL)",
         )
         batch.create_check_constraint(
             "ck_dsl_active_generation",
@@ -104,14 +112,28 @@ def downgrade() -> None:
             "cannot downgrade durable create operations while successor "
             "generations coexist"
         )
+    ambiguous_create = bind.execute(
+        sa.text(
+            f"SELECT id FROM {TABLE} "
+            "WHERE create_phase IN ('may_publish', 'observed') LIMIT 1"
+        )
+    ).first()
+    if ambiguous_create is not None:
+        raise RuntimeError(
+            "cannot downgrade durable create operations while an ambiguous "
+            "generation may still exist"
+        )
     with op.batch_alter_table(TABLE) as batch:
         batch.drop_constraint("ck_dsl_active_generation", type_="check")
+        batch.drop_constraint("ck_dsl_create_terminal_outcome", type_="check")
         batch.drop_constraint("ck_dsl_create_phase", type_="check")
         batch.drop_constraint("ck_dsl_create_operation_token", type_="check")
         batch.drop_constraint("ck_dsl_active_scope_digest", type_="check")
         batch.drop_constraint("uq_dsl_create_operation_token", type_="unique")
         batch.drop_constraint("uq_dsl_active_scope_digest", type_="unique")
+        batch.drop_index("ix_dsl_scope_digest")
         batch.create_unique_constraint("uq_dsl_scope_digest", ["scope_digest"])
+        batch.drop_column("create_terminal_outcome")
         batch.drop_column("create_phase")
         batch.drop_column("create_operation_token")
         batch.drop_column("active_scope_digest")

@@ -152,3 +152,32 @@ async def test_strict_generation_probe_fails_closed_on_malformed_name() -> None:
         await SandboxManager(service).probe_durable_sandbox_strict(DIGEST)
         is ExactGenerationProbe.UNKNOWN
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_first", [False, True])
+async def test_strict_generation_probe_exact_match_wins_over_malformed_name(
+    exact_first: bool,
+) -> None:
+    service = _service()
+    malformed = _info().model_copy(update={"name": None})
+    exact = _info()
+    service.list_sandboxes.return_value = (
+        [exact, malformed] if exact_first else [malformed, exact]
+    )
+    assert (
+        await SandboxManager(service).probe_durable_sandbox_strict(DIGEST)
+        is ExactGenerationProbe.PRESENT
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_delete_fails_closed_on_malformed_listing() -> None:
+    service = _service()
+    service.list_sandboxes.return_value = [
+        _info(),
+        _info().model_copy(update={"name": None}),
+    ]
+    with pytest.raises(SandboxContractError, match="malformed name"):
+        await SandboxManager(service).delete_durable_sandbox_strict(DIGEST)
+    service.delete.assert_not_awaited()

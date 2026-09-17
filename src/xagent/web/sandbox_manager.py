@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2050,12 +2050,13 @@ class SandboxManager:
             DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id
         )
         listed = await self._service.list_sandboxes()
-        names = {
-            sb.name
-            for sb in listed or []
-            if isinstance(sb.name, str)
-            and (sb.name == primary or sb.name.startswith(worker_prefix))
-        }
+        names, malformed = self._match_durable_sandbox_names(
+            listed or [], primary=primary, worker_prefix=worker_prefix
+        )
+        if malformed:
+            raise SandboxContractError(
+                "durable sandbox listing contained a malformed name"
+            )
         names.add(primary)
         for name in sorted(names, key=lambda item: item == primary):
             try:
@@ -2087,11 +2088,13 @@ class SandboxManager:
         )
         try:
             listed = await self._service.list_sandboxes()
-            for sandbox in listed or []:
-                if not isinstance(sandbox.name, str):
-                    return ExactGenerationProbe.UNKNOWN
-                if sandbox.name == primary or sandbox.name.startswith(worker_prefix):
-                    return ExactGenerationProbe.PRESENT
+            names, malformed = self._match_durable_sandbox_names(
+                listed or [], primary=primary, worker_prefix=worker_prefix
+            )
+            if names:
+                return ExactGenerationProbe.PRESENT
+            if malformed:
+                return ExactGenerationProbe.UNKNOWN
         except Exception as exc:
             logger.warning(
                 "Durable sandbox generation probe failed closed for %s: %s",
@@ -2100,6 +2103,34 @@ class SandboxManager:
             )
             return ExactGenerationProbe.UNKNOWN
         return ExactGenerationProbe.ABSENT
+
+    @staticmethod
+    def _match_durable_sandbox_names(
+        sandboxes: Iterable[SandboxInfo],
+        *,
+        primary: str,
+        worker_prefix: str,
+    ) -> tuple[set[str], bool]:
+        """Return exact-generation names and whether decoding was malformed.
+
+        The full listing is scanned so a confirmed exact match takes priority
+        over an unrelated malformed entry.  Without a match, any malformed
+        entry prevents an authoritative ABSENT result.
+        """
+        names: set[str] = set()
+        malformed = False
+        for sandbox in sandboxes:
+            try:
+                name = sandbox.name
+            except Exception:
+                malformed = True
+                continue
+            if not isinstance(name, str):
+                malformed = True
+                continue
+            if name == primary or name.startswith(worker_prefix):
+                names.add(name)
+        return names, malformed
 
     async def _find_lifecycle_sandbox_names(
         self,

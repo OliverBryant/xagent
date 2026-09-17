@@ -106,6 +106,12 @@ class DurableSandboxLifecycle(Base):  # type: ignore[no-any-unimported]
             name="ck_dsl_create_phase",
         ),
         CheckConstraint(
+            "(create_phase = 'terminal' AND create_terminal_outcome IS NOT NULL AND "
+            "create_terminal_outcome IN ('success', 'terminal_absent')) OR "
+            "(create_phase != 'terminal' AND create_terminal_outcome IS NULL)",
+            name="ck_dsl_create_terminal_outcome",
+        ),
+        CheckConstraint(
             "((state = 'registered' OR state = 'ready') "
             "AND active_scope_digest IS NOT NULL "
             "AND active_scope_digest = scope_digest) OR "
@@ -143,6 +149,7 @@ class DurableSandboxLifecycle(Base):  # type: ignore[no-any-unimported]
             "run_id",
             "lease_attempt_id",
         ),
+        Index("ix_dsl_scope_digest", "scope_digest"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -159,6 +166,7 @@ class DurableSandboxLifecycle(Base):  # type: ignore[no-any-unimported]
     create_phase = Column(
         String(16), nullable=False, default="not_started", server_default="not_started"
     )
+    create_terminal_outcome = Column(String(16), nullable=True)
     version = Column(Integer, nullable=False, default=1, server_default="1")
     state = Column(String(16), nullable=False, default="registered")
 

@@ -72,13 +72,15 @@ def test_sqlite_upgrade_backfills_opaque_operation_and_active_generation() -> No
         row = connection.execute(
             sa.text(
                 f"SELECT scope_digest, active_scope_digest, "
-                f"create_operation_token, create_phase FROM {TABLE}"
+                f"create_operation_token, create_phase, "
+                f"create_terminal_outcome FROM {TABLE}"
             )
         ).one()
         assert row.active_scope_digest == row.scope_digest == "a" * 64
         assert len(row.create_operation_token) == 64
         assert row.create_operation_token not in {"a" * 64, "b" * 64, "c" * 64}
         assert row.create_phase == "not_started"
+        assert row.create_terminal_outcome is None
 
         uniques = {
             item["name"]
@@ -91,6 +93,15 @@ def test_sqlite_upgrade_backfills_opaque_operation_and_active_generation() -> No
             "uq_dsl_lifecycle_token",
             "uq_dsl_backend_lifecycle_digest",
         }.issubset(uniques)
+        indexes = {item["name"] for item in sa.inspect(connection).get_indexes(TABLE)}
+        assert "ix_dsl_scope_digest" in indexes
+        plan = connection.execute(
+            sa.text(
+                f"EXPLAIN QUERY PLAN SELECT * FROM {TABLE} WHERE scope_digest = :scope"
+            ),
+            {"scope": "a" * 64},
+        ).all()
+        assert any("ix_dsl_scope_digest" in str(item) for item in plan)
 
 
 def test_sqlite_upgrade_backfills_existing_tombstone_as_quarantined() -> None:
@@ -194,6 +205,12 @@ def test_sqlite_rejects_invalid_active_shape_and_phase() -> None:
             )
         with pytest.raises(IntegrityError):
             connection.execute(sa.text(f"UPDATE {TABLE} SET create_phase = 'unknown'"))
+        with pytest.raises(IntegrityError):
+            connection.execute(sa.text(f"UPDATE {TABLE} SET create_phase = 'terminal'"))
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                sa.text(f"UPDATE {TABLE} SET create_terminal_outcome = 'success'")
+            )
 
 
 def test_upgrade_is_idempotent_and_downgrade_refuses_coexisting_generations() -> None:
@@ -233,3 +250,49 @@ def test_upgrade_is_idempotent_and_downgrade_refuses_coexisting_generations() ->
         with patch.object(migration, "op", _operations(connection)):
             with pytest.raises(RuntimeError, match="successor generations coexist"):
                 migration.downgrade()
+
+
+@pytest.mark.parametrize("phase", ["may_publish", "observed"])
+def test_downgrade_refuses_ambiguous_generation(phase: str) -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        _create_old_schema(connection)
+        _insert_old_row(connection)
+        migration = _upgrade(connection)
+        connection.execute(
+            sa.text(
+                f"UPDATE {TABLE} SET state = 'deleting', "
+                "active_scope_digest = NULL, create_phase = :phase, "
+                "deleting_at = CURRENT_TIMESTAMP, "
+                "delete_claim_expires_at = CURRENT_TIMESTAMP"
+            ),
+            {"phase": phase},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="ambiguous generation"):
+                migration.downgrade()
+
+
+def test_safe_downgrade_and_reupgrade_round_trip() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        _create_old_schema(connection)
+        _insert_old_row(connection)
+        migration = _upgrade(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        columns = {item["name"] for item in sa.inspect(connection).get_columns(TABLE)}
+        assert "create_phase" not in columns
+        assert "create_terminal_outcome" not in columns
+        assert "uq_dsl_scope_digest" in {
+            item["name"]
+            for item in sa.inspect(connection).get_unique_constraints(TABLE)
+        }
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            sa.text(f"SELECT create_phase, create_terminal_outcome FROM {TABLE}")
+        ).one()
+        assert row.create_phase == "not_started"
+        assert row.create_terminal_outcome is None

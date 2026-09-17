@@ -315,8 +315,10 @@ class TestSavedContainerMatchesTheName:
         # os.replace never ran, so the path still holds the downloaded bytes.
         assert path.read_bytes() == before
         # ...and the half-written temp file is cleaned up rather than left in
-        # the workspace, where auto_register_files would publish it.
-        assert list(tmp_path.iterdir()) == [path]
+        # the workspace, where auto_register_files would publish it. Only the
+        # temp files are asserted on: tmp_path is shared with session fixtures
+        # that drop their own entries here.
+        assert [entry.name for entry in tmp_path.glob("*.tmp")] == []
 
 
 class TestPaletteTransparency:

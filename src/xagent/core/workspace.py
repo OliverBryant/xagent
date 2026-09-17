@@ -1314,10 +1314,15 @@ class TaskWorkspace:
     ) -> bool:
         """Apply the workspace's legacy ownership and task compatibility policy.
 
-        Unscoped workspaces intentionally retain owner-only access for taskless
-        upload records. Scoped workspaces additionally require the record to
-        live below the active scope subtree.
+        Legacy ownerless callers intentionally retain their broad compatibility
+        behavior. Once a workspace has an authoritative owner, every record
+        must match it before path containment or task compatibility is checked.
+        Scoped workspaces additionally require the record to live below the
+        active scope subtree. Capability-sensitive callers such as Drive upload
+        separately require an authoritative owner before calling this helper.
         """
+        if self.owner_user_id is None:
+            return True
         if not self._file_record_owner_matches_workspace(record):
             return False
 

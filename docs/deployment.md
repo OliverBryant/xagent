@@ -390,3 +390,92 @@ The tokenizer cannot be read back out of a built index, so there is no stored va
 ### Rollback
 
 No rollback path and none needed: the previous index is replaced by one built from the same rows, and the schema, the data files and the row contents are untouched. Reverting the application code leaves the new index in place and searching it with the old tokenizer restores the previous behavior, which is the degraded one this rebuild fixes.
+
+## 2026-09-20 — Persistent memory lifecycle enablement
+
+### Deployment impact
+
+Persistent memory now admits its LanceDB storage once, at worker startup, and
+publishes a store only if that admission succeeds. Two behaviors change.
+
+The runtime reads its embedding identity from the global memory embedding
+authority alone. It no longer falls back to a user's default embedding model or
+to whichever embedding model happens to be configured in the model hub. A
+deployment with no authority configured runs persistent memory in an ephemeral
+in-process store: memory works within a worker's lifetime and is not persisted.
+
+Configuration no longer takes effect online. Changing the authority's provider,
+model, endpoint, dimension, or instruct changes the vector space; running
+workers stop serving memory and report that a restart is required. Rotating the
+credential or changing the retry budget does not change the vector space, so
+workers keep serving with their admitted credential until they restart.
+
+### Prerequisites and configuration
+
+The `global_memory_embedding_authority` table and its migration already ship.
+No new environment variable, dependency, or infrastructure requirement is
+introduced. `MEMORY_SIMILARITY_THRESHOLD` keeps its meaning.
+
+LanceDB support is unchanged: the runtime only reaches storage through the
+admission primitives, so the supported range is the one in `pyproject.toml`
+described under "LanceDB memory compatibility" above.
+
+### Deployment and migration steps
+
+1. Configure the global memory embedding authority before the rollout if
+   persistent memory is wanted. The credential must be application- or
+   organization-owned; a personal credential is rejected at rest.
+2. Quiesce memory writers. Stop task execution and chat workers; do not leave a
+   worker running against the memory LanceDB directory.
+3. Deploy the same version to every API and task-execution worker and start
+   them together. Do not roll the fleet: a mixed fleet can have one worker
+   writing under a vector space another has not admitted.
+4. Confirm the state on each worker with `GET /api/memory/store-info`.
+
+### Verification and monitoring
+
+`GET /api/memory/store-info` reports `state`, `mode`, `supports_vector_search`
+and a caller-safe `detail`. The states are:
+
+| `state` | Meaning | Operator action |
+| --- | --- | --- |
+| `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None. |
+| `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
+| `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
+| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Check that no other process is mid-maintenance, then restart this worker. |
+| `restart_required` | The authority no longer describes the stored vector space, or maintenance was left incomplete. | Quiesce, re-embed offline if the existing vectors must be kept, restart every worker together. |
+| `blocked_repair` | Storage holds invalid legacy data or an incompatible schema and is fenced off. | Offline repair; see below. |
+
+Memory API routes answer `503` in every state except `ready` and
+`not_configured`, with one stable detail that does not distinguish the faults.
+`/api/memory/store-info` keeps answering `200` in every state. Tasks and chats
+continue to start while memory is fenced off; they run with memory disabled and
+record the state as their memory availability reason.
+
+The operator log carries the detail the API deliberately does not. Search for
+`Persistent memory` at `WARNING` and `ERROR`; each non-ready state logs the
+specific quiescence and repair steps for that state.
+
+### Repairing BLOCKED_REPAIR
+
+`blocked_repair` means admission found invalid legacy data (a NULL, empty or
+duplicate note id, non-string metadata, or a `user_id` outside signed int64) or
+an incompatible schema, and refused to touch the table. Admission never mutates
+storage in this state, so the data on disk is exactly what it was.
+
+1. Stop every worker. Repair is offline work.
+2. Back up the memory LanceDB directory (`<storage root>/memory_store`, or the
+   project-local `memory_store/` when that legacy location is in use).
+3. Repair or remove the offending rows against the backup, not in place.
+4. Start every worker together and confirm `state` is `ready`.
+
+Do not start a single worker to "test" a repair: a worker that admits
+successfully begins writing, and the rest of the fleet has not admitted.
+
+### Rollback
+
+Redeploy the previous version to every worker at once, after quiescing writers.
+The previous version reads the model hub instead of the authority, so leave the
+authority row in place: it is ignored by the old code and is what the new
+version needs on the next roll-forward. Rolling back does not undo an offline
+repair, and does not need to.

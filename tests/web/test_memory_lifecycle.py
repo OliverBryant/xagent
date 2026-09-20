@@ -1,0 +1,736 @@
+"""Layer D: startup admission, publication and drift for persistent memory.
+
+These tests pin the four owner contracts:
+
+* only the explicit global authority is consumed,
+* invalid legacy data fails closed as BLOCKED_REPAIR while unrelated functions
+  keep working,
+* nothing reloads online -- meaningful drift demands a restart,
+* and no store is ever published before admission certifies one.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import multiprocessing
+import pathlib
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import lancedb  # type: ignore
+import pyarrow as pa  # type: ignore
+import pytest
+from filelock import FileLock
+from pydantic import SecretStr
+
+from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.lancedb_maintenance import lancedb_lock_path
+from xagent.core.memory.storage_admission import MemoryStorageMode
+from xagent.core.model.embedding.base import BaseEmbedding
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
+from xagent.providers.vector_store.lancedb import clear_connection_cache
+from xagent.web import dynamic_memory_store as manager_module
+from xagent.web import memory_lifecycle
+from xagent.web import memory_utils as memory_utils_module
+from xagent.web.dynamic_memory_store import (
+    AuthorityUnreadable,
+    DynamicMemoryStoreManager,
+)
+from xagent.web.memory_lifecycle import (
+    MEMORY_TABLE_NAME,
+    MemoryLifecycleState,
+    MemoryUnavailableError,
+    admit_authority_storage,
+    authority_embedding_config,
+)
+from xagent.web.services.global_memory_embedding_authority import (
+    CREDENTIAL_CONFIGURED,
+    AuthorityCredentialUnavailable,
+    CredentialSource,
+    GlobalMemoryEmbeddingAuthoritySnapshot,
+)
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
+
+DIMENSION = 4
+
+
+class ConstantEmbedding(BaseEmbedding):
+    """Deterministic in-process embedding.
+
+    Layer D is exercised with this rather than a live provider: no real
+    endpoint is reachable from the test environment, and fabricating one would
+    claim coverage the suite does not have.
+    """
+
+    def __init__(self, seed: float = 0.5) -> None:
+        self._seed = seed
+
+    def encode(self, text, dimension=None, instruct=None):
+        vector = [self._seed] * DIMENSION
+        return vector if isinstance(text, str) else [vector for _ in text]
+
+    def get_dimension(self):
+        return DIMENSION
+
+    @property
+    def abilities(self):
+        return ["embed"]
+
+
+def _snapshot(
+    *,
+    model_name: str = "text-embedding-3-small",
+    dimension: int = DIMENSION,
+    api_key: str = "secret-key",
+    credential_identity: str = "identity-1",
+    max_retries: int = 3,
+) -> GlobalMemoryEmbeddingAuthoritySnapshot:
+    now = datetime.now(timezone.utc)
+    return GlobalMemoryEmbeddingAuthoritySnapshot(
+        provider="openai",
+        model_name=model_name,
+        endpoint="https://api.openai.com/v1/embeddings",
+        dimension=dimension,
+        instruct=None,
+        max_retries=max_retries,
+        credential_source=CredentialSource.ORGANIZATION_OWNED,
+        global_sharing_consent=True,
+        consented_by_actor_subject="admin-subject",
+        consented_at=now,
+        created_at=now,
+        updated_at=now,
+        credential_status=CREDENTIAL_CONFIGURED,
+        api_key=SecretStr(api_key),
+        credential_identity=credential_identity,
+    )
+
+
+def _admit(tmp_path, snapshot=None, **kwargs):
+    return admit_authority_storage(
+        snapshot if snapshot is not None else _snapshot(),
+        db_dir=str(tmp_path),
+        embedding_factory=lambda _config: ConstantEmbedding(),
+        **kwargs,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_lancedb():
+    clear_connection_cache()
+    yield
+    clear_connection_cache()
+
+
+def _install_authority(
+    monkeypatch,
+    snapshot: Optional[GlobalMemoryEmbeddingAuthoritySnapshot],
+    *,
+    error: Optional[BaseException] = None,
+) -> dict[str, Any]:
+    """Point the manager's authority read at a fixed answer."""
+    state: dict[str, Any] = {"snapshot": snapshot, "error": error, "reads": 0}
+
+    def read() -> Optional[GlobalMemoryEmbeddingAuthoritySnapshot]:
+        state["reads"] += 1
+        if state["error"] is not None:
+            raise state["error"]
+        return state["snapshot"]
+
+    monkeypatch.setattr(manager_module, "_read_authority_snapshot", read)
+    return state
+
+
+def _manager(monkeypatch, tmp_path, state_holder=None):
+    """A manager whose admission lands in ``tmp_path`` with a fake embedding."""
+    real = memory_lifecycle.admit_authority_storage
+
+    def admit(snapshot, **kwargs):
+        kwargs["db_dir"] = str(tmp_path)
+        kwargs["embedding_factory"] = lambda _config: ConstantEmbedding()
+        return real(snapshot, **kwargs)
+
+    monkeypatch.setattr(manager_module, "admit_authority_storage", admit)
+    return DynamicMemoryStoreManager()
+
+
+def _seed_invalid_table(tmp_path) -> None:
+    """A legacy table with a NULL id, which admission must refuse to touch."""
+    connection = lancedb.connect(tmp_path)
+    table = connection.create_table(
+        MEMORY_TABLE_NAME,
+        pa.table(
+            {
+                "id": ["note-0", None],
+                "text": ["first", "second"],
+                "metadata": [json.dumps({"user_id": 1})] * 2,
+            }
+        ),
+    )
+    _safe_close_table(table)
+
+
+# --------------------------------------------------------------------------
+# The authority is the only source of runtime identity.
+# --------------------------------------------------------------------------
+
+
+def test_runtime_identity_comes_from_the_authority_alone():
+    snapshot = _snapshot()
+    config = authority_embedding_config(snapshot)
+
+    assert config.model_provider == "openai"
+    assert config.model_name == "text-embedding-3-small"
+    assert config.base_url == snapshot.endpoint
+    assert config.dimension == DIMENSION
+    assert config.max_retries == snapshot.max_retries
+    assert config.api_key == "secret-key"
+
+
+def test_manager_never_reads_the_model_hub_or_personal_defaults():
+    """The forbidden personal-default resolution has no surface left."""
+    assert not hasattr(DynamicMemoryStoreManager, "_get_embedding_model_from_db")
+    assert not hasattr(DynamicMemoryStoreManager, "_create_lancedb_store")
+
+    # Nothing on the runtime path imports the personal-default or model-hub
+    # machinery, so there is no code by which it could be consulted.
+    for module in (memory_lifecycle, manager_module, memory_utils_module):
+        tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding="utf-8"))
+        imported = {
+            alias.name.rsplit(".", 1)[-1]
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        assert "UserDefaultModel" not in imported
+        assert "SQLAlchemyModelHub" not in imported
+        assert "EmbeddingModelConfig" not in imported or module is memory_lifecycle
+
+
+# --------------------------------------------------------------------------
+# Publication happens only after admission succeeds.
+# --------------------------------------------------------------------------
+
+
+def test_admission_publishes_a_vector_capable_store(tmp_path):
+    result = _admit(tmp_path)
+
+    assert result.status.state is MemoryLifecycleState.READY
+    assert result.status.mode is MemoryStorageMode.VECTOR
+    assert result.status.vector_search is True
+    assert isinstance(result.store, UserIsolatedMemoryStore)
+    assert result.vector_space_fingerprint == _snapshot().vector_space_fingerprint()
+
+
+def test_invalid_legacy_data_blocks_repair_and_publishes_nothing(tmp_path):
+    _seed_invalid_table(tmp_path)
+    before = lancedb.connect(tmp_path).open_table(MEMORY_TABLE_NAME).to_arrow()
+
+    result = _admit(tmp_path)
+
+    assert result.status.state is MemoryLifecycleState.BLOCKED_REPAIR
+    assert result.store is None
+    assert result.vector_space_fingerprint is None
+    clear_connection_cache()
+    after = lancedb.connect(tmp_path).open_table(MEMORY_TABLE_NAME).to_arrow()
+    assert after == before
+
+
+def test_contended_admission_is_retryable_and_publishes_nothing(tmp_path):
+    connection = lancedb.connect(tmp_path)
+    started = time.monotonic()
+    with FileLock(lancedb_lock_path(connection, MEMORY_TABLE_NAME, "admission")):
+        result = _admit(tmp_path, lock_timeout=0.05)
+    assert time.monotonic() - started < 10
+
+    assert result.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert result.store is None
+
+
+def test_quiescence_is_required_before_anything_is_published(tmp_path):
+    result = _admit(tmp_path, writers_quiesced=False)
+
+    assert result.status.state is MemoryLifecycleState.RESTART_REQUIRED
+    assert result.store is None
+
+
+def test_unbounded_lock_timeout_is_a_caller_bug(tmp_path):
+    with pytest.raises(ValueError):
+        _admit(tmp_path, lock_timeout=-1)
+
+
+def test_store_construction_failure_publishes_nothing(tmp_path):
+    def explode(_config):
+        raise OSError("adapter unavailable")
+
+    result = admit_authority_storage(
+        _snapshot(), db_dir=str(tmp_path), embedding_factory=explode
+    )
+
+    assert result.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert result.store is None
+
+
+def test_manager_publishes_nothing_until_admission_succeeds(monkeypatch, tmp_path):
+    _seed_invalid_table(tmp_path)
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+
+    assert manager._publication is None
+    status = manager.admit()
+
+    assert status.state is MemoryLifecycleState.BLOCKED_REPAIR
+    assert manager._publication is None
+    with pytest.raises(MemoryUnavailableError) as raised:
+        manager.get_memory_store()
+    assert raised.value.status.state is MemoryLifecycleState.BLOCKED_REPAIR
+
+
+def test_importing_the_store_module_publishes_nothing(monkeypatch):
+    """The module-level singleton is gone; the name resolves on access."""
+    import importlib
+
+    module = importlib.import_module("xagent.web.memory_store")
+    importlib.reload(module)
+
+    calls: list[int] = []
+
+    def provider():
+        calls.append(1)
+        return "store"
+
+    monkeypatch.setattr(module, "get_memory_store", provider)
+    assert calls == []
+    assert module.global_memory_store == "store"
+    assert module.base_memory_store == "store"
+    assert calls == [1, 1]
+    with pytest.raises(AttributeError):
+        module.something_else
+
+
+# --------------------------------------------------------------------------
+# Drift: meaningful changes only, and never a stale adapter.
+# --------------------------------------------------------------------------
+
+
+def test_meaningful_drift_revokes_the_publication(monkeypatch, tmp_path):
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    published = manager._publication
+    assert published is not None
+
+    # A different embedding model is a different vector space.
+    state["snapshot"] = _snapshot(model_name="text-embedding-3-large")
+
+    assert manager.check_embedding_model_change() is True
+    assert manager._publication is None
+    with pytest.raises(MemoryUnavailableError) as raised:
+        manager.get_memory_store()
+    assert raised.value.status.state is MemoryLifecycleState.RESTART_REQUIRED
+
+
+def test_drift_is_detected_on_the_read_path_not_only_on_demand(monkeypatch, tmp_path):
+    """Staleness is structural: the store cannot be handed out after drift."""
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    assert manager.get_memory_store() is not None
+
+    state["snapshot"] = _snapshot(dimension=8)
+
+    with pytest.raises(MemoryUnavailableError):
+        manager.get_memory_store()
+
+
+def test_deleting_the_authority_is_drift(monkeypatch, tmp_path):
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+
+    state["snapshot"] = None
+
+    with pytest.raises(MemoryUnavailableError) as raised:
+        manager.get_memory_store()
+    assert raised.value.status.state is MemoryLifecycleState.RESTART_REQUIRED
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(
+            lambda: _snapshot(api_key="rotated", credential_identity="identity-2"),
+            id="credential_rotation",
+        ),
+        pytest.param(lambda: _snapshot(max_retries=9), id="retry_budget"),
+    ],
+)
+def test_non_vector_space_changes_are_not_drift(monkeypatch, tmp_path, replacement):
+    """Timestamps, provenance and credentials never move the vector space."""
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    store = manager.get_memory_store()
+
+    replaced = replacement()
+    assert replaced.authority_fingerprint() != _snapshot().authority_fingerprint()
+    assert replaced.vector_space_fingerprint() == _snapshot().vector_space_fingerprint()
+    state["snapshot"] = replaced
+
+    assert manager.check_embedding_model_change() is False
+    assert manager.get_memory_store() is store
+
+
+def test_equivalent_row_replacement_is_not_drift(monkeypatch, tmp_path):
+    """Re-writing the same authority moves only its timestamps."""
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    store = manager.get_memory_store()
+
+    later = datetime.now(timezone.utc)
+    _install_authority(
+        monkeypatch,
+        GlobalMemoryEmbeddingAuthoritySnapshot(
+            **{
+                **{
+                    field: getattr(_snapshot(), field)
+                    for field in (
+                        "provider",
+                        "model_name",
+                        "endpoint",
+                        "dimension",
+                        "instruct",
+                        "max_retries",
+                        "credential_source",
+                        "global_sharing_consent",
+                        "consented_by_actor_subject",
+                        "credential_status",
+                        "api_key",
+                        "credential_identity",
+                    )
+                },
+                "consented_at": later,
+                "created_at": later,
+                "updated_at": later,
+            }
+        ),
+    )
+
+    assert manager.check_embedding_model_change() is False
+    assert manager.get_memory_store() is store
+
+
+def test_transient_database_failure_is_not_drift(monkeypatch, tmp_path):
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    store = manager.get_memory_store()
+
+    state["error"] = AuthorityUnreadable("database is briefly unavailable")
+
+    assert manager.check_embedding_model_change() is False
+    assert manager.get_memory_store() is store
+    assert manager.status().state is MemoryLifecycleState.READY
+
+
+def test_credential_failure_after_admission_is_not_drift(monkeypatch, tmp_path):
+    """A broken credential does not change what the stored vectors mean."""
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    store = manager.get_memory_store()
+
+    state["error"] = AuthorityCredentialUnavailable("credential unavailable")
+
+    assert manager.check_embedding_model_change() is False
+    assert manager.get_memory_store() is store
+
+
+# --------------------------------------------------------------------------
+# Failure semantics.
+# --------------------------------------------------------------------------
+
+
+def test_credential_failure_at_admission_fails_closed(monkeypatch, tmp_path):
+    _install_authority(
+        monkeypatch, None, error=AuthorityCredentialUnavailable("unusable")
+    )
+    manager = _manager(monkeypatch, tmp_path)
+
+    status = manager.admit()
+
+    assert status.state is MemoryLifecycleState.CREDENTIAL_UNAVAILABLE
+    assert manager._publication is None
+    with pytest.raises(MemoryUnavailableError):
+        manager.get_memory_store()
+
+
+def test_transient_failure_at_admission_is_retried_later(monkeypatch, tmp_path):
+    monkeypatch.setattr(manager_module, "ADMISSION_RETRY_INTERVAL_SECONDS", 0.0)
+    state = _install_authority(
+        monkeypatch, None, error=AuthorityUnreadable("transient")
+    )
+    manager = _manager(monkeypatch, tmp_path)
+
+    assert manager.admit().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert manager._publication is None
+
+    state["error"] = None
+    state["snapshot"] = _snapshot()
+
+    assert manager.status().state is MemoryLifecycleState.READY
+
+
+def test_retryable_admission_is_rate_limited(monkeypatch, tmp_path):
+    """A failing admission must not queue every request behind its file lock."""
+    state = _install_authority(monkeypatch, None, error=AuthorityUnreadable("down"))
+    manager = _manager(monkeypatch, tmp_path)
+
+    assert manager.admit().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    attempts_after_startup = state["reads"]
+
+    for _ in range(5):
+        with pytest.raises(MemoryUnavailableError):
+            manager.get_memory_store()
+
+    assert state["reads"] == attempts_after_startup
+
+    manager._next_attempt_at = 0.0
+    state["error"] = None
+    state["snapshot"] = _snapshot()
+    assert manager.status().state is MemoryLifecycleState.READY
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        MemoryLifecycleState.BLOCKED_REPAIR,
+        MemoryLifecycleState.CREDENTIAL_UNAVAILABLE,
+        MemoryLifecycleState.RESTART_REQUIRED,
+        MemoryLifecycleState.NOT_CONFIGURED,
+    ],
+)
+def test_terminal_states_are_never_re_admitted_online(monkeypatch, tmp_path, state):
+    holder = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    manager._status = memory_lifecycle.MemoryLifecycleStatus(state)
+    before = holder["reads"]
+
+    manager.admit()
+
+    assert holder["reads"] == before
+    assert manager._status.state is state
+
+
+def test_failed_re_admission_leaves_the_manager_untouched(monkeypatch, tmp_path):
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    published = manager._publication
+    status = manager._status
+
+    # Model an unsettled manager that is nonetheless already serving, then let
+    # the next admission attempt fail outright.
+    manager._status = memory_lifecycle.MemoryLifecycleStatus(
+        MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    )
+    monkeypatch.setattr(
+        manager_module,
+        "admit_authority_storage",
+        lambda *_args, **_kwargs: memory_lifecycle.AdmissionResult(
+            memory_lifecycle.MemoryLifecycleStatus(
+                MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+            )
+        ),
+    )
+
+    manager.admit()
+
+    assert manager._publication is published
+    assert manager._status == status
+
+
+def test_no_authority_serves_an_ephemeral_store(monkeypatch, tmp_path):
+    _install_authority(monkeypatch, None)
+    manager = _manager(monkeypatch, tmp_path)
+
+    status = manager.admit()
+
+    assert status.state is MemoryLifecycleState.NOT_CONFIGURED
+    assert status.vector_search is False
+    store = manager.get_memory_store()
+    assert isinstance(store, UserIsolatedMemoryStore)
+    assert isinstance(store._base_store, InMemoryMemoryStore)
+
+
+def test_reinitialization_is_refused(monkeypatch, tmp_path, caplog):
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    published = manager._publication
+
+    with caplog.at_level("WARNING"):
+        manager.force_reinitialize()
+
+    assert manager._publication is published
+    assert "all-worker restart" in caplog.text
+
+
+def test_store_info_is_public_safe(monkeypatch, tmp_path):
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    manager.admit()
+
+    info = manager.get_store_info()
+
+    assert info["state"] == "ready"
+    assert info["is_lancedb"] is True
+    assert info["mode"] == "vector"
+    assert info["supports_vector_search"] is True
+    assert info["store_type"] == LanceDBMemoryStore.__name__
+    serialized = json.dumps(info)
+    assert "secret-key" not in serialized
+    assert str(tmp_path) not in serialized
+
+
+def test_operator_guidance_covers_every_non_ready_state():
+    for state in MemoryLifecycleState:
+        status = memory_lifecycle.MemoryLifecycleStatus(state)
+        assert status.detail  # every state has caller-safe wording
+        if state is not MemoryLifecycleState.READY:
+            guidance = memory_lifecycle.OPERATOR_GUIDANCE[state]
+            assert "restart" in guidance.lower()
+
+
+def test_blocked_and_restart_details_are_indistinguishable_to_callers():
+    """Public detail never tells an unprivileged caller which fault it hit."""
+    blocked = memory_lifecycle.MemoryLifecycleStatus(
+        MemoryLifecycleState.BLOCKED_REPAIR
+    )
+    restart = memory_lifecycle.MemoryLifecycleStatus(
+        MemoryLifecycleState.RESTART_REQUIRED
+    )
+    credential = memory_lifecycle.MemoryLifecycleStatus(
+        MemoryLifecycleState.CREDENTIAL_UNAVAILABLE
+    )
+    assert blocked.detail == restart.detail == credential.detail
+
+
+# --------------------------------------------------------------------------
+# Multi-worker startup and a full read/write cycle.
+# --------------------------------------------------------------------------
+
+
+def _worker_admit(database_path, results):
+    from xagent.providers.vector_store.lancedb import (
+        clear_connection_cache as clear_cache,
+    )
+
+    clear_cache()
+    results.put(
+        admit_authority_storage(
+            _snapshot(),
+            db_dir=str(database_path),
+            embedding_factory=lambda _config: ConstantEmbedding(),
+        ).status.state.value
+    )
+
+
+def test_concurrent_worker_startup_admits_one_consistent_table(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(target=_worker_admit, args=(tmp_path, results))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(120)
+        assert worker.exitcode == 0
+
+    states = sorted(results.get(timeout=30) for _ in workers)
+    assert set(states) <= {"ready", "retryable_unavailable"}
+
+    clear_connection_cache()
+    connection = lancedb.connect(tmp_path)
+    assert list(connection.table_names()) == [MEMORY_TABLE_NAME]
+    # Whatever the interleaving, a later worker admits the one table cleanly.
+    assert _admit(tmp_path).status.state is MemoryLifecycleState.READY
+
+
+def test_startup_admission_is_serialized_within_a_worker(monkeypatch, tmp_path):
+    """Concurrent first calls admit once and publish one store."""
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+
+    stores: list[Any] = []
+    barrier = threading.Barrier(4)
+
+    def acquire():
+        barrier.wait()
+        stores.append(manager.get_memory_store())
+
+    threads = [threading.Thread(target=acquire) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert len(stores) == 4
+    assert all(store is stores[0] for store in stores)
+
+
+def test_admitted_store_round_trips_reads_and_writes(tmp_path):
+    result = _admit(tmp_path)
+    store = result.store
+    assert store is not None
+
+    with UserContext(4321):
+        added = store.add(MemoryNote(content="the kettle is in the third cupboard"))
+        assert added.success
+        note_id = added.memory_id
+
+        fetched = store.get(note_id)
+        assert fetched.success
+        assert fetched.content.content == "the kettle is in the third cupboard"
+
+        assert [note.id for note in store.list_all(None)] == [note_id]
+        assert [note.id for note in store.search("kettle", k=5)] == [note_id]
+
+        assert store.delete(note_id).success
+        assert store.list_all(None) == []
+
+
+def test_admitted_store_isolates_users(tmp_path):
+    store = _admit(tmp_path).store
+    assert store is not None
+
+    with UserContext(11):
+        mine = store.add(MemoryNote(content="user eleven note"))
+        assert mine.success
+    with UserContext(12):
+        assert store.list_all(None) == []
+        assert store.get(mine.memory_id).success is False
+
+
+def test_second_admission_of_a_populated_table_is_ready(tmp_path):
+    store = _admit(tmp_path).store
+    assert store is not None
+    with UserContext(7):
+        assert store.add(MemoryNote(content="survives a restart")).success
+
+    clear_connection_cache()
+    second = _admit(tmp_path)
+
+    assert second.status.state is MemoryLifecycleState.READY
+    assert second.store is not None
+    with UserContext(7):
+        assert [note.content for note in second.store.list_all(None)] == [
+            "survives a restart"
+        ]

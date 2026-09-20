@@ -1458,21 +1458,40 @@ async def startup_event() -> None:
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
     )
 
-    # Log memory store type (using dynamic manager)
-    from .dynamic_memory_store import get_memory_store_manager
+    # Admit persistent memory storage before anything is allowed to use it.
+    # Startup is the only moment at which this process is guaranteed to have no
+    # memory writers, and no store is published unless admission succeeds.
+    # Quiescing the rest of the fleet is the operator's job: the supported
+    # procedure is an all-worker restart, never a rolling one.
+    from .dynamic_memory_store import admit_memory_storage, get_memory_store_manager
 
-    manager = get_memory_store_manager()
-    store_info = manager.get_store_info()
-
-    if store_info["is_lancedb"]:
-        logger.info("Using LanceDB memory store with vector search capabilities")
-        logger.info(f"Embedding model ID: {store_info['embedding_model_id']}")
-    else:
-        logger.info("Using in-memory store (no vector search capabilities)")
-
-    logger.info(
-        f"Memory store similarity threshold: {store_info['similarity_threshold']}"
-    )
+    with _startup_phase("memory storage admission"):
+        try:
+            memory_status = admit_memory_storage()
+            store_info = get_memory_store_manager().get_store_info()
+        except Exception:
+            # Memory must never be able to abort a boot. Unrelated functions
+            # start; memory itself stays closed until an operator acts.
+            logger.exception(
+                "Persistent memory admission raised; memory stays unavailable"
+            )
+        else:
+            if memory_status.ready:
+                logger.info(
+                    "Persistent memory admitted in %s mode (vector search: %s)",
+                    memory_status.mode.value if memory_status.mode else "unknown",
+                    memory_status.vector_search,
+                )
+            else:
+                logger.warning(
+                    "Persistent memory is not serving (%s); unrelated functions "
+                    "continue to start",
+                    memory_status.state.value,
+                )
+            logger.info(
+                "Memory store similarity threshold: %s",
+                store_info["similarity_threshold"],
+            )
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)

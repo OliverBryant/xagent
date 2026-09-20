@@ -49,6 +49,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..dynamic_memory_store import get_memory_store
+from ..memory_lifecycle import MemoryUnavailableError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import (
     get_session_local,
@@ -242,7 +243,32 @@ def resolve_agent_service_memory_policy(
     use_in_memory = (is_preview and not enabled) or (
         override is not None and not override.available
     )
-    memory = InMemoryMemoryStore() if use_in_memory else get_memory_store()
+    if use_in_memory:
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=enabled,
+            memory_available=True if override is None else override.available,
+            memory_availability_reason=None if override is None else override.reason,
+        )
+
+    try:
+        memory = get_memory_store()
+    except MemoryUnavailableError as error:
+        # Persistent memory is fenced off -- blocked on repair, awaiting a
+        # restart, or transiently unavailable. The task still starts; it simply
+        # runs with memory disabled and an inert store, so nothing reads from or
+        # writes to the storage that admission refused.
+        logger.warning(
+            "Task memory unavailable (%s); running with memory disabled",
+            error.status.state.value,
+        )
+        return AgentServiceMemoryPolicy(
+            memory=InMemoryMemoryStore(),
+            memory_enabled=False,
+            memory_available=False,
+            memory_availability_reason=error.status.state.value,
+        )
+
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
@@ -258,10 +284,10 @@ async def resolve_agent_service_memory_policy_async(
 ) -> AgentServiceMemoryPolicy:
     """Resolve runtime memory without blocking the asyncio event loop.
 
-    ``get_memory_store`` refreshes its embedding-model configuration through
-    synchronous SQLAlchemy queries. Task setup supplies detached task/config
-    data here, while the worker owns the short database Session used by the
-    dynamic store manager.
+    ``get_memory_store`` re-reads the global memory embedding authority
+    through synchronous SQLAlchemy queries to check for vector-space drift.
+    Task setup supplies detached task/config data here, while the worker owns
+    the short database Session used by the store manager.
     """
 
     return await run_db_io_cancellation_safe(

@@ -596,7 +596,7 @@ def test_post_commit_cleanup_failure_keeps_success(tmp_path, monkeypatch):
     assert _snapshot(connection)[0] == 2
 
 
-def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
+def test_admission_lock_precedes_maintenance_and_has_one_production_caller(
     tmp_path, monkeypatch
 ):
     connection = _connection(tmp_path)
@@ -621,14 +621,21 @@ def test_admission_lock_precedes_maintenance_and_has_no_production_caller(
         is VectorCompatibility.MATCHING
     )
 
+    # Layer D is the lifecycle caller this primitive was written for, and it is
+    # the only one: nothing on a request path may admit storage.
     source_root = Path(__file__).parents[3] / "src" / "xagent"
-    callers = [
+    callers = sorted(
         path
         for path in source_root.rglob("*.py")
         if path.name != "__init__.py"
         and "admit_lancedb_memory_storage(" in path.read_text(encoding="utf-8")
-    ]
-    assert callers == [source_root / "core" / "memory" / "storage_admission.py"]
+    )
+    assert callers == sorted(
+        [
+            source_root / "core" / "memory" / "storage_admission.py",
+            source_root / "web" / "memory_lifecycle.py",
+        ]
+    )
 
 
 def _scope_maintained_connection(tmp_path, *, drop_text, vector):

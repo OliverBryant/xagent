@@ -25,7 +25,16 @@ VECTOR_IDENTITY_METADATA_KEY = b"xagent.memory.vector_space"
 # never certify admission. Only the full validation below writes this one.
 FULL_ADMISSION_METADATA_KEY = b"xagent.memory.full_admission"
 FULL_ADMISSION_TABLE_VERSION_KEY = b"xagent.memory.full_admission_table_version"
-FULL_ADMISSION_VERSION = b"1"
+# Generation of the validator that certifies a table, not a schema version. The
+# fast path below trusts a marker as a promise that *this* generation's checks
+# ran, so any change that makes the scan stricter has to bump it: a marker the
+# previous, more permissive generation wrote certifies nothing about the new
+# rules, and leaving it at "1" would keep trusting projections that generation
+# staged. Generation 2 is the strict-``user_id`` scan (``strict_scope_columns``),
+# which rejects a persisted owner that does not denote exactly one in-range
+# integer instead of truncating or dropping it. Bumping it costs one strict
+# rescan per already-certified table, on its first admission after the bump.
+FULL_ADMISSION_VERSION = b"2"
 DASHSCOPE_DEFAULT_ENDPOINT = (
     "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
     "text-embedding/text-embedding"

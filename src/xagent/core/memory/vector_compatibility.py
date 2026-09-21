@@ -592,9 +592,19 @@ def create_or_recreate_vector_capable_table(
         )
         if outcome.status is not MaintenanceStatus.COMPLETE:
             raise ValueError(outcome.detail or outcome.status.value)
-        compatibility = inspect_lancedb_vector_compatibility(
-            connection, table_name, identity
-        )
+        # Maintenance classified the vector space from the schema it committed
+        # or verified, while it still held the maintenance lock. Re-opening the
+        # table here would reclassify a state this call no longer controls, and
+        # a backend failure in that read would be indistinguishable from
+        # "nothing was mutated".
+        compatibility = outcome.vector_compatibility
+        if compatibility is None:
+            # Unreachable for a COMPLETE outcome: every path that produces one
+            # classifies the table it committed or verified. Treating it as a
+            # retryable condition would hide the contract break.
+            raise AssertionError(
+                "completed memory maintenance must carry a vector-space classification"
+            )
         if compatibility is not VectorCompatibility.MATCHING:
             raise RuntimeError("created memory table failed vector compatibility")
         return compatibility

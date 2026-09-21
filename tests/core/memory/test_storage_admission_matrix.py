@@ -421,6 +421,28 @@ def test_admission_never_inspects_the_table_after_the_commit(tmp_path):
         guarded.open_table("memories")
 
 
+def test_recreation_never_inspects_the_table_after_the_commit(tmp_path):
+    connection = _connection(tmp_path)
+    guarded = _FailAfterCommitConnection(connection)
+
+    # The lifecycle recreation entry point used to re-open the table once the
+    # overwrite had committed, so a backend failure in that read looked exactly
+    # like "nothing was mutated". It now reads the classification maintenance
+    # made under its own lock, and there is no post-commit read left to fail.
+    assert (
+        create_or_recreate_vector_capable_table(guarded, "memories", IDENTITY)
+        is VectorCompatibility.MATCHING
+    )
+
+    version, schema, _rows = _snapshot(connection)
+    assert version == 2
+    assert schema.field("vector").type == pa.list_(pa.float32(), 4)
+    # The injected failure really is live: any post-commit read would have hit it.
+    assert guarded.committed
+    with pytest.raises(OSError, match="post-commit inspection"):
+        guarded.open_table("memories")
+
+
 def test_empty_vectorless_table_is_admitted_with_typed_null_vectors(tmp_path):
     connection = lancedb.connect(tmp_path)
     table = connection.create_table(

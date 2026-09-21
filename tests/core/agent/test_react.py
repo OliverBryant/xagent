@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 import unicodedata
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -9313,3 +9314,167 @@ async def test_react_final_checkpoint_failure_preserves_completed_call(
     assert pattern.tool_ledger["final-1"].status == "completed"
     assert pattern.tool_ledger["final-1"].error is None
     assert len(context.get_messages_by_role("tool")) == 1
+
+
+def _react_state_container_ids(obj: object, seen: set[int] | None = None) -> set[int]:
+    if seen is None:
+        seen = set()
+    if id(obj) in seen or not isinstance(obj, (dict, list, set)):
+        return seen
+    seen.add(id(obj))
+    values = obj.values() if isinstance(obj, dict) else obj
+    for value in values:
+        _react_state_container_ids(value, seen)
+    return seen
+
+
+def _react_live_container_ids(
+    obj: object,
+    seen: set[int] | None = None,
+    visited: set[int] | None = None,
+    depth: int = 0,
+) -> set[int]:
+    if seen is None:
+        seen = set()
+    if visited is None:
+        visited = set()
+    if depth > 8 or id(obj) in visited:
+        return seen
+    visited.add(id(obj))
+    if isinstance(obj, (dict, list, set)):
+        seen.add(id(obj))
+        values = obj.values() if isinstance(obj, dict) else obj
+        for value in values:
+            _react_live_container_ids(value, seen, visited, depth + 1)
+    elif hasattr(obj, "__dict__"):
+        for value in vars(obj).values():
+            _react_live_container_ids(value, seen, visited, depth + 1)
+    return seen
+
+
+def test_react_get_state_snapshots_in_place_mutated_containers() -> None:
+    """``get_state()`` must not hand back a container someone writes into.
+
+    The DAG checkpoint rollback restores a previously returned state to undo
+    a failed checkpoint, so any container a later code path mutates in place
+    has to be copied here.
+
+    The invariant is deliberately *not* "nothing is shared". Each exemption
+    below is write-once -- the value is replaced wholesale, never written
+    through -- so it cannot leak a later write into a snapshot, and copying
+    it would cost time on a path that runs ~20 times per step:
+
+    * ``tool_ledger`` entries' ``args`` / ``result`` -- ``_record_tool_call``
+      builds a new ``ToolCallRecord`` and replaces the entry. These also hold
+      whatever a custom or MCP tool returned, which may not be copyable at
+      all.
+    * ``last_response`` -- only ever reassigned.
+    * ``pending_tool_calls`` -- always rebound (``= list(...)``, slices).
+    * ``repeated_tool_decision`` / ``waiting_for_user_request`` -- rebound to
+      a fresh dict (see the "Rebind rather than mutate" comment in react.py).
+    """
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "response": {"deep": ["r1"]}}
+    ]
+    pattern.pending_tool_calls = [{"id": "tc1", "function": {"arguments": "{}"}}]
+    pattern.pending_tool_call_content = {"a": {"b": [1]}}
+    pattern.repeated_tool_decision = {"d": {"deep": 1}}
+    pattern.waiting_for_user_request = {"w": {"deep": 1}}
+    pattern.last_response = {"r": {"deep": 1}}
+    pattern.tool_ledger["c1"] = ToolCallRecord(
+        tool_call_id="c1",
+        tool_name="t",
+        args={"nested": {"deep": [1]}},
+        args_hash="h",
+        status="completed",
+        result={"out": ["v"]},
+    )
+
+    state = pattern.get_state()
+
+    # The containers with in-place writers must be copied.
+    assert (
+        state["pending_tool_interaction_responses"]
+        is not pattern.pending_tool_interaction_responses
+    )
+    assert state["pending_tool_call_content"] is not pattern.pending_tool_call_content
+
+    # Anything else shared must be one of the documented write-once
+    # exemptions -- a new shared container fails this test.
+    exempt = _react_state_container_ids(
+        [
+            state["last_response"],
+            state["pending_tool_calls"],
+            state["repeated_tool_decision"],
+            state["waiting_for_user_request"],
+            [
+                [record.get("args"), record.get("result")]
+                for record in state["tool_ledger"].values()
+            ],
+        ]
+    )
+    shared = _react_state_container_ids(state) & _react_live_container_ids(pattern)
+
+    assert not (shared - exempt)
+
+
+def test_react_get_state_survives_a_non_copyable_tool_result() -> None:
+    """A tool result that cannot be copied must not break checkpointing.
+
+    ``ToolCallRecord.result`` is typed ``Any`` and holds whatever a custom or
+    MCP tool returned -- a lock, a file handle, a generator. The JSON layer
+    downstream degrades such values to a placeholder; the snapshot boundary
+    must not turn them into a hard failure first.
+    """
+
+    pattern = ReActPattern()
+    pattern.tool_ledger["c1"] = ToolCallRecord(
+        tool_call_id="c1",
+        tool_name="t",
+        args={"a": 1},
+        args_hash="h",
+        status="completed",
+        result={"success": True, "handle": threading.Lock()},
+    )
+
+    state = pattern.get_state()
+
+    assert state["tool_ledger"]["c1"]["result"]["success"] is True
+
+
+def test_react_get_state_degrades_when_a_snapshotted_value_cannot_be_copied() -> None:
+    """A non-copyable value inside a snapshotted container degrades, not raises.
+
+    ``snapshot_container`` falls back to a shallow copy, which still defends
+    against the ``pop`` that the delivery loop performs on this list.
+    """
+
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "handle": threading.Lock()}
+    ]
+
+    state = pattern.get_state()
+    captured = state["pending_tool_interaction_responses"]
+
+    assert captured is not pattern.pending_tool_interaction_responses
+    pattern.pending_tool_interaction_responses.pop(0)
+    assert [entry["interaction_id"] for entry in captured] == ["i1"]
+
+
+def test_react_get_state_is_unaffected_by_later_pop() -> None:
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "response": "r1"},
+        {"tool_name": "t2", "interaction_id": "i2", "response": "r2"},
+    ]
+
+    state = pattern.get_state()
+
+    pattern.pending_tool_interaction_responses.pop(0)
+
+    assert [
+        entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
+    ] == ["i1", "i2"]

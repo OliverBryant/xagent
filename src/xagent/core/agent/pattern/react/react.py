@@ -95,6 +95,7 @@ from ...context.enrichment import (
 )
 from ...context.execution import (
     note_compaction_evidence_loss,
+    snapshot_container,
     tool_evidence_state,
 )
 from ...context.memory_tool import build_memory_tools
@@ -1714,7 +1715,21 @@ class ReActPattern(AgentPattern):
         return self._tool_decision_groups_by_name.get(tool_name, tool_name)
 
     def get_state(self) -> dict[str, Any]:
-        """Return JSON-serializable ReAct state for checkpointing."""
+        """Return JSON-serializable ReAct state for checkpointing.
+
+        Containers that some code path mutates in place are snapshotted, so
+        a caller holding the result is not looking at live state. The DAG
+        checkpoint rollback (``_DAGStepRuntime.checkpoint``) depends on
+        that: without the copy below,
+        ``_deliver_pending_tool_interaction_responses`` popping from
+        ``pending_tool_interaction_responses`` would mutate the last-good
+        snapshot and a failed checkpoint would lose the user's reply.
+
+        Everything else is emitted by reference on purpose. Values that are
+        only ever *reassigned* cannot leak a later write into a snapshot,
+        and copying them would add cost to a path that runs on the order of
+        twenty times per step -- see the per-entry notes below.
+        """
         return {
             "reasoning_mode": self.reasoning_mode.value,
             "status": self.status,
@@ -1730,16 +1745,40 @@ class ReActPattern(AgentPattern):
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
             "force_final_answer_next": self.force_final_answer_next,
+            # Write-once: both are always rebound to a fresh dict, never
+            # written through -- see the "Rebind rather than mutate" comment
+            # on the ``waiting_for_user_request`` update below.
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
-            "pending_tool_interaction_responses": (
+            # Popped in place by ``_deliver_pending_tool_interaction_responses``
+            # and appended to when a response arrives, so the list itself must
+            # be snapshotted. The entries are only read there, so a shallow
+            # copy of the list is enough.
+            "pending_tool_interaction_responses": snapshot_container(
                 self.pending_tool_interaction_responses
             ),
             "task_text": self.task_text,
             "memory_input_text": self.memory_input_text,
+            # Write-once: normally a plain dict from ``_normalize_llm_response``,
+            # but typed ``Any`` and only ever reassigned (518, 906, 993, 1831,
+            # 3490), never written through. The invariant holds by convention
+            # here rather than by construction.
             "last_response": self.last_response,
+            # Write-once: always rebound (``= list(...)``, slice assignments),
+            # never appended to or popped in place.
             "pending_tool_calls": self.pending_tool_calls,
-            "pending_tool_call_content": self.pending_tool_call_content,
+            # Written through by tool-call id while a turn is in flight
+            # (``pending_tool_call_content[tool_call_id] = content`` and a
+            # later ``pop``), so it needs a snapshot.
+            "pending_tool_call_content": snapshot_container(
+                self.pending_tool_call_content
+            ),
+            # Write-once: ``_record_tool_call`` builds a whole new
+            # ``ToolCallRecord`` per call and replaces the entry; no code
+            # mutates a stored record's ``args``/``result``. Copying them
+            # would also be the most expensive thing on this path and would
+            # break on results custom/MCP tools are free to return (locks,
+            # handles, generators).
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
@@ -3273,6 +3312,8 @@ class ReActPattern(AgentPattern):
                         # Rebind rather than mutate: get_state() hands this
                         # dict out by reference, so a fresh dict keeps any
                         # state captured earlier from aliasing this update.
+                        # get_state() relies on this being the only way this
+                        # value ever changes, and skips copying it.
                         self.waiting_for_user_request = {
                             **self.waiting_for_user_request,
                             "message_count": len(getattr(context, "messages", [])),

@@ -184,13 +184,25 @@ class _DAGStepRuntime:
         # suspension point, so restoring the whole mapping would discard a
         # sibling step's in-flight progress on failure.
         #
-        # No deep copy is needed: ``_set_active_step_context`` /
-        # ``_set_active_step_pattern_state`` *replace* the dict entry, and the
-        # values they store are freshly built by ``context.to_dict()`` and
-        # ``pattern.get_state()`` on every call. Nothing inside the ``try``
-        # mutates the previously stored object, so holding its reference and
-        # reassigning it is a complete rollback -- and it keeps the hot path
-        # (~23 checkpoint call sites per step) free of copying cost.
+        # No deep copy is needed here, which keeps the hot path (~23
+        # checkpoint call sites per step) free of copying cost. That rests on
+        # two properties, both of which are pinned by tests:
+        #
+        # 1. ``_set_active_step_context`` / ``_set_active_step_pattern_state``
+        #    *replace* the dict entry rather than mutating it in place, so the
+        #    previous object survives the write untouched.
+        # 2. ``context.to_dict()`` and ``pattern.get_state()`` snapshot every
+        #    container that some code path mutates in place, so nothing that
+        #    happens after the entry was stored can reach into it. What they
+        #    still hand out by reference is write-once (replaced wholesale,
+        #    never written through) -- both methods document each exemption,
+        #    and the tests in ``test_context.py`` / ``test_react.py`` fail if
+        #    a new shared container appears.
+        #
+        # Together they make holding the previous reference and reassigning it
+        # a complete rollback. If a future change starts mutating one of those
+        # values in place, snapshot it there -- deep-copying the whole entry
+        # here would hide the problem and put the cost on every checkpoint.
         was_active = self.step_id in self.dag_pattern.active_step_ids
         had_context = self.step_id in self.dag_pattern.active_step_contexts
         context_before = self.dag_pattern.active_step_contexts.get(self.step_id)

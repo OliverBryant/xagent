@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +49,7 @@ from xagent.core.agent.pattern.dag.plan_generator import (
     PlanLanguageMismatchError,
 )
 from xagent.core.agent.pattern.react import ReActPattern
+from xagent.core.agent.pattern.react.react import ToolCallRecord
 from xagent.core.memory.core import MemoryNote as StoredMemoryNote
 from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.types import ChunkType, StreamChunk
@@ -2110,6 +2113,162 @@ async def test_dag_step_checkpoint_rollback_preserves_cancellation() -> None:
         )
 
     assert dag.active_step_pattern_states["creative"] == {"marker": "old-state"}
+
+
+@pytest.mark.asyncio
+async def test_dag_step_checkpoint_rollback_reverts_real_context_mutation() -> None:
+    """Rollback with a real ExecutionContext, not a literal seed dict.
+
+    The stored entry is whatever ``context.to_dict()`` produced at the last
+    successful checkpoint. This pins the invariant that the snapshot shares
+    no mutable container with the live context, so a mutation made between
+    the two checkpoints does not survive the rollback.
+    """
+
+    class FlakyRuntime(PatternRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = False
+
+        async def checkpoint(self, label: str, **_kwargs: Any) -> dict[str, Any]:
+            if self.fail:
+                raise CheckpointPersistenceError("writer down")
+            return {"label": label}
+
+    dag = DAGPattern(lambda **_: build_plan())
+    parent = FlakyRuntime()
+    child_context = ExecutionContext(execution_id="dag-root:a")
+    child_context.add_user_message("instruction", metadata={"kind": "dag_step"})
+    child_context.metadata["dag_step_id"] = "a"
+    runtime = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="a",
+    )
+
+    # Checkpoint #1 succeeds and becomes the last good snapshot.
+    await runtime.checkpoint("after_llm", context=child_context, pattern=ReActPattern())
+    last_good = copy.deepcopy(dag.active_step_contexts["a"])
+
+    # The step progresses: a later writer mutates the live child context.
+    # ``metadata`` is the container real writers touch in place (dag.py
+    # writes OUTPUT_LANGUAGE_METADATA_KEY here) and the one to_dict copies.
+    child_context.metadata["output_language"] = "English"
+
+    # Checkpoint #2 fails and must reinstate the last good snapshot.
+    parent.fail = True
+    with pytest.raises(CheckpointPersistenceError):
+        await runtime.checkpoint(
+            "after_llm", context=child_context, pattern=ReActPattern()
+        )
+
+    assert dag.active_step_contexts["a"] == last_good
+    assert "output_language" not in dag.active_step_contexts["a"]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_dag_step_checkpoint_rollback_keeps_popped_pending_response() -> None:
+    """A user reply popped in place must survive a failed checkpoint.
+
+    ``_deliver_pending_tool_interaction_responses`` pops the entry it is
+    delivering before checkpointing. If the last good pattern state aliased
+    the live list, the rollback would restore the already-popped list and
+    the reply would be lost permanently.
+    """
+
+    class FlakyRuntime(PatternRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = False
+
+        async def checkpoint(self, label: str, **_kwargs: Any) -> dict[str, Any]:
+            if self.fail:
+                raise CheckpointPersistenceError("writer down")
+            return {"label": label}
+
+    dag = DAGPattern(lambda **_: build_plan())
+    parent = FlakyRuntime()
+    child_context = ExecutionContext(execution_id="dag-root:a")
+    react_pattern = ReActPattern()
+    react_pattern.pending_tool_interaction_responses = [
+        {"tool_name": "t1", "interaction_id": "i1", "response": "r1"},
+        {"tool_name": "t2", "interaction_id": "i2", "response": "r2"},
+    ]
+    runtime = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="a",
+    )
+
+    await runtime.checkpoint(
+        "tool_interaction_response_skipped",
+        context=child_context,
+        pattern=react_pattern,
+    )
+
+    # The delivery loop pops the entry it is about to deliver, in place.
+    react_pattern.pending_tool_interaction_responses.pop(0)
+
+    parent.fail = True
+    with pytest.raises(CheckpointPersistenceError):
+        await runtime.checkpoint(
+            "tool_interaction_response_delivered",
+            context=child_context,
+            pattern=react_pattern,
+        )
+
+    restored = dag.active_step_pattern_states["a"]["pending_tool_interaction_responses"]
+    assert [entry["interaction_id"] for entry in restored] == ["i1", "i2"]
+
+
+@pytest.mark.asyncio
+async def test_dag_step_checkpoint_survives_a_non_copyable_tool_result() -> None:
+    """A non-copyable tool result must not become a permanent step failure.
+
+    ``ToolCallRecord.result`` holds whatever a custom or MCP tool returned.
+    If the snapshot boundary raised on it, the raw error would reach
+    ``DAGPattern``'s generic ``except Exception`` and mark the step failed
+    forever, even though the JSON writer downstream degrades such values to
+    a placeholder and the checkpoint would otherwise persist fine.
+    """
+
+    written: list[str] = []
+
+    class JsonWriter:
+        async def checkpoint(self, **payload: Any) -> str:
+            # Mirrors the real writer: JSON with the tolerant default that
+            # degrades a non-serializable value instead of raising.
+            written.append(json.dumps(payload, default=str))
+            return "evt-1"
+
+    dag = DAGPattern(lambda **_: build_plan())
+    parent = PatternRuntime(tracer=JsonWriter(), execution_id="dag-root")
+    child_context = ExecutionContext(execution_id="dag-root:a")
+    react_pattern = ReActPattern()
+    react_pattern.tool_ledger["c1"] = ToolCallRecord(
+        tool_call_id="c1",
+        tool_name="t",
+        args={"a": 1},
+        args_hash="h",
+        status="completed",
+        result={"success": True, "client": threading.Lock()},
+    )
+    runtime = _DAGStepRuntime(
+        parent=parent,
+        dag_pattern=dag,
+        root_context=ExecutionContext(execution_id="dag-root"),
+        step_id="a",
+    )
+
+    await runtime.checkpoint("after_tool", context=child_context, pattern=react_pattern)
+
+    assert written
+    assert (
+        dag.active_step_pattern_states["a"]["tool_ledger"]["c1"]["result"]["success"]
+        is True
+    )
 
 
 @pytest.mark.asyncio

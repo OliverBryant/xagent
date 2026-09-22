@@ -28,6 +28,33 @@ issued interaction id (see :func:`_gated_interaction_id`), so an approval that
 loses its source binding between pause and resume is refused instead of being
 replayed unauthorized. An interaction the gate never gated resumes through the
 legacy path untouched.
+
+Host contract
+-------------
+Two obligations the gate cannot enforce for the host. Both are load-bearing;
+neither is checked at runtime, so a host that ignores them gets silent
+incorrectness rather than an error.
+
+1. **Persist a dispatch marker before awaiting the executor.** The resume hook
+   receives a one-shot ``executor``. Before awaiting it, the host must durably
+   record that this interaction has entered dispatch (an ``EXECUTING`` row, an
+   outbox entry - whatever its ledger calls it). The gate treats everything
+   after that await as possibly-committed and, on a cancellation, discards the
+   hook's settlement and re-raises (see :func:`_call_resume_hook`). Only the
+   host's own marker lets a later replay tell "never dispatched" from "may have
+   landed"; without it, a replay can issue a second external write.
+
+2. **Compare the approved argument hash before dispatching.** The gate freezes
+   the approved arguments at pause time and exposes
+   :attr:`GatedCall.arguments_sha256`; at resume it recomputes the same digest
+   over whatever the host passes to the executor and publishes it on
+   :class:`MCPApprovalReplayContext`. **The gate does not compare them** - it
+   has no durable copy of the pause-time value, by design: the host's approval
+   ledger is the single authoritative record of what was approved, and a second
+   persisted copy here would be a divergence path, not a safety net. The host
+   must therefore compare the replay context's digest against the value its own
+   ledger froze at approval time, and refuse on mismatch. Until it does, the
+   "approved call == executed call" property is *not* enforced anywhere.
 """
 
 from __future__ import annotations
@@ -67,10 +94,14 @@ _UNSUPPORTED_PATTERN = {
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
 }
-# How long a cancelled resume waits for an already-dispatched connector write
-# to finish before giving up on observing it. Bounded so an external cancel
-# cannot be blocked indefinitely by a hung remote call.
-_POST_DISPATCH_DRAIN_SECONDS = 5.0
+# How long the gate will wait to OBSERVE a connector write that has already
+# been dispatched - both on the ordinary success path and when draining after
+# a cancellation. Deliberately not the registration's ``timeout_seconds``:
+# that one bounds approval *policy* latency before anything is sent, and is
+# typically small, whereas this bounds a remote call that is already in flight
+# and cannot be un-sent. Bounded either way, so a hung connector can neither
+# park a resume forever nor block an external cancel.
+_DISPATCH_OBSERVE_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -107,7 +138,13 @@ class ToolCallExecutionContext:
 
 @dataclass(frozen=True)
 class GatedCall:
-    """Canonical, immutable snapshot presented to a host approval hook."""
+    """Canonical, immutable snapshot presented to a host approval hook.
+
+    ``arguments_sha256`` is the approval's identity: the host is expected to
+    freeze it alongside whatever it shows the approver, and to compare it again
+    at resume. See "Host contract" in the module docstring - the gate publishes
+    both digests but deliberately never compares them itself.
+    """
 
     connector_ref: ConnectorRef
     tool_name: str
@@ -199,7 +236,19 @@ class MCPApprovalGateRegistration:
 
 @dataclass(frozen=True)
 class MCPApprovalReplayContext:
-    """Identity bound while an approved payload uses the normal connector path."""
+    """Identity bound while an approved payload uses the normal connector path.
+
+    Read it with :func:`current_mcp_approval_replay_context` from inside a
+    connector call to learn which approval authorized the dispatch in flight.
+
+    ``arguments_sha256`` is recomputed here over the arguments the host is
+    actually about to send. **The gate never compares it to the approved
+    value** - it keeps no durable copy of that value, because the host's
+    approval ledger is the authoritative record (see "Host contract" in the
+    module docstring). A host that wants the "approved call == executed call"
+    guarantee must compare this digest against the one its ledger froze at
+    approval time and refuse on mismatch; nothing in this module does it.
+    """
 
     interaction_id: str
     arguments_sha256: str
@@ -414,6 +463,9 @@ async def _call_resume_hook(
 
     hook_task = asyncio.ensure_future(returned)
     dispatch_wait = asyncio.create_task(dispatch_started.wait())
+    # Set once the observation budget has already been spent waiting on this
+    # same dispatched call, so the cleanup path does not spend it again.
+    observed = False
     try:
         done, _ = await asyncio.wait(
             {hook_task, dispatch_wait},
@@ -438,7 +490,22 @@ async def _call_resume_hook(
             # settlement and no log line. The shield lets the cancellation
             # unwind to the ``finally`` with the task still alive, which is
             # the only state in which that drain can do its job.
-            return await asyncio.shield(hook_task)
+            #
+            # BOUNDED as well: a hung connector RPC would otherwise park the
+            # resume forever with no backstop, since the registration deadline
+            # has already been spent by this point. The TimeoutError raised on
+            # expiry reaches the caller with ``dispatch_started`` set, which is
+            # what makes it settle as ``dispatch_unknown`` rather than a clean
+            # failure - the write may well have landed.
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(hook_task), timeout=_DISPATCH_OBSERVE_SECONDS
+                )
+            except TimeoutError:
+                # The observation budget is spent; do not let the ``finally``
+                # spend a second one waiting for the same hung call.
+                observed = True
+                raise
 
         hook_task.cancel()
         await _drain(hook_task)
@@ -462,15 +529,45 @@ async def _call_resume_hook(
             if not dispatch_started.is_set():
                 hook_task.cancel()
                 await _drain(hook_task)
-            else:
+            elif not observed:
                 await _drain(
-                    asyncio.shield(hook_task), timeout=_POST_DISPATCH_DRAIN_SECONDS
+                    asyncio.shield(hook_task), timeout=_DISPATCH_OBSERVE_SECONDS
                 )
                 if not hook_task.done():
-                    logger.warning(
-                        "MCP approval resume hook is still dispatching after "
-                        "cancellation; the connector write may still land."
-                    )
+                    _report_unobserved(hook_task)
+            else:
+                # Budget already spent on the success path above.
+                _report_unobserved(hook_task)
+
+
+def _report_unobserved(hook_task: "asyncio.Future[Any]") -> None:
+    """Warn that a dispatched write outlived our ability to observe it.
+
+    Also attaches a done-callback that retrieves the eventual outcome. Only the
+    ``shield`` wrapper is cancelled when the bounded wait expires, so the real
+    ``hook_task`` keeps running; without this, its exception surfaces later as a
+    bare "Task exception was never retrieved" with no way to tie it back to the
+    interaction it belonged to.
+    """
+
+    logger.warning(
+        "MCP approval resume hook is still dispatching after %.0fs; "
+        "the connector write may still land.",
+        _DISPATCH_OBSERVE_SECONDS,
+    )
+
+    def _retrieve(task: "asyncio.Future[Any]") -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "MCP approval resume hook failed after the gate stopped "
+                "observing it: %r",
+                error,
+            )
+
+    hook_task.add_done_callback(_retrieve)
 
 
 async def _drain(awaitable: Any, *, timeout: float | None = None) -> None:
@@ -560,6 +657,49 @@ class MCPApprovalGateTool(AbstractBaseTool):
     def return_value_as_string(self, value: Any) -> str:
         return self._target.return_value_as_string(value)
 
+    @property
+    def category(self) -> Any:
+        """Delegate the tool category (MCP tools set it as an attribute)."""
+
+        return getattr(self._target, "category", None)
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate optional runtime capabilities to the wrapped tool.
+
+        Mirrors ``OutputFilteredToolWrapper.__getattr__``. Call sites across the
+        codebase duck-type tools with ``getattr(tool, "<cap>", None)`` and skip
+        the feature when it is absent, so without this a wrapped tool loses
+        those capabilities *silently* rather than loudly - e.g. ``source_server``
+        (mcp_tools.py), which MCP tools set as a plain attribute.
+
+        Only reached for attributes normal lookup did not find, so every
+        property and method defined above keeps priority. Private names are
+        refused so this never masks a missing internal during ``__init__``.
+
+        The class-attribute guard is not decoration. Python falls back to
+        ``__getattr__`` when a *property getter raises AttributeError*, not
+        only when the attribute is absent, so a naive delegation silently
+        swallows a fault inside one of this class's own properties and answers
+        with the wrapped tool's raw value instead. That is exactly how a broken
+        ``metadata`` would start returning the target's UNDEGRADED metadata -
+        re-enabling concurrent batching for a gated tool - with no error
+        anywhere. If the name is defined on the class, the descriptor ran and
+        failed, so surface that rather than paper over it.
+        """
+
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if hasattr(type(self), name):
+            raise AttributeError(
+                f"{type(self).__name__}.{name} raised AttributeError; refusing "
+                "to mask it by delegating to the wrapped tool"
+            )
+        try:
+            target = object.__getattribute__(self, "_target")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(target, name)
+
     def is_async(self) -> bool:
         return True
 
@@ -615,6 +755,16 @@ class MCPApprovalGateTool(AbstractBaseTool):
             return dict(_GATE_FAILURE)
 
         if decision.decision == "allow":
+            # ``call.arguments``, NOT the caller's ``args``. This is deliberate
+            # and load-bearing: the canonical snapshot is the exact payload the
+            # hook was shown and that ``arguments_sha256`` covers, so
+            # dispatching it is what makes "the approved call is the executed
+            # call" true even if the hook mutated the caller's dict after
+            # deciding. Dispatching ``args`` instead would reopen that gap to
+            # buy back only tuple/non-str-key fidelity, which cannot arise on
+            # the MCP path (arguments reach it as parsed JSON), and would not
+            # help with NaN/Infinity: ``from_arguments`` rejects those at
+            # snapshot time, before this branch is reached.
             return await self._target.run_json_async(call.arguments)
         if decision.decision == "deny":
             return {
@@ -632,15 +782,17 @@ class MCPApprovalGateTool(AbstractBaseTool):
             ),
             "message": decision.message or f"Approve running {self.name}?",
             "message_type": "confirmation",
+            # No ``options`` here: ``confirm`` is not in TYPES_REQUIRING_OPTIONS
+            # (interaction_types.py), the write-side validator refuses options
+            # on it outright (``options_forbidden``), and the renderer draws a
+            # confirm as a boolean switch that ignores them. A host that needs
+            # a richer prompt renders its own (the Slack approval UI does) and
+            # only needs a stable interaction to resume.
             "interactions": [
                 {
                     "type": "confirm",
                     "field": "approve",
                     "label": "Approve",
-                    "options": [
-                        {"label": "Approve", "value": "approve"},
-                        {"label": "Reject", "value": "reject"},
-                    ],
                 }
             ],
         }

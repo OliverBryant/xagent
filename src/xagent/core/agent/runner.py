@@ -22,7 +22,11 @@ from ..task_runtime import (
 )
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
-from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
+from .checkpoint import (
+    CheckpointCorruptError,
+    CheckpointPersistenceError,
+    read_latest_checkpoint_payload,
+)
 from .context import ContextManager, ExecutionContext
 from .context.execution import (
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -362,6 +366,17 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
+                    except CheckpointPersistenceError:
+                        # A checkpoint that did not persist is not a
+                        # recoverable pattern failure: the state transition
+                        # was never durably committed. Falling through to the
+                        # next pattern would let it repeat a non-idempotent
+                        # side effect the failed pattern already performed, or
+                        # report success while the checkpoint needed for
+                        # recovery is missing. Abort the run instead, the same
+                        # way ``ExecutionInterrupted`` above leaves the loop.
+                        teardown_status = "failed"
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(

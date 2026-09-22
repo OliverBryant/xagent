@@ -688,6 +688,8 @@ class RecordingTracer:
         task_id: str | None = None,
         step_id: str | None = None,
         data: dict[str, Any] | None = None,
+        # Mirrors the real ``Tracer.trace_event``; see test_runtime.py.
+        require_persisted: bool = False,
     ) -> str:
         self.events.append(
             {

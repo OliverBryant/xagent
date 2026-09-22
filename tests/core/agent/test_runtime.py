@@ -603,6 +603,10 @@ class TraceOnlyTracer:
         *,
         task_id: str | None = None,
         data: dict[str, Any] | None = None,
+        # Mirrors the real ``Tracer.trace_event``: a checkpoint write asks
+        # for persisted delivery, and a tracer that cannot accept the flag
+        # is not treated as a durable checkpoint writer.
+        require_persisted: bool = False,
     ) -> None:
         self.events.append(
             {

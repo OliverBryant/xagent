@@ -35,7 +35,7 @@ from ..tools.user_interaction import (
     WAITING_FOR_USER_STATUS,
     tool_result_waits_for_user,
 )
-from .checkpoint import CheckpointPersistenceError
+from .checkpoint import CheckpointPersistenceError, supports_kwarg
 from .context.execution import (
     COMPACT_SUMMARY_FALLBACK_BUDGETS,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -1857,13 +1857,37 @@ class PatternRuntime:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
+            # Mirror ``TraceCheckpointStore``: a plain event tracer only
+            # counts as a checkpoint writer if it can be asked for persisted
+            # delivery. Without that, the call is best-effort and returning
+            # normally would tell the caller the transition is durable when
+            # it may not be.
+            if not supports_kwarg(trace_event, "require_persisted"):
+                raise CheckpointPersistenceError(
+                    "Tracer.trace_event() cannot guarantee checkpoint persistence."
+                )
             await self._maybe_await(
                 trace_event(
                     self._checkpoint_trace_event_type(trace_event),
                     task_id=str(payload.get("execution_id") or self.execution_id),
                     data=payload,
+                    require_persisted=True,
                 )
             )
+            return
+
+        # No writer capability at all: the tracer does spans only, which is
+        # the same "checkpointing is not configured" mode as ``tracer=None``
+        # above, and is treated the same way rather than failing the run.
+        # Raising here would break every execution that passes an
+        # observability-only tracer (see the span-only tracer in
+        # ``test_react.py``), which is a supported shape.
+        #
+        # The case just above is different and does raise: a tracer that
+        # exposes an event writer but cannot be asked for persisted delivery
+        # is claiming to record the checkpoint without being able to promise
+        # it survives, and that claim must not be reported as durable.
+        return
 
     async def _maybe_await(self, result: Any) -> None:
         if inspect.isawaitable(result):

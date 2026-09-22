@@ -40,6 +40,22 @@ def checkpoint_execution_id(data: dict[str, Any]) -> str:
     )
 
 
+def supports_kwarg(method: Any, name: str) -> bool:
+    """Whether ``method`` accepts ``name`` as a keyword argument.
+
+    Used to decide whether a duck-typed tracer can be asked for persisted
+    delivery before it is treated as a durable checkpoint writer.
+    """
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    return name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
 
@@ -299,14 +315,7 @@ class TraceCheckpointStore:
         return str(execution_id)
 
     def _supports_kwarg(self, method: Any, name: str) -> bool:
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            return False
-        return name in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
+        return supports_kwarg(method, name)
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
         del trace_event

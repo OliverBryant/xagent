@@ -477,7 +477,7 @@ and a caller-safe `detail`. The states are:
 
 | `state` | Meaning | Operator action |
 | --- | --- | --- |
-| `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None. |
+| `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None when `mode` is `vector`. When `mode` is `text_only`, see "Serving in text_only mode" below: memory is writable but vector search is off, and restoring it is offline work. |
 | `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
 | `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
 | `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Check that no other process is mid-maintenance, then restart this worker. |
@@ -493,6 +493,39 @@ record the state as their memory availability reason.
 The operator log carries the detail the API deliberately does not. Search for
 `Persistent memory` at `WARNING` and `ERROR`; each non-ready state logs the
 specific quiescence and repair steps for that state.
+
+### Serving in text_only mode
+
+`state` is `ready` and `mode` is `text_only` when admission found the stored
+vectors were written under a different embedding identity than the authority
+now describes. This is a degraded but stable serving state, not a fault, and it
+is not the same as "memory works normally":
+
+* Memory is **readable and writable**. Tasks and chats keep using it.
+* New notes are stored **without vectors**. They are reachable only by lexical
+  search, never by semantic similarity.
+* **Vector search is off** for the whole table. `supports_vector_search` is
+  `false`, and searches fall back to lexical matching over every row,
+  pre-existing and new alike.
+* Existing vectors are **left exactly as they are**. The runtime holds no
+  embedding adapter in this mode, so no write re-embeds a historical row and
+  no write changes the table's vector width. Nothing mixes two vector spaces.
+
+Restoring vector search is offline work, and it does not happen by itself:
+
+1. Decide which vector identity the table should be in. Either point the
+   authority back at the identity the stored vectors were written under, or
+   keep the current authority and re-embed the data to match it.
+2. If re-embedding: quiesce all writers, back up the memory LanceDB directory,
+   and re-embed every row offline under the current authority. Do not re-embed
+   in place, and do not start a worker to do it.
+3. Restart every worker together. Confirm `mode` is `vector` and
+   `supports_vector_search` is `true`.
+
+Leaving a deployment in `text_only` indefinitely is a supported choice, as long
+as it is a deliberate one: semantic recall stays off until the step above is
+done, and every note written in the meantime will need the same offline
+re-embed before it becomes semantically searchable.
 
 ### Repairing BLOCKED_REPAIR
 
@@ -512,8 +545,55 @@ successfully begins writing, and the rest of the fleet has not admitted.
 
 ### Rollback
 
-Redeploy the previous version to every worker at once, after quiescing writers.
-The previous version reads the model hub instead of the authority, so leave the
-authority row in place: it is ignored by the old code and is what the new
-version needs on the next roll-forward. Rolling back does not undo an offline
-repair, and does not need to.
+Rolling back is **not** symmetric with rolling forward, and quiescing writers
+is not sufficient on its own. The previous version does not read the authority.
+It picks its embedding model per user from the model hub, it has none of the
+admission checks this release added, and so it will happily open the memory
+table under an identity that has nothing to do with the vectors in it. Three
+things follow, and all three are silent:
+
+* **Online re-embedding.** If the identity the old code selects has a
+  different dimension than the stored vectors, the first ordinary write
+  rewrites the whole table to the new width and re-embeds every historical row
+  under the new model. This is irreversible and there is no prompt.
+* **Mixed vector spaces.** If the identity has the *same* dimension but a
+  different model or endpoint, nothing rewrites and nothing complains. New
+  vectors are simply written into a different space than the old ones, and
+  recall degrades in a way that no state field reports.
+* **Silent loss of durability.** On an unsupported provider configuration the
+  old manager falls back to an ephemeral in-memory store. Memory appears to
+  work and is discarded when the worker exits.
+
+So gate the rollback on the persisted identity, not just on the fleet version:
+
+1. **Quiesce every writer.** Stop all API and task-execution workers. Nothing
+   below is safe against a live writer.
+2. **Establish what the persisted vector identity is.** Read it from the
+   memory table's schema metadata (`xagent.memory.vector_space`), or from this
+   release's `GET /api/memory/store-info` before you stop the fleet — a `mode`
+   of `vector` means the stored vectors match the current authority.
+3. **Establish what identity the previous release would select** for the same
+   deployment: the per-user default embedding model, or the model hub's
+   configured embedding model, as that release resolved it.
+4. **Take a backup and verify it.** Copy the memory LanceDB directory
+   (`<storage root>/memory_store`, or the project-local `memory_store/` when
+   that legacy location is in use) while writers are still fenced, then verify
+   the copy opens and its row count and vector width match the original. An
+   unverified copy is not a backup.
+5. **Compare the two identities.**
+   * **They match** — roll back. Redeploy the previous version to every worker
+     at once. Leave the authority row in place: the old code ignores it, and
+     the new version needs it on the next roll-forward.
+   * **They differ, or the persisted identity cannot be proven** — do **not**
+     start the previous version against this data. Keep memory fenced and pick
+     one: restore a verified backup that was written under the identity the
+     previous release will select, or re-embed the table offline into that
+     identity before rolling back. Only then redeploy.
+
+If you must roll the application back before either of those can be done, roll
+back with memory storage detached — move the memory directory aside so the old
+code starts against an empty one — and reattach it only once the identities
+agree. Unrelated functions are unaffected either way; persistent memory is the
+only thing at stake.
+
+Rolling back does not undo an offline repair, and does not need to.

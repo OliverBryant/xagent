@@ -1584,35 +1584,10 @@ async def startup_event() -> None:
     # memory writers, and no store is published unless admission succeeds.
     # Quiescing the rest of the fleet is the operator's job: the supported
     # procedure is an all-worker restart, never a rolling one.
-    from .dynamic_memory_store import admit_memory_storage, get_memory_store_manager
+    from .dynamic_memory_store import admit_memory_storage_at_startup
 
     with _startup_phase("memory storage admission"):
-        try:
-            memory_status = admit_memory_storage()
-            store_info = get_memory_store_manager().get_store_info()
-        except Exception:
-            # Memory must never be able to abort a boot. Unrelated functions
-            # start; memory itself stays closed until an operator acts.
-            logger.exception(
-                "Persistent memory admission raised; memory stays unavailable"
-            )
-        else:
-            if memory_status.ready:
-                logger.info(
-                    "Persistent memory admitted in %s mode (vector search: %s)",
-                    memory_status.mode.value if memory_status.mode else "unknown",
-                    memory_status.vector_search,
-                )
-            else:
-                logger.warning(
-                    "Persistent memory is not serving (%s); unrelated functions "
-                    "continue to start",
-                    memory_status.state.value,
-                )
-            logger.info(
-                "Memory store similarity threshold: %s",
-                store_info["similarity_threshold"],
-            )
+        admit_memory_storage_at_startup()
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)

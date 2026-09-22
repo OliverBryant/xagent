@@ -470,8 +470,15 @@ def test_credential_failure_at_admission_fails_closed(monkeypatch, tmp_path):
         manager.get_memory_store()
 
 
-def test_transient_failure_at_admission_is_retried_later(monkeypatch, tmp_path):
-    monkeypatch.setattr(manager_module, "ADMISSION_RETRY_INTERVAL_SECONDS", 0.0)
+def test_transient_failure_at_admission_stays_fenced_until_restart(
+    monkeypatch, tmp_path
+):
+    """A retryably-failed worker never re-admits online, even once healthy.
+
+    Admission repairs by rewriting the table, and ``writers_quiesced`` is only
+    a claim about this process. Re-attempting after the fleet is live could
+    destroy another worker's commits, so recovery is an operator restart.
+    """
     state = _install_authority(
         monkeypatch, None, error=AuthorityUnreadable("transient")
     )
@@ -480,30 +487,80 @@ def test_transient_failure_at_admission_is_retried_later(monkeypatch, tmp_path):
     assert manager.admit().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
     assert manager._publication is None
 
+    # The underlying fault clears; the fenced worker must not notice.
     state["error"] = None
     state["snapshot"] = _snapshot()
 
-    assert manager.status().state is MemoryLifecycleState.READY
+    assert manager.status().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    with pytest.raises(MemoryUnavailableError):
+        manager.get_memory_store()
+
+    # Only a restart -- a fresh manager running its own startup -- recovers.
+    restarted = _manager(monkeypatch, tmp_path)
+    assert restarted.admit().state is MemoryLifecycleState.READY
 
 
-def test_retryable_admission_is_rate_limited(monkeypatch, tmp_path):
-    """A failing admission must not queue every request behind its file lock."""
-    state = _install_authority(monkeypatch, None, error=AuthorityUnreadable("down"))
-    manager = _manager(monkeypatch, tmp_path)
+def test_request_and_status_paths_never_admit(monkeypatch, tmp_path):
+    """No request or status path may reach admission's table-rewriting repair."""
+    state = _install_authority(monkeypatch, _snapshot())
+    admissions: list[int] = []
 
-    assert manager.admit().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
-    attempts_after_startup = state["reads"]
+    real = memory_lifecycle.admit_authority_storage
 
+    def counting_admit(snapshot, **kwargs):
+        admissions.append(1)
+        kwargs["db_dir"] = str(tmp_path)
+        kwargs["embedding_factory"] = lambda _config: ConstantEmbedding()
+        return real(snapshot, **kwargs)
+
+    monkeypatch.setattr(manager_module, "admit_authority_storage", counting_admit)
+    manager = DynamicMemoryStoreManager()
+
+    # Startup admission has not run. Every caller-facing path must fail closed
+    # without admitting, however many times it is called.
     for _ in range(5):
+        assert manager.acquire() == (
+            None,
+            manager._status,
+        )
+        assert manager.status().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+        assert (
+            manager.get_store_info()["state"]
+            is MemoryLifecycleState.RETRYABLE_UNAVAILABLE.value
+        )
         with pytest.raises(MemoryUnavailableError):
             manager.get_memory_store()
 
-    assert state["reads"] == attempts_after_startup
+    assert admissions == []
+    # The authority row was never read either: a status call is not a probe.
+    assert state["reads"] == 0
 
-    manager._next_attempt_at = 0.0
-    state["error"] = None
-    state["snapshot"] = _snapshot()
-    assert manager.status().state is MemoryLifecycleState.READY
+    # admit() is the one door, and it opens exactly once.
+    assert manager.admit().state is MemoryLifecycleState.READY
+    assert len(admissions) == 1
+    manager.status()
+    manager.get_store_info()
+    assert len(admissions) == 1
+
+
+def test_a_retryably_fenced_manager_reports_retryable_unavailable(
+    monkeypatch, tmp_path
+):
+    """The fenced state an operator restarts on stays visible on every path."""
+    _install_authority(monkeypatch, None, error=AuthorityUnreadable("down"))
+    manager = _manager(monkeypatch, tmp_path)
+
+    assert manager.admit().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+
+    for _ in range(3):
+        assert manager.status().state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+        info = manager.get_store_info()
+        assert info["state"] == MemoryLifecycleState.RETRYABLE_UNAVAILABLE.value
+        assert info["store_type"] is None
+        assert info["is_lancedb"] is False
+        with pytest.raises(MemoryUnavailableError) as raised:
+            manager.get_memory_store()
+        assert raised.value.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
 
 
 @pytest.mark.parametrize(
@@ -665,7 +722,7 @@ def test_concurrent_worker_startup_admits_one_consistent_table(tmp_path):
 
 
 def test_startup_admission_is_serialized_within_a_worker(monkeypatch, tmp_path):
-    """Concurrent first calls admit once and publish one store."""
+    """Concurrent startup admissions admit once and publish one store."""
     _install_authority(monkeypatch, _snapshot())
     manager = _manager(monkeypatch, tmp_path)
 
@@ -674,6 +731,7 @@ def test_startup_admission_is_serialized_within_a_worker(monkeypatch, tmp_path):
 
     def acquire():
         barrier.wait()
+        manager.admit()
         stores.append(manager.get_memory_store())
 
     threads = [threading.Thread(target=acquire) for _ in range(4)]

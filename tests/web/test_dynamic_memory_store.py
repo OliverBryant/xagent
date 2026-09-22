@@ -74,7 +74,10 @@ def _manager_with_fake_authority(
 
     monkeypatch.setattr(manager_module, "_read_authority_snapshot", read)
     monkeypatch.setattr(manager_module, "admit_authority_storage", admit)
-    return DynamicMemoryStoreManager()
+    manager = DynamicMemoryStoreManager()
+    # Admission is startup-only; nothing publishes a store lazily any more.
+    manager.admit()
+    return manager
 
 
 def test_key_rotation_on_the_same_authority_does_not_rebuild(monkeypatch) -> None:

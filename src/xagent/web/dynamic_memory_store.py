@@ -6,13 +6,18 @@ reload configuration online -- a changed authority, a changed vector space or
 invalid legacy data all require quiescence, offline repair where applicable,
 and an all-worker restart. See :mod:`xagent.web.memory_lifecycle` for the
 contracts and for the operator guidance this module logs.
+
+Admission is startup-only. :meth:`DynamicMemoryStoreManager.admit` is the sole
+entry point; request and status paths never admit, because admission's repair
+path rewrites the table and cannot fence the rest of the fleet. Every entry
+point that needs persistent memory must therefore call it during its own
+startup -- the FastAPI app does, and so does ``xagent.web.worker``.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -38,11 +43,6 @@ from .services.global_memory_embedding_authority import (
 from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
-
-# How long a worker waits before re-attempting an admission that failed for a
-# retryable reason. Without it every request would queue behind the admission
-# file lock, turning one busy directory into a fleet-wide stall.
-ADMISSION_RETRY_INTERVAL_SECONDS = 30.0
 
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
@@ -115,7 +115,6 @@ class DynamicMemoryStoreManager:
         )
         self._lock = threading.RLock()
         self._publication: Optional[_Publication] = None
-        self._next_attempt_at = 0.0
         # Nothing is published before admission runs, so the honest starting
         # point is "not available yet, an attempt is still owed".
         self._status = MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
@@ -128,16 +127,25 @@ class DynamicMemoryStoreManager:
     def admit(self, *, writers_quiesced: bool = True) -> MemoryLifecycleStatus:
         """Run storage admission once, publishing only if it succeeds.
 
-        Call this from application startup, before any request is served: that
-        is the moment at which this process truly has no writers. Quiescing the
-        rest of the fleet is the operator's job, and the contract that makes it
-        safe is an all-worker restart, not a rolling one.
+        This is the *only* entry point that admits. Call it from an entry
+        point's startup sequence, before any request is served or any task is
+        claimed: that is the moment at which this process truly has no writers.
+        Quiescing the rest of the fleet is the operator's job, and the contract
+        that makes it safe is an all-worker restart, not a rolling one.
+
+        Admission never happens lazily on a request or status path. The repair
+        path inside admission reads the table, stages it, and rewrites it with
+        ``mode="overwrite"``; ``writers_quiesced=True`` is only a claim about
+        *this* process and fences no other worker. Running that from a request
+        would let one worker's repair silently destroy a commit another worker
+        had already made -- the version check that would catch it only runs
+        after the overwrite. A worker whose startup admission failed therefore
+        stays fenced until an operator restarts it, which is exactly what
+        ``docs/deployment.md`` already prescribes for ``retryable_unavailable``.
         """
         with self._lock:
             if self._settled:
                 return self._status
-            # Startup admission is never rate limited: it is the attempt the
-            # operator restarted the worker to make.
             self._admit_locked(writers_quiesced=writers_quiesced)
             return self._status
 
@@ -176,7 +184,6 @@ class DynamicMemoryStoreManager:
                 else result.status
             )
             log_operator_guidance(result.status)
-            self._next_attempt_at = time.monotonic() + ADMISSION_RETRY_INTERVAL_SECONDS
             return
 
         self._publication = _Publication(
@@ -235,14 +242,16 @@ class DynamicMemoryStoreManager:
         return None
 
     def acquire(self) -> tuple[Optional[MemoryStoreType], MemoryLifecycleStatus]:
-        """Return the live store and status, admitting first if still owed."""
+        """Return the live store and status. Never admits.
+
+        Read-only with respect to memory storage: the only thing this may do
+        beyond returning what startup published is *revoke* it, by re-reading
+        the authority row and comparing vector-space fingerprints. That read
+        touches the database, never the memory LanceDB directory. A worker that
+        never ran :meth:`admit`, or whose admission failed, returns ``None``
+        here for the rest of its life.
+        """
         with self._lock:
-            if not self._settled and time.monotonic() >= self._next_attempt_at:
-                # Lazy admission for entry points that do not run the startup
-                # phase. Nothing is published yet in this process, so claiming
-                # quiescence here is truthful for it; quiescing the fleet
-                # remains the operator's all-worker restart.
-                self._admit_locked(writers_quiesced=True)
             publication = self._revalidated_publication_locked()
             if publication is None:
                 return None, self._status
@@ -260,7 +269,7 @@ class DynamicMemoryStoreManager:
         return store
 
     def status(self) -> MemoryLifecycleStatus:
-        """Current public-safe lifecycle status, admitting first if still owed."""
+        """Current public-safe lifecycle status. Never admits."""
         return self.acquire()[1]
 
     def force_reinitialize(self) -> None:
@@ -329,6 +338,41 @@ def get_memory_store_manager(
 def admit_memory_storage() -> MemoryLifecycleStatus:
     """Run startup admission for the process-wide manager."""
     return get_memory_store_manager().admit()
+
+
+def admit_memory_storage_at_startup() -> Optional[MemoryLifecycleStatus]:
+    """Admit persistent memory during an entry point's startup, never raising.
+
+    Shared by every entry point that serves memory -- the FastAPI app and the
+    shared task worker -- so they cannot drift apart on the two things that
+    matter: memory may never abort a boot, and a non-ready outcome must reach
+    the operator log. Returns ``None`` when admission itself raised.
+    """
+    try:
+        status = admit_memory_storage()
+        store_info = get_memory_store_manager().get_store_info()
+    except Exception:
+        # Memory must never be able to abort a boot. Unrelated functions start;
+        # memory itself stays closed until an operator acts.
+        logger.exception("Persistent memory admission raised; memory stays unavailable")
+        return None
+
+    if status.ready:
+        logger.info(
+            "Persistent memory admitted in %s mode (vector search: %s)",
+            status.mode.value if status.mode else "unknown",
+            status.vector_search,
+        )
+    else:
+        logger.warning(
+            "Persistent memory is not serving (%s); unrelated functions "
+            "continue to start",
+            status.state.value,
+        )
+    logger.info(
+        "Memory store similarity threshold: %s", store_info["similarity_threshold"]
+    )
+    return status
 
 
 def memory_store_status() -> MemoryLifecycleStatus:

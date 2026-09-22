@@ -383,6 +383,15 @@ def _load_tool_exchanges(
         step_discriminator = str(trace_row.step_id or "")
 
         if trace_row.event_type == "tool_execution_start":
+            if data.get("settlement_delivery"):
+                # A settlement start re-opens a call that already emitted its
+                # own start; it carries no new prose or params. Recording a
+                # second pending start would dangle -- the resumed run has a
+                # different step id, so it could never pair with the original
+                # end -- and would inflate the dangling-start count. The
+                # settlement end is matched to the original exchange by call
+                # id below instead.
+                continue
             call_id = str(data.get("tool_call_id") or "") or f"recon-{row_id}"
             assistant_content = str(data.get("assistant_content") or "").strip()
             start_turn_id = str(data.get("turn_id") or "")
@@ -444,6 +453,28 @@ def _load_tool_exchanges(
             tool_params = {}
 
         result = _resolve_tool_result(cast(str, trace_row.event_type), data)
+
+        if data.get("settlement_delivery") and raw_call_id:
+            # The resumed outcome supersedes the pause observation for the SAME
+            # call. Overwrite that exchange's result in place rather than
+            # appending: a second exchange would replay one tool call to the
+            # planner twice, once "waiting for user" and once settled. Keeping
+            # the original sort_key/prose also preserves the call's position in
+            # the reconstructed transcript. Replaying the settlement is
+            # idempotent because it rewrites the same exchange.
+            superseded = next(
+                (
+                    exchange
+                    for exchange in reversed(exchanges)
+                    if exchange.call_id == raw_call_id
+                ),
+                None,
+            )
+            if superseded is not None:
+                superseded.result = result
+                continue
+            # No original exchange in this window: fall through and append, so
+            # the settled outcome reaches the planner rather than vanishing.
 
         # Dedup of prose repeated across a parallel tool-call batch happens
         # below, in final sort-key order -- not here. Trace rows are iterated

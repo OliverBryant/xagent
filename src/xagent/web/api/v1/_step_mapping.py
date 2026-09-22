@@ -230,6 +230,10 @@ class PublicStepProjector:
         # opted out of retention (see the class docstring): those steps
         # are still returned by ``feed``, they are just not kept after.
         self._finished: Optional[List[Dict[str, Any]]] = [] if retain_finished else None
+        # Where a settlement-reopened step sat in ``_finished``, so it can be
+        # put back there rather than at the tail (see
+        # ``_restore_settlement_position``).
+        self._settlement_reopen_index: Dict[Tuple[str, str], int] = {}
         # ``dag_plan_*`` has no per-plan identifier in the event data, so
         # we synthesize one by counting starts and remembering the
         # currently-open key. Replan in a single task (rare but legal)
@@ -290,6 +294,46 @@ class PublicStepProjector:
         steps = list(self._finished)
         steps.extend(self._pending.values())
         return steps
+
+    def _restore_settlement_position(self, key: Tuple[str, str]) -> None:
+        """Put a re-finalized settlement step back where its start-time belongs.
+
+        ``_finalize_pending`` appends, but this step was already in the
+        finished list at the position its ``started_at`` earned; the settlement
+        did not change that timestamp. Leaving it at the tail would break the
+        ``/v1/.../steps`` contract of "``started_at`` ascending", which the
+        endpoint documents and satisfies purely through insertion order.
+        """
+        index = self._settlement_reopen_index.pop(key, None)
+        if index is None or not self._finished:
+            return
+        self._finished.insert(index, self._finished.pop())
+
+    def _reopen_finished_step(
+        self, public_type: str, key: str
+    ) -> Optional[Dict[str, Any]]:
+        """Pull an already-finalized step back out of the finished history.
+
+        Used only by settlement delivery, which re-runs the start/end pair for
+        a call that already completed. Returning the SAME dict (rather than a
+        copy) is what keeps the public id stable and keeps the call to one
+        step: ``_finalize_pending`` re-appends this object when the settlement
+        end arrives. Returns ``None`` when there is nothing to re-open -- no
+        finished history (``retain_finished=False``), or a first-ever delivery
+        whose start was never seen -- and the caller then builds a fresh step.
+        """
+        if self._finished is None:
+            return None
+        for index in range(len(self._finished) - 1, -1, -1):
+            step = self._finished[index]
+            if (
+                step.get("type") == public_type
+                and step.get("id") == f"{public_type}:{key}"
+            ):
+                self._settlement_reopen_index[(public_type, key)] = index
+                del self._finished[index]
+                return step
+        return None
 
     def feed(self, event: Any) -> List[Dict[str, Any]]:
         """Fold one trace event, returning the step(s) it changed.
@@ -414,6 +458,24 @@ class PublicStepProjector:
                 return []
 
             if event_type == "tool_execution_start":
+                # A settlement lifecycle projects a resumed outcome onto a call
+                # that already finished (its pause pair closed it). Re-open the
+                # finished step under the same public id instead of building a
+                # second one: the END below then finalizes and re-appends that
+                # same object, so the call keeps exactly one PublicStep whose
+                # result is the settled one. Re-opening is also what makes a
+                # replayed settlement idempotent. With retain_finished=False
+                # (the SSE lane) there is no finished list to re-open from, and
+                # emitting the pair again under the same id is already an
+                # update for a client that folds by id.
+                reopened = (
+                    self._reopen_finished_step(public_type, str(key))
+                    if _data_get(event, "settlement_delivery")
+                    else None
+                )
+                if reopened is not None:
+                    self._pending[(public_type, str(key))] = reopened
+                    return [reopened]
                 step = _build_tool_start(
                     event,
                     public_type=public_type,
@@ -449,6 +511,8 @@ class PublicStepProjector:
                         }
                     ),
                 )
+                if finalized is not None:
+                    self._restore_settlement_position((public_type, str(key)))
                 return [finalized] if finalized is not None else []
             # tool_execution_failed: v2 runtime emits a dedicated failure
             # event (TraceCategory.TOOL + TraceAction.ERROR) instead of
@@ -467,6 +531,8 @@ class PublicStepProjector:
                     or "Tool execution failed"
                 },
             )
+            if finalized is not None:
+                self._restore_settlement_position((public_type, str(key)))
             return [finalized] if finalized is not None else []
 
         # ===== skill_select_*: surface as tool_call with skill name =====

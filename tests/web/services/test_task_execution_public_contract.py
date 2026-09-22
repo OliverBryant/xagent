@@ -85,6 +85,12 @@ EXPECTED_RESUME_PARAMETERS: list[tuple[str, Any]] = [
     ("delivery_already_dispatched", False),
     ("delivery_notifier", None),
     ("expected_run_id", None),
+    # Added by the MCP approval gate host wiring: the task row's own
+    # ``source``, so a resumed gated call is evaluated under the source it
+    # was gated for. Additive and defaulted, so the downstream keyword set
+    # below still binds unchanged; the downstream should start passing it
+    # once it has an authoritative row of its own to read.
+    ("trusted_task_source", None),
     ("resolved_execution_scope", EXECUTION_SCOPE_NOT_PROVIDED),
     ("preacquired_lease", None),
     ("preacquired_heartbeat_stop", None),

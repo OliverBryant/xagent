@@ -693,6 +693,11 @@ async def execute_channel_background(
 
     context: dict[str, Any] = {
         "turn_id": command.command_id,
+        # Server-owned execution identity: it selects this run's MCP approval
+        # registration. Taken from the task row this command was admitted
+        # against, matching what the websocket turn path and the three
+        # channel bots' direct path bind.
+        "task_source": snapshot.task.source,
         "files": payload.attachments
         or normalize_attachments_for_persistence(file_infos),
         "display_message": payload.transcript_message,

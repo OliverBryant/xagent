@@ -536,6 +536,10 @@ class SlackBotInstance:
             )
             if setup_snapshot is None:
                 raise RuntimeError(f"Task {task_id} disappeared before execution")
+            # Server-owned execution identity: it selects this run's MCP
+            # approval registration, so it is read from the task row and
+            # never from the inbound chat event.
+            task_row_source = setup_snapshot.task.source
 
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
@@ -560,6 +564,10 @@ class SlackBotInstance:
 
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
+            # The shared-turn executor does not carry this dict at all: it
+            # binds the same value from its own snapshot in
+            # ``shared_channel_execution.execute_channel_background``.
+            context["task_source"] = task_row_source
             display_message = text
             execution_text = prompt_text
             persisted_attachments: list[dict[str, Any]] = []

@@ -1907,10 +1907,26 @@ async def execute_task_background(
             # Execute the next turn under the same task/thread id.
             actual_task_id = str(task_id)
             task_for_agent = llm_user_message or user_message
+            # ``task_source`` and ``run_id`` are server-owned execution
+            # identities: the first selects the MCP approval registration,
+            # the second names the lease an approval is recorded under. This
+            # context is caller supplied, so both keys are overwritten rather
+            # than defaulted -- a client must not be able to relabel its task
+            # into (or out of) another source's approval policy, nor claim a
+            # different execution lease.
+            agent_context = dict(context_dict)
+            agent_context["task_source"] = snapshot.task.source
+            turn_run_id = (
+                task_lease.run_id if task_lease is not None else expected_run_id
+            )
+            if turn_run_id is not None:
+                agent_context["run_id"] = turn_run_id
+            else:
+                agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
                 task=task_for_agent,
-                context=context,
+                context=agent_context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
                 db_session=None,
@@ -2457,6 +2473,13 @@ async def execute_resume_background(
     # forgets to pass its own run id would silently claim a lease under a
     # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
+    # The task row's own ``source``, read by the caller that already holds an
+    # authoritative row for this task. It is overlaid onto the restored
+    # checkpoint metadata so a resumed MCP approval is evaluated under the
+    # source it was gated for. ``None`` means "this caller has no trusted
+    # value", never "this task has no source": the runner's overlay ignores a
+    # None and keeps whatever the checkpoint carries.
+    trusted_task_source: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -2847,7 +2870,13 @@ async def execute_resume_background(
             bind_task_lease_context(lease),
         ):
             result = await run_while_task_lease_owned(
-                agent_service.resume_execution_by_id(str(task_id)),
+                agent_service.resume_execution_by_id(
+                    str(task_id),
+                    metadata={
+                        "task_source": trusted_task_source,
+                        "run_id": lease.run_id,
+                    },
+                ),
                 lease_heartbeat_task,
             )
 

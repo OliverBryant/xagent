@@ -34,7 +34,7 @@ from .config import (
     normalize_tool_allowlist,
     run_with_tool_runtime_cleanup,
 )
-from .connector_runtime import ConnectorRuntimeError
+from .connector_runtime import ConnectorRef, ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
 
@@ -989,6 +989,29 @@ class ToolFactory:
             kwargs["message"] = message
         return UnavailableMCPTool(**kwargs)
 
+    @staticmethod
+    def _mcp_connector_refs(
+        configs_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, ConnectorRef]:
+        """Persisted connector identity per MCP server name.
+
+        The approval gate needs the authoritative persisted server id, which
+        the transport mapping handed to the loader deliberately does not
+        carry (a sandbox guest must never receive host authorization
+        identity). Both loader seams below build the mapping here so they
+        cannot drift apart, and so the bool-safe positive-int check exists
+        once: ``bool`` is an ``int`` subclass, and ``True`` would otherwise
+        become connector id 1 -- some other tenant's server.
+        """
+
+        refs: dict[str, ConnectorRef] = {}
+        for server_name, config in configs_by_name.items():
+            server_id = config.get("id")
+            if type(server_id) is not int or server_id <= 0:
+                continue
+            refs[server_name] = ConnectorRef("mcp", server_id)
+        return refs
+
     @classmethod
     def _unavailable_mcp_tools_from_load_failures(
         cls,
@@ -1208,6 +1231,9 @@ class ToolFactory:
                     if connections:
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
+                            connector_refs=ToolFactory._mcp_connector_refs(
+                                configs_by_name
+                            ),
                             sandbox=sandbox,
                         )  # type: ignore[arg-type]
                         normal_tools.extend(load_result.tools)
@@ -1348,7 +1374,10 @@ class ToolFactory:
 
             # Load MCP tools
             try:
-                load_result = await load_mcp_tools_as_agent_tools(connections)
+                load_result = await load_mcp_tools_as_agent_tools(
+                    connections,
+                    connector_refs=ToolFactory._mcp_connector_refs(configs_by_name),
+                )
             except ConnectorRuntimeError:
                 raise
             except Exception as e:

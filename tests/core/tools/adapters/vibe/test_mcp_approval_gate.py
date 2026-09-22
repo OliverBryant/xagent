@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -650,6 +651,13 @@ def test_gated_interaction_id_round_trips_any_registered_source(
         "xgate:nope:slack",
         "xgate:99:slack",
         "xgate::slack",
+        # Numeric-but-not-decimal: str.isdigit() accepts these, int() does not.
+        # Parsing must reject them, never raise - this helper runs outside any
+        # try in resume_user_interaction, and ReAct invokes that callback
+        # outside its own rollback block, so a raise here would strand the
+        # pending entry and wedge the task forever.
+        "xgate:²:slackfoo",
+        "xgate:⁵:slackfoo",
     ],
 )
 def test_ids_this_wrapper_did_not_issue_are_not_treated_as_gated(
@@ -691,10 +699,23 @@ async def test_resume_hands_the_host_back_its_own_interaction_id(
 
 
 @pytest.mark.asyncio
-async def test_external_cancellation_does_not_leave_a_write_detached(
-    registrations: list[Any],
+@pytest.mark.parametrize("cancel_delay", [0, 0.001, 0.01])
+async def test_external_cancellation_does_not_kill_an_in_flight_write(
+    registrations: list[Any], cancel_delay: float
 ) -> None:
-    """A cancelled resume must not abandon an in-flight connector write."""
+    """A cancelled resume must not abandon OR interrupt a dispatched write.
+
+    The delay is the whole point. At ``cancel_delay=0`` the gate has not yet
+    parked on its post-dispatch await, so the cancellation lands somewhere
+    harmless and the ``finally`` drain runs. Give the loop even one extra turn
+    and the gate is sitting in ``return await asyncio.shield(hook_task)`` -
+    which is the realistic shape of a task cancel or lease loss arriving while
+    the connector RPC is in flight. Unshielded, the cancel tore straight into
+    the host hook inside ``await executor(...)``, leaving ``hook_task`` already
+    done-and-cancelled by the time the ``finally`` ran, so the bounded drain
+    and its warning were skipped entirely and the write died mid-RPC with no
+    settlement and no log line.
+    """
 
     started = asyncio.Event()
     landed = asyncio.Event()
@@ -722,14 +743,113 @@ async def test_external_cancellation_does_not_leave_a_write_detached(
 
     task = asyncio.ensure_future(run())
     await started.wait()
+    if cancel_delay:
+        await asyncio.sleep(cancel_delay)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     # The drain observed the dispatched write to completion inside the
-    # cancelled frame rather than leaving it running unobserved.
+    # cancelled frame rather than killing it or leaving it unobserved.
     assert landed.is_set()
     assert target.calls == [{"text": "ok"}]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_drain(
+    registrations: list[Any], monkeypatch: Any, caplog: Any
+) -> None:
+    """The bounded drain gives up loudly instead of hanging the cancellation."""
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate."
+        "_POST_DISPATCH_DRAIN_SECONDS",
+        0.05,
+    )
+    started = asyncio.Event()
+
+    class HangingTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            started.set()
+            await asyncio.sleep(30)
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=30)
+    target = HangingTarget()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def run() -> Any:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            )
+
+    task = asyncio.ensure_future(run())
+    await started.wait()
+    await asyncio.sleep(0.01)
+    with caplog.at_level(logging.WARNING):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    # Cancellation completed (it was not blocked forever by the hung RPC)...
+    assert task.cancelled()
+    # ...and the unobservable write was reported rather than silently dropped.
+    assert any("may still land" in record.message for record in caplog.records), [
+        record.message for record in caplog.records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_before_dispatch_still_cancels_the_hook_promptly(
+    registrations: list[Any],
+) -> None:
+    """Shielding the post-dispatch await must not keep a policy hook alive.
+
+    Guards the other half of the branch: pre-dispatch there is no external
+    effect to preserve, so the hook is cancelled and drained rather than
+    shielded, and the executor is never entered.
+    """
+
+    started = asyncio.Event()
+    outcome: list[str] = []
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        started.set()
+        try:
+            # Policy work only: the executor is never awaited, so
+            # dispatch_started stays clear.
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            outcome.append("hook-cancelled")
+            raise
+        outcome.append("hook-finished")
+        return ToolInteractionSettlement.succeeded({"success": True})
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=30)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def run() -> Any:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            )
+
+    task = asyncio.ensure_future(run())
+    await started.wait()
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert outcome == ["hook-cancelled"]
+    assert target.calls == []
 
 
 def test_registration_is_scoped_and_not_last_writer_wins(

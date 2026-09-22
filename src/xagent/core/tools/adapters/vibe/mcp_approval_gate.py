@@ -313,16 +313,27 @@ def _gated_interaction_source(interaction_id: str) -> tuple[str, str] | None:
     """Recover ``(task_source, host_interaction_id)`` from a gated id.
 
     Returns ``None`` for any id this wrapper did not issue, which is what
-    keeps a never-gated interaction on the legacy resume path.
+    keeps a never-gated interaction on the legacy resume path. This function
+    parses untrusted-shaped input and must never raise: it is called at the top
+    of ``resume_user_interaction``, outside any try, and ReAct invokes that
+    callback outside its own rollback block, so an exception here would escape
+    ``_deliver_pending_tool_interaction_responses`` with the pending entry
+    un-popped - i.e. a permanently stuck task.
     """
 
     parts = interaction_id.split(_GATED_INTERACTION_SEPARATOR, 2)
     if len(parts) != 3 or parts[0] != _GATED_INTERACTION_PREFIX:
         return None
     _, raw_length, payload = parts
-    if not raw_length.isdigit():
+    # ``isdecimal`` rather than ``isdigit``: the latter accepts superscripts
+    # and other numeric-but-not-decimal code points ("²".isdigit() is True)
+    # that int() then rejects with ValueError.
+    if not raw_length.isdecimal():
         return None
-    length = int(raw_length)
+    try:
+        length = int(raw_length)
+    except ValueError:  # pragma: no cover - belt and braces behind isdecimal
+        return None
     if length <= 0 or length > len(payload):
         return None
     return payload[:length], payload[length:]
@@ -378,7 +389,26 @@ async def _call_resume_hook(
     /,
     **kwargs: Any,
 ) -> Any:
-    """Bound only pre-dispatch resume policy; never cancel a started write."""
+    """Bound only pre-dispatch resume policy; never cancel a started write.
+
+    Cancellation semantics, post-dispatch
+    -------------------------------------
+    Once the host has entered the executor, this function's job is to make sure
+    the connector write is *observed*, not to keep the caller alive. An external
+    cancellation that arrives after dispatch therefore still propagates: the
+    drained hook's settlement, if it produced one, is deliberately **discarded**
+    and ``CancelledError`` is re-raised, so a write that demonstrably completed
+    is rolled back to "pending" from the runtime's point of view.
+
+    That is the correct trade. The caller is being torn down (task cancel, lease
+    loss); there is no longer a ledger to project a settlement onto, and
+    smuggling a return value out of a cancelled frame would suppress the
+    cancellation the host asked for. Correctness on replay comes from
+    idempotency instead: the host resume hook must persist its EXECUTING /
+    dispatch marker *before* awaiting the executor - which the module docstring
+    already requires - so a later replay recognizes the in-flight attempt rather
+    than issuing a second write.
+    """
 
     returned = _ensure_awaitable(hook(**kwargs))
 
@@ -397,7 +427,18 @@ async def _call_resume_hook(
             # no longer approval-policy latency and must not be cancelled by
             # the short gate deadline: cancellation cannot prove a remote
             # write did not commit.
-            return await hook_task
+            #
+            # SHIELDED, and that is load-bearing. A bare ``await hook_task``
+            # here is the frame an external cancel lands on while the write is
+            # in flight: it would tear straight through into ``hook_task``,
+            # killing the host hook inside ``await executor(...)`` mid-RPC.
+            # ``hook_task`` would then already be done-and-cancelled by the
+            # time the ``finally`` runs, so the bounded drain and its warning
+            # below would be skipped entirely - the write interrupted with no
+            # settlement and no log line. The shield lets the cancellation
+            # unwind to the ``finally`` with the task still alive, which is
+            # the only state in which that drain can do its job.
+            return await asyncio.shield(hook_task)
 
         hook_task.cancel()
         await _drain(hook_task)

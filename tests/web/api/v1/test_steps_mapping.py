@@ -1842,3 +1842,227 @@ def test_two_full_rounds_interrupted_then_failed_close_independently():
     assert round_one_step["completed_at"] is None
     assert round_two_step["status"] == "failed"
     assert round_two_step["completed_at"] is not None
+
+
+def test_settlement_delivery_updates_the_original_tool_step() -> None:
+    """A resumed settlement must not create a second PublicStep (#2256).
+
+    The pause pair already produced ``tool_call:<id>``; the settlement pair
+    reuses that same ``tool_call_id`` under a fresh step id. Before settlement
+    delivery was made an update, the batch lane returned two steps sharing one
+    public id.
+    """
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "tool_params": {"text": "publish"},
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "status": "waiting_for_user",
+                "result": {"message": "Publish this?"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True, "post_urn": "urn:li:share:123"},
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+    tool_steps = [step for step in steps if step["type"] == "tool_call"]
+
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["id"] == "tool_call:call-1"
+    assert tool_steps[0]["status"] == "completed"
+    # The settled result supersedes the pause observation.
+    assert tool_steps[0]["data"]["result"] == {
+        "success": True,
+        "post_urn": "urn:li:share:123",
+    }
+    # The original start metadata survives the update: the settlement start
+    # carries no tool_params, so these can only have come from the pause start.
+    assert tool_steps[0]["data"]["name"] == "approval_gate"
+    assert tool_steps[0]["data"]["args"] == {"text": "publish"}
+
+
+def test_replayed_settlement_delivery_stays_one_step() -> None:
+    """The run-start repair pass may deliver the same pair twice."""
+
+    settlement = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        ),
+    ]
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "call-1"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "status": "waiting_for_user",
+                "result": {"message": "Publish this?"},
+            },
+        ),
+        *settlement,
+        *settlement,
+    ]
+
+    tool_steps = [
+        step
+        for step in map_trace_events_to_public_steps(events)
+        if step["type"] == "tool_call"
+    ]
+
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["data"]["result"] == {"success": True}
+
+
+def test_settlement_without_an_original_start_still_surfaces() -> None:
+    """A truncated query window must not swallow the settled outcome."""
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "orphan",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "orphan",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        ),
+    ]
+
+    tool_steps = [
+        step
+        for step in map_trace_events_to_public_steps(events)
+        if step["type"] == "tool_call"
+    ]
+
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["status"] == "completed"
+
+
+def test_settlement_delivery_preserves_started_at_ordering() -> None:
+    """The settled step keeps its chronological slot, not the tail.
+
+    ``/v1/tasks/{id}/steps`` documents "steps array in started_at ascending
+    order" and satisfies it purely through insertion order. A settlement does
+    not change the call's ``started_at``, so re-finalizing it must not move it
+    behind steps that started later.
+    """
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "call-1"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "result": {"message": "Publish?"},
+            },
+        ),
+        # A later, unrelated call completes before the resume arrives.
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "search", "tool_call_id": "call-2"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={"tool_name": "search", "tool_call_id": "call-2", "result": {"h": 1}},
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+    tool_ids = [step["id"] for step in steps if step["type"] == "tool_call"]
+
+    assert tool_ids == ["tool_call:call-1", "tool_call:call-2"]
+    started = [step["started_at"] for step in steps if step["type"] == "tool_call"]
+    assert started == sorted(started)

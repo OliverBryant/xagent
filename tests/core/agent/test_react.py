@@ -7870,7 +7870,10 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
     assert record.result["success"] is False
     assert record.result["settlement_status"] == status
     guarded = status in {"rejected", "dispatch_unknown"}
-    assert pattern.force_final_answer_next is guarded
+    # Only the settlement-owned fence is raised. The shared
+    # force_final_answer_next is deliberately left alone: it outlives the turn
+    # and would lock the next unrelated request out of its tools.
+    assert pattern.force_final_answer_next is False
     assert pattern.settlement_final_answer_fence is guarded
     assert pattern.settlement_fence_turn_id == ("approval-turn" if guarded else None)
     assert pattern._consecutive_successful_tool_group_count("approval_gate") == 0
@@ -8074,9 +8077,9 @@ async def test_terminal_settlement_keeps_the_batch_final_answer_fence(
         context=context,
         runtime=runtime,
     )
-    assert pattern.force_final_answer_next is True
     assert pattern.settlement_final_answer_fence is True
     assert pattern.settlement_fence_turn_id == "approval-turn"
+    assert pattern.force_final_answer_next is False
 
     # The successful sibling still settled correctly on its own row and in the
     # transcript; the fence is turn-wide, not a per-row veto.
@@ -8343,15 +8346,18 @@ async def test_settlement_fence_does_not_outlive_its_turn(exit_kind: str) -> Non
             "requests": [],
             "interactions": [],
         }
-    # Whatever the exit route, the flag is still latched on the pattern.
+    # Whatever the exit route, the fence is still latched on the pattern, and
+    # no shared flag was co-latched with it. Nothing is reset by hand below:
+    # resetting force_final_answer_next here would mask the very production
+    # path this test exists to cover.
     assert pattern.settlement_final_answer_fence is True
+    assert pattern.force_final_answer_next is False
 
     # A brand-new user turn must get its tools back.
     next_context = ExecutionContext(execution_id=f"fence-exit-{exit_kind}-next")
     next_context.add_user_message("Now compute 2+2.", metadata={"turn_id": "next-turn"})
     pattern.status = "idle"
     pattern.waiting_for_user_request = None
-    pattern.force_final_answer_next = False
     pattern.max_iterations = 3
     next_tool = WorkTool()
     next_llm = FakeLLM(
@@ -8387,10 +8393,15 @@ async def test_settlement_fence_does_not_outlive_its_turn(exit_kind: str) -> Non
     result = await pattern.run(context=next_context, tools=[next_tool], llm=next_llm)
 
     assert result["success"] is True
-    assert next_tool.calls == 1
+    # The very first call of the new turn must already carry the work tools:
+    # a narrowed first schema would be the bug even if a later protocol-retry
+    # recovery handed them back.
     assert "calculator" in [
         schema["function"]["name"] for schema in next_llm.calls[0]["tools"]
     ]
+    # And the work actually ran, rather than the model being steered into a
+    # tool-free final answer.
+    assert next_tool.calls == 1
     assert pattern.settlement_final_answer_fence is False
     assert pattern.settlement_fence_turn_id is None
 
@@ -11029,3 +11040,132 @@ def test_react_get_state_is_unaffected_by_later_pop() -> None:
     assert [
         entry["interaction_id"] for entry in state["pending_tool_interaction_responses"]
     ] == ["i1", "i2"]
+
+
+@pytest.mark.asyncio
+async def test_settlement_trace_lost_to_a_crash_is_replayed_at_run_start() -> None:
+    """The checkpoint->trace gap must not lose the lifecycle permanently.
+
+    The pair is emitted only after the settlement checkpoint is durable, so a
+    crash in between leaves a terminal ledger row whose trace still reads
+    waiting_for_user, with the pending entry already popped. The run-start
+    repair pass re-emits it straight from the durable row.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="settlement-crash")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    crashed_tracer = TraceEventRecorder()
+    crashed_runtime = PatternRuntime(
+        execution_id="settlement-crash", tracer=crashed_tracer
+    )
+    crashed_runtime.active_turn_id = "approval-turn"
+
+    async def cancel_in_the_gap(**_: Any) -> None:
+        raise asyncio.CancelledError("worker cancelled after checkpoint")
+
+    pattern._trace_tool_interaction_settlement = cancel_in_the_gap  # type: ignore[assignment]
+    with pytest.raises(asyncio.CancelledError):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[
+                SettlementApprovalTool(
+                    resume_result=ToolInteractionSettlement.succeeded(
+                        {"success": True, "post_urn": "urn:li:share:123"}
+                    )
+                )
+            ],
+            context=context,
+            runtime=crashed_runtime,
+        )
+
+    # The settlement is durable, the queue is drained, and no trace reached
+    # the consumer: the exact divergence the repair pass exists for.
+    state = pattern.get_state()
+    assert state["tool_ledger"]["call-1"]["settlement_status"] == "succeeded"
+    assert state["pending_tool_interaction_responses"] == []
+    assert _settlement_trace_events(crashed_tracer, "call-1") == []
+
+    # Restore from that durable state in a fresh process and run.
+    restored = ReActPattern(max_iterations=1)
+    restored.load_state(state)
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="settlement-crash", tracer=tracer)
+
+    await restored._replay_unemitted_settlement_traces(runtime=runtime)
+
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    settlement_end = next(
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
+        and event["event_type"] == "action_end_tool"
+    )
+    assert settlement_end["data"]["settlement_delivery"] is True
+    assert settlement_end["data"]["settlement_status"] == "succeeded"
+    assert settlement_end["data"]["result"] == {
+        "success": True,
+        "post_urn": "urn:li:share:123",
+    }
+
+    # Idempotent: a second pass in the same process re-emits nothing.
+    await restored._replay_unemitted_settlement_traces(runtime=runtime)
+    assert len(_settlement_trace_events(tracer, "call-1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_normally_delivered_settlement_is_not_replayed() -> None:
+    """The repair pass must stay silent when the normal path already emitted."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="settlement-no-replay")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="settlement-no-replay", tracer=tracer)
+    runtime.active_turn_id = "approval-turn"
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+
+    await pattern._replay_unemitted_settlement_traces(runtime=runtime)
+
+    assert len(_settlement_trace_events(tracer, "call-1")) == 2

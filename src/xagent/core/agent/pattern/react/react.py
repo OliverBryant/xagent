@@ -578,6 +578,11 @@ class ReActPattern(AgentPattern):
         # that received a rejected / dispatch-unknown settlement.
         self.settlement_final_answer_fence = False
         self.settlement_fence_turn_id: str | None = None
+        # (tool_call_id, settlement_turn_id) pairs whose settlement trace
+        # lifecycle this process has already emitted. Process-local on
+        # purpose and never checkpointed -- see
+        # _replay_unemitted_settlement_traces.
+        self._emitted_settlement_traces: set[tuple[str, str]] = set()
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.pending_tool_interaction_responses: list[dict[str, str]] = []
@@ -679,6 +684,11 @@ class ReActPattern(AgentPattern):
                 context=context,
                 runtime=runtime,
             )
+            # Repair any settlement whose trace lifecycle was lost between its
+            # durable checkpoint and its emission. Runs after delivery so a
+            # settlement completed in this very pass is already marked emitted
+            # and is not re-sent.
+            await self._replay_unemitted_settlement_traces(runtime=runtime)
             result = await self._run_tool_calling_loop(
                 context=context,
                 tools=context_tools,
@@ -2374,14 +2384,19 @@ class ReActPattern(AgentPattern):
                         "external outcome is unknown and automatic retry is disabled."
                     )
                 )
-            settled = isinstance(resumed, ToolInteractionSettlement)
+            # One isinstance for the whole delivery, bound as a narrowed value
+            # rather than a bool so every use below is checked against the
+            # settlement type instead of silently falling back to ``Any``.
+            settlement = (
+                resumed if isinstance(resumed, ToolInteractionSettlement) else None
+            )
 
             popped = False
             try:
-                if settled:
+                if settlement is not None:
                     self._project_tool_interaction_settlement(
                         record=record,
-                        settlement=resumed,
+                        settlement=settlement,
                         context=context,
                         runtime=runtime,
                     )
@@ -2400,7 +2415,9 @@ class ReActPattern(AgentPattern):
                         "tool_name": tool_name,
                         "tool_call_id": pending.get("tool_call_id", ""),
                         "interaction_id": pending.get("interaction_id", ""),
-                        "settlement_status": resumed.status if settled else None,
+                        "settlement_status": (
+                            settlement.status if settlement is not None else None
+                        ),
                     },
                 )
             except BaseException:
@@ -2413,10 +2430,15 @@ class ReActPattern(AgentPattern):
                 if popped:
                     self.pending_tool_interaction_responses.insert(0, pending)
                 raise
-            if settled:
+            if settlement is not None:
+                # Read back the row the projection just wrote, so the trace
+                # reports exactly what was made durable.
+                settled_record = self.tool_ledger.get(record.tool_call_id, record)
                 await self._trace_tool_interaction_settlement(
-                    record=record,
-                    settlement=resumed,
+                    record=settled_record,
+                    status=settlement.status,
+                    result=settled_record.result,
+                    error=settled_record.error,
                     runtime=runtime,
                 )
 
@@ -2539,9 +2561,12 @@ class ReActPattern(AgentPattern):
             if popped:
                 self.pending_tool_interaction_responses.insert(0, pending)
             raise
+        settled_record = self.tool_ledger.get(record.tool_call_id, record)
         await self._trace_tool_interaction_settlement(
-            record=record,
-            settlement=settlement,
+            record=settled_record,
+            status=settlement.status,
+            result=settled_record.result,
+            error=settled_record.error,
             runtime=runtime,
         )
 
@@ -2576,7 +2601,9 @@ class ReActPattern(AgentPattern):
         self,
         *,
         record: ToolCallRecord,
-        settlement: ToolInteractionSettlement,
+        status: str,
+        result: Any,
+        error: str | None,
         runtime: PatternRuntime,
     ) -> None:
         """Emit a paired lifecycle after the settlement is durably checkpointed.
@@ -2592,19 +2619,24 @@ class ReActPattern(AgentPattern):
         mirrors what ``PatternRuntime.on_tool_start`` / ``on_tool_end`` /
         ``on_tool_error`` write, and the ``settlement_delivery`` marker lets
         consumers tell a settlement pair from an execution pair.
+
+        Takes the settled values as primitives rather than a
+        ``ToolInteractionSettlement`` so the run-start repair pass
+        (``_replay_unemitted_settlement_traces``) can emit the identical pair
+        straight from the durable ledger row, without reconstructing — and
+        re-validating — a settlement object it did not produce.
         """
 
         tracer = getattr(runtime, "tracer", None)
         trace_event = getattr(tracer, "trace_event", None)
         if not callable(trace_event):
             return
-        result = settlement.projected_result()
-        succeeded = settlement.status == "succeeded"
+        succeeded = status == "succeeded"
         base: dict[str, Any] = {
             "tool_name": record.tool_name,
             "tool_call_id": record.tool_call_id,
             "settlement_delivery": True,
-            "settlement_status": settlement.status,
+            "settlement_status": status,
         }
         turn_id = getattr(runtime, "active_turn_id", None)
         if turn_id:
@@ -2622,8 +2654,7 @@ class ReActPattern(AgentPattern):
             }
         else:
             error_message = str(
-                settlement.error
-                or (result.get("error") if isinstance(result, dict) else result)
+                error or (result.get("error") if isinstance(result, dict) else result)
             )
             end_type = TraceEventType(
                 TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL
@@ -2648,6 +2679,49 @@ class ReActPattern(AgentPattern):
             runtime=runtime,
             data=end_data,
         )
+        self._emitted_settlement_traces.add(
+            (record.tool_call_id, record.settlement_turn_id or "")
+        )
+
+    async def _replay_unemitted_settlement_traces(
+        self, *, runtime: PatternRuntime
+    ) -> None:
+        """Re-emit settlement lifecycles this process has not delivered yet.
+
+        The normal path emits the pair only after the settlement checkpoint is
+        durable, so that a settlement rolled back by a failed checkpoint is
+        never shown as final. The cost of that ordering is a window: a crash or
+        cancellation between the checkpoint and the emission leaves a durably
+        terminal ledger row whose trace still reads ``waiting_for_user``, with
+        the pending entry already popped, so nothing would ever deliver it.
+
+        This pass closes that window from the durable ledger itself -- the
+        settled row *is* the marker, so no extra persisted field and no second
+        checkpoint are needed. ``_emitted_settlement_traces`` is process-local
+        and deliberately not checkpointed: a restored pattern starts with it
+        empty, which is exactly when a replay is owed. Consumers treat a
+        settlement pair as an in-place update keyed by ``tool_call_id``, so a
+        pair delivered twice collapses onto one action.
+
+        The trade-off is that a restart re-emits one pair per settled call in
+        the ledger, not only the one that was lost. That is display-neutral
+        given idempotent consumers and bounded by the ledger size, and it buys
+        not having to persist per-record trace bookkeeping.
+        """
+
+        for record in list(self.tool_ledger.values()):
+            if not record.settlement_status:
+                continue
+            key = (record.tool_call_id, record.settlement_turn_id or "")
+            if key in self._emitted_settlement_traces:
+                continue
+            await self._trace_tool_interaction_settlement(
+                record=record,
+                status=record.settlement_status,
+                result=record.result,
+                error=record.error,
+                runtime=runtime,
+            )
 
     @staticmethod
     async def _emit_settlement_trace_event(
@@ -2795,8 +2869,15 @@ class ReActPattern(AgentPattern):
         # a pair; the fine half is the turn-scoped duplicate-write guard in
         # _suppressed_duplicate_write_result, which blocks the one exact write
         # even when the model is allowed to call tools at all.
+        #
+        # Deliberately NOT also setting the shared ``force_final_answer_next``:
+        # the run loop ORs this fence into its decision directly, so the shared
+        # flag would add nothing inside the turn, while its other writers and
+        # its own durability would carry it past the turn -- expiry here only
+        # clears the settlement-owned fields, so a fenced turn that exits via
+        # max_iterations, an interrupt, protocol exhaustion or a second pause
+        # would leave the next unrelated turn locked to final_answer only.
         if settlement.status in _GUARDED_SETTLEMENT_STATUSES:
-            self.force_final_answer_next = True
             self.settlement_final_answer_fence = True
             self.settlement_fence_turn_id = (
                 str(settlement_turn_id) if settlement_turn_id else None

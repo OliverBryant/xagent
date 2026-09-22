@@ -2473,13 +2473,6 @@ async def execute_resume_background(
     # forgets to pass its own run id would silently claim a lease under a
     # run nobody else knows about instead of failing loudly.
     expected_run_id: str | None = None,
-    # The task row's own ``source``, read by the caller that already holds an
-    # authoritative row for this task. It is overlaid onto the restored
-    # checkpoint metadata so a resumed MCP approval is evaluated under the
-    # source it was gated for. ``None`` means "this caller has no trusted
-    # value", never "this task has no source": the runner's overlay ignores a
-    # None and keeps whatever the checkpoint carries.
-    trusted_task_source: str | None = None,
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
@@ -2487,6 +2480,18 @@ async def execute_resume_background(
     preacquired_heartbeat_stop: asyncio.Event | None = None,
     preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
     preacquired_prior_status: TaskStatus | None = None,
+    # Appended, never inserted: this function has no ``*`` separator and a
+    # downstream caller (xagent-saas ``external_input_dispatch``) binds it by
+    # keyword against a pinned parameter order, so a new parameter goes last
+    # or it shifts every positional slot after it.
+    #
+    # The task row's own ``source``, read by the caller that already holds an
+    # authoritative row for this task. It is overlaid onto the restored
+    # checkpoint metadata so a resumed MCP approval is evaluated under the
+    # source it was gated for. ``None`` means "this caller has no trusted
+    # value", never "this task has no source": the runner's overlay ignores a
+    # None and keeps whatever the checkpoint carries.
+    trusted_task_source: str | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 

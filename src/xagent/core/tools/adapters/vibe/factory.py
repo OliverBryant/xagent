@@ -1068,6 +1068,7 @@ class ToolFactory:
         """Create MCP tools while keeping actor session identity host-only."""
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_approval_gate import gate_mcp_tools
 
             unavailable_tools: list[Tool] = []
             normal_configs: list[dict[str, Any]] = []
@@ -1206,7 +1207,21 @@ class ToolFactory:
                                 session_identity=identity,
                                 sandbox=sandbox,
                             )
-                            normal_tools.extend(consumed_tools)
+                            # This consumer bypasses the generic MCP loader
+                            # (it binds a host-only execution scope), so the
+                            # loader's gate wrapping never sees these tools.
+                            # They are ordinary dispatchable MCP adapters, so
+                            # the wrapping has to happen here instead -- with
+                            # the same persisted connector identity the
+                            # loader route carries.
+                            normal_tools.extend(
+                                gate_mcp_tools(
+                                    consumed_tools,
+                                    connector_ref=ToolFactory._mcp_connector_refs(
+                                        {server_name: configs_by_name[server_name]}
+                                    ).get(server_name),
+                                )
+                            )
                         except ConnectorRuntimeError:
                             raise
                         except Exception as exc:

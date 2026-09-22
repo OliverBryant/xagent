@@ -1,24 +1,40 @@
-"""Every channel turn binds the task row's ``source`` into its agent context.
+"""Every channel turn binds the row's ``source`` AND its ``run_id``.
 
-``task_source`` is the key the MCP approval gate selects a registration by
-(``mcp_approval_gate``'s module docstring: an unregistered or absent source is
-not gated, so a host that forgets to bind it simply gets no approval prompt).
+``task_source`` is the key the MCP approval gate selects a registration by,
+and ``run_id`` is part of the execution identity that registration then
+requires: ``ToolCallExecutionContext.is_complete()`` is false without it, and
+a registered source presenting an incomplete identity is refused before
+dispatch. Binding only the source would therefore turn a registration on that
+source into a hard outage on these paths -- strictly worse than leaving them
+unbound, where the call simply passes through ungated.
+
 The three chat bots build their own ``context`` dict and call
 ``AgentService.execute_task`` directly, bypassing the WebSocket turn path that
-binds it, so each one has to bind it itself -- from the task row it already
-loaded, never from the inbound chat event.
+binds the pair, so each binds it itself: the source from the task row it
+already loaded, the run id from the lease it already holds -- never from the
+inbound chat event. Their shared-turn path does not carry these dicts at all;
+it rebuilds one in ``execute_channel_background``, covered at the bottom.
 
-The shared-turn path does not carry these dicts at all: it re-builds one in
-``shared_channel_execution.execute_channel_background`` and is covered there.
+On ``source`` values: no production row carries "slack"/"telegram"/"feishu".
+Bot-created tasks fall to the ``Task.source`` column default "internal", the
+same value the web UI gets (``channel_runtime`` and ``task_command_execution``
+both construct ``Task(...)`` without ``source=``). A host that wants to gate
+only its own flow has to stamp a distinct source on the tasks it creates, so
+these tests use "internal" plus a host-stamped value rather than a channel
+name that does not exist.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import BaseModel
+
+from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
 
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.slack.bot import SlackBotInstance
@@ -73,6 +89,14 @@ def _agent_manager(contexts: list[Any], service: Any) -> Any:
     return FakeAgentManager()
 
 
+# The two shapes a real row can present to this binding: the column default
+# every bot-created task gets, and a source a host stamped itself (the only
+# way to single out one tenant flow, since "internal" also covers the web UI).
+# ``None`` is the legacy-row case, where the binding must still not fabricate
+# a value.
+_SOURCE_CASES = ["internal", "toby-slack", None]
+
+
 class _FakeManagedLease:
     heartbeat_task = None
 
@@ -86,11 +110,14 @@ class _FakeManagedLease:
         return True
 
 
-@pytest.mark.parametrize("source", ["slack", None])
-@pytest.mark.asyncio
-async def test_slack_turn_binds_the_task_rows_source(
-    monkeypatch: pytest.MonkeyPatch, source: str | None
-) -> None:
+async def _drive_slack_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str | None,
+    *,
+    run_id: str | None = "run-a",
+) -> list[Any]:
+    """Run one real Slack turn and return the context dicts it forwarded."""
+
     bot = object.__new__(SlackBotInstance)
     bot.channel_id = 7
     bot.channel_name = "Support Slack"
@@ -105,7 +132,7 @@ async def test_slack_turn_binds_the_task_rows_source(
     bot._save_active_tasks = lambda: None
 
     managed = _FakeManagedLease(
-        TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
+        TaskLease(task_id=45, runner_id="runner-a", run_id=run_id)
     )
     contexts: list[Any] = []
     service = _agent_service()
@@ -151,12 +178,22 @@ async def test_slack_turn_binds_the_task_rows_source(
             "text": "hello",
         },
     )
+    return contexts
+
+
+@pytest.mark.parametrize("source", _SOURCE_CASES)
+@pytest.mark.asyncio
+async def test_slack_turn_binds_the_task_rows_source(
+    monkeypatch: pytest.MonkeyPatch, source: str | None
+) -> None:
+    contexts = await _drive_slack_turn(monkeypatch, source)
 
     assert len(contexts) == 1
     assert contexts[0]["task_source"] == source
+    assert contexts[0]["run_id"] == "run-a"
 
 
-@pytest.mark.parametrize("source", ["telegram", None])
+@pytest.mark.parametrize("source", _SOURCE_CASES)
 @pytest.mark.asyncio
 async def test_telegram_turn_binds_the_task_rows_source(
     monkeypatch: pytest.MonkeyPatch, source: str | None
@@ -245,9 +282,10 @@ async def test_telegram_turn_binds_the_task_rows_source(
 
     assert len(contexts) == 1
     assert contexts[0]["task_source"] == source
+    assert contexts[0]["run_id"] == "run-a"
 
 
-@pytest.mark.parametrize("source", ["feishu", None])
+@pytest.mark.parametrize("source", _SOURCE_CASES)
 @pytest.mark.asyncio
 async def test_feishu_turn_binds_the_task_rows_source(
     monkeypatch: pytest.MonkeyPatch, source: str | None
@@ -308,6 +346,7 @@ async def test_feishu_turn_binds_the_task_rows_source(
 
     assert len(contexts) == 1
     assert contexts[0]["task_source"] == source
+    assert contexts[0]["run_id"] == "run-a"
 
 
 @pytest.mark.asyncio
@@ -331,7 +370,7 @@ async def test_shared_channel_turn_binds_the_snapshot_source(
         conversation_history=(),
         conversation_watermark=None,
         execution_recovery=TaskExecutionRecoverySnapshot(),
-        task=SimpleNamespace(source="slack", user_id=5),
+        task=SimpleNamespace(source="internal", user_id=5),
     )
 
     async def _materialize(_recovery: Any) -> dict[str, Any]:
@@ -393,4 +432,151 @@ async def test_shared_channel_turn_binds_the_snapshot_source(
         )
 
     assert len(contexts) == 1
-    assert contexts[0]["task_source"] == "slack"
+    assert contexts[0]["task_source"] == "internal"
+    assert contexts[0]["run_id"] == "run-a"
+
+
+@pytest.mark.asyncio
+async def test_a_lease_without_a_run_id_binds_neither_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both keys or neither -- never a half identity.
+
+    A ``TaskLease`` carries ``run_id: str | None``. With a source bound but
+    no run id, ``ToolCallExecutionContext.is_complete()`` is false and a
+    registered source is refused before dispatch. Leaving both unbound keeps
+    the documented safe default instead: the call passes through ungated.
+    """
+
+    contexts = await _drive_slack_turn(monkeypatch, "toby-slack", run_id=None)
+
+    assert len(contexts) == 1
+    assert "task_source" not in contexts[0]
+    assert "run_id" not in contexts[0]
+
+
+@pytest.mark.asyncio
+async def test_a_bot_context_reaches_the_gate_hook_rather_than_failing_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reason the binding must carry both keys, end to end.
+
+    Takes the context dict the real Slack turn above produced, registers a
+    gate for that row's source, and runs it through
+    ``AgentService.execute_task``. The hook must be reached with a complete
+    execution identity -- not refused with ``_GATE_FAILURE`` before dispatch,
+    which is what a source-only binding produces.
+    """
+
+    from xagent.core.agent.service import AgentService
+    from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+        GateDecision,
+        gate_mcp_tools,
+        register_mcp_approval_gate,
+        unregister_mcp_approval_gate,
+    )
+
+    contexts = await _drive_slack_turn(monkeypatch, "toby-slack")
+    bot_context = dict(contexts[0])
+    assert bot_context["task_source"] == "toby-slack"
+
+    seen: list[Any] = []
+
+    async def gate(call: Any) -> Any:
+        seen.append(call)
+        return GateDecision.deny(message="Not approved.")
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run for a denied call")
+
+    target = _StubConnectorWrite()
+    (gated,) = gate_mcp_tools([target], connection={"id": 41})
+    handle = register_mcp_approval_gate(
+        task_source="toby-slack", gate=gate, resume=resume
+    )
+    try:
+        result = await AgentService(
+            name="slack-agent",
+            id="svc-slack-gate",
+            tools=[gated],
+            llm=_ScriptedLLM(),
+            pattern="react",
+        ).execute_task("Publish the post.", context=bot_context, task_id="task-248032")
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert len(seen) == 1, (
+        "the gate hook was never reached -- an incomplete execution identity "
+        "was refused before dispatch"
+    )
+    execution = seen[0].execution_context
+    assert execution.is_complete()
+    assert execution.task_source == "toby-slack"
+    assert execution.run_id == "run-a"
+    assert target.calls == [], "a denied write must not be dispatched"
+    assert "approval gate is unavailable" not in str(result)
+
+
+class _StubConnectorWrite(AbstractBaseTool):
+    """Minimal MCP-shaped write target for the end-to-end gate assertion."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._metadata = ToolMetadata(
+            name="mcp_LinkedIn_create_post",
+            description="Create a post.",
+            concurrency_safe=False,
+            read_only=False,
+        )
+
+    @property
+    def metadata(self) -> ToolMetadata:
+        return self._metadata
+
+    @property
+    def name(self) -> str:
+        return "mcp_LinkedIn_create_post"
+
+    @property
+    def description(self) -> str:
+        return "Create a post."
+
+    def args_type(self) -> type[BaseModel]:
+        return _WriteArgs
+
+    def return_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        raise AssertionError("the async path is the one under test")
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
+
+
+class _WriteArgs(BaseModel):
+    text: str = ""
+
+
+class _ScriptedLLM:
+    model_name = "stub-model"
+
+    def __init__(self) -> None:
+        self.responses: list[Any] = [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "mcp_LinkedIn_create_post",
+                            "arguments": '{"text":"publish"}',
+                        },
+                    }
+                ]
+            },
+            {"content": "Done.", "done": True},
+        ]
+
+    async def chat(self, **_kwargs: Any) -> Any:
+        return self.responses.pop(0)

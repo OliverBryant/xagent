@@ -30,6 +30,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
 )
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GateDecision,
+    gate_mcp_tools,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
@@ -276,3 +277,98 @@ def test_connector_ref_helper_rejects_non_positive_and_bool_ids() -> None:
     )
 
     assert refs == {"good": ConnectorRef("mcp", 7)}
+
+
+@pytest.mark.asyncio
+async def test_actor_stdio_session_tools_are_gated_with_their_connector_ref() -> None:
+    """The Chrome actor-stdio consumer bypasses the generic MCP loader.
+
+    ``consume_chrome_actor_stdio_session`` binds a host-only execution scope
+    and builds its adapters through ``load_execution_scoped_chrome_tools``,
+    so the loader's wrapping never sees them. They are ordinary dispatchable
+    MCP adapters on a live production path, so the factory wraps them at the
+    consumption site instead -- with the persisted server id, or a gated call
+    would fail closed for want of a connector ref.
+    """
+
+    target = _McpTarget()
+    consumed: list[Any] = []
+
+    async def consumer(**kwargs: Any) -> list[Any]:
+        consumed.append(kwargs)
+        return [target]
+
+    configs = [
+        {
+            "id": 31,
+            "name": "chrome",
+            "transport": "stdio",
+            "config": {"command": "npx", "args": ["chrome-mcp"]},
+        }
+    ]
+    load = AsyncMock(
+        return_value=MCPLoadResult(tools=(), loaded_servers=(), failures=())
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        new=load,
+    ):
+        tools = await ToolFactory._create_mcp_tools_from_configs(
+            configs,
+            actor_stdio_session_identities={"chrome": object()},
+            actor_stdio_session_consumer=consumer,
+        )
+
+    assert consumed, "the consumer was never reached"
+    # The consumer's own tools never go through the loader, so nothing else
+    # could have wrapped them.
+    load.assert_not_awaited()
+    assert len(tools) == 1
+    assert tools[0] is not target
+    assert tools[0].target is target
+    assert tools[0]._connector_ref == ConnectorRef("mcp", 31)
+
+
+def test_load_summary_reads_source_server_through_metadata() -> None:
+    """A wrapped MCP tool must still count toward its server's load summary.
+
+    ``_build_mcp_load_summary`` used to read ``tool.source_server`` directly.
+    ``SandboxedToolWrapper`` forwards ``metadata`` but defines neither that
+    attribute nor ``__getattr__``, so every sandboxed MCP server silently
+    reported zero loaded tools -- a pre-existing gap the gate wrapper would
+    otherwise have widened. Reading it off ``metadata`` first fixes both
+    wrappers at once; the assertions below pin the real wrapper's shape so
+    this stand-in cannot drift away from it.
+    """
+
+    from xagent.core.tools.adapters.vibe.mcp_tools import _build_mcp_load_summary
+    from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+        SandboxedToolWrapper,
+    )
+
+    assert not hasattr(SandboxedToolWrapper, "source_server")
+    assert "__getattr__" not in vars(SandboxedToolWrapper)
+
+    class _MetadataOnlyWrapper:
+        """The sandbox wrapper's shape: metadata forwarded, nothing else."""
+
+        def __init__(self, target: _McpTarget) -> None:
+            self._target = target
+
+        @property
+        def metadata(self) -> ToolMetadata:
+            return self._target.metadata
+
+    target = _McpTarget()
+    configs = [{"name": "linkedin"}]
+
+    assert _build_mcp_load_summary(
+        configs, [_MetadataOnlyWrapper(target)]
+    ).loaded_servers == ("linkedin",)
+    # And the gate wrapper, which reaches it either way on this base.
+    assert _build_mcp_load_summary(
+        configs, [gate_mcp_tools([target])[0]]
+    ).loaded_servers == ("linkedin",)
+    # The unwrapped adapter keeps working through the direct-attribute
+    # fallback, which is what a tool with no ToolMetadata still needs.
+    assert _build_mcp_load_summary(configs, [target]).loaded_servers == ("linkedin",)

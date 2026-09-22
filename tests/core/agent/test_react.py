@@ -7416,6 +7416,9 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     record = restored_pattern.tool_ledger["original-publish-call"]
     assert record.status == "completed"
     assert record.settlement_status == "succeeded"
+    # The issuing ReAct step survives the checkpoint round-trip, so a resumed
+    # gated call can rebuild the exact execution identity it paused with.
+    assert record.step_id
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     assert (
         restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1

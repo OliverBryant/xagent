@@ -24,7 +24,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from ...user_interaction import WAITING_FOR_USER_STATUS
+from ...user_interaction import WAITING_FOR_USER_STATUS, ToolInteractionSettlement
 from .base import AbstractBaseTool, ToolMetadata
 from .connector_runtime import ConnectorRef
 
@@ -42,14 +42,6 @@ _UNSUPPORTED_PATTERN = {
     "success": False,
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
-}
-_DISPATCH_UNKNOWN = {
-    "success": False,
-    "status": "dispatch_unknown",
-    "error": (
-        "The connector call may have been sent, but its outcome could not be "
-        "confirmed. Do not retry it automatically."
-    ),
 }
 
 
@@ -475,19 +467,27 @@ class MCPApprovalGateTool(AbstractBaseTool):
         *,
         interaction_id: str,
         response: str,
-    ) -> Any:
+    ) -> ToolInteractionSettlement | None:
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
         if registration is None:
             if (context is None or not context.task_source) and _has_registrations():
-                return dict(_GATE_FAILURE)
+                return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
             target_resume = getattr(self._target, "resume_user_interaction", None)
             if not callable(target_resume):
                 return None
             resumed = target_resume(interaction_id=interaction_id, response=response)
-            return await resumed if inspect.isawaitable(resumed) else resumed
+            resumed = await resumed if inspect.isawaitable(resumed) else resumed
+            if resumed is not None and not isinstance(
+                resumed, ToolInteractionSettlement
+            ):
+                raise TypeError(
+                    "resume_user_interaction must return "
+                    "ToolInteractionSettlement or None"
+                )
+            return resumed
         if context is None or not context.is_complete() or self._connector_ref is None:
-            return dict(_GATE_FAILURE)
+            return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
 
         connector_ref = self._connector_ref
         active = True
@@ -522,7 +522,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 _CURRENT_REPLAY_CONTEXT.reset(token)
 
         try:
-            return await _call_resume_hook(
+            result = await _call_resume_hook(
                 registration.resume,
                 registration.timeout_seconds,
                 dispatch_started,
@@ -533,6 +533,11 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 execution_context=context,
                 executor=executor,
             )
+            if not isinstance(result, ToolInteractionSettlement):
+                raise TypeError(
+                    "MCP approval resume hook must return ToolInteractionSettlement"
+                )
+            return result
         except Exception:
             logger.warning(
                 "MCP approval resume failed closed for tool=%s task_id=%s "
@@ -543,9 +548,14 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 interaction_id,
                 exc_info=True,
             )
-            return dict(
-                _DISPATCH_UNKNOWN if dispatch_started.is_set() else _GATE_FAILURE
-            )
+            if dispatch_started.is_set():
+                return ToolInteractionSettlement.dispatch_unknown(
+                    error=(
+                        "The connector call may have reached the external system. "
+                        "Automatic retry is disabled."
+                    )
+                )
+            return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
         finally:
             active = False
 

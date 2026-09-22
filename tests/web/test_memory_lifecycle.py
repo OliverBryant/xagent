@@ -25,7 +25,12 @@ import pyarrow as pa  # type: ignore
 import pytest
 from filelock import FileLock
 from pydantic import SecretStr
+from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import assert_pool_checkout_off_loop
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
@@ -52,6 +57,7 @@ from xagent.web.revocable_memory_store import (
     RevocableMemoryStore,
     unwrap_memory_store,
 )
+from xagent.web.services import agent_service_manager
 from xagent.web.services.global_memory_embedding_authority import (
     CREDENTIAL_CONFIGURED,
     AuthorityCredentialUnavailable,
@@ -453,6 +459,62 @@ def test_credential_failure_after_admission_is_not_drift(monkeypatch, tmp_path):
 
     assert manager.check_embedding_model_change() is False
     assert manager.get_memory_store() is store
+
+
+@pytest.mark.asyncio
+async def test_drift_check_pool_timeout_runs_off_loop_and_stays_loud(
+    monkeypatch, tmp_path
+):
+    """A real QueuePool wait must run off-loop and remain a visible failure.
+
+    The drift check is the only remaining path that reads the authority for a
+    caller, so it is where pool exhaustion can still reach one. Two things have
+    to hold there: the synchronous checkout must happen on a worker thread
+    rather than on the event loop, and the timeout must propagate instead of
+    being folded into a quiet memory outage.
+    """
+    read_authority_snapshot = manager_module._read_authority_snapshot
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path / "memory")
+    assert manager.admit().state is MemoryLifecycleState.READY
+
+    # Admission is over. From here the drift check must reach the database,
+    # which is what makes the exhausted pool below observable at all.
+    monkeypatch.setattr(
+        manager_module, "_read_authority_snapshot", read_authority_snapshot
+    )
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    session_factory = sessionmaker(bind=engine)
+
+    def get_test_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(manager_module, "get_db", get_test_db)
+    monkeypatch.setattr(
+        agent_service_manager, "get_memory_store", manager.get_memory_store
+    )
+
+    held_connection = engine.connect()
+    try:
+        with assert_pool_checkout_off_loop(engine):
+            with pytest.raises(SQLAlchemyTimeoutError):
+                await agent_service_manager.resolve_agent_service_memory_policy_async(
+                    agent_config={},
+                )
+    finally:
+        held_connection.close()
+        engine.dispose()
 
 
 # --------------------------------------------------------------------------

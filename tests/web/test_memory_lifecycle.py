@@ -48,15 +48,15 @@ from xagent.web.memory_lifecycle import (
     admit_authority_storage,
     authority_embedding_config,
 )
+from xagent.web.revocable_memory_store import (
+    RevocableMemoryStore,
+    unwrap_memory_store,
+)
 from xagent.web.services.global_memory_embedding_authority import (
     CREDENTIAL_CONFIGURED,
     AuthorityCredentialUnavailable,
     CredentialSource,
     GlobalMemoryEmbeddingAuthoritySnapshot,
-)
-from xagent.web.revocable_memory_store import (
-    RevocableMemoryStore,
-    unwrap_memory_store,
 )
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 

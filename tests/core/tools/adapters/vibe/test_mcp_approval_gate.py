@@ -10,10 +10,10 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from xagent.core.tools.adapters.vibe.base import AbstractBaseTool
+from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
-    GateDecision,
     GatedCall,
+    GateDecision,
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
     current_mcp_approval_replay_context,
@@ -28,10 +28,21 @@ class _Args(BaseModel):
 
 
 class _Target(AbstractBaseTool):
-    def __init__(self, *, sandboxed: bool = False) -> None:
+    def __init__(
+        self, *, sandboxed: bool = False, concurrency_safe: bool = False
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.is_sandboxed = sandboxed
         self.replay_contexts: list[Any] = []
+        self._metadata = ToolMetadata(
+            name=self.name,
+            concurrency_safe=concurrency_safe,
+            read_only=concurrency_safe,
+        )
+
+    @property
+    def metadata(self) -> ToolMetadata:
+        return self._metadata
 
     @property
     def name(self) -> str:
@@ -81,11 +92,10 @@ def registrations() -> list[Any]:
 
 
 def _register(registrations: list[Any], gate: Any, resume: Any, **kwargs: Any) -> None:
-    registrations.append(
-        register_mcp_approval_gate(
-            task_source="slack", gate=gate, resume=resume, **kwargs
-        )
+    handle = register_mcp_approval_gate(
+        task_source="slack", gate=gate, resume=resume, **kwargs
     )
+    registrations.append(handle)
 
 
 async def _unused_resume(**_: Any) -> None:
@@ -119,6 +129,40 @@ async def test_registration_only_applies_to_its_task_source(
 
     assert result["success"] is True
     assert target.calls == [{"text": "web call"}]
+
+
+@pytest.mark.asyncio
+async def test_missing_source_fails_closed_when_any_gate_is_registered(
+    registrations: list[Any],
+) -> None:
+    _register(registrations, lambda _: None, _unused_resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    missing_source = replace(_context(), task_source="")
+
+    with bind_tool_call_execution_context(missing_source):
+        result = await tool.run_json_async({"text": "must not publish"})
+        with pytest.raises(RuntimeError, match="requires async approval"):
+            tool.run_json_sync({"text": "must not publish"})
+
+    assert result["status"] == "error"
+    assert target.calls == []
+
+
+def test_registered_gate_revokes_concurrency_metadata(
+    registrations: list[Any],
+) -> None:
+    target = _Target(concurrency_safe=True)
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+    assert tool.metadata.concurrency_safe is True
+    assert tool.metadata.read_only is True
+
+    _register(registrations, lambda _: None, _unused_resume)
+
+    assert tool.metadata.concurrency_safe is False
+    assert tool.metadata.read_only is False
+    assert target.metadata.concurrency_safe is True
+    assert target.metadata.read_only is True
 
 
 @pytest.mark.asyncio
@@ -314,6 +358,60 @@ async def test_resume_hook_failures_never_dispatch(
 
     assert result["status"] == "error"
     assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_timeout_does_not_cancel_a_started_dispatch(
+    registrations: list[Any],
+) -> None:
+    completed = asyncio.Event()
+
+    class SlowTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            await asyncio.sleep(0.02)
+            completed.set()
+            return await super().run_json_async(args)
+
+    async def resume(*, executor: Any, **_: Any) -> Any:
+        return await executor({"text": "approved"})
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=0.001)
+    target = SlowTarget()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.resume_user_interaction(
+            interaction_id="interaction-1", response="approve"
+        )
+
+    assert completed.is_set()
+    assert result["success"] is True
+    assert target.calls == [{"text": "approved"}]
+
+
+@pytest.mark.asyncio
+async def test_unhandled_failure_after_dispatch_is_reported_as_unknown(
+    registrations: list[Any],
+) -> None:
+    class FailingTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            self.calls.append(dict(args))
+            raise RuntimeError("connection lost after request write")
+
+    async def resume(*, executor: Any, **_: Any) -> Any:
+        return await executor({"text": "approved"})
+
+    _register(registrations, lambda _: None, resume)
+    target = FailingTarget()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.resume_user_interaction(
+            interaction_id="interaction-1", response="approve"
+        )
+
+    assert result["status"] == "dispatch_unknown"
+    assert target.calls == [{"text": "approved"}]
 
 
 def test_registration_is_scoped_and_not_last_writer_wins(

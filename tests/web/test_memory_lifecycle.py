@@ -734,3 +734,203 @@ def test_second_admission_of_a_populated_table_is_ready(tmp_path):
         assert [note.content for note in second.store.list_all(None)] == [
             "survives a restart"
         ]
+
+
+# --------------------------------------------------------------------------
+# TEXT_ONLY admission never receives the authority's embedding adapter.
+#
+# A table whose stored vectors were written under a different identity is
+# admitted TEXT_ONLY: writable, no vector search. Handing it the authority's
+# adapter would make the first ordinary write rewrite the table to the new
+# width and re-embed every historical row -- the online re-embedding the
+# lifecycle forbids. These tests pin that it does not happen.
+# --------------------------------------------------------------------------
+
+
+class _SizedEmbedding(BaseEmbedding):
+    """Deterministic embedding of an arbitrary width."""
+
+    def __init__(self, dimension: int, seed: float = 0.25) -> None:
+        self._dimension = dimension
+        self._seed = seed
+
+    def encode(self, text, dimension=None, instruct=None):
+        vector = [self._seed] * self._dimension
+        return vector if isinstance(text, str) else [vector for _ in text]
+
+    def get_dimension(self):
+        return self._dimension
+
+    @property
+    def abilities(self):
+        return ["embed"]
+
+
+def _table_vectors(tmp_path) -> dict[str, Optional[list[float]]]:
+    """Read every row's vector straight off disk, bypassing the store."""
+    clear_connection_cache()
+    connection = lancedb.connect(tmp_path)
+    table = connection.open_table(MEMORY_TABLE_NAME)
+    try:
+        rows = table.to_arrow().to_pylist()
+        return {row["id"]: row.get("vector") for row in rows}
+    finally:
+        _safe_close_table(table)
+
+
+def _table_vector_dimension(tmp_path) -> Optional[int]:
+    """The declared on-disk vector width, or ``None`` when there is no column."""
+    clear_connection_cache()
+    connection = lancedb.connect(tmp_path)
+    table = connection.open_table(MEMORY_TABLE_NAME)
+    try:
+        if "vector" not in table.schema.names:
+            return None
+        return int(table.schema.field("vector").type.list_size)
+    finally:
+        _safe_close_table(table)
+
+
+def _seed_vector_table(tmp_path, *, user_id: int = 99) -> str:
+    """Admit a 4-dimension authority and leave one ordinary note behind."""
+    seeded = admit_authority_storage(
+        _snapshot(dimension=DIMENSION),
+        db_dir=str(tmp_path),
+        embedding_factory=lambda _config: _SizedEmbedding(DIMENSION),
+    )
+    assert seeded.status.mode is MemoryStorageMode.VECTOR
+    assert seeded.store is not None
+    with UserContext(user_id):
+        added = seeded.store.add(MemoryNote(content="the older note about kettles"))
+    assert added.success
+    clear_connection_cache()
+    return added.memory_id
+
+
+@pytest.fixture
+def text_only_admission(tmp_path):
+    """A 4-dimension table admitted under an 8-dimension authority."""
+    old_note_id = _seed_vector_table(tmp_path)
+    assert _table_vector_dimension(tmp_path) == DIMENSION
+
+    wider = _snapshot(model_name="text-embedding-3-large", dimension=8)
+    built: list[BaseEmbedding] = []
+
+    def factory(_config):
+        adapter = _SizedEmbedding(8)
+        built.append(adapter)
+        return adapter
+
+    result = admit_authority_storage(
+        wider, db_dir=str(tmp_path), embedding_factory=factory
+    )
+    return result, old_note_id, built
+
+
+def test_mismatching_vectors_admit_text_only_without_vector_search(
+    text_only_admission,
+):
+    result, _old_note_id, _built = text_only_admission
+
+    assert result.status.state is MemoryLifecycleState.READY
+    assert result.status.mode is MemoryStorageMode.TEXT_ONLY
+    assert result.status.vector_search is False
+    assert result.store is not None
+
+
+def test_text_only_admission_never_builds_the_authority_adapter(text_only_admission):
+    """The adapter is not merely withheld from the store; it is never built."""
+    _result, _old_note_id, built = text_only_admission
+
+    assert built == []
+
+
+def test_text_only_write_does_not_re_embed_or_widen_the_table(
+    tmp_path, text_only_admission
+):
+    """One ordinary write must not rewrite the table under the new identity."""
+    result, old_note_id, _built = text_only_admission
+    store = result.store
+    assert store is not None
+    before = _table_vectors(tmp_path)
+
+    with UserContext(99):
+        added = store.add(MemoryNote(content="a newer note about saucepans"))
+    assert added.success
+
+    # (a) the on-disk vector width is untouched
+    assert _table_vector_dimension(tmp_path) == DIMENSION
+
+    after = _table_vectors(tmp_path)
+    # (b) the pre-existing row's vector is byte-for-byte what it was
+    assert after[old_note_id] == before[old_note_id]
+    assert after[old_note_id] is not None
+    assert len(after[old_note_id]) == DIMENSION
+    # (c) the new row carries no vector at all
+    assert after[added.memory_id] is None
+
+    # (d) both rows are still reachable, through the lexical fallback
+    with UserContext(99):
+        found = {note.id for note in store.search("note", k=10)}
+    assert found == {old_note_id, added.memory_id}
+
+
+def test_same_width_identity_drift_also_gets_no_adapter(tmp_path):
+    """Drift that keeps the dimension is still a different vector space."""
+    old_note_id = _seed_vector_table(tmp_path, user_id=5)
+    before = _table_vectors(tmp_path)
+
+    # Same dimension, different model and endpoint: no rewrite would betray
+    # this at the schema level, so mixing the two spaces would go unnoticed.
+    drifted = _snapshot(model_name="text-embedding-ada-002", dimension=DIMENSION)
+    built: list[BaseEmbedding] = []
+
+    def factory(_config):
+        adapter = _SizedEmbedding(DIMENSION, seed=0.9)
+        built.append(adapter)
+        return adapter
+
+    result = admit_authority_storage(
+        drifted, db_dir=str(tmp_path), embedding_factory=factory
+    )
+
+    assert result.status.mode is MemoryStorageMode.TEXT_ONLY
+    assert result.status.vector_search is False
+    assert built == []
+
+    store = result.store
+    assert store is not None
+    with UserContext(5):
+        added = store.add(MemoryNote(content="written after the identity moved"))
+    assert added.success
+
+    after = _table_vectors(tmp_path)
+    assert _table_vector_dimension(tmp_path) == DIMENSION
+    assert after[old_note_id] == before[old_note_id]
+    assert after[added.memory_id] is None
+
+
+def test_vector_mode_still_receives_the_authority_adapter(tmp_path):
+    """The fix must not starve the mode that is entitled to the adapter."""
+    built: list[BaseEmbedding] = []
+
+    def factory(_config):
+        adapter = _SizedEmbedding(DIMENSION)
+        built.append(adapter)
+        return adapter
+
+    result = admit_authority_storage(
+        _snapshot(dimension=DIMENSION),
+        db_dir=str(tmp_path),
+        embedding_factory=factory,
+    )
+
+    assert result.status.mode is MemoryStorageMode.VECTOR
+    assert len(built) == 1
+
+    store = result.store
+    assert store is not None
+    with UserContext(3):
+        added = store.add(MemoryNote(content="vector mode still embeds"))
+    assert added.success
+    assert _table_vectors(tmp_path)[added.memory_id] is not None

@@ -372,11 +372,31 @@ def admit_authority_storage(
         return AdmissionResult(MemoryLifecycleStatus(state))
 
     capabilities = outcome.admitted.capabilities
+    # Only a VECTOR-mode admission may carry the authority's embedding adapter.
+    #
+    # In TEXT_ONLY mode the stored vectors were written under a different
+    # identity than the authority now describes. Handing the adapter to the
+    # store there would make the *first ordinary write* rewrite the table to
+    # the authority's width and re-embed every historical row under the new
+    # model -- irreversibly, and without any operator action. That is exactly
+    # the online re-embedding the lifecycle forbids, and it would happen in the
+    # state the runtime reports as ``text_only`` with vector search off.
+    #
+    # Passing ``None`` is what layer B's TEXT_ONLY contract actually means:
+    # ``LanceDBMemoryStore`` keeps the table writable, stores new notes without
+    # vectors, leaves existing vectors untouched, and answers searches from the
+    # lexical fallback. Restoring vector search is an offline re-embed plus an
+    # all-worker restart, never a side effect of a user write.
     try:
+        embedding_model = (
+            embedding_factory(config)
+            if capabilities.mode is MemoryStorageMode.VECTOR
+            else None
+        )
         store = LanceDBMemoryStore(
             db_dir=directory,
             collection_name=MEMORY_TABLE_NAME,
-            embedding_model=embedding_factory(config),
+            embedding_model=embedding_model,
             similarity_threshold=threshold,
         )
     except Exception:

@@ -2,8 +2,32 @@
 
 The module has no web or ORM dependencies. A host registers async hooks for
 one exact task source, and the MCP loader wraps both direct and sandboxed tools
-at their common host-side boundary. With no matching registration the wrapper
-is a transparent pass-through.
+at their common host-side boundary.
+
+Scoping contract
+----------------
+**An unregistered or absent ``task_source`` is not gated.** A call whose source
+has no registration dispatches to the wrapped tool exactly as it did before the
+wrapper existed, and :attr:`MCPApprovalGateTool.metadata` reports the wrapped
+tool's own metadata. Fail-closed behavior applies only to a call whose source
+*is* registered: such a call must present a complete execution identity and a
+connector ref, or it is refused before dispatch.
+
+Hosts that need gating must therefore bind ``task_source`` at their own entry
+point. A host that registers a gate for ``"slack"`` but forgets to bind
+``task_source="slack"`` on its executions gets *no* approval prompt; it does
+not get a fleet-wide outage. This is deliberate: the wrapper sits on the single
+loader boundary shared by every execution entry point in the process, so a
+global fail-closed rule would take every other host's MCP traffic - read-only
+calls included - down with it the moment any one tenant registered a gate.
+
+The one place the wrapper still fails closed without a matching registration is
+:meth:`MCPApprovalGateTool.resume_user_interaction` for an interaction that
+*this wrapper itself* gated at pause time. That fact is carried durably in the
+issued interaction id (see :func:`_gated_interaction_id`), so an approval that
+loses its source binding between pause and resume is refused instead of being
+replayed unauthorized. An interaction the gate never gated resumes through the
+legacy path untouched.
 """
 
 from __future__ import annotations
@@ -43,6 +67,10 @@ _UNSUPPORTED_PATTERN = {
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
 }
+# How long a cancelled resume waits for an already-dispatched connector write
+# to finish before giving up on observing it. Bounded so an external cancel
+# cannot be blocked indefinitely by a hung remote call.
+_POST_DISPATCH_DRAIN_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -251,6 +279,55 @@ def _has_registrations() -> bool:
         return bool(_REGISTRATIONS)
 
 
+# Durable marker prefix for an interaction id this wrapper issued. The id is
+# the ONLY gate-owned value that survives a full checkpoint round-trip: ReAct
+# copies it verbatim into the pending-response entry, serializes that entry in
+# ``pattern_state``, restores it into a rebuilt process, and hands it back to
+# ``resume_user_interaction(interaction_id=...)``. Nothing else the gate can
+# write at pause time reaches resume (the published request payload projects a
+# fixed key set, and process memory does not survive a rebuild), so the source
+# this call was gated for rides along inside the id itself.
+_GATED_INTERACTION_PREFIX = "xgate"
+_GATED_INTERACTION_SEPARATOR = ":"
+
+
+def _gated_interaction_id(task_source: str, host_interaction_id: str) -> str:
+    """Stamp the gating source onto a host-issued interaction id.
+
+    The source is length-prefixed rather than merely delimited: a registered
+    ``task_source`` may legitimately contain the separator, and a plain
+    three-way split would then recover a *prefix* of the real source and
+    silently match a different registration.
+    """
+
+    return _GATED_INTERACTION_SEPARATOR.join(
+        (
+            _GATED_INTERACTION_PREFIX,
+            str(len(task_source)),
+            task_source + host_interaction_id,
+        )
+    )
+
+
+def _gated_interaction_source(interaction_id: str) -> tuple[str, str] | None:
+    """Recover ``(task_source, host_interaction_id)`` from a gated id.
+
+    Returns ``None`` for any id this wrapper did not issue, which is what
+    keeps a never-gated interaction on the legacy resume path.
+    """
+
+    parts = interaction_id.split(_GATED_INTERACTION_SEPARATOR, 2)
+    if len(parts) != 3 or parts[0] != _GATED_INTERACTION_PREFIX:
+        return None
+    _, raw_length, payload = parts
+    if not raw_length.isdigit():
+        return None
+    length = int(raw_length)
+    if length <= 0 or length > len(payload):
+        return None
+    return payload[:length], payload[length:]
+
+
 @contextmanager
 def bind_tool_call_execution_context(
     context: ToolCallExecutionContext,
@@ -272,12 +349,18 @@ def current_mcp_approval_replay_context() -> MCPApprovalReplayContext | None:
     return _CURRENT_REPLAY_CONTEXT.get()
 
 
+def _ensure_awaitable(returned: Any) -> Any:
+    """Reject a hook that is not async, before anything is scheduled."""
+
+    if not inspect.isawaitable(returned):
+        raise TypeError("MCP approval gate hooks must be async")
+    return returned
+
+
 async def _call_async_hook(
     hook: Callable[..., Any], timeout_seconds: float, /, *args: Any, **kwargs: Any
 ) -> Any:
-    returned = hook(*args, **kwargs)
-    if not inspect.isawaitable(returned):
-        raise TypeError("MCP approval gate hooks must be async")
+    returned = _ensure_awaitable(hook(*args, **kwargs))
     return await asyncio.wait_for(returned, timeout=timeout_seconds)
 
 
@@ -297,9 +380,7 @@ async def _call_resume_hook(
 ) -> Any:
     """Bound only pre-dispatch resume policy; never cancel a started write."""
 
-    returned = hook(**kwargs)
-    if not inspect.isawaitable(returned):
-        raise TypeError("MCP approval gate hooks must be async")
+    returned = _ensure_awaitable(hook(**kwargs))
 
     hook_task = asyncio.ensure_future(returned)
     dispatch_wait = asyncio.create_task(dispatch_started.wait())
@@ -319,14 +400,53 @@ async def _call_resume_hook(
             return await hook_task
 
         hook_task.cancel()
-        try:
-            await hook_task
-        except asyncio.CancelledError:
-            pass
+        await _drain(hook_task)
         raise TimeoutError("MCP approval resume hook timed out before dispatch")
     finally:
         if not dispatch_wait.done():
             dispatch_wait.cancel()
+        # An EXTERNAL cancellation (task cancel, lease loss) unwinds through
+        # here while ``hook_task`` may be mid connector write. Leaving it
+        # detached lets that write land after the caller believes the task was
+        # cancelled, with no settlement recorded anywhere.
+        #
+        # Pre-dispatch there is nothing to preserve, so cancel and drain.
+        # Post-dispatch the write is already in flight and cancelling proves
+        # nothing about it, so the drain is bounded and shielded: bounded
+        # because a `finally` that awaits forever would make the enclosing
+        # cancellation un-cancellable, shielded because the drain itself is
+        # running under an active CancelledError and would otherwise be
+        # interrupted immediately.
+        if not hook_task.done():
+            if not dispatch_started.is_set():
+                hook_task.cancel()
+                await _drain(hook_task)
+            else:
+                await _drain(
+                    asyncio.shield(hook_task), timeout=_POST_DISPATCH_DRAIN_SECONDS
+                )
+                if not hook_task.done():
+                    logger.warning(
+                        "MCP approval resume hook is still dispatching after "
+                        "cancellation; the connector write may still land."
+                    )
+
+
+async def _drain(awaitable: Any, *, timeout: float | None = None) -> None:
+    """Await ``awaitable`` to completion, swallowing its outcome.
+
+    Used only on paths that already have a settlement to report: the point is
+    that no connector write is left running unobserved, not to surface the
+    drained task's own result or error.
+    """
+
+    try:
+        if timeout is None:
+            await awaitable
+        else:
+            await asyncio.wait_for(awaitable, timeout=timeout)
+    except (Exception, asyncio.CancelledError):
+        logger.debug("drained MCP approval resume hook task", exc_info=True)
 
 
 class MCPApprovalGateTool(AbstractBaseTool):
@@ -362,12 +482,26 @@ class MCPApprovalGateTool(AbstractBaseTool):
         metadata = self._target.metadata
         if not _has_registrations():
             return metadata
-        # ReAct fans one response out to every interaction paused in a
-        # concurrent batch. A gated tool must therefore revoke the scheduler's
-        # concurrency/idempotency declaration while any gate can be active.
-        return metadata.model_copy(
-            update={"read_only": False, "concurrency_safe": False}
-        )
+        # ReAct fans one user response out to every interaction paused in a
+        # concurrent batch, so two gated calls batched together can both be
+        # settled by a single approval. A tool that can pause for approval
+        # must therefore revoke the scheduler's concurrency declaration.
+        #
+        # Scoping this to the call's own task_source is not possible here:
+        # ``metadata`` is a property read by ``_tool_is_concurrency_safe``
+        # (react.py:3513) while the scheduler is *planning* a batch, outside
+        # any bound ToolCallExecutionContext, so there is no call whose source
+        # could be consulted. Degrading only ``concurrency_safe`` keeps the
+        # blast radius to batching: that field is, per the contract comment on
+        # ToolMetadata (base.py:83-86), "the only field the scheduler reads".
+        #
+        # ``read_only`` is deliberately left as the wrapped tool declares it.
+        # Nothing in the agent or scheduler layer reads ``metadata.read_only``
+        # (only base.py:190-194 consumes it, to derive ``concurrency_safe``
+        # when a tool declares no explicit value) so forcing it to False buys
+        # no safety, while lying about a read-only tool's nature would
+        # mis-describe every wrapped MCP tool to any future consumer.
+        return metadata.model_copy(update={"concurrency_safe": False})
 
     @property
     def is_sandboxed(self) -> bool:
@@ -392,22 +526,28 @@ class MCPApprovalGateTool(AbstractBaseTool):
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
         if registration is None:
-            if (context is None or not context.task_source) and _has_registrations():
-                raise RuntimeError(
-                    f"MCP tool {self.name} requires async approval evaluation"
-                )
+            # Unregistered or absent source: not this gate's business. Dispatch
+            # exactly as the unwrapped tool would.
             return self._target.run_json_sync(args)
+        # The call's own source IS registered, so it must be evaluated. The
+        # gate hooks are async and there is no running loop to await them on.
         raise RuntimeError(f"MCP tool {self.name} requires async approval evaluation")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
         if registration is None:
-            if (context is None or not context.task_source) and _has_registrations():
-                return dict(_GATE_FAILURE)
+            # Unregistered or absent source: transparent pass-through.
             return await self._target.run_json_async(args)
+        # From here the call's own source is registered, so every remaining
+        # exit fails closed.
         if context is None or not context.is_complete() or self._connector_ref is None:
             return dict(_GATE_FAILURE)
+        if context.pattern != "react":
+            # Checked BEFORE the hook: a decision issued for an unsupported
+            # pattern would leave the host holding a persisted, clickable
+            # approval prompt that nothing can ever resume.
+            return dict(_UNSUPPORTED_PATTERN)
 
         try:
             call = GatedCall.from_arguments(
@@ -441,12 +581,14 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 "status": "denied",
                 "error": decision.message or "The connector call was denied.",
             }
-        if context.pattern != "react":
-            return dict(_UNSUPPORTED_PATTERN)
         return {
             "success": False,
             "status": WAITING_FOR_USER_STATUS,
-            "interaction_id": decision.interaction_id,
+            # Stamped with the gating source so a resume that arrives without a
+            # matching binding is refused instead of replayed unauthorized.
+            "interaction_id": _gated_interaction_id(
+                registration.handle.task_source, decision.interaction_id or ""
+            ),
             "message": decision.message or f"Approve running {self.name}?",
             "message_type": "confirmation",
             "interactions": [
@@ -470,9 +612,41 @@ class MCPApprovalGateTool(AbstractBaseTool):
     ) -> ToolInteractionSettlement | None:
         context = current_tool_call_execution_context()
         registration = _registration_for(context.task_source if context else None)
-        if registration is None:
-            if (context is None or not context.task_source) and _has_registrations():
-                return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
+        # What this wrapper itself recorded at pause time, carried durably in
+        # the interaction id. ``None`` means the gate never gated this call.
+        gated = _gated_interaction_source(interaction_id)
+
+        if (
+            registration is None
+            or gated is None
+            or gated[0] != registration.handle.task_source
+        ):
+            if gated is not None:
+                # This interaction WAS gated, for source ``gated[0]``, but the
+                # resume context does not present that source (it lost its
+                # binding, or arrived through a different entry point). Replaying
+                # the approved write here would dispatch it outside the policy
+                # that authorized it, so refuse. ``failed`` is correct rather
+                # than ``dispatch_unknown``: nothing was dispatched.
+                logger.warning(
+                    "Refusing to resume a gated MCP interaction without its "
+                    "gating source. tool=%s gated_source=%r resume_source=%r "
+                    "interaction_id=%r",
+                    self.name,
+                    gated[0],
+                    context.task_source if context else None,
+                    interaction_id,
+                )
+                return ToolInteractionSettlement.failed(
+                    result=dict(_GATE_FAILURE),
+                    error=(
+                        "This connector call was approved under a different "
+                        "execution identity and was not sent."
+                    ),
+                )
+            # Never gated by this wrapper: legacy path, byte-for-byte what the
+            # unwrapped tool would do. Returning ``None`` for a target with no
+            # callback keeps ReAct's free-text replan behavior unchanged.
             target_resume = getattr(self._target, "resume_user_interaction", None)
             if not callable(target_resume):
                 return None
@@ -486,6 +660,10 @@ class MCPApprovalGateTool(AbstractBaseTool):
                     "ToolInteractionSettlement or None"
                 )
             return resumed
+
+        # The gating source and the resume source agree. Hand the host back the
+        # id it issued, not the wrapper's stamped one.
+        host_interaction_id = gated[1]
         if context is None or not context.is_complete() or self._connector_ref is None:
             return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
 
@@ -506,7 +684,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 execution_context=context,
             )
             replay = MCPApprovalReplayContext(
-                interaction_id=interaction_id,
+                interaction_id=host_interaction_id,
                 arguments_sha256=canonical.arguments_sha256,
                 execution_context=context,
             )
@@ -526,7 +704,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 registration.resume,
                 registration.timeout_seconds,
                 dispatch_started,
-                interaction_id=interaction_id,
+                interaction_id=host_interaction_id,
                 response=response,
                 connector_ref=connector_ref,
                 tool_name=self.name,

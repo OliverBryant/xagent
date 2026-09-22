@@ -7154,6 +7154,116 @@ async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ungated_mcp_tool_pause_and_resume_takes_the_legacy_path() -> None:
+    """The gate wrapper is inert for an interaction it never gated.
+
+    ``MCPApprovalGateTool`` exposes ``resume_user_interaction`` for every MCP
+    tool, so every wrapped tool now looks resumable to
+    ``_queue_tool_interaction_responses``. That is only safe because the gate
+    returns ``None`` for an interaction it did not issue, and ReAct reads
+    ``None`` as "legacy replan": nothing is projected onto the ledger row and
+    the model replans from the user's reply, exactly as before the wrapper.
+    """
+
+    class WaitingMCPTool(FakeTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.name = "mcp_notion_search"
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(args)
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "host-owned-interaction",
+                "message": "Which page?",
+                "message_type": "question",
+                "interactions": [
+                    {"type": "text_input", "field": "page", "label": "Page"}
+                ],
+            }
+
+    target = WaitingMCPTool()
+    (gated,) = gate_mcp_tools([target], connection={"id": 41})
+    # A gate is registered for a DIFFERENT source; this execution carries none.
+    registration = register_mcp_approval_gate(
+        task_source="slack",
+        gate=_never_called_gate,
+        resume=_never_called_gate,
+    )
+    try:
+        context = ExecutionContext(execution_id="ungated-mcp-interaction")
+        context.add_user_message("Find the page.")
+        pattern = ReActPattern(max_iterations=2)
+        waiting = await pattern.run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "wait-call",
+                                "function": {
+                                    "name": "mcp_notion_search",
+                                    "arguments": '{"expression":"roadmap"}',
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+        assert waiting["status"] == "waiting_for_user"
+        # The gate did not stamp this id: the tool, not the gate, issued it.
+        assert pattern.tool_ledger["wait-call"].result["interaction_id"] == (
+            "host-owned-interaction"
+        )
+
+        context.add_user_message("The roadmap page")
+        resumed_pattern = ReActPattern(max_iterations=2)
+        resumed_pattern.load_state(pattern.get_state())
+        resumed = await resumed_pattern.run(
+            context=context,
+            tools=[gated],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "final-call",
+                                "function": {
+                                    "name": "final_answer",
+                                    "arguments": (
+                                        '{"response_language":"English",'
+                                        '"answer":"Found it.",'
+                                        '"outcome":"completed"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+    assert resumed["success"] is True
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    # Legacy path: no settlement was projected onto the original row, and the
+    # gate never re-dispatched the call.
+    record = resumed_pattern.tool_ledger["wait-call"]
+    assert record.status == "waiting_for_user"
+    assert record.settlement_status is None
+    assert target.calls == [{"expression": "roadmap"}]
+
+
+async def _never_called_gate(*_: Any, **__: Any) -> None:
+    raise AssertionError("an ungated execution must not reach the gate hooks")
+
+
+@pytest.mark.asyncio
 async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
     class ResumableTool:
         def __init__(self) -> None:

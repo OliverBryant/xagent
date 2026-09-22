@@ -1176,6 +1176,30 @@ def test_merge_context_metadata_restored_overlays_execution_identity(
     assert context.metadata["other"] == "checkpointed"
 
 
+@pytest.mark.parametrize("key", ["task_source", "run_id"])
+def test_merge_context_metadata_restored_keeps_identity_against_none(
+    tmp_path: Path, key: str
+) -> None:
+    """A resume entry point with no trusted source must not erase the real one.
+
+    Several resume paths pass these keys unconditionally with a None value.
+    Overwriting the checkpointed identity with None would permanently deny a
+    pending approval that was gated under it.
+    """
+
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-trusted-identity")
+    context.metadata.update({"task_source": "slack", "run_id": "run-original"})
+
+    runner._merge_context_metadata(context, {key: None}, restored=True)
+
+    assert context.metadata["task_source"] == "slack"
+    assert context.metadata["run_id"] == "run-original"
+
+
 @pytest.mark.asyncio
 async def test_runner_empty_resume_metadata_preserves_non_modality_metadata(
     tmp_path: Path,

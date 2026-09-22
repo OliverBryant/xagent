@@ -9,13 +9,18 @@ from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 
 from .dynamic_memory_store import get_memory_store_manager
+from .revocable_memory_store import RevocableMemoryStore
 from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
 
-# Type alias for our memory store types that includes user isolation
+# Type alias for our memory store types that includes user isolation and the
+# revocation wrapper the manager publishes.
 MemoryStoreType = Union[
-    InMemoryMemoryStore, LanceDBMemoryStore, UserIsolatedMemoryStore
+    InMemoryMemoryStore,
+    LanceDBMemoryStore,
+    UserIsolatedMemoryStore,
+    RevocableMemoryStore,
 ]
 
 

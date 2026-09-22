@@ -54,6 +54,10 @@ from xagent.web.services.global_memory_embedding_authority import (
     CredentialSource,
     GlobalMemoryEmbeddingAuthoritySnapshot,
 )
+from xagent.web.revocable_memory_store import (
+    RevocableMemoryStore,
+    unwrap_memory_store,
+)
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 DIMENSION = 4
@@ -621,8 +625,11 @@ def test_no_authority_serves_an_ephemeral_store(monkeypatch, tmp_path):
     assert status.state is MemoryLifecycleState.NOT_CONFIGURED
     assert status.vector_search is False
     store = manager.get_memory_store()
-    assert isinstance(store, UserIsolatedMemoryStore)
-    assert isinstance(store._base_store, InMemoryMemoryStore)
+    # Published through the revocation wrapper, with user isolation intact
+    # underneath it and the ephemeral store at the bottom.
+    assert isinstance(store, RevocableMemoryStore)
+    assert isinstance(store._base_store, UserIsolatedMemoryStore)
+    assert isinstance(unwrap_memory_store(store), InMemoryMemoryStore)
 
 
 def test_reinitialization_is_refused(monkeypatch, tmp_path, caplog):

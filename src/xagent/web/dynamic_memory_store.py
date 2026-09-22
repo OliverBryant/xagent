@@ -35,6 +35,7 @@ from .memory_lifecycle import (
     log_operator_guidance,
 )
 from .models.database import get_db
+from .revocable_memory_store import RevocableMemoryStore, unwrap_memory_store
 from .services.db_runtime import is_database_pool_timeout
 from .services.global_memory_embedding_authority import (
     GlobalMemoryEmbeddingAuthorityService,
@@ -44,9 +45,13 @@ from .user_isolated_memory import UserIsolatedMemoryStore
 
 logger = logging.getLogger(__name__)
 
-# Type alias for our memory store types that includes user isolation
+# Type alias for our memory store types that includes user isolation and the
+# revocation wrapper the manager publishes.
 MemoryStoreType = Union[
-    InMemoryMemoryStore, LanceDBMemoryStore, UserIsolatedMemoryStore
+    InMemoryMemoryStore,
+    LanceDBMemoryStore,
+    UserIsolatedMemoryStore,
+    RevocableMemoryStore,
 ]
 
 
@@ -115,6 +120,11 @@ class DynamicMemoryStoreManager:
         )
         self._lock = threading.RLock()
         self._publication: Optional[_Publication] = None
+        # Moves whenever a publication is established or revoked. Every store
+        # handed out captures the value it was published under, which is what
+        # lets an already-distributed reference be revoked -- see
+        # :mod:`xagent.web.revocable_memory_store`.
+        self._generation = 0
         # Nothing is published before admission runs, so the honest starting
         # point is "not available yet, an attempt is still owed".
         self._status = MemoryLifecycleStatus(MemoryLifecycleState.RETRYABLE_UNAVAILABLE)
@@ -123,6 +133,29 @@ class DynamicMemoryStoreManager:
     def _settled(self) -> bool:
         """True once admission reached an outcome no retry can change."""
         return self._status.ready or self._status.terminal
+
+    # -- the slice RevocableMemoryStore depends on -------------------------
+
+    def publication_generation(self) -> int:
+        """The generation a reference must still match to be usable."""
+        return self._generation
+
+    def published_status(self) -> MemoryLifecycleStatus:
+        """The status a revoked reference reports (``restart_required`` on drift)."""
+        return self._status
+
+    def _publish_locked(self, publication: Optional[_Publication]) -> None:
+        """Install or revoke the publication and move the generation.
+
+        The status is set by the caller *before* this runs, so a lock-free
+        reader that sees the new generation also sees the status explaining it.
+        """
+        self._publication = publication
+        self._generation += 1
+
+    def _revocable(self, store: MemoryStoreType) -> MemoryStoreType:
+        """Bind ``store`` to the generation it is about to be published under."""
+        return RevocableMemoryStore(store, self, self._generation + 1)
 
     def admit(self, *, writers_quiesced: bool = True) -> MemoryLifecycleStatus:
         """Run storage admission once, publishing only if it succeeds.
@@ -176,7 +209,9 @@ class DynamicMemoryStoreManager:
             # A failed admission publishes nothing and takes nothing away: a
             # manager that is already serving an admitted store keeps serving
             # it, and its status keeps describing that publication rather than
-            # the attempt that just failed.
+            # the attempt that just failed. The generation deliberately does
+            # not move -- references handed out under that publication stay
+            # valid, because nothing about it changed.
             self._publication = previous_publication
             self._status = (
                 previous_publication.status
@@ -186,12 +221,14 @@ class DynamicMemoryStoreManager:
             log_operator_guidance(result.status)
             return
 
-        self._publication = _Publication(
-            store=result.store,
-            status=result.status,
-            vector_space_fingerprint=result.vector_space_fingerprint,
-        )
         self._status = result.status
+        self._publish_locked(
+            _Publication(
+                store=self._revocable(result.store),
+                status=result.status,
+                vector_space_fingerprint=result.vector_space_fingerprint,
+            )
+        )
         logger.info(
             "Persistent memory admitted in %s mode (vector search: %s)",
             result.status.mode.value if result.status.mode else "unknown",
@@ -201,12 +238,14 @@ class DynamicMemoryStoreManager:
     def _publish_in_memory_locked(self) -> None:
         """No authority configured: serve an ephemeral, non-persistent store."""
         status = MemoryLifecycleStatus(MemoryLifecycleState.NOT_CONFIGURED)
-        self._publication = _Publication(
-            store=UserIsolatedMemoryStore(InMemoryMemoryStore()),
-            status=status,
-            vector_space_fingerprint=None,
-        )
         self._status = status
+        self._publish_locked(
+            _Publication(
+                store=self._revocable(UserIsolatedMemoryStore(InMemoryMemoryStore())),
+                status=status,
+                vector_space_fingerprint=None,
+            )
+        )
         log_operator_guidance(status)
 
     def _revalidated_publication_locked(self) -> Optional[_Publication]:
@@ -235,9 +274,11 @@ class DynamicMemoryStoreManager:
         # Meaningful drift: the authority now describes a different vector
         # space than the one these vectors were written under. Drop the
         # publication before returning, so there is no path by which a caller
-        # can still be handed the adapter built for the previous space.
-        self._publication = None
+        # can still be handed the adapter built for the previous space --
+        # and move the generation, which fails closed every reference already
+        # handed out, including one a cached agent is using mid-execution.
         self._status = MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
+        self._publish_locked(None)
         log_operator_guidance(self._status)
         return None
 
@@ -302,9 +343,9 @@ class DynamicMemoryStoreManager:
         with self._lock:
             store, status = self.acquire()
             threshold = self._similarity_threshold
-        base_store = (
-            store._base_store if isinstance(store, UserIsolatedMemoryStore) else store
-        )
+        # Report what the storage adapter actually is, through both the
+        # revocation and the user-isolation wrapper.
+        base_store = unwrap_memory_store(store)
         return {
             "store_type": type(base_store).__name__ if base_store is not None else None,
             "is_lancedb": isinstance(base_store, LanceDBMemoryStore),

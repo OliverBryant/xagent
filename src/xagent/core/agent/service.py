@@ -71,6 +71,8 @@ class AgentService:
         compact_llm: BaseLLM | None = None,
         memory_similarity_threshold: float | None = None,
         memory_enabled: bool = True,
+        memory_available: bool = True,
+        memory_availability_reason: str | None = None,
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
@@ -101,6 +103,12 @@ class AgentService:
         self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        # Why memory is off, when it is off for a reason the runtime chose
+        # rather than one the caller asked for. Caller-safe by construction:
+        # whoever builds this service is responsible for passing a value fit
+        # to publish (see the web layer's memory availability policy).
+        self.memory_available = memory_available
+        self.memory_availability_reason = memory_availability_reason
         self.react_max_iterations = max(1, int(react_max_iterations))
         self.enable_default_tools = enable_default_tools
         self.skills_enabled = skills_enabled
@@ -415,6 +423,9 @@ class AgentService:
             "patterns_count": 1 if self.llm else 0,
             "tools_count": len(self.tools),
             "memory_type": self.memory.__class__.__name__,
+            "memory_enabled": self.memory_enabled,
+            "memory_available": self.memory_available,
+            "memory_availability_reason": self.memory_availability_reason,
             "ready": self.llm is not None,
             "execution_type": self._execution_type(),
             "llm_configured": self.llm is not None,

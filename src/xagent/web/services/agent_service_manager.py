@@ -47,7 +47,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..dynamic_memory_store import get_memory_store
-from ..memory_lifecycle import MemoryUnavailableError
+from ..memory_lifecycle import MemoryLifecycleState, MemoryUnavailableError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import (
     get_session_local,
@@ -204,12 +204,58 @@ def _load_agent_for_task_runtime(
     return agent if int(agent.id) in visible_agent_ids else None
 
 
+#: Availability reasons that may be published to a caller. These are exactly
+#: the lifecycle states ``/api/memory/store-info`` already publishes, so they
+#: carry no path, model name, endpoint or credential material.
+PUBLIC_MEMORY_AVAILABILITY_REASONS = frozenset(
+    state.value for state in MemoryLifecycleState
+)
+
+#: What any other reason becomes. A trusted host resolver's reason is
+#: host-supplied text that nothing vetted for callers, so it reaches the
+#: operator's trace but never a public status payload.
+GENERIC_MEMORY_AVAILABILITY_REASON = "unavailable"
+
+#: Execution-metadata keys. They ride into the task's trace, where an operator
+#: can see per task why memory was disabled.
+MEMORY_AVAILABLE_METADATA_KEY = "memory_available"
+MEMORY_AVAILABILITY_REASON_METADATA_KEY = "memory_availability_reason"
+
+
+def public_memory_availability_reason(reason: str | None) -> str | None:
+    """Fold an availability reason onto something safe to publish."""
+    if reason is None:
+        return None
+    if reason in PUBLIC_MEMORY_AVAILABILITY_REASONS:
+        return reason
+    return GENERIC_MEMORY_AVAILABILITY_REASON
+
+
 @dataclass(frozen=True)
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
     memory_enabled: bool
     memory_available: bool = True
     memory_availability_reason: str | None = None
+
+    @property
+    def public_availability_reason(self) -> str | None:
+        """The reason as a caller may see it."""
+        return public_memory_availability_reason(self.memory_availability_reason)
+
+    def execution_metadata(self) -> dict[str, Any]:
+        """Operator-facing availability, for the task's execution metadata.
+
+        Empty while memory is available, so an ordinary task's trace is
+        unchanged. The unfolded reason is used here on purpose: this reaches
+        the operator's tracing backend, not a public API response.
+        """
+        if self.memory_available:
+            return {}
+        return {
+            MEMORY_AVAILABLE_METADATA_KEY: False,
+            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.memory_availability_reason,
+        }
 
 
 def _optional_task_int(task: Any, field: str) -> int | None:
@@ -2912,6 +2958,9 @@ class AgentServiceManager:
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
                         memory_enabled=memory_policy.memory_enabled,
+                        memory_available=memory_policy.memory_available,
+                        memory_availability_reason=memory_policy.public_availability_reason,
+                        execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
 
@@ -3940,6 +3989,9 @@ class AgentServiceManager:
                     task_id=str(task_id),
                     memory_similarity_threshold=memory_similarity_threshold,
                     memory_enabled=memory_policy.memory_enabled,
+                    memory_available=memory_policy.memory_available,
+                    memory_availability_reason=memory_policy.public_availability_reason,
+                    execution_metadata=memory_policy.execution_metadata(),
                 )
 
             agent_service = self._agents[task_id]

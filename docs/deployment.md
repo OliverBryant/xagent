@@ -616,10 +616,32 @@ So gate the rollback on the persisted identity, not just on the fleet version:
    the copy opens and its row count and vector width match the original. An
    unverified copy is not a backup.
 5. **Compare the two identities.**
-   * **They match** — roll back. Redeploy the previous version to every worker
-     at once. Leave the authority row in place: the old code ignores it, and
-     the new version needs it on the next roll-forward.
-   * **They differ, or the persisted identity cannot be proven** — do **not**
+   * **They match** — this proves only that the identities agree, not that
+     the previous release will persist anything. Its memory manager resolves
+     the embedding model from the model hub (never from the authority) and,
+     when it cannot build a persistent store for that row — a failed lookup, a
+     provider it does not build a store for, a construction error — it logs
+     the error and serves the in-memory store instead. So before rolling back,
+     get positive evidence for every identity step 3 found:
+     * a model hub row the previous release will select (the user's default
+       embedding model, else the first active embedding model visible to the
+       user), active and carrying that identity; and
+     * a verified start of the previous version, with memory storage detached
+       (both memory directory locations moved aside) and no other worker
+       running, in which a memory request made as that user (for example
+       `GET /api/memory/list`) is followed by `GET /api/memory/store-info`
+       reporting `store_type` `LanceDBMemoryStore`, `is_lancedb` `true` and
+       the expected `embedding_model_id`. `InMemoryMemoryStore` or
+       `is_lancedb` `false` means the fallback, not a persistent store.
+
+     With both, stop that instance, discard whatever memory directory it
+     created, reattach the real one, and
+     redeploy the previous version to every worker at once. Leave the
+     authority row in place: the old code ignores it, and the new version
+     needs it on the next roll-forward. Without both, treat the case as
+     unprovable and follow the next branch.
+   * **They differ, or the persisted identity or the previous release's
+     persistence under it cannot be proven** — do **not**
      start the previous version against this data. Keep memory fenced and pick
      one: restore a verified backup that was written under the identity the
      previous release will select, or re-embed the table offline into that

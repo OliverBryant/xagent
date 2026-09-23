@@ -209,3 +209,96 @@ async def test_max_retries_none_falls_back_to_three_attempts(
         await model.generate_image(prompt="p")
 
     assert images.calls == ["generate", "generate", "generate"]
+
+
+@pytest.mark.asyncio
+async def test_negative_max_retries_is_clamped_to_one_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row's negative max_retries must not reach RetryWrapper unclamped.
+
+    ``-1`` is truthy, so ``getattr(db_model, "max_retries", 3) or 3`` passes it
+    straight through instead of substituting the fallback (0 would already be
+    caught by ``or 3``, since 0 is falsy -- only a negative value survives).
+    ``range(max_retries)`` is then empty for anything <= 0, so RetryWrapper
+    skips the target entirely -- not even one attempt -- and raises a
+    synthetic ``RuntimeError("Retry failed with no exception")``. The caller
+    never sees the real failure, and a billed-invalid response is never
+    recorded at all. Clamped to at least 1, the real error and exactly one
+    attempt come through instead.
+    """
+    row = _db_row(max_retries=-1)
+    images = _patch_openai_transport(monkeypatch, [RuntimeError("boom")])
+    model = _published_model([row], monkeypatch)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await model.generate_image(prompt="p")
+
+    assert images.calls == ["generate"]
+
+
+@pytest.mark.asyncio
+async def test_falsy_zero_max_retries_still_falls_back_to_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """0 is falsy, so it was never affected by the clamp bug: `0 or 3` already
+    substitutes the fallback before the clamp ever sees the value. Pinned
+    separately from the negative case above so the two are not conflated."""
+    row = _db_row(max_retries=0)
+    images = _patch_openai_transport(
+        monkeypatch, [RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")]
+    )
+    model = _published_model([row], monkeypatch)
+
+    with pytest.raises(RuntimeError):
+        await model.generate_image(prompt="p")
+
+    assert images.calls == ["generate", "generate", "generate"]
+
+
+@pytest.mark.asyncio
+async def test_negative_max_retries_still_bills_the_invalid_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import requests
+    from openai import APIResponseValidationError
+
+    row = _db_row(model_id="row-billed", max_retries=-1)
+    validation_error = APIResponseValidationError(
+        response=requests.Response(), body=None, message="bad body"
+    )
+    images = _patch_openai_transport(monkeypatch, [validation_error])
+    model = _published_model([row], monkeypatch)
+
+    with TokenContextManager() as manager:
+        with pytest.raises(Exception):
+            await model.generate_image(prompt="p")
+        media_rows = [
+            d for d in manager.get_usage().details if d.get("type") == "media"
+        ]
+
+    assert images.calls == ["generate"]
+    assert len(media_rows) == 1
+    assert media_rows[0]["model_id"] == "row-billed"
+
+
+def test_adapter_path_also_clamps_negative_max_retries() -> None:
+    """The other construction path (get_image_model_instance) applies the same
+    clamp, so the two never disagree about how many attempts a row gets."""
+    from types import SimpleNamespace
+
+    from xagent.core.model.image.adapter import get_image_model_instance
+
+    row = SimpleNamespace(
+        model_id="adapter-row",
+        model_name="gpt-image-1",
+        model_provider="openai",
+        api_key="k",
+        base_url=None,
+        abilities=["generate", "edit"],
+        timeout=5.0,
+        max_retries=-1,
+    )
+    wrapper = get_image_model_instance(row)
+
+    assert wrapper._retry_wrapper.max_retries == 1

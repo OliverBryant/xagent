@@ -662,12 +662,16 @@ def _add_image_model_with_id(
     setattr(instance, "model_id", str(db_model.model_id))
     # Same retry policy as get_image_model_instance, so both construction paths
     # agree on how often a call is attempted and never retry an already-billed
-    # invalid response. max_retries is the total attempt bound.
+    # invalid response. max_retries is the total attempt bound, clamped to at
+    # least 1: `or 3` only substitutes when the row's value is falsy (None or
+    # 0), so a negative row value passed straight through, and RetryWrapper's
+    # `range(max_retries)` is empty for anything <= 0 -- every call raised a
+    # bare RuntimeError without the target ever being invoked.
     models_dict[str(db_model.model_id)] = create_retry_wrapper(
         instance,
         BaseImageModel,
         retry_methods={"generate_image", "edit_image"},
-        max_retries=getattr(db_model, "max_retries", 3) or 3,
+        max_retries=max(getattr(db_model, "max_retries", 3) or 3, 1),
         retry_on=retry_image_call,
     )
     logger.info(

@@ -550,6 +550,10 @@ def test_unusable_legacy_user_id_requires_repair(tmp_path, metadata):
     before = _snapshot(connection)
     outcome = _admit(connection)
     assert outcome.state is StorageAdmissionState.BLOCKED_REPAIR
+    # Pinned as well as the public state: the owner is what the scan refused,
+    # so a future change that reached BLOCKED_REPAIR for some other reason
+    # would no longer be exercising this contract.
+    assert outcome.maintenance.status is MaintenanceStatus.INVALID_LEGACY_DATA
     assert outcome.detail == REPAIR_REQUIRED_DETAIL
     assert _snapshot(connection) == before
 

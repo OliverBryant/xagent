@@ -57,6 +57,9 @@ from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_memory_embedding_authority import (
+    OPENAPI_COMPONENT_SCHEMAS as ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+)
+from .api.admin_memory_embedding_authority import (
     router as admin_memory_embedding_authority_router,
 )
 from .api.admin_users import router as admin_users_router
@@ -1375,6 +1378,38 @@ app.include_router(share_router)
 # Public SDK surface, mounted under /v1. Auth via xag_* API key,
 # error envelope {"error": {"code", "message"}}. See web/api/v1/.
 app.include_router(v1_router)
+
+
+#: Schemas no route signature declares, so the framework never walks them.
+#: A route that reads its own body declares its ``requestBody`` by hand and
+#: references a component; without registering that component here, the served
+#: document would carry a ``$ref`` that resolves to nothing.
+DECLARED_OPENAPI_COMPONENT_SCHEMAS: dict[str, Any] = {
+    **ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+}
+
+_assembled_openapi = app.openapi
+
+
+def openapi_with_declared_components() -> dict[str, Any]:
+    """The assembled document, plus the schemas it cannot infer.
+
+    Merged rather than overwritten: where the framework already inferred a
+    definition from a response model, that one stays authoritative and only
+    the genuinely missing definitions are added.
+    """
+    schema = _assembled_openapi()
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    for name, definition in DECLARED_OPENAPI_COMPONENT_SCHEMAS.items():
+        components.setdefault(name, definition)
+    # ``app.openapi`` caches and returns that same dict, so the merge above
+    # has already landed in the cache; this only covers the first call, which
+    # populates it.
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = openapi_with_declared_components  # type: ignore[method-assign]
 
 
 def start_runtime_performance_monitor(app_instance: FastAPI) -> None:

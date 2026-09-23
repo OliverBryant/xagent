@@ -8737,4 +8737,67 @@ describe("projectAppState ADD_TRACE_EVENT settlement routing", () => {
       state.messages.find((m) => m.id === "waiting-question")?.traceEvents
     ).toHaveLength(2)
   })
+
+  it("does not route a settlement into a DIFFERENT call's message sharing the same id", () => {
+    // tool_call_id is only unique in principle: a provider that omits ids
+    // makes the backend's fallback ("tool_call_{index}") collide across
+    // concurrent DAG steps. Two UNRELATED sealed messages each hold a
+    // tool_execution_start with the same id, one per step. The settlement
+    // carries its own original step_id, which must disambiguate which
+    // message it belongs to.
+    const withStep = (eventType: string, data: Record<string, unknown>, eventId: string, stepId: string) =>
+      ({ event_id: eventId, event_type: eventType, step_id: stepId, data }) as unknown as Parameters<
+        typeof projectAppState
+      >[1] extends never
+        ? never
+        : any
+
+    let state = createInitialState()
+    // Message A: call-1 paused under step-a.
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: withStep("tool_execution_start", { tool_name: "approval_gate", tool_call_id: "call-1" }, "a1", "step-a"),
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "message-a", role: "assistant", content: "A", timestamp: "t1", isResult: true },
+    } as any)
+    // A non-result message breaks the "append to last result" default
+    // buffering rule, exactly as the real reply-then-next-tool-call shape
+    // does in stateWithSealedPausePair above.
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "between", role: "user", content: "continue", timestamp: "t1.5" },
+    } as any)
+    // Message B: an UNRELATED call, under step-b, that happens to share "call-1".
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: withStep("tool_execution_start", { tool_name: "search", tool_call_id: "call-1" }, "b1", "step-b"),
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "message-b", role: "assistant", content: "B", timestamp: "t2", isResult: true },
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "reply", role: "user", content: "Approve", timestamp: "t2.5" },
+    } as any)
+
+    // The settlement for A's call, carrying A's OWN original step_id.
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: withStep(
+        "tool_execution_end",
+        { tool_name: "approval_gate", tool_call_id: "call-1", settlement_delivery: true, settlement_status: "succeeded" },
+        "a2",
+        "step-a"
+      ),
+    } as any)
+
+    const messageA = state.messages.find((m) => m.id === "message-a")
+    const messageB = state.messages.find((m) => m.id === "message-b")
+    expect((messageA?.traceEvents ?? []).map((e: any) => e.event_id)).toEqual(["a1", "a2"])
+    // B's message is untouched.
+    expect((messageB?.traceEvents ?? []).map((e: any) => e.event_id)).toEqual(["b1"])
+  })
 })

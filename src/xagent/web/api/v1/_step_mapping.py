@@ -310,7 +310,7 @@ class PublicStepProjector:
         self._finished.insert(index, self._finished.pop())
 
     def _reopen_finished_step(
-        self, public_type: str, key: str
+        self, public_type: str, key: str, origin_step_id: str
     ) -> Optional[Dict[str, Any]]:
         """Pull an already-finalized step back out of the finished history.
 
@@ -319,21 +319,60 @@ class PublicStepProjector:
         copy) is what keeps the public id stable and keeps the call to one
         step: ``_finalize_pending`` re-appends this object when the settlement
         end arrives. Returns ``None`` when there is nothing to re-open -- no
-        finished history (``retain_finished=False``), or a first-ever delivery
-        whose start was never seen -- and the caller then builds a fresh step.
+        finished history (``retain_finished=False``), a first-ever delivery
+        whose start was never seen, or an unresolved collision among several
+        candidates (see below) -- and the caller then builds a fresh step
+        rather than overwrite someone else's result.
+
+        ``key`` (``tool_call_id``, or the legacy ``tool_execution_id``) is
+        only unique in principle: a provider that omits tool call ids makes
+        the backend's synthesized fallback (``tool_call_{index}``) collide
+        across concurrent DAG steps, each running its own ReAct loop. When
+        TWO distinct original calls happen to share a key, ``_finished`` ends
+        up holding two entries with the same public id, and picking "the most
+        recent one" (the naive rule this used to follow) can attach a
+        settlement to the WRONG call's finished result.
+
+        Disambiguating on ``origin_step_id`` (each step dict's own
+        ``_origin_step_id``, stamped at build time from the event that
+        created it) only when there is more than one candidate is
+        deliberate: a single call's OWN settlement can legitimately carry a
+        step_id that differs from its original start's (a ledger row
+        restored without ``ToolCallRecord.step_id`` falls back to the
+        resumed run's fresh id -- see react.py's
+        ``_trace_tool_interaction_settlement``), so requiring an exact match
+        unconditionally would refuse to reopen the common, unambiguous case.
+        The check only needs to fire when there is genuine ambiguity to
+        resolve.
         """
         if self._finished is None:
             return None
-        for index in range(len(self._finished) - 1, -1, -1):
-            step = self._finished[index]
-            if (
-                step.get("type") == public_type
-                and step.get("id") == f"{public_type}:{key}"
-            ):
-                self._settlement_reopen_index[(public_type, key)] = index
-                del self._finished[index]
-                return step
-        return None
+        candidates = [
+            index
+            for index in range(len(self._finished) - 1, -1, -1)
+            if self._finished[index].get("type") == public_type
+            and self._finished[index].get("id") == f"{public_type}:{key}"
+        ]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            candidates = [
+                index
+                for index in candidates
+                if self._finished[index].get("_origin_step_id") == origin_step_id
+            ]
+            if len(candidates) != 1:
+                # Either no candidate's origin matches, or (should not
+                # happen -- origins are stamped from a step_id that is
+                # unique per invocation) more than one does. Either way
+                # there is no single safe target; let the caller append a
+                # fresh step instead of guessing.
+                return None
+        index = candidates[0]
+        step = self._finished[index]
+        self._settlement_reopen_index[(public_type, key)] = index
+        del self._finished[index]
+        return step
 
     def feed(self, event: Any) -> List[Dict[str, Any]]:
         """Fold one trace event, returning the step(s) it changed.
@@ -477,24 +516,41 @@ class PublicStepProjector:
                     # how the ``started_at`` ascending order this endpoint
                     # documents gets broken.
                     #
-                    # Only when neither exists is a placeholder built. That is
-                    # the ``retain_finished=False`` (SSE) lane, which keeps no
-                    # history: its ``started_at`` is the settlement's, the one
-                    # field that lane cannot recover.
+                    # Only when neither exists -- or ``_reopen_finished_step``
+                    # can't resolve a genuine collision among several
+                    # same-key candidates (a provider that omits tool call ids
+                    # makes the synthesized fallback id collide across
+                    # concurrent DAG steps) -- is a placeholder built. That
+                    # also covers the ``retain_finished=False`` (SSE) lane,
+                    # which keeps no history: its ``started_at`` is patched
+                    # from the settlement's own ``original_started_at``
+                    # payload field when present (the ledger's durable record
+                    # of when the call actually started), falling back to the
+                    # settlement's own timestamp only for legacy events
+                    # emitted before that field existed.
                     pending_key = (public_type, str(key))
-                    reopened = self._reopen_finished_step(public_type, str(key))
+                    origin_step_id = str(_safe_get(event, "step_id") or "")
+                    reopened = self._reopen_finished_step(
+                        public_type, str(key), origin_step_id
+                    )
                     if reopened is None:
                         reopened = self._pending.get(pending_key)
-                    self._pending[pending_key] = (
-                        reopened
-                        if reopened is not None
-                        else _build_tool_start(
+                    if reopened is not None:
+                        placeholder = reopened
+                    else:
+                        placeholder = _build_tool_start(
                             event,
                             public_type=public_type,
                             tool_name=tool_name,
                             key=str(key),
                         )
-                    )
+                        placeholder["_origin_step_id"] = origin_step_id
+                        original_started_at = _data_get(event, "original_started_at")
+                        if original_started_at is not None:
+                            placeholder["started_at"] = datetime.fromtimestamp(
+                                float(original_started_at), tz=timezone.utc
+                            )
+                    self._pending[pending_key] = placeholder
                     # Emit nothing here. The call is already terminal for every
                     # consumer, and re-announcing it as ``running`` would make
                     # a client that folds by id regress a finished step back to
@@ -507,6 +563,12 @@ class PublicStepProjector:
                     tool_name=tool_name,
                     key=str(key),
                 )
+                # Internal only -- stripped by Pydantic's default
+                # ``extra="ignore"`` when a step dict is handed to
+                # ``PublicStep(**step)``. Lets ``_reopen_finished_step``
+                # disambiguate WHICH original call a settlement belongs to
+                # when its key collides with another call's (see there).
+                step["_origin_step_id"] = str(_safe_get(event, "step_id") or "")
                 self._pending[(public_type, str(key))] = step
                 return [step]
             if event_type == "tool_execution_end":

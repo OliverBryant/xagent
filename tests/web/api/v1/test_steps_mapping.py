@@ -2228,3 +2228,135 @@ def test_replayed_settlement_after_a_lost_end_keeps_the_original_started_at() ->
     assert tool_steps[0]["started_at"] == at(1)
     started = [step["started_at"] for step in tool_steps]
     assert started == sorted(started)
+
+
+def test_settlement_delivery_does_not_reopen_a_colliding_step() -> None:
+    """A settlement for one call must never overwrite a DIFFERENT call's step.
+
+    ``tool_call_id`` is only unique in principle: a provider that omits ids
+    makes ``_normalize_tool_calls``'s fallback (``tool_call_{index}``) collide
+    across concurrent DAG steps, each running its own ReAct loop. Two
+    completed calls can then share the same public id in ``_finished``. The
+    settlement for the EARLIER call must resolve to its OWN finished entry --
+    disambiguated by ``step_id``, which react.py stamps with the original
+    issuing step -- never to the LATER, unrelated call sharing the id.
+    """
+
+    events = [
+        # Step A: approval_gate pauses, then settles later.
+        _ev(
+            "tool_execution_start",
+            step_id="dag_step_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "tool_call_0"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="dag_step_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "result": {"call": "A", "status": "waiting"},
+            },
+        ),
+        # Step B: a concurrent DAG step whose provider ALSO omitted the id,
+        # so it synthesizes the SAME fallback "tool_call_0". It runs to
+        # completion before A's settlement arrives.
+        _ev(
+            "tool_execution_start",
+            step_id="dag_step_b",
+            data={"tool_name": "search", "tool_call_id": "tool_call_0"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="dag_step_b",
+            data={
+                "tool_name": "search",
+                "tool_call_id": "tool_call_0",
+                "result": {"call": "B", "hits": 3},
+            },
+        ),
+        # A's settlement: carries A's OWN original step_id (react.py threads
+        # ``record.step_id`` through), which is what disambiguates it from B.
+        _ev(
+            "tool_execution_start",
+            step_id="dag_step_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="dag_step_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"call": "A", "status": "APPROVED"},
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+    tool_steps = [step for step in steps if step["type"] == "tool_call"]
+
+    by_name = {step["data"]["name"]: step for step in tool_steps}
+    # B's result is untouched -- the settlement never landed on it.
+    assert by_name["search"]["data"]["result"] == {"call": "B", "hits": 3}
+    # A's own step reopened and carries the settled result, not appended as
+    # an ambiguous third card.
+    assert by_name["approval_gate"]["data"]["result"] == {
+        "call": "A",
+        "status": "APPROVED",
+    }
+    assert len(tool_steps) == 2
+
+
+def test_settlement_delivery_recovers_started_at_on_the_sse_lane() -> None:
+    """The SSE (``retain_finished=False``) lane has no history to fall back on.
+
+    react.py threads the ledger's durable ``issued_at`` through the
+    settlement's own ``original_started_at`` payload field so this lane can
+    still report the call's TRUE start time instead of stamping the
+    settlement's own (much later) timestamp as ``started_at``.
+    """
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    original_started = base - timedelta(hours=1)
+
+    projector = PublicStepProjector(retain_finished=False)
+    changed = projector.feed(
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            timestamp=base,
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "original_started_at": original_started.timestamp(),
+            },
+        )
+    )
+    # The settlement START never emits on its own (see feed()'s docstring).
+    assert changed == []
+
+    finalized = projector.feed(
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            timestamp=base + timedelta(seconds=1),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        )
+    )
+
+    assert len(finalized) == 1
+    assert finalized[0]["started_at"] == original_started

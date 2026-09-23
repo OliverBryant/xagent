@@ -1343,16 +1343,36 @@ function settlementTargetMessageIndex(
   if (data.settlement_delivery !== true) return -1
   const toolCallId = data.tool_call_id
   if (typeof toolCallId !== "string" || !toolCallId) return -1
-
+  // tool_call_id alone is not invocation-global: a provider that omits ids
+  // makes the backend's synthesized fallback (`tool_call_{index}`) collide
+  // across concurrent DAG steps, and a bare-id match could route this
+  // settlement into a DIFFERENT call's message. But a single call's OWN
+  // settlement can legitimately carry a step_id that differs from its
+  // pause's (a ledger row without a persisted original step_id falls back
+  // to the resumed run's fresh one -- see react.py's
+  // `_trace_tool_interaction_settlement`), so requiring an exact match
+  // unconditionally would misroute the common, unambiguous case. Only gate
+  // on it when more than one message's stored call actually shares this id.
+  const originStepId = event.step_id
+  const owningIndexes: number[] = []
   for (let index = messages.length - 1; index >= 0; index--) {
     const owns = (messages[index].traceEvents || []).some(candidate => {
       if (candidate?.event_type !== "tool_execution_start") return false
       const candidateData = (candidate?.data ?? {}) as Record<string, unknown>
       return candidateData.tool_call_id === toolCallId
     })
-    if (owns) return index
+    if (owns) owningIndexes.push(index)
   }
-  return -1
+  if (owningIndexes.length === 0) return -1
+  if (owningIndexes.length === 1) return owningIndexes[0]
+  const exact = owningIndexes.filter(index =>
+    (messages[index].traceEvents || []).some(candidate => {
+      if (candidate?.event_type !== "tool_execution_start") return false
+      const candidateData = (candidate?.data ?? {}) as Record<string, unknown>
+      return candidateData.tool_call_id === toolCallId && candidate.step_id === originStepId
+    })
+  )
+  return exact.length === 1 ? exact[0] : -1
 }
 
 // Pure reducer over (state, action). Exported for unit testing -- notably the

@@ -824,4 +824,106 @@ describe("processTraceEvents settlement delivery", () => {
     expect(settled?.status).toBe("completed")
     expect(settled?.data.output).toBe("urn:li:share:123")
   })
+
+  it("does not reopen a DIFFERENT step's action sharing the same tool_call_id", () => {
+    // tool_call_id is only unique in principle: a provider that omits ids
+    // makes the backend's fallback ("tool_call_{index}") collide across
+    // concurrent DAG steps, each running its own ReAct loop. Step A pauses
+    // and settles later; step B is a completely different, unrelated call
+    // that happens to synthesize the SAME id and finishes first. The
+    // settlement carries its OWN original step_id (step-a), which is what
+    // must disambiguate it from step-b's unrelated result.
+    const inStepA = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-a",
+      data,
+    })
+    const inStepB = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-b",
+      data,
+    })
+    const stepAStart = { event_type: "react_task_start", step_id: "step-a", data: { step_name: "A" } }
+    const stepBStart = { event_type: "react_task_start", step_id: "step-b", data: { step_name: "B" } }
+
+    const events = [
+      stepAStart,
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish?" },
+      }),
+      stepBStart,
+      inStepB("tool_execution_start", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+      }),
+      inStepB("tool_execution_end", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        result: { output: "3 hits" },
+      }),
+      // The settlement for A's call, carrying A's OWN original step_id.
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "urn:li:share:123" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+    const search = toolActions.find((a) => a.data.tool === "search")
+    const approval = toolActions.find((a) => a.data.tool === "approval_gate")
+
+    // B's unrelated result is untouched.
+    expect(search?.data.output).toBe("3 hits")
+    // A's own action reopened and carries the settled result, not a third,
+    // ambiguous card.
+    expect(approval?.data.output).toBe("urn:li:share:123")
+    expect(toolActions).toHaveLength(2)
+  })
+
+  it("clears the stale pause output when a settlement fails", () => {
+    // A rejected/errored settlement produces no new output -- only an error.
+    // Without clearing it, ToolOutputDisplay would keep rendering the
+    // original pause prompt ("Publish this exact post?") alongside the new
+    // error message.
+    const events = [
+      ...pausePair,
+      resumedStepStart,
+      inStep2("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+      }),
+      inStep2("tool_execution_failed", {
+        tool_name: "approval_gate",
+        tool_call_id: "call-1",
+        settlement_delivery: true,
+        settlement_status: "rejected",
+        error: "The user rejected the tool call.",
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(1)
+    expect(toolActions[0].status).toBe("failed")
+    expect(toolActions[0].data.error).toBe("The user rejected the tool call.")
+    expect(toolActions[0].data.output).toBeUndefined()
+  })
 })

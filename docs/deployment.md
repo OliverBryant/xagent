@@ -2,11 +2,24 @@
 
 ## LanceDB memory compatibility
 
-The declared LanceDB dependency range is the one in `pyproject.toml`; this
-section does not restate it. CI exercises three representatives of that range:
-the declared minimum, the version pinned in `uv.lock`, and the newest minor
-tested so far. It does not claim that every intervening release is tested
-individually.
+The LanceDB dependency is bounded: `lancedb>=0.32.0,<0.38` in `pyproject.toml`.
+The bound is deliberate. Persistent memory reaches storage only through the
+admission primitives, and those depend on LanceDB table, metadata and commit
+semantics that no minor release is contracted to preserve, so an unbounded
+range would let an untested minor be installed under a runtime that fences
+memory off when it disagrees.
+
+CI exercises three representatives of that range:
+
+| Version | Why |
+| --- | --- |
+| `0.32.0` | The declared minimum. |
+| `0.33.0` | The version pinned in `uv.lock`, which is what a default install resolves to. |
+| `0.37.1` | The newest supported minor. |
+
+Those three are tested, not every intervening release. Raising the upper bound
+means testing the new minor against the admission matrix first and moving the
+`pyproject.toml` bound, the lock and this table together.
 
 ## 2026-08-11 — New public-task File Operation isolation
 

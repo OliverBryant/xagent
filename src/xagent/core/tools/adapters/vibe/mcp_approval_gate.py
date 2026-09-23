@@ -144,13 +144,24 @@ _UNSUPPORTED_PATTERN = {
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
 }
-# How long the gate will wait to OBSERVE a connector write that has already
-# been dispatched - both on the ordinary success path and when draining after
-# a cancellation. Deliberately not the registration's ``timeout_seconds``:
-# that one bounds approval *policy* latency before anything is sent, and is
-# typically small, whereas this bounds a remote call that is already in flight
-# and cannot be un-sent. Bounded either way, so a hung connector can neither
-# park a resume forever nor block an external cancel.
+# Default for how long the gate will wait to OBSERVE a connector write that
+# has already been dispatched - both on the ordinary success path and when
+# draining after a cancellation. Deliberately not the registration's
+# ``timeout_seconds``: that one bounds approval *policy* latency before
+# anything is sent, and is typically small, whereas this bounds a remote call
+# that is already in flight and cannot be un-sent. Bounded either way, so a
+# hung connector can neither park a resume forever nor block an external
+# cancel.
+#
+# This is a default, not a universal ceiling: no supported MCP transport
+# guarantees every call completes within 30s (the direct adapter awaits
+# ``session.call_tool`` with no per-call timeout, and streamable-HTTP/SSE
+# sessions default their own read timeout to five minutes - see
+# ``sessions.py``). A host whose registered task source dispatches to
+# connectors that legitimately run longer must override this via
+# ``register_mcp_approval_gate(..., dispatch_observe_seconds=...)`` rather
+# than have valid in-flight writes settle as ``dispatch_unknown`` at this
+# default cutoff.
 _DISPATCH_OBSERVE_SECONDS = 30.0
 # How long the gate waits for a connector call it has given up observing to
 # actually unwind once cancelled. This is a *teardown* budget, not a response
@@ -323,6 +334,7 @@ class _RegisteredHooks:
     gate: GateHook
     resume: GateResumeHook
     timeout_seconds: float
+    dispatch_observe_seconds: float
 
 
 _REGISTRATIONS: dict[str, _RegisteredHooks] = {}
@@ -341,8 +353,21 @@ def register_mcp_approval_gate(
     gate: GateHook,
     resume: GateResumeHook,
     timeout_seconds: float = 10.0,
+    dispatch_observe_seconds: float | None = None,
 ) -> MCPApprovalGateRegistration:
-    """Register async hooks for one task source; duplicate scopes are refused."""
+    """Register async hooks for one task source; duplicate scopes are refused.
+
+    ``dispatch_observe_seconds`` bounds how long the gate will wait to OBSERVE
+    a connector write *this registration* has already dispatched, once its
+    resume hook enters the one-shot executor (see ``_DISPATCH_OBSERVE_SECONDS``
+    and :func:`_call_resume_hook`). It is deliberately independent from
+    ``timeout_seconds``, which only bounds pre-dispatch approval *policy*
+    latency and is typically small. Leave it unset to use the module default;
+    pass an explicit value when this task source's connectors are known to run
+    longer (or shorter) than that default - for example to match a connector's
+    own configured call timeout - so a valid in-flight write is not discarded
+    as ``dispatch_unknown`` at an unrelated cutoff.
+    """
 
     if (
         not isinstance(task_source, str)
@@ -354,6 +379,15 @@ def register_mcp_approval_gate(
         raise TypeError("gate and resume hooks must be callable")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be finite and positive")
+    if dispatch_observe_seconds is not None and (
+        not math.isfinite(dispatch_observe_seconds) or dispatch_observe_seconds <= 0
+    ):
+        raise ValueError("dispatch_observe_seconds must be finite and positive")
+    resolved_observe_seconds = (
+        float(dispatch_observe_seconds)
+        if dispatch_observe_seconds is not None
+        else _DISPATCH_OBSERVE_SECONDS
+    )
     handle = MCPApprovalGateRegistration(task_source, str(uuid4()))
     with _REGISTRATIONS_LOCK:
         if task_source in _REGISTRATIONS:
@@ -365,6 +399,7 @@ def register_mcp_approval_gate(
             gate=gate,
             resume=resume,
             timeout_seconds=float(timeout_seconds),
+            dispatch_observe_seconds=resolved_observe_seconds,
         )
     return handle
 
@@ -498,6 +533,8 @@ async def _call_resume_hook(
     timeout_seconds: float,
     dispatch_started: asyncio.Event,
     /,
+    *,
+    dispatch_observe_seconds: float,
     **kwargs: Any,
 ) -> Any:
     """Bound only pre-dispatch resume policy; never cancel a started write.
@@ -519,6 +556,15 @@ async def _call_resume_hook(
     dispatch marker *before* awaiting the executor - which the module docstring
     already requires - so a later replay recognizes the in-flight attempt rather
     than issuing a second write.
+
+    ``dispatch_observe_seconds`` is spent exactly once per dispatched call,
+    never twice. A monotonic deadline is recorded the moment the gate starts
+    observing (right before the first post-dispatch ``wait_for``); if an
+    external cancellation interrupts that wait before it times out, the
+    ``finally`` drain below reuses the SAME deadline and passes only the
+    remaining time, rather than re-arming a fresh full budget. Without this, a
+    cancellation landing near the end of the first wait would let the caller
+    stay blocked for close to two full budgets back to back.
     """
 
     returned = _ensure_awaitable(hook(**kwargs))
@@ -528,6 +574,12 @@ async def _call_resume_hook(
     # Set once the observation budget has already been spent waiting on this
     # same dispatched call, so the cleanup path does not spend it again.
     observed = False
+    # Monotonic wall-clock deadline for the observation budget, set once when
+    # the gate first starts waiting on the dispatched call below. ``None``
+    # until then: cancellation arriving before dispatch is even observed has
+    # nothing to share a deadline with, so that path keeps its own full
+    # budget (see the ``finally`` branch below).
+    observe_deadline: float | None = None
     try:
         done, _ = await asyncio.wait(
             {hook_task, dispatch_wait},
@@ -559,9 +611,12 @@ async def _call_resume_hook(
             # expiry reaches the caller with ``dispatch_started`` set, which is
             # what makes it settle as ``dispatch_unknown`` rather than a clean
             # failure - the write may well have landed.
+            observe_deadline = (
+                asyncio.get_running_loop().time() + dispatch_observe_seconds
+            )
             try:
                 return await asyncio.wait_for(
-                    asyncio.shield(hook_task), timeout=_DISPATCH_OBSERVE_SECONDS
+                    asyncio.shield(hook_task), timeout=dispatch_observe_seconds
                 )
             except TimeoutError:
                 # The observation budget is spent; do not let the ``finally``
@@ -592,17 +647,28 @@ async def _call_resume_hook(
                 hook_task.cancel()
                 await _drain(hook_task)
             elif not observed:
-                await _drain(
-                    asyncio.shield(hook_task), timeout=_DISPATCH_OBSERVE_SECONDS
-                )
+                # Cancellation interrupted the observation wait above before
+                # it timed out. Share its deadline instead of re-arming a
+                # fresh ``dispatch_observe_seconds``: with ``observe_deadline``
+                # unset (cancellation raced ahead of the assignment above, or
+                # arrived before this call ever started observing) the full
+                # budget still applies, matching the pre-existing behavior.
+                remaining = dispatch_observe_seconds
+                if observe_deadline is not None:
+                    remaining = max(
+                        0.0, observe_deadline - asyncio.get_running_loop().time()
+                    )
+                await _drain(asyncio.shield(hook_task), timeout=remaining)
                 if not hook_task.done():
-                    _terminate_unobserved(hook_task)
+                    _terminate_unobserved(hook_task, dispatch_observe_seconds)
             else:
                 # Budget already spent on the success path above.
-                _terminate_unobserved(hook_task)
+                _terminate_unobserved(hook_task, dispatch_observe_seconds)
 
 
-def _terminate_unobserved(hook_task: "asyncio.Future[Any]") -> None:
+def _terminate_unobserved(
+    hook_task: "asyncio.Future[Any]", dispatch_observe_seconds: float
+) -> None:
     """Cancel and drain a dispatched call the gate has stopped observing.
 
     Bounded observation is not bounded *resource* lifetime. Only the ``shield``
@@ -637,7 +703,7 @@ def _terminate_unobserved(hook_task: "asyncio.Future[Any]") -> None:
     logger.warning(
         "MCP approval resume hook is still dispatching after %.0fs; "
         "cancelling it - the connector write may still have landed.",
-        _DISPATCH_OBSERVE_SECONDS,
+        dispatch_observe_seconds,
     )
 
     def _retrieve(task: "asyncio.Future[Any]") -> None:
@@ -987,6 +1053,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 registration.resume,
                 registration.timeout_seconds,
                 dispatch_started,
+                dispatch_observe_seconds=registration.dispatch_observe_seconds,
                 interaction_id=host_interaction_id,
                 response=response,
                 connector_ref=connector_ref,

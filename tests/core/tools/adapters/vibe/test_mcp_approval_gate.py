@@ -998,6 +998,121 @@ async def test_unobserved_dispatch_is_cancelled_and_its_transport_torn_down(
     assert not leaked, f"dispatch left {len(leaked)} task(s) running"
 
 
+@pytest.mark.asyncio
+async def test_dispatch_observe_seconds_overrides_the_module_default(
+    registrations: list[Any], monkeypatch: Any
+) -> None:
+    """A registration's own budget is honored even when it differs from the
+    module default - proves the value actually threads through to
+    ``_call_resume_hook``, not just validated at registration and discarded.
+    """
+
+    # Pin the module default far above the test's patience. The assertions
+    # below can only pass if the per-registration override - not this
+    # constant - is what actually bounds the observation wait.
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
+        999.0,
+    )
+    torn_down = asyncio.Event()
+
+    class HungTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                torn_down.set()
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=30,
+        dispatch_observe_seconds=0.05,
+    )
+    (tool,) = gate_mcp_tools([HungTarget()], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+
+    assert settlement is not None
+    assert settlement.status == "dispatch_unknown"
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_mid_observation_shares_the_deadline_not_restarts_it(
+    registrations: list[Any],
+) -> None:
+    """Cancellation mid-observation must not re-arm a fresh full budget.
+
+    Regression test for the #2582 review finding on the cancellation branch:
+    previously, only the ``TimeoutError`` raised by the first post-dispatch
+    ``wait_for`` set ``observed = True``. A cancellation that instead
+    interrupted that same wait bypassed it, so the ``finally`` drain re-armed
+    a brand-new ``dispatch_observe_seconds`` window regardless of how much of
+    the first one had already elapsed - roughly doubling worst-case
+    dispatch-to-cancel-completion latency. The fix records a monotonic
+    deadline once and shares it between both waits.
+    """
+
+    dispatch_observe_seconds = 0.4
+    started = asyncio.Event()
+
+    class HangingTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            started.set()
+            await asyncio.Event().wait()  # never completes on its own
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=30,
+        dispatch_observe_seconds=dispatch_observe_seconds,
+    )
+    (tool,) = gate_mcp_tools([HangingTarget()], connection={"id": 41})
+
+    async def run() -> Any:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            )
+
+    task = asyncio.ensure_future(run())
+    await started.wait()
+    # Let the observation wait consume roughly half its budget before the
+    # external cancellation arrives - the shape that used to restart it.
+    await asyncio.sleep(dispatch_observe_seconds / 2)
+    loop = asyncio.get_running_loop()
+    cancel_time = loop.time()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=dispatch_observe_seconds * 3)
+    elapsed_after_cancel = loop.time() - cancel_time
+
+    # The fix bounds this to roughly the REMAINING half of the shared budget
+    # (~0.2s here). The bug re-armed a fresh full budget in `finally`
+    # (~0.4s), so a threshold at 75% of the full budget cleanly separates the
+    # two without being sensitive to ordinary scheduling jitter.
+    assert elapsed_after_cancel < dispatch_observe_seconds * 0.75, elapsed_after_cancel
+
+
 def test_wrapper_delegates_unknown_attributes_to_the_wrapped_tool() -> None:
     """Call sites duck-type tools with getattr, so losses would be silent."""
 
@@ -1128,6 +1243,23 @@ def test_register_refuses_an_unusable_timeout(timeout_seconds: float) -> None:
             gate=lambda _: None,
             resume=lambda **_: None,
             timeout_seconds=timeout_seconds,
+        )
+
+
+@pytest.mark.parametrize(
+    "dispatch_observe_seconds",
+    [0, -1, float("nan"), float("inf")],
+    ids=["zero", "neg", "nan", "inf"],
+)
+def test_register_refuses_an_unusable_dispatch_observe_seconds(
+    dispatch_observe_seconds: float,
+) -> None:
+    with pytest.raises(ValueError):
+        register_mcp_approval_gate(
+            task_source="slack",
+            gate=lambda _: None,
+            resume=lambda **_: None,
+            dispatch_observe_seconds=dispatch_observe_seconds,
         )
 
 

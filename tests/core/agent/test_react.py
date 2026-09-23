@@ -11186,6 +11186,65 @@ async def test_a_swallowed_trace_write_keeps_the_obligation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_swallowed_production_style_db_failure_keeps_the_obligation() -> None:
+    """A database write failure that would normally be swallowed must not be.
+
+    ``Tracer.trace_event`` defaults to ``require_persisted=False``, and the
+    production ``DatabaseTraceHandler`` logs and returns normally on an
+    ordinary write failure in that mode -- it only raises when the caller
+    asks for persisted delivery. This fake mirrors exactly that contract
+    (unlike ``HalfBrokenTracer`` above, which raises unconditionally): it
+    only fails the END write when ``require_persisted`` is actually passed.
+    If settlement trace events did not request persistence, this write would
+    report success and durably clear the obligation on a pair that was never
+    actually written to the database -- rogercloud's round-2 review of #2554.
+    """
+
+    class ProductionStyleTracer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+            self.calls += 1
+            if self.calls == 2 and kwargs.get("require_persisted"):
+                raise RuntimeError("db insert failed")
+            return "ok"
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="db-swallow")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(
+            execution_id="db-swallow", tracer=ProductionStyleTracer()
+        ),
+    )
+
+    # The END write's failure must not be swallowed into a false "success":
+    # the obligation must survive so the next run start replays the pair.
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is True
+
+
+@pytest.mark.asyncio
 async def test_settlement_trace_is_emitted_under_the_original_step_id() -> None:
     """The pair must land in the step that issued the call, not the resumed one.
 

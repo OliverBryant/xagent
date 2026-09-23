@@ -123,6 +123,13 @@ class _ToolExchange:
     # (see AgentRunner._ensure_user_message_turn_id). An empty turn_id means
     # the exchange is omitted rather than placed by guesswork.
     turn_id: str = ""
+    # The step_id of the end event that finalized this exchange (empty when
+    # absent). Used only to gate the settlement supersede-match below: a
+    # provider that omits tool call ids makes the fallback synthesized id
+    # collide across concurrent DAG steps, so matching ``call_id`` alone could
+    # supersede an unrelated exchange from a different, concurrent step that
+    # happens to share it.
+    step_id: str = ""
 
 
 @dataclass
@@ -467,14 +474,32 @@ def _load_tool_exchanges(
             # the original sort_key/prose also preserves the call's position in
             # the reconstructed transcript. Replaying the settlement is
             # idempotent because it rewrites the same exchange.
-            superseded = next(
-                (
+            #
+            # ``call_id`` alone is unsafe in general -- a provider that omits
+            # tool call ids makes the fallback synthesized id
+            # (``tool_call_{index}``) collide across concurrent DAG steps,
+            # each producing its own exchange for the same raw_call_id -- but
+            # a single call's OWN settlement can legitimately carry a step_id
+            # that differs from its pause's (a ledger row without a persisted
+            # original step_id falls back to the resumed run's fresh one --
+            # see react.py's ``_trace_tool_interaction_settlement``), so
+            # requiring an exact ``step_id`` match unconditionally would fail
+            # to supersede the common, unambiguous case. Only gate on it when
+            # more than one exchange actually shares this call_id.
+            candidates = [
+                exchange for exchange in exchanges if exchange.call_id == raw_call_id
+            ]
+            superseded: Optional[_ToolExchange] = None
+            if len(candidates) == 1:
+                superseded = candidates[0]
+            elif len(candidates) > 1:
+                exact = [
                     exchange
-                    for exchange in reversed(exchanges)
-                    if exchange.call_id == raw_call_id
-                ),
-                None,
-            )
+                    for exchange in candidates
+                    if exchange.step_id == step_discriminator
+                ]
+                if len(exact) == 1:
+                    superseded = exact[0]
             if superseded is not None:
                 superseded.result = result
                 continue
@@ -510,6 +535,7 @@ def _load_tool_exchanges(
                 assistant_content=assistant_content,
                 sort_key=sort_key,
                 turn_id=turn_id,
+                step_id=step_discriminator,
             )
         )
 

@@ -61,7 +61,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass, replace
-from datetime import timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, cast
 
@@ -218,6 +218,16 @@ class ToolCallRecord:
     # settlement checkpoint, so only a persisted flag can tell a cold start
     # that a pair is still owed. Legacy rows default to False.
     settlement_trace_pending: bool = False
+    # Wall-clock time this call was first registered (``status="running"``),
+    # captured once and carried unchanged through every later rewrite of this
+    # row (completed/failed/settlement all replace the row wholesale -- see
+    # ``_record_tool_call``). Exists so a settlement's trace pair can report
+    # the ORIGINAL start time: the ``retain_finished=False`` (SSE) projector
+    # lane keeps no history to recover it from otherwise, and would
+    # incorrectly stamp the settlement's own timestamp as the call's
+    # ``started_at``. None for records restored from a checkpoint written
+    # before this field existed.
+    issued_at: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -233,6 +243,7 @@ class ToolCallRecord:
             "settlement_turn_id": self.settlement_turn_id,
             "step_id": self.step_id,
             "settlement_trace_pending": self.settlement_trace_pending,
+            "issued_at": self.issued_at,
         }
 
     @classmethod
@@ -258,6 +269,9 @@ class ToolCallRecord:
             ),
             step_id=str(data["step_id"]) if data.get("step_id") else None,
             settlement_trace_pending=bool(data.get("settlement_trace_pending", False)),
+            issued_at=(
+                float(data["issued_at"]) if data.get("issued_at") is not None else None
+            ),
         )
 
 
@@ -2632,6 +2646,15 @@ class ReActPattern(AgentPattern):
         turn_id = getattr(runtime, "active_turn_id", None)
         if turn_id:
             base["turn_id"] = str(turn_id)
+        # Carried so a consumer with no history to recover it from (the
+        # ``retain_finished=False`` SSE projector lane) can still report the
+        # call's ORIGINAL start time instead of stamping this settlement's own
+        # timestamp as ``started_at``. Omitted for legacy ledger rows
+        # (``issued_at`` is None for records restored from a checkpoint
+        # written before the field existed) -- that lane already falls back
+        # to the settlement's own timestamp in that case.
+        if record.issued_at is not None:
+            base["original_started_at"] = record.issued_at
         start_data = {**base, "tool_params": copy.deepcopy(record.args)}
         if succeeded:
             end_type = TraceEventType(
@@ -2752,6 +2775,17 @@ class ReActPattern(AgentPattern):
         settlement that is already durable -- but the caller needs to know,
         because a swallowed failure means the row's trace obligation has NOT
         been discharged and must survive to the next run start.
+
+        Passes ``require_persisted=True``: the production tracer's database
+        handler swallows an ordinary write failure (logs and returns) unless
+        the event asks for persistence, in which case it raises instead. A
+        settlement's trace lifecycle is exactly the case that must not be
+        allowed to silently fail -- a swallowed failure would let this method
+        report success (via ``trace_event``'s own returned id) while nothing
+        was actually written, and the caller would durably clear the replay
+        obligation on a pair that was never persisted. Requiring persistence
+        turns that swallow into the ``Exception`` this method already catches
+        below, so the obligation correctly survives to the next run start.
         """
 
         execution_id = getattr(runtime, "execution_id", None)
@@ -2761,6 +2795,7 @@ class ReActPattern(AgentPattern):
                 task_id=str(execution_id or ""),
                 step_id=str(step_id or execution_id or "root"),
                 data=data,
+                require_persisted=True,
             )
             if inspect.isawaitable(emitted):
                 await emitted
@@ -5277,6 +5312,17 @@ class ReActPattern(AgentPattern):
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
         args_hash = self._args_hash(args)
+        # This row is replaced wholesale on every call (running -> completed/
+        # failed/waiting_for_user -> settled), so the ONLY way ``issued_at``
+        # survives to the settled row is to read it back from whatever is
+        # already there and carry it forward; a fresh ``ToolCallRecord`` with
+        # no override would otherwise silently reset it on every rewrite.
+        existing = self.tool_ledger.get(tool_call_id)
+        issued_at = (
+            existing.issued_at
+            if existing is not None and existing.issued_at is not None
+            else datetime.now(timezone.utc).timestamp()
+        )
         self.tool_ledger[tool_call_id] = ToolCallRecord(
             tool_call_id=tool_call_id,
             tool_name=str(tool_call["name"]),
@@ -5292,6 +5338,7 @@ class ReActPattern(AgentPattern):
             ),
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
             settlement_trace_pending=settlement_trace_pending,
+            issued_at=issued_at,
         )
 
     @staticmethod

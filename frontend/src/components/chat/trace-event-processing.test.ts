@@ -705,8 +705,9 @@ describe("processTraceEvents settlement delivery", () => {
     expect(toolActions[0].data.tool_call_id).toBe("call-1")
     expect(toolActions[0].status).toBe("completed")
     expect(toolActions[0].data.output).toBe("urn:li:share:123")
-    expect(toolActions[0].data.settlementStatus).toBe("succeeded")
-    expect(toolActions[0].data.settling).toBe(false)
+    // The resumed step never ran the tool, so it must not advertise it.
+    const resumedStep = steps.find((step) => step.stepId === "step-2")
+    expect(resumedStep?.tools ?? []).toHaveLength(0)
   })
 
   it("marks a denied settlement as failed on the original action", () => {
@@ -733,7 +734,6 @@ describe("processTraceEvents settlement delivery", () => {
     expect(toolActions).toHaveLength(1)
     expect(toolActions[0].status).toBe("failed")
     expect(toolActions[0].data.error).toBe("The user rejected the tool call.")
-    expect(toolActions[0].data.settlementStatus).toBe("rejected")
   })
 
   it("is idempotent when the backend replays the settlement pair", () => {
@@ -762,9 +762,12 @@ describe("processTraceEvents settlement delivery", () => {
     expect(toolActions[0].data.output).toBe("urn:li:share:123")
   })
 
-  it("appends a card when the original START is outside the replay window", () => {
-    // Truncated history: the settlement must still be visible rather than
-    // silently dropped.
+  it("appends a card only when no message window holds the original", () => {
+    // Truncated history -- the original start is genuinely absent, so the
+    // settlement must still be visible rather than silently dropped. In
+    // production this is the rare case, not the norm: the backend emits the
+    // pair under the original call's step id and the chat reducer routes it
+    // to the message that already holds that tool_call_id.
     const events = [
       resumedStepStart,
       inStep2("tool_execution_start", {

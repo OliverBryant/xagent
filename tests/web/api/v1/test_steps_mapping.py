@@ -2066,3 +2066,63 @@ def test_settlement_delivery_preserves_started_at_ordering() -> None:
     assert tool_ids == ["tool_call:call-1", "tool_call:call-2"]
     started = [step["started_at"] for step in steps if step["type"] == "tool_call"]
     assert started == sorted(started)
+
+
+def test_settlement_delivery_never_reopens_a_terminal_step_on_the_sse_lane() -> None:
+    """The incremental lane must not regress a finished call to ``running``.
+
+    ``retain_finished=False`` keeps no history to re-open, so a settlement
+    start has nothing to update. Emitting a freshly-built start would push a
+    ``running`` step with a NEW ``started_at`` under an id the client already
+    holds as terminal, so a client folding by id would watch a completed tool
+    go back in flight. The settlement END carries the single terminal update.
+    """
+
+    projector = PublicStepProjector(retain_finished=False)
+    # feed() hands back the live step object, which a later finalize mutates
+    # in place -- snapshot each emission so this asserts what the client saw
+    # at the time, not the end state.
+    emitted: list[dict[str, Any]] = []
+    for event in (
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "call-1"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "result": {"message": "Publish?"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        ),
+    ):
+        emitted.extend(copy.deepcopy(step) for step in projector.feed(event))
+
+    statuses = [step["status"] for step in emitted if step["type"] == "tool_call"]
+    # running (original start), completed (pause), completed (settlement).
+    # Critically: no second "running" after the call first completed.
+    assert statuses == ["running", "completed", "completed"]
+    assert emitted[-1]["data"]["result"] == {"success": True}

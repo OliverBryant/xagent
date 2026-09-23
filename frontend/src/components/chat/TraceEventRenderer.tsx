@@ -703,31 +703,34 @@ export function processTraceEvents(
           });
         }
 
-        if (toolName) {
-          // Merge with existing tools instead of replacing
-          if (!step.tools.some(tItem => tItem.function.name === toolName)) {
-            step.tools.push({ function: { name: toolName } });
-          }
-        }
-
         // A settlement START never opens a new card: it re-opens the original
         // call's action so the resumed outcome lands on the one card the user
         // already saw. Appending here is what rendered a resumed approval as a
         // second, duplicate tool execution. When the original card is absent
         // (its START fell outside a truncated replay window) the target is
         // null and we append below, so the outcome is still visible.
+        //
+        // Resolved BEFORE step.tools is touched: when the call folds into
+        // another step's bucket, this step never ran that tool and must not
+        // advertise it.
         const settlementStartTarget = isSettlementEvent(event)
           ? resolveSettlementTarget(toolCallId)
           : null;
+
+        if (toolName && !settlementStartTarget) {
+          // Merge with existing tools instead of replacing
+          if (!step.tools.some(tItem => tItem.function.name === toolName)) {
+            step.tools.push({ function: { name: toolName } });
+          }
+        }
+
         if (settlementStartTarget) {
           if (toolCallId) {
             settlementTargets.set(toolCallId, settlementStartTarget);
           }
           // Deliberately NOT flipping status back to 'running': if the
           // settlement END is lost, a card stuck at 'running' reads worse than
-          // one still showing its (accurate) pause result. The flag marks it
-          // as updating without that hazard.
-          settlementStartTarget.data.settling = true;
+          // one still showing its (accurate) pause result.
         } else {
           step.actions.push({
             id: eventId,
@@ -813,12 +816,6 @@ export function processTraceEvents(
           action.data.rawResult = result;
           if (artifacts) {
             action.data.artifacts = artifacts;
-          }
-          if (isSettlementEvent(event)) {
-            action.data.settling = false;
-            action.data.settlementStatus = event.data?.settlement_status as
-              | string
-              | undefined;
           }
         } else {
           // Fallback
@@ -936,9 +933,6 @@ export function processTraceEvents(
           if (isSettlementEvent(event)) {
             runningAction = settlementErrorTarget ?? undefined;
             if (settlementErrorTarget) {
-              settlementErrorTarget.data.settling = false;
-              settlementErrorTarget.data.settlementStatus = event.data
-                ?.settlement_status as string | undefined;
               settlementErrorTarget.data.rawResult = event.data?.result;
             }
           } else {

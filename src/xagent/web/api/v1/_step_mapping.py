@@ -459,23 +459,34 @@ class PublicStepProjector:
 
             if event_type == "tool_execution_start":
                 # A settlement lifecycle projects a resumed outcome onto a call
-                # that already finished (its pause pair closed it). Re-open the
-                # finished step under the same public id instead of building a
-                # second one: the END below then finalizes and re-appends that
-                # same object, so the call keeps exactly one PublicStep whose
-                # result is the settled one. Re-opening is also what makes a
-                # replayed settlement idempotent. With retain_finished=False
-                # (the SSE lane) there is no finished list to re-open from, and
-                # emitting the pair again under the same id is already an
-                # update for a client that folds by id.
-                reopened = (
-                    self._reopen_finished_step(public_type, str(key))
-                    if _data_get(event, "settlement_delivery")
-                    else None
-                )
-                if reopened is not None:
-                    self._pending[(public_type, str(key))] = reopened
-                    return [reopened]
+                # that already finished (its pause pair closed it), so this is
+                # an update, not a new invocation.
+                if _data_get(event, "settlement_delivery"):
+                    # Re-open the real finished step where one is kept, so the
+                    # call keeps exactly one PublicStep, at its original
+                    # position and with its original ``started_at``; the END
+                    # below finalizes that same object. With
+                    # ``retain_finished=False`` (the SSE lane) no history is
+                    # kept, so a placeholder carries the pairing instead --
+                    # its ``started_at`` is the settlement's, the one field
+                    # that lane cannot recover.
+                    reopened = self._reopen_finished_step(public_type, str(key))
+                    self._pending[(public_type, str(key))] = (
+                        reopened
+                        if reopened is not None
+                        else _build_tool_start(
+                            event,
+                            public_type=public_type,
+                            tool_name=tool_name,
+                            key=str(key),
+                        )
+                    )
+                    # Emit nothing here. The call is already terminal for every
+                    # consumer, and re-announcing it as ``running`` would make
+                    # a client that folds by id regress a finished step back to
+                    # in-flight. The settlement END emits the single terminal
+                    # update.
+                    return []
                 step = _build_tool_start(
                     event,
                     public_type=public_type,

@@ -170,8 +170,8 @@ async def test_transient_edit_failure_is_retried_max_retries_times(
 async def test_billed_invalid_body_is_not_retried_and_bills_the_row_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from openai import APIResponseValidationError
     import requests
+    from openai import APIResponseValidationError
 
     row = _db_row(model_id="row-billed", max_retries=5)
     validation_error = APIResponseValidationError(

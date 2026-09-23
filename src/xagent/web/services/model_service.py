@@ -665,7 +665,7 @@ def _add_image_model_with_id(
     # invalid response. max_retries is the total attempt bound.
     models_dict[str(db_model.model_id)] = create_retry_wrapper(
         instance,
-        BaseImageModel,  # type: ignore[type-abstract]
+        BaseImageModel,
         retry_methods={"generate_image", "edit_image"},
         max_retries=getattr(db_model, "max_retries", 3) or 3,
         retry_on=retry_image_call,

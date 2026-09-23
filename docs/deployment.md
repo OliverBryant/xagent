@@ -498,7 +498,7 @@ and a caller-safe `detail`. The states are:
 | `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None when `mode` is `vector`. When `mode` is `text_only`, see "Serving in text_only mode" below: memory is writable but vector search is off, and restoring it is offline work. |
 | `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
 | `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
-| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Check that no other process is mid-maintenance, then restart this worker. |
+| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Stop every API and task-execution memory writer and keep them all stopped until the retried admission has finished, then restart the fleet together. Ordinary memory writes take neither the admission nor the maintenance lock, and any write invalidates the version-bound full-admission marker, so a retry that runs beside a live writer can rescan and overwrite the table while that writer commits. Checking that no process is mid-maintenance is not enough. |
 | `restart_required` | The authority no longer describes the stored vector space, or maintenance was left incomplete. | Quiesce, re-embed offline if the existing vectors must be kept, restart every worker together. |
 | `blocked_repair` | Storage holds invalid legacy data or an incompatible schema and is fenced off. | Offline repair; see below. |
 

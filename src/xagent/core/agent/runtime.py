@@ -1871,10 +1871,15 @@ class PatternRuntime:
             #
             # The store also keeps the capability check: it raises
             # ``CheckpointPersistenceError`` when ``trace_event`` cannot
-            # accept ``require_persisted``, and when the write returns no
-            # event id. Nothing is double-wrapped, because a tracer that is
-            # already a ``TraceCheckpointStore`` exposes ``checkpoint`` and
-            # returns at the first branch above.
+            # accept ``require_persisted``, when a genuine ``Tracer`` has no
+            # handler that can answer a checkpoint read (a ``Tracer`` wired
+            # with only observational handlers such as
+            # ``ConsoleTraceHandler`` would otherwise dispatch cleanly and
+            # return an event id without ever being able to survive a cold
+            # resume), and when the write returns no event id. Nothing is
+            # double-wrapped, because a tracer that is already a
+            # ``TraceCheckpointStore`` exposes ``checkpoint`` and returns at
+            # the first branch above.
             await TraceCheckpointStore(self.tracer, require_persisted=True).save(
                 payload
             )

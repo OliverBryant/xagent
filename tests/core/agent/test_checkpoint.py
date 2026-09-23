@@ -19,7 +19,12 @@ from xagent.core.agent.checkpoint import (
     TraceCheckpointStore,
     read_latest_checkpoint_payload,
 )
-from xagent.core.agent.trace import TraceEvent, TraceHandler, Tracer
+from xagent.core.agent.trace import (
+    ConsoleTraceHandler,
+    TraceEvent,
+    TraceHandler,
+    Tracer,
+)
 
 
 class PersistentTraceBackend:
@@ -513,6 +518,33 @@ async def test_bare_tracer_checkpoint_round_trips_through_the_real_reader() -> N
     assert restored is not None
     assert restored["label"] == "after_tool"
     assert restored["execution_id"] == "exec-bare-roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_bare_tracer_rejects_a_console_only_handler() -> None:
+    """A ``Tracer`` with only observational handlers is not durable.
+
+    ``Tracer.trace_event(require_persisted=True)`` only proves every
+    currently attached handler dispatched without raising; it does not prove
+    any of them can answer a checkpoint read. A ``Tracer`` wired with only
+    ``ConsoleTraceHandler`` would previously "succeed" here (return a
+    non-``None`` event id) and still lose the checkpoint, since
+    ``ConsoleTraceHandler`` has no ``load_latest_checkpoint``. This must be
+    rejected instead of silently reported as durable.
+    """
+
+    tracer = Tracer()
+    tracer.add_handler(ConsoleTraceHandler())
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-console-only")
+
+    with pytest.raises(CheckpointPersistenceError) as exc_info:
+        await runtime.checkpoint(
+            "before_llm",
+            context=ExecutionContext(execution_id="exec-console-only"),
+            pattern=SimpleNamespace(status="running"),
+        )
+
+    assert "no checkpoint-reading handler" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

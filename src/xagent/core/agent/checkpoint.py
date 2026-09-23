@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope, Tracer
 
 CHECKPOINT_TYPE = "agent_execution_checkpoint"
 LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})
@@ -235,6 +235,31 @@ class TraceCheckpointStore:
                 raise CheckpointPersistenceError(
                     "Tracer.trace_event() cannot guarantee checkpoint persistence."
                 )
+            if self.require_persisted and isinstance(self.tracer, Tracer):
+                # ``Tracer.trace_event(require_persisted=True)`` only proves
+                # every handler currently attached to this ``Tracer``
+                # dispatched without raising, and that at least one handler
+                # is registered -- it does not prove any of them can durably
+                # store this checkpoint and later answer a read for it. A
+                # ``Tracer`` wired with only observational handlers (for
+                # example ``ConsoleTraceHandler``) would otherwise "succeed"
+                # here and still lose the checkpoint on a cold resume, since
+                # no handler is capable of ``load_latest_checkpoint``. This
+                # check is scoped to genuine ``Tracer`` instances: a
+                # duck-typed writer that implements its own
+                # ``trace_event(require_persisted=...)`` (with no
+                # ``.handlers`` list to inspect) already made its own
+                # persistence promise via the kwarg check above, and is
+                # trusted at face value as before.
+                if not any(
+                    callable(getattr(handler, "load_latest_checkpoint", None))
+                    for handler in self.tracer.handlers
+                ):
+                    raise CheckpointPersistenceError(
+                        "Tracer has no checkpoint-reading handler attached; "
+                        "its trace_event(require_persisted=True) acknowledgement "
+                        "cannot be trusted as a durable checkpoint write."
+                    )
             result = trace_event(
                 self._checkpoint_trace_event_type(trace_event),
                 task_id=event_payload["root_execution_id"],

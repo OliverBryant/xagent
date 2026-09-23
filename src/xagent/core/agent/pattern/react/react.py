@@ -214,6 +214,11 @@ class ToolCallRecord:
     # The ReAct step that issued the call. Persisted so a rebuilt runtime can
     # resume the exact gate identity instead of inventing a new execution slot.
     step_id: str | None = None
+    # True between "this row's settlement is durable" and "its trace lifecycle
+    # has been delivered". Durable on purpose: the emission happens after the
+    # settlement checkpoint, so only a persisted flag can tell a cold start
+    # that a pair is still owed. Legacy rows default to False.
+    settlement_trace_pending: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -228,6 +233,7 @@ class ToolCallRecord:
             "turn_id": self.turn_id,
             "settlement_turn_id": self.settlement_turn_id,
             "step_id": self.step_id,
+            "settlement_trace_pending": self.settlement_trace_pending,
         }
 
     @classmethod
@@ -252,6 +258,7 @@ class ToolCallRecord:
                 else None
             ),
             step_id=str(data["step_id"]) if data.get("step_id") else None,
+            settlement_trace_pending=bool(data.get("settlement_trace_pending", False)),
         )
 
 
@@ -578,11 +585,6 @@ class ReActPattern(AgentPattern):
         # that received a rejected / dispatch-unknown settlement.
         self.settlement_final_answer_fence = False
         self.settlement_fence_turn_id: str | None = None
-        # (tool_call_id, settlement_turn_id) pairs whose settlement trace
-        # lifecycle this process has already emitted. Process-local on
-        # purpose and never checkpointed -- see
-        # _replay_unemitted_settlement_traces.
-        self._emitted_settlement_traces: set[tuple[str, str]] = set()
         self.repeated_tool_decision: dict[str, Any] | None = None
         self.waiting_for_user_request: dict[str, Any] | None = None
         self.pending_tool_interaction_responses: list[dict[str, str]] = []
@@ -2667,53 +2669,76 @@ class ReActPattern(AgentPattern):
                 "result": result,
                 "success": False,
             }
-        await self._emit_settlement_trace_event(
+        # The pair must land in the ORIGINAL call's step, not the resumed
+        # run's. Consumers bucket actions by step and only search the bucket
+        # an event names, so emitting under the fresh react_<uuid> of the
+        # resumed run puts the update where the original card is not -- which
+        # is what made it render as a second card. ``record.step_id`` is the
+        # issuing step, persisted with the row.
+        settlement_step_id = record.step_id or getattr(
+            runtime, "active_react_step_id", None
+        )
+        started = await self._emit_settlement_trace_event(
             trace_event,
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
             runtime=runtime,
+            step_id=settlement_step_id,
             data=start_data,
         )
-        await self._emit_settlement_trace_event(
+        ended = await self._emit_settlement_trace_event(
             trace_event,
             end_type,
             runtime=runtime,
+            step_id=settlement_step_id,
             data=end_data,
         )
-        self._emitted_settlement_traces.add(
-            (record.tool_call_id, record.settlement_turn_id or "")
-        )
+        # Only a COMPLETE pair discharges the obligation. A half-written
+        # lifecycle (or a swallowed tracer fault) leaves the flag set so the
+        # next run start delivers it again -- consumers fold a redelivered
+        # pair onto the same action, so repeating is safe and dropping is not.
+        if started and ended:
+            self._clear_settlement_trace_pending(record.tool_call_id)
+
+    def _clear_settlement_trace_pending(self, tool_call_id: str) -> None:
+        """Discharge a row's trace obligation, writing by replacement.
+
+        Ledger rows are exempt from #2553's checkpoint-snapshot copying on the
+        grounds that they are replaced wholesale rather than mutated in place;
+        this keeps that invariant true. The cleared flag reaches durable state
+        on whatever checkpoint the run takes next -- deliberately not a
+        checkpoint of its own. Re-emitting after a crash in that window is
+        harmless; the alternative is a checkpoint per settlement.
+        """
+
+        record = self.tool_ledger.get(tool_call_id)
+        if record is None or not record.settlement_trace_pending:
+            return
+        self.tool_ledger[tool_call_id] = replace(record, settlement_trace_pending=False)
 
     async def _replay_unemitted_settlement_traces(
         self, *, runtime: PatternRuntime
     ) -> None:
-        """Re-emit settlement lifecycles this process has not delivered yet.
+        """Deliver settlement lifecycles that are still durably owed.
 
         The normal path emits the pair only after the settlement checkpoint is
-        durable, so that a settlement rolled back by a failed checkpoint is
-        never shown as final. The cost of that ordering is a window: a crash or
+        durable, so a settlement rolled back by a failed checkpoint is never
+        shown as final. The cost of that ordering is a window: a crash or
         cancellation between the checkpoint and the emission leaves a durably
         terminal ledger row whose trace still reads ``waiting_for_user``, with
-        the pending entry already popped, so nothing would ever deliver it.
+        the pending entry already popped, so nothing would otherwise deliver
+        it.
 
-        This pass closes that window from the durable ledger itself -- the
-        settled row *is* the marker, so no extra persisted field and no second
-        checkpoint are needed. ``_emitted_settlement_traces`` is process-local
-        and deliberately not checkpointed: a restored pattern starts with it
-        empty, which is exactly when a replay is owed. Consumers treat a
-        settlement pair as an in-place update keyed by ``tool_call_id``, so a
-        pair delivered twice collapses onto one action.
-
-        The trade-off is that a restart re-emits one pair per settled call in
-        the ledger, not only the one that was lost. That is display-neutral
-        given idempotent consumers and bounded by the ledger size, and it buys
-        not having to persist per-record trace bookkeeping.
+        The obligation is tracked by ``ToolCallRecord.settlement_trace_pending``,
+        written by the same projection that makes the settlement durable and
+        cleared only once both trace writes have actually succeeded. It has to
+        be durable rather than process-local: a fresh ``ReActPattern`` is built
+        per run and per DAG-step entry, so in-memory bookkeeping would make
+        every cold start, worker handoff and DAG re-entry re-emit a pair for
+        every settled row in the ledger.
         """
 
         for record in list(self.tool_ledger.values()):
-            if not record.settlement_status:
-                continue
-            key = (record.tool_call_id, record.settlement_turn_id or "")
-            if key in self._emitted_settlement_traces:
+            if not (record.settlement_status and record.settlement_trace_pending):
                 continue
             await self._trace_tool_interaction_settlement(
                 record=record,
@@ -2729,12 +2754,18 @@ class ReActPattern(AgentPattern):
         event_type: TraceEventType,
         *,
         runtime: PatternRuntime,
+        step_id: str | None,
         data: dict[str, Any],
-    ) -> None:
-        """Write one settlement trace event, matching runtime's best-effort rule."""
+    ) -> bool:
+        """Write one settlement trace event; report whether it landed.
+
+        Trace writes stay best-effort -- a tracer fault must never undo a
+        settlement that is already durable -- but the caller needs to know,
+        because a swallowed failure means the row's trace obligation has NOT
+        been discharged and must survive to the next run start.
+        """
 
         execution_id = getattr(runtime, "execution_id", None)
-        step_id = getattr(runtime, "active_react_step_id", None)
         try:
             emitted = trace_event(
                 event_type,
@@ -2745,10 +2776,11 @@ class ReActPattern(AgentPattern):
             if inspect.isawaitable(emitted):
                 await emitted
         except Exception:
-            # UI trace events are best-effort, exactly as in
-            # PatternRuntime._emit_trace_event; a tracer fault must not undo a
-            # settlement that is already durable.
+            # Swallowed exactly as in PatternRuntime._emit_trace_event, but
+            # reported so the obligation is not cleared on a failed write.
             logger.debug("settlement trace event failed", exc_info=True)
+            return False
+        return True
 
     def _validate_tool_interaction_settlement_target(
         self,
@@ -2825,7 +2857,14 @@ class ReActPattern(AgentPattern):
         result: Any,
         runtime: PatternRuntime,
     ) -> None:
-        """Rewrite the ledger row and raise the fence a denied outcome demands."""
+        """Rewrite the ledger row and raise the fence a denied outcome demands.
+
+        The row is written with ``settlement_trace_pending=True`` so the very
+        checkpoint that makes this settlement durable also records that its
+        trace lifecycle is still owed. Nothing else has to be persisted, and no
+        extra checkpoint is taken: the flag is cleared in memory once both
+        trace writes succeed and rides out on whatever checkpoint comes next.
+        """
 
         tool_call: dict[str, Any] = {
             "id": record.tool_call_id,
@@ -2845,6 +2884,7 @@ class ReActPattern(AgentPattern):
                 result=result,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         else:
             error = str(
@@ -2858,6 +2898,7 @@ class ReActPattern(AgentPattern):
                 error=error,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         # A rejection or an unknown dispatch anywhere in the delivery batch is
         # an authorization boundary for the whole resumed turn. Maintainers
@@ -5242,6 +5283,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
         settlement_status: str | None = None,
         settlement_turn_id: str | None = None,
+        settlement_trace_pending: bool = False,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
         args = self._tool_call_args_dict(tool_call)
@@ -5260,6 +5302,7 @@ class ReActPattern(AgentPattern):
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
+            settlement_trace_pending=settlement_trace_pending,
         )
 
     @staticmethod

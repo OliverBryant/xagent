@@ -2423,7 +2423,7 @@ def test_same_prose_separated_by_a_prose_less_exchange_is_kept():
         db_session.close()
 
 
-def test_settlement_delivery_supersedes_the_pause_observation():
+def test_settlement_delivery_supersedes_the_pause_observation(caplog):
     """A resumed settlement replaces its call's result, not adds a second call.
 
     The settlement pair reuses the original ``tool_call_id`` but is emitted
@@ -2511,7 +2511,9 @@ def test_settlement_delivery_supersedes_the_pause_observation():
             },
         )
 
-        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        logger_name = "xagent.web.services.task_conversation_context_service"
+        with caplog.at_level(logging.INFO, logger=logger_name):
+            messages = load_task_conversation_context_sync(db_session, int(task.id))
 
         publish_results = [
             message
@@ -2524,6 +2526,15 @@ def test_settlement_delivery_supersedes_the_pause_observation():
             "success": True,
             "post_urn": "urn:li:share:123",
         }
+        # The settlement end is start-less by design (its start is skipped),
+        # so it must not register as a reconstruction drop.
+        summary = next(
+            record.getMessage()
+            for record in caplog.records
+            if "task_conversation_context_reconstructed" in record.getMessage()
+        )
+        assert "tool_ends_without_start=0" in summary
+
         # And only one assistant tool_call announces it.
         announced = [
             call

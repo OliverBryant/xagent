@@ -149,6 +149,7 @@ vi.mock("sonner", () => ({
   },
 }))
 
+import { projectAppState, createInitialState } from "@/contexts/app-context-chat"
 import {
   AppProvider,
   VERSIONED_TASK_EVENT_TYPES,
@@ -8588,5 +8589,152 @@ describe("error frame display projection", () => {
     expect(
       projectErrorFrameForDisplay(frame, { trustLegacyErrorProse, translate, controlEnvelope }),
     ).toEqual(expected)
+  })
+})
+
+describe("projectAppState ADD_TRACE_EVENT settlement routing", () => {
+  const traceEvent = (
+    eventType: string,
+    data: Record<string, unknown>,
+    eventId: string
+  ) =>
+    ({ event_id: eventId, event_type: eventType, data }) as unknown as Parameters<
+      typeof projectAppState
+    >[1] extends never
+      ? never
+      : any
+
+  /**
+   * Production shape of a resumed interaction:
+   *   1. the pause pair is sealed into the waiting-question result message
+   *      (ADD_MESSAGE merges the live buffer into it and resets the buffer),
+   *   2. the user's reply is appended as a role:"user" message,
+   *   3. the settlement pair arrives.
+   *
+   * At step 3 the tail is a user message, so the default buffering files the
+   * update into the NEXT result message -- a different TraceEventRenderer
+   * window from the card it must update, which renders a second card. It has
+   * to land in the message that already owns the tool_call_id.
+   */
+  const stateWithSealedPausePair = () => {
+    let state = createInitialState()
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: traceEvent(
+        "tool_execution_start",
+        { tool_name: "approval_gate", tool_call_id: "call-1" },
+        "e1"
+      ),
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: traceEvent(
+        "tool_execution_end",
+        {
+          tool_name: "approval_gate",
+          tool_call_id: "call-1",
+          status: "waiting_for_user",
+        },
+        "e2"
+      ),
+    } as any)
+    // The waiting-question assistant result message seals the buffer.
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: {
+        id: "waiting-question",
+        role: "assistant",
+        content: "Publish this exact post?",
+        timestamp: "t1",
+        isResult: true,
+      },
+    } as any)
+    // The user answers.
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: {
+        id: "reply",
+        role: "user",
+        content: "Approve",
+        timestamp: "t2",
+      },
+    } as any)
+    return state
+  }
+
+  it("routes a settlement pair to the message holding the original call", () => {
+    let state = stateWithSealedPausePair()
+    expect(state.traceEvents).toHaveLength(0)
+
+    for (const [eventType, eventId] of [
+      ["tool_execution_start", "e3"],
+      ["tool_execution_end", "e4"],
+    ] as const) {
+      state = projectAppState(state, {
+        type: "ADD_TRACE_EVENT",
+        payload: traceEvent(
+          eventType,
+          {
+            tool_name: "approval_gate",
+            tool_call_id: "call-1",
+            settlement_delivery: true,
+            settlement_status: "succeeded",
+          },
+          eventId
+        ),
+      } as any)
+    }
+
+    const waiting = state.messages.find((m) => m.id === "waiting-question")
+    // All four events live in the one window the renderer folds over.
+    expect((waiting?.traceEvents ?? []).map((e: any) => e.event_id)).toEqual([
+      "e1",
+      "e2",
+      "e3",
+      "e4",
+    ])
+    // Nothing leaked into the live buffer that feeds the NEXT result message.
+    expect(state.traceEvents).toHaveLength(0)
+    expect(state.messages.find((m) => m.id === "reply")?.traceEvents).toBeUndefined()
+  })
+
+  it("buffers a settlement whose original call no message owns", () => {
+    let state = stateWithSealedPausePair()
+
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: traceEvent(
+        "tool_execution_end",
+        {
+          tool_name: "approval_gate",
+          tool_call_id: "unknown-call",
+          settlement_delivery: true,
+        },
+        "e9"
+      ),
+    } as any)
+
+    expect(state.traceEvents).toHaveLength(1)
+    const waiting = state.messages.find((m) => m.id === "waiting-question")
+    expect(waiting?.traceEvents).toHaveLength(2)
+  })
+
+  it("leaves ordinary (non-settlement) trace events on the buffer", () => {
+    let state = stateWithSealedPausePair()
+
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: traceEvent(
+        "tool_execution_start",
+        { tool_name: "calculator", tool_call_id: "call-1" },
+        "e5"
+      ),
+    } as any)
+
+    // Same tool_call_id, but no settlement marker: routing must not apply.
+    expect(state.traceEvents).toHaveLength(1)
+    expect(
+      state.messages.find((m) => m.id === "waiting-question")?.traceEvents
+    ).toHaveLength(2)
   })
 })

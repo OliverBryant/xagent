@@ -11043,17 +11043,17 @@ def test_react_get_state_is_unaffected_by_later_pop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_settlement_trace_lost_to_a_crash_is_replayed_at_run_start() -> None:
-    """The checkpoint->trace gap must not lose the lifecycle permanently.
+async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> None:
+    """The obligation is durable, so it survives a fresh ReActPattern.
 
-    The pair is emitted only after the settlement checkpoint is durable, so a
-    crash in between leaves a terminal ledger row whose trace still reads
-    waiting_for_user, with the pending entry already popped. The run-start
-    repair pass re-emits it straight from the durable row.
+    A pattern is rebuilt per run and per DAG-step entry, so process-local
+    bookkeeping made every cold start, worker handoff and DAG re-entry re-emit
+    a pair for every settled row. Only ``settlement_trace_pending`` rows may
+    replay, and delivering one must clear the flag.
     """
 
     pattern = ReActPattern()
-    context = ExecutionContext(execution_id="settlement-crash")
+    context = ExecutionContext(execution_id="cold-start")
     context.add_tool_result(
         "approval_gate",
         {"success": False, "status": "waiting_for_user"},
@@ -11068,72 +11068,67 @@ async def test_settlement_trace_lost_to_a_crash_is_replayed_at_run_start() -> No
             "response": "Approve",
         }
     ]
-    crashed_tracer = TraceEventRecorder()
-    crashed_runtime = PatternRuntime(
-        execution_id="settlement-crash", tracer=crashed_tracer
-    )
-    crashed_runtime.active_turn_id = "approval-turn"
 
     async def cancel_in_the_gap(**_: Any) -> None:
-        raise asyncio.CancelledError("worker cancelled after checkpoint")
+        raise asyncio.CancelledError("cancelled after checkpoint")
 
     pattern._trace_tool_interaction_settlement = cancel_in_the_gap  # type: ignore[assignment]
     with pytest.raises(asyncio.CancelledError):
         await pattern._deliver_pending_tool_interaction_responses(
             tools=[
                 SettlementApprovalTool(
-                    resume_result=ToolInteractionSettlement.succeeded(
-                        {"success": True, "post_urn": "urn:li:share:123"}
-                    )
+                    resume_result=ToolInteractionSettlement.succeeded({"success": True})
                 )
             ],
             context=context,
-            runtime=crashed_runtime,
+            runtime=PatternRuntime(execution_id="cold-start"),
         )
 
-    # The settlement is durable, the queue is drained, and no trace reached
-    # the consumer: the exact divergence the repair pass exists for.
-    state = pattern.get_state()
-    assert state["tool_ledger"]["call-1"]["settlement_status"] == "succeeded"
-    assert state["pending_tool_interaction_responses"] == []
-    assert _settlement_trace_events(crashed_tracer, "call-1") == []
+    lost_state = pattern.get_state()
+    assert lost_state["tool_ledger"]["call-1"]["settlement_trace_pending"] is True
 
-    # Restore from that durable state in a fresh process and run.
-    restored = ReActPattern(max_iterations=1)
-    restored.load_state(state)
+    # Cold start #1: the owed pair is delivered exactly once.
+    first = ReActPattern()
+    first.load_state(lost_state)
     tracer = TraceEventRecorder()
-    runtime = PatternRuntime(execution_id="settlement-crash", tracer=tracer)
-
-    await restored._replay_unemitted_settlement_traces(runtime=runtime)
-
+    await first._replay_unemitted_settlement_traces(
+        runtime=PatternRuntime(execution_id="cold-start", tracer=tracer)
+    )
     assert _settlement_trace_events(tracer, "call-1") == [
         "action_start_tool",
         "action_end_tool",
     ]
-    settlement_end = next(
+    replayed_end = next(
         event
         for event in tracer.events
         if event["data"].get("tool_call_id") == "call-1"
         and event["event_type"] == "action_end_tool"
     )
-    assert settlement_end["data"]["settlement_delivery"] is True
-    assert settlement_end["data"]["settlement_status"] == "succeeded"
-    assert settlement_end["data"]["result"] == {
-        "success": True,
-        "post_urn": "urn:li:share:123",
-    }
+    assert replayed_end["data"]["settlement_delivery"] is True
+    assert replayed_end["data"]["settlement_status"] == "succeeded"
+    assert replayed_end["data"]["result"] == {"success": True}
+    assert first.tool_ledger["call-1"].settlement_trace_pending is False
 
-    # Idempotent: a second pass in the same process re-emits nothing.
-    await restored._replay_unemitted_settlement_traces(runtime=runtime)
-    assert len(_settlement_trace_events(tracer, "call-1")) == 2
+    # The cleared flag rides out on the next checkpoint; three further cold
+    # starts from that state must stay silent.
+    settled_state = first.get_state()
+    assert settled_state["tool_ledger"]["call-1"]["settlement_trace_pending"] is False
+    for index in range(3):
+        later = ReActPattern()
+        later.load_state(settled_state)
+        later_tracer = TraceEventRecorder()
+        later_runtime = PatternRuntime(execution_id="cold-start", tracer=later_tracer)
+        later_runtime.active_turn_id = f"later-turn-{index}"
+        await later._replay_unemitted_settlement_traces(runtime=later_runtime)
+        assert _settlement_trace_events(later_tracer, "call-1") == []
 
 
 @pytest.mark.asyncio
-async def test_a_normally_delivered_settlement_is_not_replayed() -> None:
-    """The repair pass must stay silent when the normal path already emitted."""
+async def test_a_normally_delivered_settlement_never_replays_on_a_cold_start() -> None:
+    """Delivery clears the obligation, so later processes emit nothing."""
 
     pattern = ReActPattern()
-    context = ExecutionContext(execution_id="settlement-no-replay")
+    context = ExecutionContext(execution_id="no-replay")
     context.add_tool_result(
         "approval_gate",
         {"success": False, "status": "waiting_for_user"},
@@ -11149,8 +11144,121 @@ async def test_a_normally_delivered_settlement_is_not_replayed() -> None:
         }
     ]
     tracer = TraceEventRecorder()
-    runtime = PatternRuntime(execution_id="settlement-no-replay", tracer=tracer)
+    runtime = PatternRuntime(execution_id="no-replay", tracer=tracer)
     runtime.active_turn_id = "approval-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+    assert len(_settlement_trace_events(tracer, "call-1")) == 2
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is False
+
+    state = pattern.get_state()
+    for index in range(3):
+        restored = ReActPattern()
+        restored.load_state(state)
+        cold_tracer = TraceEventRecorder()
+        cold_runtime = PatternRuntime(execution_id="no-replay", tracer=cold_tracer)
+        cold_runtime.active_turn_id = f"later-turn-{index}"
+        await restored._replay_unemitted_settlement_traces(runtime=cold_runtime)
+        assert _settlement_trace_events(cold_tracer, "call-1") == []
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_trace_write_keeps_the_obligation() -> None:
+    """A half-written or failed pair must not discharge the obligation.
+
+    The writes are best-effort so a tracer fault cannot undo a durable
+    settlement, but clearing the flag anyway would drop the lifecycle for good.
+    """
+
+    class HalfBrokenTracer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+            self.calls += 1
+            if self.calls == 2:  # the END write fails
+                raise RuntimeError("tracer down")
+            return "ok"
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="half-written")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record("call-1")
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(execution_id="half-written", tracer=HalfBrokenTracer()),
+    )
+
+    # The settlement is durable, but its trace is not -- still owed.
+    assert pattern.tool_ledger["call-1"].settlement_status == "succeeded"
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is True
+
+    tracer = TraceEventRecorder()
+    await pattern._replay_unemitted_settlement_traces(
+        runtime=PatternRuntime(execution_id="half-written", tracer=tracer)
+    )
+    assert _settlement_trace_events(tracer, "call-1") == [
+        "action_start_tool",
+        "action_end_tool",
+    ]
+    assert pattern.tool_ledger["call-1"].settlement_trace_pending is False
+
+
+@pytest.mark.asyncio
+async def test_settlement_trace_is_emitted_under_the_original_step_id() -> None:
+    """The pair must land in the step that issued the call, not the resumed one.
+
+    Consumers bucket actions by step and only search the bucket an event
+    names, so emitting under the resumed run's fresh ``react_<uuid>`` puts the
+    update where the original card is not.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="step-routing")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record(
+        "call-1", step_id="react_original"
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="step-routing", tracer=tracer)
+    runtime.active_react_step_id = "react_resumed"
 
     await pattern._deliver_pending_tool_interaction_responses(
         tools=[
@@ -11161,11 +11269,11 @@ async def test_a_normally_delivered_settlement_is_not_replayed() -> None:
         context=context,
         runtime=runtime,
     )
-    assert _settlement_trace_events(tracer, "call-1") == [
-        "action_start_tool",
-        "action_end_tool",
+
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
     ]
-
-    await pattern._replay_unemitted_settlement_traces(runtime=runtime)
-
-    assert len(_settlement_trace_events(tracer, "call-1")) == 2
+    assert len(settlement_events) == 2
+    assert {event["step_id"] for event in settlement_events} == {"react_original"}

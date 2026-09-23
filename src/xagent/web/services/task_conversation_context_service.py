@@ -428,7 +428,12 @@ def _load_tool_exchanges(
             # step id doesn't match this end's). Fall back to a synthesized
             # key so pairing always has an identity.
             call_id = raw_call_id or f"recon-{row_id}"
-            stats.tool_ends_without_start += 1
+            # A settlement end is start-less by construction: its own start is
+            # skipped above because it re-opens a call that already has one.
+            # Counting it here would make a health signal meant to reveal real
+            # reconstruction drops fire once per resumed interaction.
+            if not data.get("settlement_delivery"):
+                stats.tool_ends_without_start += 1
 
         tool_name = str(data.get("tool_name") or "").strip()
         if not tool_name and start is not None:

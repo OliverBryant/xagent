@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -19,6 +20,30 @@ from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
 MEMORY_READ_UNAVAILABLE_DETAIL = "Memory storage is temporarily unavailable."
+
+
+@contextmanager
+def memory_operation() -> Iterator[None]:
+    """Answer a revocation that lands mid-operation with the same stable 503.
+
+    :attr:`MemoryManagementRouter.memory_store` maps only the *initial*
+    acquisition failure. The store it returns is a revocable proxy that
+    re-checks its publication generation on every call, so a concurrent
+    revalidation -- an administrator changing the authority's vector space,
+    another worker revoking the publication -- can raise
+    :class:`MemoryUnavailableError` from the delegated operation instead,
+    after the acquisition already succeeded.
+
+    Without this, each route's broad ``except Exception`` turned that into a
+    500 naming the internal failure. One shared boundary keeps every route on
+    the single public-safe detail, and keeps the seven of them from drifting
+    apart. ``store-info`` deliberately does not use it: it reports the
+    lifecycle rather than operating on the store, and answers 200 throughout.
+    """
+    try:
+        yield
+    except MemoryUnavailableError as error:
+        raise HTTPException(status_code=503, detail=error.status.detail) from None
 
 
 class MemoryListRequest(BaseModel):
@@ -149,15 +174,16 @@ class MemoryManagementRouter:
                         filters["date_to"] = date_to
 
                     try:
-                        if search:
-                            memories = self.memory_store.search(
-                                query=search,
-                                k=1000,
-                                filters=filters if filters else None,
-                                similarity_threshold=similarity_threshold,
-                            )
-                        else:
-                            memories = self.memory_store.list_all(filters)
+                        with memory_operation():
+                            if search:
+                                memories = self.memory_store.search(
+                                    query=search,
+                                    k=1000,
+                                    filters=filters if filters else None,
+                                    similarity_threshold=similarity_threshold,
+                                )
+                            else:
+                                memories = self.memory_store.list_all(filters)
                     except HTTPException:
                         raise
                     except Exception:
@@ -205,7 +231,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     response = self.memory_store.delete(memory_id)
                     if response.success:
                         return {
@@ -231,7 +257,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     # Get existing memory
                     get_response = self.memory_store.get(memory_id)
                     if not get_response.success:
@@ -294,7 +320,7 @@ class MemoryManagementRouter:
         ) -> MemoryStatsResponse:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     stats = self.memory_store.get_stats()
                     return MemoryStatsResponse(**stats)
             except HTTPException:
@@ -317,7 +343,7 @@ class MemoryManagementRouter:
             store = self.memory_store
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     # Create new memory note
                     memory_note = MemoryNote(
                         content=memory_request.get("content", ""),
@@ -340,6 +366,11 @@ class MemoryManagementRouter:
                             detail=response.error or "Failed to create memory",
                         )
 
+            except HTTPException:
+                # Needed for the 503 above to reach the caller at all: without
+                # it the broad handler re-wrapped every HTTPException raised
+                # inside the block, status code included, as a 500.
+                raise
             except Exception as e:
                 raise HTTPException(
                     status_code=500, detail=f"Failed to create memory: {str(e)}"
@@ -379,7 +410,7 @@ class MemoryManagementRouter:
         ) -> dict[str, Any]:
             try:
                 # Set user context for memory operations
-                with UserContext(int(user.id)):
+                with UserContext(int(user.id)), memory_operation():
                     response = self.memory_store.get(memory_id)
                     if response.success and response.content:
                         memory = response.content

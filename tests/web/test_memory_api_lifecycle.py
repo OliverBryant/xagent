@@ -149,6 +149,93 @@ def test_unrelated_routes_keep_working_while_memory_is_fenced_off(auth_headers, 
     assert client.get("/api/memory/list", headers=auth_headers).status_code == 503
 
 
+class _RevokedAfterAcquire:
+    """A published proxy revoked between acquisition and the operation.
+
+    This is what the runtime actually hands out: the store the router acquires
+    is a revocation proxy that re-checks its publication generation on *every*
+    call, so a concurrent revalidation raises out of the delegated operation
+    rather than out of the acquisition the router already mapped.
+    """
+
+    def __init__(self, status: MemoryLifecycleStatus) -> None:
+        self._status = status
+
+    def _revoked(self, *_args, **_kwargs):
+        raise MemoryUnavailableError(self._status)
+
+    add = _revoked
+    get = _revoked
+    update = _revoked
+    delete = _revoked
+    search = _revoked
+    list_all = _revoked
+    get_stats = _revoked
+
+
+@pytest.mark.parametrize("state", UNAVAILABLE_STATES)
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("get", "/api/memory/list", None),
+        ("get", "/api/memory/list?search=note", None),
+        ("get", "/api/memory/stats", None),
+        ("get", "/api/memory/some-id", None),
+        ("post", "/api/memory", {"content": "note"}),
+        ("put", "/api/memory/some-id", {"content": "note"}),
+        ("delete", "/api/memory/some-id", None),
+    ],
+)
+def test_a_revocation_after_acquisition_still_answers_the_stable_503(
+    auth_headers, state, method, path, body
+):
+    """Revocation mid-operation is the same public condition as at acquisition.
+
+    Each route's broad ``except Exception`` used to turn the delegated
+    ``MemoryUnavailableError`` into a 500 naming the internal failure, so the
+    stable 503 depended on losing a race with revalidation.
+    """
+    status = MemoryLifecycleStatus(state)
+    client = _client(lambda: _RevokedAfterAcquire(status))
+
+    response = getattr(client, method)(
+        path, headers=auth_headers, **({"json": body} if body is not None else {})
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == status.detail
+
+
+def test_store_info_keeps_answering_two_hundred_through_a_revocation(
+    monkeypatch, auth_headers
+):
+    """The one route that must not turn a revocation into a 503."""
+    from xagent.web.api import memory as memory_api
+
+    info = {
+        "store_type": None,
+        "is_lancedb": False,
+        "state": MemoryLifecycleState.RESTART_REQUIRED.value,
+        "detail": MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED).detail,
+        "mode": None,
+        "supports_vector_search": False,
+        "similarity_threshold": 1.5,
+    }
+
+    class _Manager:
+        def get_store_info(self) -> dict:
+            return info
+
+    monkeypatch.setattr(memory_api, "get_memory_store_manager", lambda: _Manager())
+    status = MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
+    client = _client(lambda: _RevokedAfterAcquire(status))
+
+    response = client.get("/api/memory/store-info", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json() == info
+
+
 def test_store_info_answers_while_memory_is_blocked(monkeypatch, auth_headers):
     """The status route must survive the state it exists to report."""
     from xagent.web.api import memory as memory_api

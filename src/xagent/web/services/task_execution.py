@@ -1915,13 +1915,20 @@ async def execute_task_background(
             # into (or out of) another source's approval policy, nor claim a
             # different execution lease.
             agent_context = dict(context_dict)
-            agent_context["task_source"] = snapshot.task.source
             turn_run_id = (
                 task_lease.run_id if task_lease is not None else expected_run_id
             )
             if turn_run_id is not None:
+                # Both keys or neither: a registered source presenting an
+                # incomplete identity (``task_source`` with no ``run_id``)
+                # is refused before dispatch, which would turn a
+                # registration on this path into a hard outage for every
+                # MCP call -- strictly worse than leaving both unbound,
+                # where the call simply passes through ungated.
+                agent_context["task_source"] = snapshot.task.source
                 agent_context["run_id"] = turn_run_id
             else:
+                agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
             result = await agent_manager.execute_task(
                 agent_service=agent_service,

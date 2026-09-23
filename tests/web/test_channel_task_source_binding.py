@@ -207,13 +207,10 @@ async def test_telegram_turn_binds_the_task_rows_source(
     bot._ingress_stopped = False
     bot._stop_lock = None
     bot._stop_loop = None
-    bot.user_message_queues = {}
-    bot.user_message_tasks = {}
-    bot.user_active_executions = {}
+    # The shared initializer rather than a hand-listed set of fields, so a
+    # future batch-control field does not silently break this harness.
+    bot._initialize_batch_control()
     bot.user_active_trace_handlers = {}
-    bot.user_preparing_executions = set()
-    bot.user_stop_events = {}
-    bot.user_conversation_generations = {}
     bot.user_switch_locks = {}
     bot.selected_agents = {}
     bot._save_selected_agents = lambda: True
@@ -296,6 +293,10 @@ async def test_feishu_turn_binds_the_task_rows_source(
     bot.active_tasks = {"open-id": "45"}
     bot.api_client = object()
     bot._save_active_tasks = lambda: None
+    # The shared initializer rather than a hand-listed set of fields, so a
+    # future batch-control field does not silently break this harness.
+    bot._initialize_batch_control()
+    bot.user_active_trace_handlers = {}
 
     managed = _FakeManagedLease(
         TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")

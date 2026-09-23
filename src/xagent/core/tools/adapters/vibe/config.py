@@ -19,6 +19,11 @@ ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
     "actor_stdio_session_runtime_unavailable"
 )
 ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
+# A delegated sub-agent run cannot pause for approval (a paused child is
+# classified as an unsupported nested interaction), so when the delegating
+# run's task source has an approval gate registered, its children get the
+# selected MCP servers reported as unavailable instead of live and ungated.
+NESTED_DELEGATION_NOT_APPROVABLE_REASON = "nested_delegation_not_approvable"
 
 
 class MCPFailurePolicy(str, Enum):
@@ -72,6 +77,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
         ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
         ACTOR_STDIO_SHADOWED_REASON,
+        NESTED_DELEGATION_NOT_APPROVABLE_REASON,
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",

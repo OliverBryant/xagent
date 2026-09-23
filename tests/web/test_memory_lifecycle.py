@@ -857,6 +857,8 @@ async def test_a_reconciled_service_cannot_reach_the_old_store(monkeypatch, tmp_
 
     assert agent.memory is not published
     assert isinstance(unwrap_memory_store(agent.memory), InMemoryMemoryStore)
+    # The compatibility shim no longer points at the revoked proxy either.
+    assert agent.agent.memory_store is agent.memory
     # No store reaches the runtime at all, so no memory tool is built from one.
     assert agent._execution_adapter.config.memory_store is None
     assert (

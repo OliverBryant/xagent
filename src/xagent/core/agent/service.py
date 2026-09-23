@@ -430,6 +430,8 @@ class AgentService:
         respect to the turn it is about to run.
         """
         self.memory = inert_store
+        # Keep the compatibility shim in step with a freshly built service.
+        self.agent.memory_store = inert_store
         self.memory_enabled = False
         self.memory_available = False
         self.memory_availability_reason = availability_reason

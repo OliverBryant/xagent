@@ -465,13 +465,27 @@ class PublicStepProjector:
                     # Re-open the real finished step where one is kept, so the
                     # call keeps exactly one PublicStep, at its original
                     # position and with its original ``started_at``; the END
-                    # below finalizes that same object. With
-                    # ``retain_finished=False`` (the SSE lane) no history is
-                    # kept, so a placeholder carries the pairing instead --
-                    # its ``started_at`` is the settlement's, the one field
-                    # that lane cannot recover.
+                    # below finalizes that same object.
+                    #
+                    # Order matters. Prefer the finished history, then a step
+                    # still sitting in ``_pending`` -- that is the call whose
+                    # END was lost (a swallowed trace write), so the run-start
+                    # replay is re-delivering both halves. Reusing it keeps the
+                    # ORIGINAL ``started_at``: rebuilding from the replay event
+                    # would stamp the replay's timestamp onto a step that is
+                    # then re-inserted at its original index, which is exactly
+                    # how the ``started_at`` ascending order this endpoint
+                    # documents gets broken.
+                    #
+                    # Only when neither exists is a placeholder built. That is
+                    # the ``retain_finished=False`` (SSE) lane, which keeps no
+                    # history: its ``started_at`` is the settlement's, the one
+                    # field that lane cannot recover.
+                    pending_key = (public_type, str(key))
                     reopened = self._reopen_finished_step(public_type, str(key))
-                    self._pending[(public_type, str(key))] = (
+                    if reopened is None:
+                        reopened = self._pending.get(pending_key)
+                    self._pending[pending_key] = (
                         reopened
                         if reopened is not None
                         else _build_tool_start(

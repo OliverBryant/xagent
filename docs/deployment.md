@@ -499,9 +499,26 @@ and a caller-safe `detail`. The states are:
 
 Memory API routes answer `503` in every state except `ready` and
 `not_configured`, with one stable detail that does not distinguish the faults.
-`/api/memory/store-info` keeps answering `200` in every state. Tasks and chats
-continue to start while memory is fenced off; they run with memory disabled and
-record the state as their memory availability reason.
+`/api/memory/store-info` keeps answering `200` in every state, including when
+the database connection pool is exhausted: it then reports the last published
+state rather than failing.
+
+Tasks and chats continue to start while memory is fenced off; they run with
+memory disabled and an inert store, so nothing reads from or writes to the
+storage admission refused.
+
+Where the reason is recorded, and where it is not:
+
+* **Recorded.** The lifecycle state reaches the task's execution metadata
+  (`memory_available`, `memory_availability_reason`), which rides into the
+  tracing backend and into the execution checkpoint, and it is reported by the
+  internal `AgentService` status. That is what to read when asking why a
+  particular task ran without memory.
+* **Not recorded.** It is deliberately *not* written to the durable `Task` or
+  `TaskChatMessage` rows, and it does not appear in the `TaskInfo` or
+  task-completion payloads a caller receives. Do not query task records or
+  public task payloads for it; use the execution metadata above, or
+  `GET /api/memory/store-info` for the worker-wide state.
 
 The operator log carries the detail the API deliberately does not. Search for
 `Persistent memory` at `WARNING` and `ERROR`; each non-ready state logs the

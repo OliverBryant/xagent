@@ -8578,9 +8578,7 @@ async def test_react_run_reports_pattern_error_when_resume_checkpoint_fails() ->
     class _FailingResumeCheckpointTracer(TraceEventRecorder):
         async def checkpoint(self, **payload: Any) -> None:
             if payload.get("label") == "tool_interaction_response_received":
-                raise CheckpointPersistenceError(
-                    "transient checkpoint write failure"
-                )
+                raise CheckpointPersistenceError("transient checkpoint write failure")
 
     tracer = _FailingResumeCheckpointTracer()
     pattern = ReActPattern()
@@ -8601,9 +8599,7 @@ async def test_react_run_reports_pattern_error_when_resume_checkpoint_fails() ->
         await pattern.run(context=context, tools=[], llm=FakeLLM([]), runtime=runtime)
 
     error_events = [
-        event
-        for event in tracer.events
-        if event["event_type"] == "task_error_general"
+        event for event in tracer.events if event["event_type"] == "task_error_general"
     ]
     assert error_events
     assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"

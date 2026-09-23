@@ -6395,20 +6395,14 @@ async def test_dag_pattern_reraises_checkpoint_persistence_error_from_plan_gener
     """
 
     class PlanCheckpointFailingRuntime(PatternRuntime):
-        async def checkpoint(
-            self, label: str, **kwargs: Any
-        ) -> dict[str, Any]:
+        async def checkpoint(self, label: str, **kwargs: Any) -> dict[str, Any]:
             if label == "dag_plan_generated":
-                raise CheckpointPersistenceError(
-                    "transient checkpoint write failure"
-                )
+                raise CheckpointPersistenceError("transient checkpoint write failure")
             return await super().checkpoint(label, **kwargs)
 
     plan = build_plan(PlanStep(id="step_1", task="do the thing"))
     pattern = DAGPattern(lambda **_: plan)
-    runtime = PlanCheckpointFailingRuntime(
-        execution_id="dag-plan-checkpoint-failure"
-    )
+    runtime = PlanCheckpointFailingRuntime(execution_id="dag-plan-checkpoint-failure")
 
     with pytest.raises(CheckpointPersistenceError):
         await pattern.run(
@@ -6506,9 +6500,7 @@ async def test_dag_pattern_reraises_checkpoint_persistence_error_from_completion
     runtime = _ReplanCheckpointFailingRuntime(
         execution_id="dag-completion-replan-checkpoint-failure"
     )
-    context = ExecutionContext(
-        execution_id="dag-completion-replan-checkpoint-failure"
-    )
+    context = ExecutionContext(execution_id="dag-completion-replan-checkpoint-failure")
 
     with pytest.raises(CheckpointPersistenceError):
         await pattern._handle_completed_plan(

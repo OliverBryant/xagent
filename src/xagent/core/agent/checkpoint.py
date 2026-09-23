@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope, Tracer
+from .trace import TraceAction, TraceCategory, TraceEventType, Tracer, TraceScope
 
 CHECKPOINT_TYPE = "agent_execution_checkpoint"
 LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})

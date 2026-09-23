@@ -35,7 +35,6 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
-
 from xagent.web.channels.feishu.bot import FeishuBotInstance
 from xagent.web.channels.slack.bot import SlackBotInstance
 from xagent.web.channels.telegram.bot import TelegramBotInstance

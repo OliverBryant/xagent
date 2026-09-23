@@ -22,8 +22,8 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.agent_tool import _nested_mcp_refusal_reason
 from xagent.core.tools.adapters.vibe.config import (
-    NESTED_DELEGATION_NOT_APPROVABLE_REASON,
     _PUBLIC_MCP_UNAVAILABLE_REASONS,
+    NESTED_DELEGATION_NOT_APPROVABLE_REASON,
 )
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GateDecision,

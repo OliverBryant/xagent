@@ -46,6 +46,7 @@ from ..core.memory.lancedb_maintenance import (
 from ..core.memory.vector_compatibility import (
     canonical_embedding_identity,
     create_or_recreate_vector_capable_table,
+    embedding_identity_fingerprint,
 )
 from ..core.model.embedding import create_embedding_adapter
 from ..core.model.embedding.base import BaseEmbedding
@@ -315,7 +316,6 @@ def admit_authority_storage(
     # rather than letting the admission primitive raise mid-flow, where the
     # broad handler below would report it as a transient backend failure.
     validate_lock_timeout(lock_timeout)
-    fingerprint = snapshot.vector_space_fingerprint()
     try:
         config = authority_embedding_config(snapshot)
         identity = canonical_embedding_identity(config)
@@ -330,6 +330,15 @@ def admit_authority_storage(
         return AdmissionResult(
             MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
         )
+
+    # Taken from the canonical identity, never from the raw snapshot. The same
+    # ``identity`` builds the embedding adapter and the stored LanceDB
+    # vector-space metadata below, and the manager's drift check compares this
+    # value against a freshly canonicalized authority, so all five key on one
+    # vector space. Fingerprinting the raw snapshot instead let two spellings
+    # of the same space disagree and turned a cosmetic edit into a demand for
+    # an all-worker restart.
+    fingerprint = embedding_identity_fingerprint(identity)
 
     directory = db_dir if db_dir is not None else memory_store_dir()
     threshold = (

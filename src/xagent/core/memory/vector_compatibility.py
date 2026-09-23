@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -105,6 +106,23 @@ class EmbeddingIdentity:
 HISTORICAL_DASHSCOPE_IDENTITY = EmbeddingIdentity(
     "dashscope", "text-embedding-v4", DASHSCOPE_DEFAULT_ENDPOINT, 1024, None
 )
+
+
+def embedding_identity_fingerprint(identity: EmbeddingIdentity) -> str:
+    """Stable digest of one canonical vector space.
+
+    The single place a vector space is reduced to a comparable value. Callers
+    that key on a vector space -- the authority snapshot, the admitted
+    publication, the manager's drift check -- must all fingerprint the
+    *canonical* identity through here, never the fields they happened to be
+    handed: two spellings of the same space have to compare equal, or a
+    cosmetic edit reads as drift and demands a fleet restart that changes
+    nothing.
+    """
+    encoded = json.dumps(
+        identity.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def canonical_embedding_identity(

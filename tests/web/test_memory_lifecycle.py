@@ -17,6 +17,7 @@ import multiprocessing
 import pathlib
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -36,6 +37,10 @@ from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.lancedb_maintenance import lancedb_lock_path
 from xagent.core.memory.storage_admission import MemoryStorageMode
+from xagent.core.memory.vector_compatibility import (
+    canonical_embedding_identity,
+    embedding_identity_fingerprint,
+)
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from xagent.providers.vector_store.lancedb import clear_connection_cache
@@ -58,10 +63,15 @@ from xagent.web.revocable_memory_store import (
     unwrap_memory_store,
 )
 from xagent.web.services import agent_service_manager
+from xagent.web.models.global_memory_embedding_authority import (
+    GlobalMemoryEmbeddingAuthority,
+)
 from xagent.web.services.global_memory_embedding_authority import (
     CREDENTIAL_CONFIGURED,
+    AuthorityConfiguration,
     AuthorityCredentialUnavailable,
     CredentialSource,
+    GlobalMemoryEmbeddingAuthorityService,
     GlobalMemoryEmbeddingAuthoritySnapshot,
 )
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
@@ -320,6 +330,141 @@ def test_importing_the_store_module_publishes_nothing(monkeypatch):
     assert calls == [1, 1]
     with pytest.raises(AttributeError):
         module.something_else
+
+
+# --------------------------------------------------------------------------
+# One canonical embedding identity.
+# --------------------------------------------------------------------------
+
+#: Minimal dashscope authority request. Dashscope is the one provider that
+#: keeps ``instruct`` at all, so it is the only place a spelling of that field
+#: can reach persistence and be mistaken for a different vector space.
+_DASHSCOPE_AUTHORITY = {
+    "provider": "dashscope",
+    "model_name": "text-embedding-v4",
+    "dimension": DIMENSION,
+    "max_retries": 3,
+    "credential_source": "organization_owned",
+    "global_sharing_consent": True,
+    "api_key": "organization-owned-secret",
+}
+
+
+@pytest.fixture
+def authority_database(tmp_path):
+    """A real authority table, so canonicalization runs on the way in and out."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'authority.db'}")
+    GlobalMemoryEmbeddingAuthority.__table__.create(engine)
+    try:
+        yield sessionmaker(bind=engine)
+    finally:
+        engine.dispose()
+
+
+def _store_authority(sessions, **overrides) -> None:
+    with sessions() as db:
+        GlobalMemoryEmbeddingAuthorityService(db).set(
+            AuthorityConfiguration(**{**_DASHSCOPE_AUTHORITY, **overrides}),
+            actor_subject="admin-subject",
+        )
+
+
+def _persisted_instruct(sessions):
+    with sessions() as db:
+        return db.get(GlobalMemoryEmbeddingAuthority, "global").instruct
+
+
+def _write_raw_instruct(sessions, value) -> None:
+    """Plant a row an earlier build could have written, bypassing the service."""
+    with sessions() as db:
+        db.get(GlobalMemoryEmbeddingAuthority, "global").instruct = value
+        db.commit()
+
+
+def _loaded_snapshot(sessions):
+    with sessions() as db:
+        return GlobalMemoryEmbeddingAuthorityService(db).load_snapshot()
+
+
+def test_one_vector_space_fingerprints_once_however_it_is_spelled(tmp_path):
+    """Admission keys on the canonical identity, not on how it was written.
+
+    Fingerprinting the raw snapshot let an aliased provider, a trailing slash
+    or a blank instruction describe the same vector space under a different
+    value -- which the manager then reads as drift and answers with a demand
+    for an all-worker restart that changes nothing.
+    """
+    canonical = _admit(tmp_path).vector_space_fingerprint
+    identity = canonical_embedding_identity(authority_embedding_config(_snapshot()))
+
+    assert canonical == embedding_identity_fingerprint(identity)
+    for spelling in (
+        replace(_snapshot(), endpoint="https://api.openai.com/v1/embeddings/"),
+        replace(_snapshot(), provider="openai_embedding"),
+        replace(_snapshot(), instruct="   "),
+    ):
+        assert _admit(tmp_path, spelling).vector_space_fingerprint == canonical
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param({}, {"instruct": "   "}, id="omitted_then_whitespace"),
+        pytest.param({"instruct": "   "}, {}, id="whitespace_then_omitted"),
+        pytest.param({"instruct": None}, {"instruct": ""}, id="null_then_empty"),
+        pytest.param({"instruct": ""}, {"instruct": "\t \n"}, id="empty_then_blanks"),
+    ],
+)
+def test_equivalent_instruct_spellings_are_never_drift(
+    monkeypatch, tmp_path, authority_database, first, second
+):
+    """Omitted, null, empty and whitespace-only instructions are one identity.
+
+    Driven through the real service and the real row, because this is a
+    persistence contract: the two spellings have to reach the same stored
+    value, so the manager cannot see a second vector space where an
+    administrator only re-saved the same one.
+    """
+    sessions = authority_database
+    monkeypatch.setattr(
+        manager_module, "_read_authority_snapshot", lambda: _loaded_snapshot(sessions)
+    )
+
+    _store_authority(sessions, **first)
+    assert _persisted_instruct(sessions) is None
+    fingerprint = _loaded_snapshot(sessions).vector_space_fingerprint()
+
+    manager = _manager(monkeypatch, tmp_path / "memory")
+    assert manager.admit().state is MemoryLifecycleState.READY
+    store = manager.get_memory_store()
+
+    _store_authority(sessions, **second)
+
+    assert _persisted_instruct(sessions) is None
+    assert _loaded_snapshot(sessions).vector_space_fingerprint() == fingerprint
+    assert manager.check_embedding_model_change() is False
+    assert manager.status().state is MemoryLifecycleState.READY
+    assert manager.get_memory_store() is store
+
+
+@pytest.mark.parametrize("stored", ["", "   ", "\t\n"])
+def test_a_blank_instruct_row_materializes_as_the_omitted_identity(
+    authority_database, stored
+):
+    """A row an earlier build persisted blank still names the same space."""
+    sessions = authority_database
+    _store_authority(sessions)
+    omitted = _loaded_snapshot(sessions)
+
+    _write_raw_instruct(sessions, stored)
+    blank = _loaded_snapshot(sessions)
+
+    assert blank.instruct is None
+    assert blank.vector_space_fingerprint() == omitted.vector_space_fingerprint()
+    assert blank.authority_fingerprint() == omitted.authority_fingerprint()
+    with sessions() as db:
+        record = GlobalMemoryEmbeddingAuthorityService(db).read_record()
+    assert record is not None and record.instruct is None
 
 
 # --------------------------------------------------------------------------

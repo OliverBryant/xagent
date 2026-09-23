@@ -231,6 +231,25 @@ def public_memory_availability_reason(reason: str | None) -> str | None:
     return GENERIC_MEMORY_AVAILABILITY_REASON
 
 
+def caller_facing_execution_metadata(metadata: Any) -> dict[str, Any]:
+    """A copy of a run's execution metadata that is safe to send to its caller.
+
+    The execution metadata carries the unfolded availability reason for the
+    operator's trace and checkpoint; anything forwarded to the task owner gets
+    it folded like every other caller-facing surface. The input is not mutated.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    folded = dict(metadata)
+    if MEMORY_AVAILABILITY_REASON_METADATA_KEY in folded:
+        folded[MEMORY_AVAILABILITY_REASON_METADATA_KEY] = (
+            public_memory_availability_reason(
+                folded[MEMORY_AVAILABILITY_REASON_METADATA_KEY]
+            )
+        )
+    return folded
+
+
 @dataclass(frozen=True)
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
@@ -248,7 +267,9 @@ class AgentServiceMemoryPolicy:
 
         Empty while memory is available, so an ordinary task's trace is
         unchanged. The unfolded reason is used here on purpose: this reaches
-        the operator's tracing backend, not a public API response.
+        the operator's tracing backend, not a public API response. Anything
+        that forwards run metadata to the caller must pass it through
+        ``caller_facing_execution_metadata`` first.
         """
         if self.memory_available:
             return {}

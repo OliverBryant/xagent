@@ -47,6 +47,7 @@ from ...services.channel_runtime import (
     ChannelConfigurationError,
     DownloadedChannelFile,
     authorize_channel_sender,
+    bind_channel_turn_identity,
     deactivate_channel_sync,
     load_active_channel_configs,
     load_channel_output_files,
@@ -564,25 +565,9 @@ class SlackBotInstance:
 
             turn_id = str(uuid4())
             context: dict[str, Any] = {"turn_id": turn_id}
-            turn_run_id = (
-                managed_lease.lease.run_id if managed_lease is not None else None
+            bind_channel_turn_identity(
+                context, task_source=task_row_source, managed_lease=managed_lease
             )
-            if turn_run_id is not None:
-                # Both keys or neither.
-                # ``ToolCallExecutionContext.is_complete()`` requires
-                # ``run_id`` as well as the source, and a registered source
-                # presenting an incomplete identity is refused before
-                # dispatch. Binding the source alone would therefore turn a
-                # registration on this source into a hard outage for every
-                # MCP call on this path -- strictly worse than leaving it
-                # unbound, where the call simply passes through ungated,
-                # which is also what a lease with no run id gets here.
-                #
-                # The shared-turn executor does not carry this dict at all:
-                # it binds the same pair from its own snapshot and lease in
-                # ``shared_channel_execution.execute_channel_background``.
-                context["task_source"] = task_row_source
-                context["run_id"] = turn_run_id
             display_message = text
             execution_text = prompt_text
             persisted_attachments: list[dict[str, Any]] = []

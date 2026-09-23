@@ -8,6 +8,10 @@ import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
 from xagent.core.agent import runtime as runtime_module
+from xagent.core.agent.checkpoint import (
+    CHECKPOINT_SCHEMA_VERSION,
+    READABLE_CHECKPOINT_TYPES,
+)
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
@@ -607,7 +611,7 @@ class TraceOnlyTracer:
         # for persisted delivery, and a tracer that cannot accept the flag
         # is not treated as a durable checkpoint writer.
         require_persisted: bool = False,
-    ) -> None:
+    ) -> str:
         self.events.append(
             {
                 "event_type": getattr(event_type, "value", str(event_type)),
@@ -615,6 +619,9 @@ class TraceOnlyTracer:
                 "data": data or {},
             }
         )
+        # The real ``Tracer.trace_event`` returns the event id; a writer that
+        # returns nothing cannot evidence persistence and is rejected.
+        return f"evt-{len(self.events)}"
 
 
 class FailingTraceOnlyTracer:
@@ -1223,16 +1230,37 @@ async def test_runtime_checkpoint_prefers_checkpoint_api() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_checkpoint_trace_event_fallback_is_task_scoped() -> None:
+async def test_runtime_checkpoint_trace_event_fallback_is_a_canonical_checkpoint() -> (
+    None
+):
+    """The event-tracer fallback must emit a *readable* checkpoint.
+
+    Asking a plain event tracer for persisted delivery only proves its
+    handlers ran. The checkpoint readers select on the canonical envelope --
+    system scope, ``checkpoint_type``, and a ``snapshot`` dict -- so a
+    task-scoped event carrying the raw payload is dropped by
+    ``EphemeralCheckpointTraceHandler`` and filtered out of the database
+    checkpoint lookup, and a cold resume would find nothing.
+    """
+
     tracer = TraceOnlyTracer()
     runtime = PatternRuntime(tracer=tracer, execution_id="exec-runtime")
     context = ExecutionContext(execution_id="exec-runtime")
 
     await runtime.checkpoint("fallback", context=context, pattern=PatternWithState())
 
-    assert tracer.events[0]["event_type"] == "task_update_general"
-    assert tracer.events[0]["task_id"] == "exec-runtime"
-    assert tracer.events[0]["data"]["label"] == "fallback"
+    event = tracer.events[0]
+    assert event["event_type"] == "system_update_general"
+    assert event["task_id"] == "exec-runtime"
+    data = event["data"]
+    # The exact fields the readers select on.
+    assert data["checkpoint_type"] in READABLE_CHECKPOINT_TYPES
+    assert data["snapshot_schema_version"] == CHECKPOINT_SCHEMA_VERSION
+    assert data["root_execution_id"] == "exec-runtime"
+    assert data["execution_id"] == "exec-runtime"
+    assert data["label"] == "fallback"
+    assert isinstance(data["snapshot"], dict)
+    assert data["snapshot"]["label"] == "fallback"
 
 
 @pytest.mark.asyncio

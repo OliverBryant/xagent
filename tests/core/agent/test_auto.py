@@ -1133,10 +1133,12 @@ async def test_auto_pattern_does_not_emit_general_task_start_or_completion() -> 
     )
 
     assert result["success"] is True
+    # The checkpoint now rides the canonical system-scoped envelope rather
+    # than a task-scoped progress event, so no general task event is emitted.
     assert {event["event_type"] for event in tracer.events} == {
         "action_start_llm",
         "action_end_llm",
-        "task_update_general",
+        "system_update_general",
     }
 
 

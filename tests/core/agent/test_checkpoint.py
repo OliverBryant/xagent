@@ -479,6 +479,43 @@ async def test_pattern_runtime_without_a_tracer_stays_a_no_op() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bare_tracer_checkpoint_round_trips_through_the_real_reader() -> None:
+    """A bare tracer's checkpoint must be findable on a cold resume.
+
+    Goes through the real ``EphemeralCheckpointTraceHandler`` and its real
+    ``load_latest_checkpoint``. Before the fallback wrote the canonical
+    envelope, this call reported success while the handler dropped the event,
+    so the lookup returned ``None`` and a resume could replay work that had
+    already run.
+
+    The ``DatabaseTraceHandler`` path is PostgreSQL-only and is not exercised
+    here; it selects on the same ``checkpoint_type`` /
+    ``READABLE_CHECKPOINT_TYPES`` filter that the wire-format assertions
+    below pin.
+    """
+
+    from xagent.web.tracing import EphemeralCheckpointTraceHandler
+
+    store: dict[str, dict[str, Any]] = {}
+    handler = EphemeralCheckpointTraceHandler(store)
+    tracer = Tracer()
+    tracer.add_handler(handler)
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-bare-roundtrip")
+
+    await runtime.checkpoint(
+        "after_tool",
+        context=ExecutionContext(execution_id="exec-bare-roundtrip"),
+        pattern=SimpleNamespace(status="running"),
+    )
+
+    restored = await handler.load_latest_checkpoint("exec-bare-roundtrip")
+
+    assert restored is not None
+    assert restored["label"] == "after_tool"
+    assert restored["execution_id"] == "exec-bare-roundtrip"
+
+
+@pytest.mark.asyncio
 async def test_runner_can_use_trace_checkpoint_store_for_resume() -> None:
     backend = PersistentTraceBackend()
     store = TraceCheckpointStore(backend)

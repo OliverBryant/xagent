@@ -473,11 +473,16 @@ described under "LanceDB memory compatibility" above.
 
 ### Deployment and migration steps
 
-1. Configure the global memory embedding authority before the rollout if
-   persistent memory is wanted. The credential must be application- or
-   organization-owned; a personal credential is rejected at rest.
-2. Quiesce memory writers. Stop task execution and chat workers; do not leave a
-   worker running against the memory LanceDB directory.
+1. Quiesce memory writers first. Stop every API, task-execution and chat
+   worker; do not leave a worker running against the memory LanceDB directory.
+2. Configure the global memory embedding authority if persistent memory is
+   wanted. The credential must be application- or organization-owned; a
+   personal credential is rejected at rest. Never create or change the
+   authority while any API or task worker is serving memory: a running agent
+   keeps the adapter it was built with until its next hand-off, so a live
+   change leaves a window in which the old adapter is still writing, and a
+   same-width change silently mixes two vector spaces in one table. These are
+   the same steps for a first rollout and for a later vector-space change.
 3. Deploy the same version to every API and task-execution worker and start
    them together. Do not roll the fleet: a mixed fleet can have one worker
    writing under a vector space another has not admitted.

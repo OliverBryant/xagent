@@ -18,7 +18,7 @@ from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
-from .retrieval_compatibility import stream_lexical_top_k
+from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
     MemorySchemaMismatch,
@@ -43,6 +43,8 @@ class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
 
     _embedding_model: Optional[BaseEmbedding]
+    # Rows per backend batch on the streamed text-search path.
+    _stream_batch_size: int = DEFAULT_STREAM_BATCH_SIZE
 
     def __init__(
         self,
@@ -933,8 +935,9 @@ class LanceDBMemoryStore(MemoryStore):
                         seen_ids.add(identity)
                         deduplicated.append(note)
                 results = deduplicated
-                # Dormant streaming retrieval (#2346): bounded batches, the
-                # scope clause pushed into `where`, and a heap bounded at the
+                # Ranked streaming retrieval (#2346), reached only from the
+                # dormant admission primitive: bounded batches, the scope
+                # clause pushed into `where`, and a heap bounded at the
                 # outstanding quota. ANN ids are excluded at the source, so a
                 # duplicate cannot consume a lexical slot.
                 candidates = (
@@ -960,50 +963,23 @@ class LanceDBMemoryStore(MemoryStore):
                         break
                 return results[:k]
 
-            # Fallback to text search if no vector results or vector search failed
+            # Fallback to text search if no vector results or vector search
+            # failed: the first k substring matches in scan order, streamed in
+            # bounded batches with the scope clause pushed into `where` and the
+            # residual filters applied per batch, instead of materialising the
+            # whole table.
             if not results:
-                # Text search
-                df = table.search().to_pandas()
-                other_filters = self._flat_other_filters(filters)
-
-                # Filter by query text and apply filters
-                for _, row in df.iterrows():
-                    text = row.get("text", "")
-
-                    # Simple text matching
-                    if query and query.lower() not in text.lower():
-                        continue
-
-                    note_data = {
-                        "id": row.get("id", ""),
-                        "text": text,
-                        "metadata": row.get("metadata", "{}"),
-                    }
-                    # #847: here a malformed row would escape to the outer
-                    # except and turn the whole query into an empty result.
-                    try:
-                        note = self._dict_to_memory_note(note_data)
-                    except Exception as row_error:
-                        logger.warning(
-                            "Skipping malformed memory row %r in text "
-                            "search results: %s",
-                            note_data["id"],
-                            row_error,
-                        )
-                        continue
-
-                    # Unlike the vector path, nothing was pushed into `where`
-                    # here, so the full filters apply (including the
-                    # scope-exclusive directive and nested metadata isolation).
-                    if filters and not self._matches_filters(
-                        note, filters, other_filters
-                    ):
-                        continue
-
-                    results.append(note)
-
-                    if len(results) >= k:
-                        break
+                results = stream_lexical_top_k(
+                    self._dormant_memory_handle(),
+                    query,
+                    k,
+                    row_to_note=self._dict_to_memory_note,
+                    note_filter_factory=self._residual_note_filter,
+                    filters=filters,
+                    null_vectors_only=False,
+                    batch_size=self._stream_batch_size,
+                    ranked=False,
+                )
 
             return results[:k]
 

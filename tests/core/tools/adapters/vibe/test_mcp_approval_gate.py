@@ -770,10 +770,15 @@ async def test_external_cancellation_does_not_kill_an_in_flight_write(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_drain(
+async def test_cancellation_after_dispatch_reclaims_a_write_that_outlasts_the_drain(
     registrations: list[Any], monkeypatch: Any, caplog: Any
 ) -> None:
-    """The bounded drain gives up loudly instead of hanging the cancellation."""
+    """The bounded drain gives up loudly, then reclaims the connector call.
+
+    Giving up on *observing* the write must not mean giving up on its socket
+    and (for stdio) its child process, so the hook task is cancelled rather
+    than left detached.
+    """
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
@@ -781,10 +786,15 @@ async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_dra
     )
     started = asyncio.Event()
 
+    torn_down = asyncio.Event()
+
     class HangingTarget(_Target):
         async def run_json_async(self, args: Mapping[str, Any]) -> Any:
             started.set()
-            await asyncio.sleep(30)
+            try:
+                await asyncio.sleep(30)
+            finally:
+                torn_down.set()
             return {"success": True}
 
     async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
@@ -811,10 +821,12 @@ async def test_cancellation_after_dispatch_warns_when_the_write_outlasts_the_dra
 
     # Cancellation completed (it was not blocked forever by the hung RPC)...
     assert task.cancelled()
-    # ...and the unobservable write was reported rather than silently dropped.
-    assert any("may still land" in record.message for record in caplog.records), [
-        record.message for record in caplog.records
-    ]
+    # ...the unobservable write was reported rather than silently dropped...
+    assert any(
+        "may still have landed" in record.message for record in caplog.records
+    ), [record.message for record in caplog.records]
+    # ...and its transport was actually unwound rather than left detached.
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
 
 
 @pytest.mark.asyncio
@@ -922,6 +934,68 @@ async def test_hung_connector_settles_as_dispatch_unknown(
     # Never "failed": the write may have reached the external system.
     assert settlement.status == "dispatch_unknown"
     assert started.is_set()
+
+
+@pytest.mark.asyncio
+async def test_unobserved_dispatch_is_cancelled_and_its_transport_torn_down(
+    registrations: list[Any], monkeypatch: Any
+) -> None:
+    """Bounded observation must also bound the connector's resource lifetime.
+
+    Only the ``shield`` wrapper is cancelled when the observation budget
+    expires, so the real hook task keeps running unless the gate cancels it:
+    its MCP session, socket and (for stdio, which has no read deadline of its
+    own) child process would stay alive for as long as the remote stays
+    silent, once per approval. The ``finally`` in the target below stands in
+    for ``async with create_session(...)`` unwinding.
+    """
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_approval_gate._DISPATCH_OBSERVE_SECONDS",
+        0.05,
+    )
+    torn_down = asyncio.Event()
+
+    class HungTarget(_Target):
+        async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                torn_down.set()
+            return {"success": True}
+
+    async def resume(*, executor: Any, **_: Any) -> ToolInteractionSettlement:
+        return ToolInteractionSettlement.succeeded(await executor({"text": "ok"}))
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=30)
+    (tool,) = gate_mcp_tools([HungTarget()], connection={"id": 41})
+
+    before = {task for task in asyncio.all_tasks()}
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+
+    # The caller's contract is unchanged: the write may have landed.
+    assert settlement is not None
+    assert settlement.status == "dispatch_unknown"
+
+    # ...and the connector call is actually unwound, not merely logged.
+    await asyncio.wait_for(torn_down.wait(), timeout=5)
+    for _ in range(50):
+        leaked = {
+            task
+            for task in asyncio.all_tasks()
+            if task not in before and task is not asyncio.current_task()
+        }
+        if not leaked:
+            break
+        await asyncio.sleep(0.01)
+    assert not leaked, f"dispatch left {len(leaked)} task(s) running"
 
 
 def test_wrapper_delegates_unknown_attributes_to_the_wrapped_tool() -> None:

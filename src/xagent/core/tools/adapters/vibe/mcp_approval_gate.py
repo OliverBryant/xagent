@@ -55,6 +55,56 @@ incorrectness rather than an error.
    must therefore compare the replay context's digest against the value its own
    ledger froze at approval time, and refuse on mismatch. Until it does, the
    "approved call == executed call" property is *not* enforced anywhere.
+
+Host integration: which ``task_source`` to register
+---------------------------------------------------
+The ``"slack"`` example above is deliberately a *host-stamped* value, not one
+this repository produces. Registering a source that no row carries silently
+gates nothing, and registering one that several producers share over-scopes
+the gate, so the real taxonomy matters. ``Task.source`` is ``String(20)``,
+``default="internal"``, nullable:
+
+=========================================  ====================================
+``Task.source``                            produced by
+=========================================  ====================================
+``"internal"``                             Web UI / WebSocket / REST chat
+                                           (``task_command_execution``) **and**
+                                           every Slack / Telegram / Feishu task,
+                                           direct and shared (``channel_runtime``)
+                                           - both construct ``Task(...)`` with no
+                                           ``source=`` and fall to the column
+                                           default
+``"sdk"``                                  SDK (``task_start``, ``api/v1``)
+``"a2a"``                                  A2A (``task_start``, ``task_resume``)
+``"trigger"``                              scheduled triggers
+``"widget"`` / ``"shared_link"``           public chat surfaces
+caller-supplied, lower-cased,              workforce runs
+``"internal"`` by default
+``"external"``                             stamped by the SaaS deployment for
+                                           its own session transports; never
+                                           written by this repository
+=========================================  ====================================
+
+Two consequences a host must plan for.
+
+**The channel bots do not have a source of their own.** There is no string
+that selects Slack/Telegram/Feishu without also selecting the web UI, because
+both are ``"internal"``. Registering ``"internal"`` gates the entire default
+surface of the deployment - every web chat turn as well as every channel turn.
+A host that wants to gate one tenant or one channel flow must therefore
+**stamp a distinct ``Task.source`` on the tasks it creates** and register that
+value. This is the supported way to scope the gate; there is no per-channel
+registration key.
+
+**A nested sub-agent run is not covered by the parent's registration.** An
+``AgentTool`` delegation builds a fresh execution context with no inherited
+``task_source``, and nested interactions are unsupported
+(``agent_tool._classify_delegated_child_failure`` turns a paused child into a
+failure), so a child cannot pause for approval even in principle. Rather than
+let a delegated run dispatch governed connector writes outside the parent's
+approval scope, ``AgentTool`` refuses to materialize MCP tools for a child
+whose parent source has a registration, and reports them to the model as
+unavailable. A parent whose source is unregistered is unaffected.
 """
 
 from __future__ import annotations
@@ -102,6 +152,18 @@ _UNSUPPORTED_PATTERN = {
 # and cannot be un-sent. Bounded either way, so a hung connector can neither
 # park a resume forever nor block an external cancel.
 _DISPATCH_OBSERVE_SECONDS = 30.0
+# How long the gate waits for a connector call it has given up observing to
+# actually unwind once cancelled. This is a *teardown* budget, not a response
+# budget: what it covers is the ``async with create_session(...)`` exit -
+# closing the socket and, for stdio, terminating and reaping the child
+# process - not the remote's answer, which by this point is never coming.
+_DISPATCH_CLEANUP_SECONDS = 5.0
+
+# Cleanup tasks for dispatches the gate stopped observing. Held in a
+# module-level set purely so the event loop keeps a strong reference: a bare
+# ``ensure_future`` result can be garbage collected mid-flight, which would
+# abandon exactly the teardown this set exists to guarantee.
+_ORPHANED_DISPATCH_CLEANUPS: set["asyncio.Task[None]"] = set()
 
 
 @dataclass(frozen=True)
@@ -534,25 +596,47 @@ async def _call_resume_hook(
                     asyncio.shield(hook_task), timeout=_DISPATCH_OBSERVE_SECONDS
                 )
                 if not hook_task.done():
-                    _report_unobserved(hook_task)
+                    _terminate_unobserved(hook_task)
             else:
                 # Budget already spent on the success path above.
-                _report_unobserved(hook_task)
+                _terminate_unobserved(hook_task)
 
 
-def _report_unobserved(hook_task: "asyncio.Future[Any]") -> None:
-    """Warn that a dispatched write outlived our ability to observe it.
+def _terminate_unobserved(hook_task: "asyncio.Future[Any]") -> None:
+    """Cancel and drain a dispatched call the gate has stopped observing.
 
-    Also attaches a done-callback that retrieves the eventual outcome. Only the
-    ``shield`` wrapper is cancelled when the bounded wait expires, so the real
-    ``hook_task`` keeps running; without this, its exception surfaces later as a
-    bare "Task exception was never retrieved" with no way to tie it back to the
-    interaction it belonged to.
+    Bounded observation is not bounded *resource* lifetime. Only the ``shield``
+    wrapper is cancelled when the observation budget expires, so without this
+    the real ``hook_task`` keeps running: its MCP session, its socket and -
+    for the stdio transport, which has no read deadline of its own - its child
+    process stay alive for as long as the remote stays silent. One stalled
+    connector then costs one task, one socket and one process *per approval*,
+    with nothing to reclaim them.
+
+    Cancelling here does not violate the "never cancel a started write"
+    invariant. That invariant protects the *observation* of a write that might
+    still answer; by this point the full observation budget has already been
+    spent and the caller has already been handed its outcome (``TimeoutError``
+    with ``dispatch_started`` set, which
+    :meth:`MCPApprovalGateTool.resume_user_interaction` projects as
+    ``dispatch_unknown``). Cancelling cannot change that outcome, and the write
+    may still have landed either way - which is exactly what
+    ``dispatch_unknown`` already says. What cancelling does change is that the
+    transport unwinds instead of leaking.
+
+    The drain runs as its own task because both call sites are ``finally``
+    paths that may be unwinding under an active ``CancelledError``; awaiting
+    there would either be interrupted immediately or make the enclosing
+    cancellation un-cancellable. It is bounded by
+    ``_DISPATCH_CLEANUP_SECONDS`` so a connector that ignores cancellation
+    cannot park the cleanup either, and the done-callback attached first keeps
+    a late failure traceable to this interaction instead of surfacing as a
+    bare "Task exception was never retrieved".
     """
 
     logger.warning(
         "MCP approval resume hook is still dispatching after %.0fs; "
-        "the connector write may still land.",
+        "cancelling it - the connector write may still have landed.",
         _DISPATCH_OBSERVE_SECONDS,
     )
 
@@ -568,6 +652,12 @@ def _report_unobserved(hook_task: "asyncio.Future[Any]") -> None:
             )
 
     hook_task.add_done_callback(_retrieve)
+    hook_task.cancel()
+    cleanup = asyncio.ensure_future(
+        _drain(hook_task, timeout=_DISPATCH_CLEANUP_SECONDS)
+    )
+    _ORPHANED_DISPATCH_CLEANUPS.add(cleanup)
+    cleanup.add_done_callback(_ORPHANED_DISPATCH_CLEANUPS.discard)
 
 
 async def _drain(awaitable: Any, *, timeout: float | None = None) -> None:

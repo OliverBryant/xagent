@@ -175,19 +175,78 @@ async def test_registered_parent_source_refuses_the_child_s_connectors(
 
 
 @pytest.mark.asyncio
+async def test_refusal_is_sticky_through_a_grandchild_delegation(
+    slack_gate: Any,
+) -> None:
+    """The surviving nested occurrence: a grandchild of a gated source must
+    stay refused even though its own tool-call binding carries no
+    ``task_source`` at all.
+
+    ``_nested_mcp_refusal_reason`` reads only the *immediately enclosing*
+    bound ``ToolCallExecutionContext``. A published agent A delegated from
+    a gated parent binds no ``task_source`` for its own ReAct loop, so when
+    A in turn delegates to a published agent B, B's config would see an
+    unbound context and read as unregistered -- unless the refusal A itself
+    was built under is carried forward. This pins the fix: the grandchild's
+    config takes ``_nested_mcp_refusal_reason() or
+    <the parent-hop's inherited reason>``, mirroring how ``AgentTool``
+    threads ``inherited_mcp_unavailable_reason`` through
+    ``construction_kwargs`` the same way it already threads ``voice``.
+    """
+
+    calls: list[str] = []
+    with bind_tool_call_execution_context(_parent_context("toby-slack")):
+        # Hop 1: parent -> child A. The live binding covers this hop.
+        reason_for_a = _nested_mcp_refusal_reason()
+    assert reason_for_a == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+    # A's own tool config carries that reason forward (what
+    # ``execute_delegated_runtime`` builds it with).
+    config_for_a = _child_config(mcp_unavailable_reason=reason_for_a)
+
+    # Hop 2: child A -> grandchild B. A's ReAct loop binds no task_source
+    # of its own, so the live context here reads as unbound -- exactly the
+    # shape ``rogercloud`` reproduced at ``agent_tool.py:1656-1684``.
+    with bind_tool_call_execution_context(_parent_context(None)):
+        reason_for_b = _nested_mcp_refusal_reason()
+    assert reason_for_b is None, "the live binding alone must not see hop 1"
+
+    # Without the fix, B would be built with ``mcp_unavailable_reason=None``
+    # and dispatch live. With it, B inherits A's own config's reason.
+    effective_reason_for_b = reason_for_b or config_for_a.get_mcp_unavailable_reason()
+    assert effective_reason_for_b == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+    config_for_b = _child_config(mcp_unavailable_reason=effective_reason_for_b)
+    _stub_loader(config_for_b, calls)
+    configs = await config_for_b.get_mcp_server_configs()
+
+    assert calls == [], "the grandchild must not reach the loader"
+    for entry in configs:
+        assert entry["config"] == {
+            "unavailable": True,
+            "reason": NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+        }
+
+
+@pytest.mark.asyncio
 async def test_unregistered_parent_source_leaves_the_child_untouched(
     slack_gate: Any,
 ) -> None:
     """The blast-radius case: a parent whose source is not gated is unchanged.
 
     ``AgentTool`` passes no reason at all here, so the config takes exactly
-    the loader path it took before the refusal existed.
+    the loader path it took before the refusal existed. The reason is
+    computed through ``_nested_mcp_refusal_reason`` itself -- not
+    hand-supplied -- so a break in that function's own unregistered-source
+    handling would fail this test rather than pass silently.
     """
 
     calls: list[str] = []
     with bind_tool_call_execution_context(_parent_context("internal")):
         assert not has_approval_gate_for_source("internal")
-        config = _child_config()
+        reason = _nested_mcp_refusal_reason()
+        assert reason is None
+        config = _child_config(mcp_unavailable_reason=reason)
         assert config._mcp_unavailable_reason is None
         _stub_loader(config, calls)
         configs = await config.get_mcp_server_configs()
@@ -241,9 +300,12 @@ def test_the_delegated_config_is_actually_wired_to_the_refusal() -> None:
     real one needs a database, an LLM and a published agent row, none of which
     this property depends on. What it does depend on is that the one
     ``WebToolConfig`` ``AgentTool`` builds passes
-    ``mcp_unavailable_reason=_nested_mcp_refusal_reason()`` -- drop that
-    keyword and every behavioural test above still passes while the bypass is
-    wide open again.
+    ``mcp_unavailable_reason=_nested_mcp_refusal_reason() or
+    self._inherited_mcp_unavailable_reason`` -- drop either half and every
+    behavioural test above still passes while a bypass is open again: drop
+    the live read and the direct hop is ungated; drop the inherited
+    fallback and the grandchild hop is (see
+    ``test_refusal_is_sticky_through_a_grandchild_delegation``).
     """
 
     import ast
@@ -268,5 +330,19 @@ def test_the_delegated_config_is_actually_wired_to_the_refusal() -> None:
             "gated parent's child materialize live MCP connectors"
         )
         value = reason[0].value
-        assert isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
-        assert value.func.id == "_nested_mcp_refusal_reason"
+        # ``_nested_mcp_refusal_reason() or self._inherited_mcp_unavailable_reason``:
+        # an ``or`` BoolOp whose first operand is the live-context call and
+        # whose second is the inherited-reason attribute read.
+        assert isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or)
+        assert len(value.values) == 2
+        live_call, inherited_read = value.values
+
+        assert isinstance(live_call, ast.Call) and isinstance(live_call.func, ast.Name)
+        assert live_call.func.id == "_nested_mcp_refusal_reason"
+
+        assert isinstance(inherited_read, ast.Attribute)
+        assert inherited_read.attr == "_inherited_mcp_unavailable_reason"
+        assert (
+            isinstance(inherited_read.value, ast.Name)
+            and inherited_read.value.id == "self"
+        )

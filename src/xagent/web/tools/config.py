@@ -2646,6 +2646,10 @@ class WebToolConfig(BaseToolConfig):
         """See BaseToolConfig.get_voice's docstring."""
         return self._voice
 
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
+        return self._mcp_unavailable_reason
+
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.
 

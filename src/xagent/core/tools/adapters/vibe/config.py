@@ -480,6 +480,18 @@ class BaseToolConfig(ABC):
         top-level one - without core importing a web route module."""
         return None
 
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """The reason this config's MCP servers were refused, or None.
+
+        Set when a delegated run's connectors were refused rather than
+        loaded (see ``_nested_mcp_refusal_reason`` in ``agent_tool.py``).
+        Threaded the same way as ``get_voice`` into any further AgentTool
+        this config builds, so the refusal survives past the one hop the
+        ReAct-bound execution context covers: a grandchild delegation binds
+        no ``task_source`` of its own and would otherwise read as
+        unregistered and dispatch ungated."""
+        return None
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""
         return None

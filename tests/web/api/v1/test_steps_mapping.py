@@ -2126,3 +2126,105 @@ def test_settlement_delivery_never_reopens_a_terminal_step_on_the_sse_lane() -> 
     # Critically: no second "running" after the call first completed.
     assert statuses == ["running", "completed", "completed"]
     assert emitted[-1]["data"]["result"] == {"success": True}
+
+
+def test_replayed_settlement_after_a_lost_end_keeps_the_original_started_at() -> None:
+    """A half-written pair must not let the replay restamp ``started_at``.
+
+    The settlement trace writes are independent best-effort events, so the
+    START can land while the END is swallowed. The run-start repair pass then
+    re-delivers both halves. At that point the call's step is dangling in the
+    pending table -- never finalized -- so there is nothing in the finished
+    history to re-open. Rebuilding it from the replay START would stamp the
+    replay's timestamp onto a step that is then re-inserted at its original
+    index, breaking the ``started_at`` ascending order ``/v1/tasks/{id}/steps``
+    documents.
+    """
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    at = lambda seconds: base + timedelta(seconds=seconds)  # noqa: E731
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            timestamp=at(1),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "tool_params": {"text": "publish"},
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            timestamp=at(2),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "result": {"message": "Publish?"},
+            },
+        ),
+        # A later, unrelated call starts and completes.
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            timestamp=at(3),
+            data={"tool_name": "search", "tool_call_id": "call-2"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            timestamp=at(4),
+            data={"tool_name": "search", "tool_call_id": "call-2", "result": {"h": 1}},
+        ),
+        # First settlement attempt: the START lands, the END is swallowed.
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            timestamp=at(5),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        # Run-start replay re-delivers BOTH halves.
+        _ev(
+            "tool_execution_start",
+            step_id="react_b",
+            timestamp=at(6),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_b",
+            timestamp=at(7),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "result": {"success": True},
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+    tool_steps = [step for step in steps if step["type"] == "tool_call"]
+
+    # One step for the settled call, carrying the settled result.
+    assert [step["id"] for step in tool_steps] == [
+        "tool_call:call-1",
+        "tool_call:call-2",
+    ]
+    assert tool_steps[0]["data"]["result"] == {"success": True}
+    # Its started_at is the ORIGINAL call's (t+1), not the first settlement
+    # start (t+5) nor the replay start (t+6) -- and the array is ascending.
+    assert tool_steps[0]["started_at"] == at(1)
+    started = [step["started_at"] for step in tool_steps]
+    assert started == sorted(started)

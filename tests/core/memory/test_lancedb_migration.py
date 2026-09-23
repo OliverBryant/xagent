@@ -276,3 +276,109 @@ def test_add_record_without_embedding_into_vector_table(temp_db_dir):
     assert {"withvec", "novec"} <= ids
     # The vector-less row still round-trips through get().
     assert store.get("novec").success
+
+
+def _fail_next_table_add(monkeypatch, store, error):
+    """Make the next ``table.add`` on the store's collection raise ``error``.
+
+    Only the first call fails, so a (wrong) rebuild-then-retry would still be
+    able to commit and the test observes what add() did to the table.
+    """
+    conn = store._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    table_type = type(table)
+    _safe_close_table(table)
+    original_add = table_type.add
+    calls = {"count": 0}
+
+    def _flaky_add(self, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise error
+        return original_add(self, *args, **kwargs)
+
+    monkeypatch.setattr(table_type, "add", _flaky_add)
+    return calls
+
+
+def _table_snapshot(store):
+    conn = store._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    try:
+        arrow = table.to_arrow()
+    finally:
+        _safe_close_table(table)
+    rows = {
+        row["id"]: row.get("vector")
+        for row in arrow.select(
+            [name for name in ("id", "vector") if name in arrow.schema.names]
+        ).to_pylist()
+    }
+    return arrow.schema, rows
+
+
+def test_text_only_write_failure_never_rebuilds_the_vector_table(
+    temp_db_dir, monkeypatch
+):
+    """A no-adapter (TEXT_ONLY) store whose insert fails for a reason unrelated
+    to schema must surface the failure and leave every row and vector intact —
+    never rewrite the table without its vector column."""
+    writer = _store(temp_db_dir, MockEmbedding(64))
+    assert writer.add(MemoryNote(id="a", content="alpha")).success
+    assert writer.add(MemoryNote(id="b", content="beta")).success
+    schema_before, rows_before = _table_snapshot(writer)
+    assert "vector" in schema_before.names
+
+    text_only = _store(temp_db_dir, None)
+    _fail_next_table_add(monkeypatch, text_only, OSError("No space left on device"))
+
+    result = text_only.add(MemoryNote(id="c", content="gamma"))
+
+    assert not result.success
+    assert result.error
+    schema_after, rows_after = _table_snapshot(text_only)
+    assert schema_after == schema_before
+    assert rows_after == rows_before
+
+
+def test_text_only_write_failure_on_a_stale_vector_table_only_backfills(
+    temp_db_dir, monkeypatch
+):
+    """Missing non-vector columns are still backfilled from the no-adapter add()
+    path on a vector table, and the vectors survive the backfill."""
+    writer = _store(temp_db_dir, MockEmbedding(64))
+    assert writer.add(MemoryNote(id="a", content="alpha")).success
+    # Open the TEXT_ONLY store first, so the stale column reaches add() rather
+    # than the init path's own schema resolution.
+    text_only = _store(temp_db_dir, None)
+    conn = writer._vector_store.get_raw_connection()
+    table = conn.open_table("mem")
+    try:
+        table.drop_columns(["text"])
+    finally:
+        _safe_close_table(table)
+    _, rows_before = _table_snapshot(writer)
+
+    assert text_only.add(MemoryNote(id="b", content="beta")).success
+
+    schema_after, rows_after = _table_snapshot(text_only)
+    assert "vector" in schema_after.names
+    assert "text" in schema_after.names
+    assert rows_after["a"] == rows_before["a"]
+    assert rows_after["b"] is None
+
+
+def test_adapter_store_write_failure_on_a_compatible_table_is_surfaced(
+    temp_db_dir, monkeypatch
+):
+    """With an adapter and a matching schema, a non-schema insert failure is
+    reported and nothing is migrated."""
+    store = _store(temp_db_dir, MockEmbedding(64))
+    assert store.add(MemoryNote(id="a", content="alpha")).success
+    schema_before, rows_before = _table_snapshot(store)
+    _fail_next_table_add(monkeypatch, store, OSError("transient"))
+
+    assert not store.add(MemoryNote(id="b", content="beta")).success
+    schema_after, rows_after = _table_snapshot(store)
+    assert schema_after == schema_before
+    assert rows_after == rows_before

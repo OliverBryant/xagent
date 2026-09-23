@@ -21,6 +21,7 @@ from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
+    MemorySchemaMismatch,
     classify_memory_schema_mismatch,
     migrate_table_swap,
 )
@@ -356,7 +357,12 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
     def _resolve_schema_mismatch(
-        self, conn: Any, expected_dim: Optional[int], *, raise_when_compatible: bool
+        self,
+        conn: Any,
+        expected_dim: Optional[int],
+        *,
+        raise_when_compatible: bool,
+        allow_vector_drop: bool = True,
     ) -> None:
         """Classify and safely resolve a schema mismatch (shared by add/init).
 
@@ -369,6 +375,13 @@ class LanceDBMemoryStore(MemoryStore):
         controls behavior: the ``add()`` path passes ``True`` (its insert failed,
         so a compatible schema means an unexpected error to surface rather than
         silently drop); the init path passes ``False`` (nothing to migrate).
+
+        ``allow_vector_drop=False`` forbids the one rebuild that removes a
+        vector column (``expected_dim is None`` against a table that has one).
+        The ``add()`` path passes it: there ``None`` only means this store
+        cannot produce vectors, not that the table should lose them. Missing
+        non-vector columns are still backfilled in place, and a table with
+        nothing else to resolve is treated as compatible.
         """
         table = conn.open_table(self._collection_name)
         try:
@@ -377,6 +390,21 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
         mismatch = classify_memory_schema_mismatch(schema, expected_dim)
+        if (
+            mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD
+            and expected_dim is None
+            and not allow_vector_drop
+        ):
+            # Keep the vectors; resolve only what an additive backfill can.
+            mismatch = MemorySchemaMismatch(
+                kind=(
+                    MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN
+                    if mismatch.missing_columns
+                    else MemoryMismatchKind.NONE
+                ),
+                missing_columns=mismatch.missing_columns,
+                current_dim=mismatch.current_dim,
+            )
 
         if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
             self._backfill_missing_columns(conn, mismatch.missing_columns)
@@ -395,7 +423,16 @@ class LanceDBMemoryStore(MemoryStore):
             )
 
     def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
-        """Resolve the schema mismatch that made an ``add()`` insert fail."""
+        """Resolve the schema mismatch that made an ``add()`` insert fail.
+
+        A failed insert is not proof of a schema mismatch: disk pressure, lock
+        contention or a backend hiccup fail it too. So this never drops the
+        vector column: a store that cannot produce vectors (no adapter, e.g.
+        TEXT_ONLY, or an embedding call that just failed) must not rewrite a
+        table whose vectors were written under another identity. An insert
+        failure with nothing resolvable is raised and reported as a failed
+        write, leaving the table untouched.
+        """
         # The dimension we are trying to store now determines the target schema.
         if record.get("vector"):
             expected_dim: Optional[int] = len(record["vector"])
@@ -404,7 +441,12 @@ class LanceDBMemoryStore(MemoryStore):
         else:
             expected_dim = None
 
-        self._resolve_schema_mismatch(conn, expected_dim, raise_when_compatible=True)
+        self._resolve_schema_mismatch(
+            conn,
+            expected_dim,
+            raise_when_compatible=True,
+            allow_vector_drop=False,
+        )
 
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
         """Insert a record, adapting it to the (possibly migrated) table schema."""

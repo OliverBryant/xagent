@@ -24,6 +24,7 @@ from typing import Any, Optional
 import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
 import pytest
+from fastapi import FastAPI
 from filelock import FileLock
 from pydantic import SecretStr
 from sqlalchemy import create_engine
@@ -31,7 +32,10 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
-from tests.web.pool_contention_shared import assert_pool_checkout_off_loop
+from tests.web.pool_contention_shared import (
+    EXHAUSTION_POOL_TIMEOUT,
+    assert_pool_checkout_off_loop,
+)
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
@@ -660,6 +664,97 @@ async def test_drift_check_pool_timeout_runs_off_loop_and_stays_loud(
     finally:
         held_connection.close()
         engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_store_info_answers_two_hundred_while_the_pool_is_exhausted(
+    monkeypatch, tmp_path
+):
+    """``/api/memory/store-info`` reports in every state, this one included.
+
+    The report reaches the manager's drift check, which checks out its own
+    authority Session while ``get_current_user``'s request-scoped connection
+    is still held. On a one-slot, no-overflow pool that nested checkout has
+    nowhere to go. Two things have to hold for the route to keep its promise:
+    the checkout must run off the event loop, and the boundary must degrade to
+    the last published state instead of letting the timeout become a 500.
+
+    Driven through the real router and real Bearer authentication, because a
+    fake manager never reaches this boundary at all.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from xagent.web.api import memory as memory_api
+    from xagent.web.api.auth import create_access_token, hash_password
+    from xagent.web.api.memory import MemoryManagementRouter
+    from xagent.web.models.database import Base, get_db
+    from xagent.web.models.user import User
+
+    read_authority_snapshot = manager_module._read_authority_snapshot
+    _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path / "memory")
+    assert manager.admit().state is MemoryLifecycleState.READY
+
+    # Admission is over. From here the report must reach the database, which
+    # is what makes the exhausted pool observable from the route at all.
+    monkeypatch.setattr(
+        manager_module, "_read_authority_snapshot", read_authority_snapshot
+    )
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'store-info-pool.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=EXHAUSTION_POOL_TIMEOUT,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine)
+
+    def get_test_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(manager_module, "get_db", get_test_db)
+
+    with session_factory() as db:
+        operator = User(
+            username="memory-store-info-operator",
+            password_hash=hash_password("operator"),
+            is_admin=True,
+        )
+        db.add(operator)
+        db.commit()
+        token = create_access_token({"sub": operator.username, "user_id": operator.id})
+
+    app = FastAPI()
+    app.include_router(MemoryManagementRouter().get_router())
+    app.dependency_overrides[get_db] = get_test_db
+    monkeypatch.setattr(memory_api, "get_memory_store_manager", lambda: manager)
+
+    with assert_pool_checkout_off_loop(engine):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            response = await client.get(
+                "/api/memory/store-info",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert response.status_code == 200
+    body = response.json()
+    # The last published state, reported as it stands -- not a fabricated
+    # outage, and not the pool timeout leaking into a lifecycle state.
+    assert body["state"] == MemoryLifecycleState.READY.value
+    assert body["detail"] == memory_lifecycle.PUBLIC_DETAILS[MemoryLifecycleState.READY]
+    assert body["is_lancedb"] is True
+    assert body["store_type"] == LanceDBMemoryStore.__name__
+    assert body["mode"] == MemoryStorageMode.VECTOR.value
+    assert body["supports_vector_search"] is True
+    engine.dispose()
 
 
 # --------------------------------------------------------------------------

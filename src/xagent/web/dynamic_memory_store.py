@@ -339,9 +339,34 @@ class DynamicMemoryStoreManager:
             return before is not self._publication
 
     def get_store_info(self) -> dict:
-        """Public-safe description of the current memory store."""
+        """Public-safe description of the current memory store.
+
+        Degrades instead of raising. This is the one report an operator has
+        for seeing *why* memory is fenced off, and ``docs/deployment.md``
+        promises it answers in every state, so a database fault on the drift
+        read must not turn the lifecycle report itself into an error. When the
+        authority cannot be read, the last published status and state are
+        reported as they stand.
+
+        Deliberately confined to this boundary. ``_read_authority_snapshot``
+        still re-raises a connection-pool timeout, and the drift check on the
+        memory path still propagates it: pool exhaustion is a deployment fault
+        that has to stay loud for the callers that would otherwise read and
+        write through a store this manager could not revalidate. A status
+        report is the one caller for which answering beats failing.
+        """
         with self._lock:
-            store, status = self.acquire()
+            try:
+                store, status = self.acquire()
+            except Exception:
+                logger.warning(
+                    "Persistent memory authority could not be read for the "
+                    "store-info report; reporting the last published state",
+                    exc_info=True,
+                )
+                publication = self._publication
+                store = publication.store if publication is not None else None
+                status = self._status
             threshold = self._similarity_threshold
         # Report what the storage adapter actually is, through both the
         # revocation and the user-isolation wrapper.

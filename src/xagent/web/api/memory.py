@@ -14,6 +14,7 @@ from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.user import User
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..user_isolated_memory import UserContext
 
 logger = logging.getLogger(__name__)
@@ -356,7 +357,16 @@ class MemoryManagementRouter:
             while the rest of the deployment keeps serving.
             """
             try:
-                return get_memory_store_manager().get_store_info()
+                # Off the event loop, like every other caller of the manager:
+                # the report reaches the drift check, which checks out a
+                # synchronous authority Session. Running that inline would
+                # block the loop thread while ``get_current_user``'s
+                # request-scoped connection is still held, so on a
+                # single-slot pool the nested checkout would be waiting on
+                # the very thread that has to release it.
+                return await run_db_io_cancellation_safe(
+                    get_memory_store_manager().get_store_info
+                )
             except Exception:
                 logger.exception("Failed to read memory store info")
                 raise HTTPException(

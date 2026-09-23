@@ -2415,6 +2415,10 @@ class AgentServiceManager:
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
 
+        # A cache hit re-checks owner and scope invariants only; memory policy
+        # is resolved on construction. Remembered here so the fall-through can
+        # reconcile the cached service before it is handed to the next turn.
+        rebuilt_this_call = task_id not in self._agents
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = task_setup_snapshot is not None
@@ -3019,12 +3023,94 @@ class AgentServiceManager:
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
+        if not rebuilt_this_call:
+            await self._reconcile_cached_agent_memory_policy(
+                task_id,
+                task=(
+                    task_setup_snapshot.task
+                    if task_setup_snapshot is not None
+                    else None
+                ),
+                agent_config=persisted_agent_config,
+            )
+
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
+
+    async def _reconcile_cached_agent_memory_policy(
+        self,
+        task_id: int,
+        *,
+        task: Optional[Any],
+        agent_config: Optional[Mapping[str, Any]],
+    ) -> None:
+        """Re-resolve memory policy for a cached AgentService before its turn.
+
+        The cache-hit path re-checks owner and scope invariants only, so
+        without this a service built while memory was serving would keep
+        ``memory_enabled``, its published store and its execution-scoped
+        memory tools for the rest of its life -- reading and writing through
+        the adapter built for a vector space the authority no longer
+        describes.
+
+        This resolution is also the cross-worker signal. It reaches
+        ``get_memory_store()``, whose drift check re-reads the shared
+        authority row, so an authority change an administrator made, or a
+        revocation another worker already performed, advances *this* worker's
+        publication generation too -- and from that point every proxy this
+        worker has handed out fails closed on its own process-local check,
+        including one a cached agent is already holding. That is the
+        non-obvious part: nothing else on the cache-hit path re-reads the
+        shared authority, so a worker that is not building agents would never
+        learn. It costs exactly the one authority read the manager's drift
+        check already performs, and nothing is added to any per-operation
+        path: ``RevocableMemoryStore._live()`` stays lock-free and never
+        touches the database.
+
+        Reconciliation is one-directional and atomic with respect to the turn.
+        One-directional, because this path does not carry every input that
+        decided enablement when the service was built -- a preview or an
+        agent-backed task runs with memory off by configuration, not by
+        lifecycle -- so a policy that now reports memory as available never
+        turns memory back on. Atomic, because the policy is resolved first and
+        then applied without awaiting in between, under the per-task build
+        lock: the turn either runs with memory or runs disabled with a
+        recorded reason, never half-reconciled.
+
+        An operation already past its ``_live()`` check completes. That is
+        inherent to any revocation boundary -- the check cannot un-issue a
+        call that is already inside the store -- and the deployment contract
+        already requires quiescing writers for a vector-space change, so
+        nothing here tries to abort work in flight.
+        """
+        agent = self._agents.get(task_id)
+        if agent is None or not getattr(agent, "memory_enabled", False):
+            # Already running without memory. Nothing to reconcile, and this
+            # path never re-enables, so there is no reason to read anything.
+            return
+
+        policy = await resolve_agent_service_memory_policy_async(
+            task=task,
+            agent_config=agent_config,
+        )
+        if policy.memory_available:
+            return
+
+        agent.revoke_memory(
+            inert_store=policy.memory,
+            availability_reason=policy.public_availability_reason,
+            execution_metadata=policy.execution_metadata(),
+        )
+        logger.warning(
+            "Reconciled cached AgentService for task %s onto an inert memory "
+            "store (%s); this turn runs with memory disabled",
+            task_id,
+            policy.memory_availability_reason,
+        )
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]

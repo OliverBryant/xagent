@@ -407,6 +407,40 @@ class AgentService:
             dict[str, Any] | None, self._execution_adapter.get_status(execution_id)
         )
 
+    def revoke_memory(
+        self,
+        *,
+        inert_store: MemoryStore,
+        availability_reason: str | None,
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Take this service off persistent memory before its next turn.
+
+        Sets exactly the fields a service constructed with unavailable memory
+        already carries, so a reconciled turn is indistinguishable from a
+        freshly built one: the inert store replaces the published one, memory
+        is disabled -- which is what withholds the execution-scoped memory
+        tools, because the pattern builds them from the store the adapter is
+        handed -- and the reason reaches both the service status and the
+        execution metadata that rides into the trace and the checkpoint.
+
+        Applied to the adapter as well as to the service, so the change has
+        landed by the time this returns rather than at the start of the next
+        execution. That is what lets a caller treat the swap as atomic with
+        respect to the turn it is about to run.
+        """
+        self.memory = inert_store
+        self.memory_enabled = False
+        self.memory_available = False
+        self.memory_availability_reason = availability_reason
+        if execution_metadata:
+            self.execution_metadata.update(execution_metadata)
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.memory_store = None
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
+            )
+
     def add_pattern(self, pattern: Any) -> None:
         self.patterns.append(pattern)
         self.agent.patterns = self.patterns

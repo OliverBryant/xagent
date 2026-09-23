@@ -758,6 +758,177 @@ async def test_store_info_answers_two_hundred_while_the_pool_is_exhausted(
 
 
 # --------------------------------------------------------------------------
+# Reconciling a cached agent at the turn boundary.
+# --------------------------------------------------------------------------
+
+
+def _cached_agent(store, *, memory_enabled=True, **overrides):
+    """A cached AgentService as the manager's cache-hit path would find one."""
+    from xagent.core.agent.service import AgentService
+
+    return AgentService(
+        name="cached-agent",
+        id="cached-agent",
+        tools=[],
+        memory=store,
+        memory_enabled=memory_enabled,
+        enable_workspace=False,
+        **overrides,
+    )
+
+
+def _cache(agent, *, task_id=7, owner_id=3):
+    """An AgentServiceManager already holding ``agent`` for ``task_id``."""
+    from xagent.core.execution_scope import scope_fingerprint
+
+    agents = agent_service_manager.AgentServiceManager()
+    agents._agents[task_id] = agent
+    agents._agent_owner_ids[task_id] = owner_id
+    agents._agent_scope_fingerprints[task_id] = scope_fingerprint(None)
+    return agents
+
+
+async def _turn(agents, *, task_id=7, owner_id=3):
+    """One cache-hit turn through the public entry point."""
+    return await agents.get_agent_for_task(
+        task_id,
+        task_owner_user_id=owner_id,
+        resolved_execution_scope=None,
+    )
+
+
+def _ready_runtime(monkeypatch, tmp_path):
+    """An admitted manager wired in as the runtime's memory source."""
+    state = _install_authority(monkeypatch, _snapshot())
+    manager = _manager(monkeypatch, tmp_path)
+    assert manager.admit().state is MemoryLifecycleState.READY
+    monkeypatch.setattr(
+        agent_service_manager, "get_memory_store", manager.get_memory_store
+    )
+    return state, manager
+
+
+@pytest.mark.asyncio
+async def test_a_cache_hit_after_drift_runs_with_memory_disabled(monkeypatch, tmp_path):
+    """The cache-hit path must not hand out a service built for a dead space.
+
+    The hit path re-checks owner and scope invariants only, so a service built
+    while memory was serving kept ``memory_enabled``, the published store and
+    its execution-scoped memory tools after an administrator changed the
+    authority's vector space -- reading and writing through the adapter built
+    for the previous one.
+    """
+    state, manager = _ready_runtime(monkeypatch, tmp_path)
+    published = manager.get_memory_store()
+    agent = _cached_agent(published)
+    # Built before the drift, exactly as a live turn would have left it.
+    agent._execution_adapter = agent._build_execution_adapter()
+    assert agent._execution_adapter.config.memory_store is published
+    agents = _cache(agent)
+
+    # An administrator repoints the authority between turns.
+    state["snapshot"] = _snapshot(model_name="text-embedding-3-large")
+
+    returned = await _turn(agents)
+
+    assert returned is agent
+    assert agent.memory_enabled is False
+    assert agent.memory_available is False
+    reason = MemoryLifecycleState.RESTART_REQUIRED.value
+    assert agent.memory_availability_reason == reason
+    status = agent.get_status()
+    assert status["memory_available"] is False
+    assert status["memory_availability_reason"] == reason
+    assert agent.execution_metadata["memory_available"] is False
+    assert agent.execution_metadata["memory_availability_reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_a_reconciled_service_cannot_reach_the_old_store(monkeypatch, tmp_path):
+    """Neither through the service, nor through the tools built from it."""
+    state, manager = _ready_runtime(monkeypatch, tmp_path)
+    published = manager.get_memory_store()
+    agent = _cached_agent(published)
+    agent._execution_adapter = agent._build_execution_adapter()
+    agents = _cache(agent)
+
+    state["snapshot"] = _snapshot(model_name="text-embedding-3-large")
+    await _turn(agents)
+
+    assert agent.memory is not published
+    assert isinstance(unwrap_memory_store(agent.memory), InMemoryMemoryStore)
+    # No store reaches the runtime at all, so no memory tool is built from one.
+    assert agent._execution_adapter.config.memory_store is None
+    assert (
+        agent._execution_adapter.config.execution_metadata["memory_availability_reason"]
+        == MemoryLifecycleState.RESTART_REQUIRED.value
+    )
+    # And the reference anyone still holds fails closed on its own check.
+    with pytest.raises(MemoryUnavailableError):
+        published.add(MemoryNote(content="after the change"))
+
+
+@pytest.mark.asyncio
+async def test_a_ready_cache_hit_costs_one_authority_read_and_changes_nothing(
+    monkeypatch, tmp_path
+):
+    """The reconciliation is the drift check, not an extra read on top of it.
+
+    It must also stay off every per-operation path: the proxy's own liveness
+    check is lock-free by contract and never reads the authority, so a turn
+    that does any amount of memory work still costs this one read.
+    """
+    state, manager = _ready_runtime(monkeypatch, tmp_path)
+    published = manager.get_memory_store()
+    agent = _cached_agent(published)
+    agents = _cache(agent)
+
+    before = state["reads"]
+    returned = await _turn(agents)
+    reads_for_the_turn = state["reads"] - before
+
+    assert reads_for_the_turn == 1
+    assert returned is agent
+    assert agent.memory is published
+    assert agent.memory_enabled is True
+    assert agent.memory_available is True
+    assert agent.memory_availability_reason is None
+
+    with UserContext(11):
+        published.add(MemoryNote(content="ordinary memory traffic"))
+        assert published.list_all()
+    assert state["reads"] - before == reads_for_the_turn
+
+
+@pytest.mark.asyncio
+async def test_a_service_already_without_memory_reads_nothing_and_stays_off(
+    monkeypatch, tmp_path
+):
+    """One-directional: this path disables, it never re-enables.
+
+    A preview or an agent-backed task runs with memory off by configuration,
+    not by lifecycle, and the cache-hit path does not carry the inputs that
+    decided that -- so a healthy lifecycle must not turn memory back on.
+    """
+    state, _manager_ = _ready_runtime(monkeypatch, tmp_path)
+    agent = _cached_agent(
+        InMemoryMemoryStore(),
+        memory_enabled=False,
+        memory_available=False,
+        memory_availability_reason="blocked_repair",
+    )
+    agents = _cache(agent)
+
+    before = state["reads"]
+    await _turn(agents)
+
+    assert state["reads"] == before
+    assert agent.memory_enabled is False
+    assert agent.memory_available is False
+    assert agent.memory_availability_reason == "blocked_repair"
+
+
+# --------------------------------------------------------------------------
 # Failure semantics.
 # --------------------------------------------------------------------------
 

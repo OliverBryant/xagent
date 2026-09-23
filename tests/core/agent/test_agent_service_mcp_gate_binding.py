@@ -180,9 +180,19 @@ async def test_an_unregistered_source_dispatches_exactly_as_before() -> None:
 
 @pytest.mark.asyncio
 async def test_a_host_that_never_binds_a_source_is_not_gated() -> None:
-    """Workforce, sub-agents, the builtin executor, agent previews, the
-    agent-builder chat and triggers deliberately bind no ``task_source``.
-    They must keep dispatching, not fail closed, while a gate is live."""
+    """Workforce, the builtin executor, agent previews, the agent-builder
+    chat, triggers, and sub-agents of an unregistered or unbound parent
+    deliberately bind no ``task_source``. They must keep dispatching, not
+    fail closed, while a gate is live.
+
+    Sub-agents of a *registered* parent source are a different case, not
+    this one: ``AgentTool`` refuses to materialize governed MCP connectors
+    for them instead (see ``_nested_mcp_refusal_reason`` in
+    ``agent_tool.py`` and ``tests/core/tools/adapters/vibe/
+    test_nested_agent_mcp_refusal.py``). This test exercises a bare
+    ``AgentService.execute_task`` call with no bound execution context at
+    all -- the shape workforce runs, the builtin executor, previews and
+    triggers actually have -- not the delegated-child path."""
 
     async def gate(_call: GatedCall) -> GateDecision:
         raise AssertionError("an unbound source must not reach any hook")

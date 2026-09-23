@@ -369,6 +369,30 @@ def test_load_summary_reads_source_server_through_metadata() -> None:
     assert _build_mcp_load_summary(
         configs, [gate_mcp_tools([target])[0]]
     ).loaded_servers == ("linkedin",)
+
     # The unwrapped adapter keeps working through the direct-attribute
     # fallback, which is what a tool with no ToolMetadata still needs.
-    assert _build_mcp_load_summary(configs, [target]).loaded_servers == ("linkedin",)
+    # ``target`` itself cannot exercise this: its own ``metadata.source_server``
+    # is already "linkedin", so the metadata-first read above would satisfy
+    # this assertion even if the fallback were deleted entirely. A target
+    # whose metadata carries no ``source_server`` is required to actually
+    # reach the ``getattr(tool, "source_server", None)`` branch.
+    class _DirectAttributeOnlyTarget(_McpTarget):
+        """No ``source_server`` on ``metadata`` -- only the direct attribute."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._metadata = ToolMetadata(
+                name="mcp_LinkedIn_create_post",
+                concurrency_safe=True,
+                read_only=False,
+                source_server=None,
+                mcp_non_idempotent_write=True,
+            )
+
+    direct_attribute_target = _DirectAttributeOnlyTarget()
+    assert direct_attribute_target.metadata.source_server is None
+    assert direct_attribute_target.source_server == "linkedin"
+    assert _build_mcp_load_summary(
+        configs, [direct_attribute_target]
+    ).loaded_servers == ("linkedin",)

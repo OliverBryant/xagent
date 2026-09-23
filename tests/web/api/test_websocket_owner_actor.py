@@ -1569,6 +1569,12 @@ async def test_running_chat_message_uses_one_offloop_scope_and_no_request_sessio
     assert len(resolver_threads) == 1
     assert claim_threads and claim_threads[0] != main_thread_id
     assert resume_bg.await_args.kwargs["resolved_execution_scope"] is scope
+    # The paused task row's own source must reach the resume, not the
+    # ``execute_resume_background`` default of ``None`` -- see
+    # ``test_execution_scope_turn_wiring.test_resume_task_forwards_the_task_rows_source``
+    # for the sibling resume-command call site.
+    assert resume_bg.await_args.kwargs["trusted_task_source"] == task.source
+    assert task.source == "sdk"
 
 
 @pytest.mark.asyncio

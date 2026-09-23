@@ -663,6 +663,90 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
 
 
 @pytest.mark.asyncio
+async def test_resume_task_forwards_the_task_rows_source() -> None:
+    """``resume_task`` must forward the paused task row's own ``source`` as
+    ``trusted_task_source`` -- not leave it at the ``execute_resume_background``
+    default of ``None``.
+
+    ``task_source`` is the key the MCP approval gate selects a registration
+    by; a resumed run that lost it would have its checkpointed source
+    overwritten by the runner's overlay reading nothing, silently ungating
+    (or wrongly refusing) an approval the user is resuming. No existing test
+    asserted this kwarg at all: a deleted ``trusted_task_source=`` line at
+    this call site would still pass the rest of the suite.
+    """
+    register_scope_resolver(lambda task_id: None)
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            id=42,
+            user_id=1,
+            status=TaskStatus.PAUSED,
+            control_state="paused",
+            run_id="run-a",
+            state_version=3,
+            source="toby-slack",
+        ),
+        runtime_user=SimpleNamespace(id=1, is_admin=False),
+    )
+    agent_service = MagicMock()
+    agent_service.supports_live_control.return_value = True
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
+    resume_started = asyncio.Event()
+    resume_kwargs: dict[str, Any] = {}
+
+    async def execute_resume(**kwargs: Any) -> None:
+        resume_kwargs.update(kwargs)
+        resume_started.set()
+
+    background_manager = MagicMock()
+    background_manager.running_tasks = {}
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
+    transition = AsyncMock(
+        return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
+    )
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+                return_value=snapshot,
+            ),
+            patch(
+                "xagent.web.services.agent_service_manager.get_agent_manager",
+                return_value=agent_manager,
+            ),
+            patch(
+                "xagent.web.api.websocket.task_execution_controller.transition",
+                new=transition,
+            ),
+            patch(
+                "xagent.web.services.task_execution.background_task_manager",
+                background_manager,
+            ),
+            patch(
+                "xagent.web.services.task_command_execution.task_has_live_foreign_runner",
+                return_value=False,
+            ),
+            patch(
+                "xagent.web.services.task_execution.execute_resume_background",
+                side_effect=execute_resume,
+            ),
+        ]
+    ):
+        await resume_task(
+            _make_command_reply(MagicMock()),
+            42,
+            {"user": SimpleNamespace(id=1, is_admin=False)},
+        )
+        await asyncio.wait_for(resume_started.wait(), timeout=1)
+
+    assert resume_kwargs["trusted_task_source"] == "toby-slack"
+
+
+@pytest.mark.asyncio
 async def test_resume_survives_a_scope_authority_mismatch() -> None:
     """A control operation must stay available while the scope is in dispute.
 

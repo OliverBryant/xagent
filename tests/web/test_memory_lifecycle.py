@@ -62,14 +62,14 @@ from xagent.web.memory_lifecycle import (
     admit_authority_storage,
     authority_embedding_config,
 )
+from xagent.web.models.global_memory_embedding_authority import (
+    GlobalMemoryEmbeddingAuthority,
+)
 from xagent.web.revocable_memory_store import (
     RevocableMemoryStore,
     unwrap_memory_store,
 )
 from xagent.web.services import agent_service_manager
-from xagent.web.models.global_memory_embedding_authority import (
-    GlobalMemoryEmbeddingAuthority,
-)
 from xagent.web.services.global_memory_embedding_authority import (
     CREDENTIAL_CONFIGURED,
     AuthorityConfiguration,

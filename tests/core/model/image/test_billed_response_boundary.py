@@ -609,10 +609,8 @@ async def test_undecodable_billed_body_async_is_not_retried() -> None:
         calls["n"] += 1
         return await decode_billed_body_async(decode, "ctx")
 
-    attempts = 0
     last: Exception | None = None
     for _ in range(4):
-        attempts += 1
         try:
             await call()
         except Exception as error:  # noqa: BLE001

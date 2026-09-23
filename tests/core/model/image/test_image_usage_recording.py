@@ -1919,8 +1919,8 @@ def test_record_image_usage_empty_or_missing_usage() -> None:
 
 def test_record_image_usage_never_raises_on_garbage() -> None:
     with TokenContextManager() as manager:
-        # Not a dict / no usage / None usage must all be tolerated.
-        record_image_usage({}, model_name="m")  # type: ignore[arg-type]
+        # Missing usage / None usage must both be tolerated.
+        record_image_usage({}, model_name="m")
         record_image_usage({"usage": None}, model_name="m")
         usage = manager.get_usage()
 
@@ -2283,7 +2283,11 @@ def test_countable_agrees_with_the_write_boundary() -> None:
     because every disagreement found so far was a different shape.
     """
     from xagent.core.model.chat.token_context import _coerce_media_tokens
-    from xagent.core.model.image.usage import _MAX_TOKENS, _countable
+    from xagent.core.model.image.usage import (
+        _MAX_TOKENS,
+        _countable,
+        _is_authoritative_zero,
+    )
 
     values: list[object] = [
         -0.5,
@@ -2320,8 +2324,14 @@ def test_countable_agrees_with_the_write_boundary() -> None:
         if _countable(value):
             # "Usable" must mean the boundary bills exactly this, so stopping
             # the alias scan here cannot cost real usage. Zero is the one
-            # legitimate exception: a provider-reported 0 is a real measurement.
-            assert billed == int(value) or billed == 0, value  # type: ignore[call-overload]
+            # legitimate exception: a provider-reported 0 is a real
+            # measurement -- gated on the authoritative check itself, not on
+            # `billed == 0` alone, or a future gate that wrongly called a
+            # negative value countable would still pass here (max(0, a
+            # negative) == 0 too).
+            assert billed == int(value) or (
+                billed == 0 and _is_authoritative_zero(value)
+            ), value  # type: ignore[call-overload]
         elif billed > 0 and billed <= _MAX_TOKENS:
             # The other direction, which is what actually regressed twice: a
             # gate STRICTER than the boundary skips a value the boundary would
@@ -2629,8 +2639,10 @@ def test_a_hostile_comparison_result_cannot_cost_the_row() -> None:
 
     # Not asserting that the object is rejected -- that was an artefact of an
     # earlier gate that compared `value` directly. The contract is that a
-    # hostile comparison cannot cost the row, whichever way the gate decides.
-    assert _countable(_SneakyComparison()) in (True, False)
+    # hostile comparison cannot cost the row, whichever way the gate decides:
+    # the call itself must not raise. `_countable` always returns a bool, so
+    # asserting on its result would never be able to fail.
+    _countable(_SneakyComparison())
 
     with TokenContextManager() as manager:
         record_image_usage(

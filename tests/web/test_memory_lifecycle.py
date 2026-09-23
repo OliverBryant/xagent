@@ -878,18 +878,28 @@ def test_operator_guidance_covers_every_non_ready_state():
             assert "restart" in guidance.lower()
 
 
-def test_blocked_and_restart_details_are_indistinguishable_to_callers():
-    """Public detail never tells an unprivileged caller which fault it hit."""
-    blocked = memory_lifecycle.MemoryLifecycleStatus(
-        MemoryLifecycleState.BLOCKED_REPAIR
-    )
-    restart = memory_lifecycle.MemoryLifecycleStatus(
-        MemoryLifecycleState.RESTART_REQUIRED
-    )
-    credential = memory_lifecycle.MemoryLifecycleStatus(
-        MemoryLifecycleState.CREDENTIAL_UNAVAILABLE
-    )
-    assert blocked.detail == restart.detail == credential.detail
+def test_every_fenced_state_is_indistinguishable_to_callers():
+    """Public detail never tells an unprivileged caller which fault it hit.
+
+    Asserted over the whole matrix rather than a chosen few, because the API
+    returns ``status.detail`` verbatim: one fenced state wording itself
+    differently -- ``retryable_unavailable`` used to say "temporarily
+    unavailable" -- is enough to let a caller separate a transient backend
+    failure from a credential fault or from invalid legacy data.
+    """
+    fenced = set(MemoryLifecycleState) - {
+        MemoryLifecycleState.READY,
+        MemoryLifecycleState.NOT_CONFIGURED,
+    }
+    # A state added later is fenced unless it is deliberately classified as
+    # servable, so this matrix cannot silently stop covering one.
+    assert memory_lifecycle.FENCED_STATES == fenced
+
+    details = {memory_lifecycle.MemoryLifecycleStatus(state).detail for state in fenced}
+    assert details == {memory_lifecycle.FENCED_DETAIL}
+    # The distinguishing text still exists -- for the operator log only.
+    guidance = {memory_lifecycle.OPERATOR_GUIDANCE[state] for state in fenced}
+    assert len(guidance) == len(fenced)
 
 
 # --------------------------------------------------------------------------

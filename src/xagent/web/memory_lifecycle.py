@@ -84,23 +84,29 @@ class MemoryLifecycleState(str, Enum):
     BLOCKED_REPAIR = "blocked_repair"
 
 
+#: The states in which no store may be served. Derived rather than listed, so
+#: a state added later is fenced -- and detailed -- by default instead of by
+#: someone remembering to add it here.
+FENCED_STATES = frozenset(MemoryLifecycleState) - {
+    MemoryLifecycleState.READY,
+    MemoryLifecycleState.NOT_CONFIGURED,
+}
+
+#: The one caller-safe detail every fenced state answers with. One string for
+#: all of them is the contract, not an oversight: the API returns this detail
+#: verbatim, so a per-state wording would let an unprivileged caller tell a
+#: credential fault from invalid legacy data from a transient backend failure.
+#: The state-specific text lives in :data:`OPERATOR_GUIDANCE` alone.
+FENCED_DETAIL = "Persistent memory is unavailable pending administrator action."
+
 #: Stable, caller-safe wording. These strings are part of the API contract and
 #: deliberately carry no path, model name, endpoint or credential material.
+#: The fenced entries are generated, which is what makes "one detail for every
+#: fenced state" structural rather than a convention a new state can break.
 PUBLIC_DETAILS: dict[MemoryLifecycleState, str] = {
     MemoryLifecycleState.READY: "Persistent memory is available.",
     MemoryLifecycleState.NOT_CONFIGURED: "Persistent memory is not configured.",
-    MemoryLifecycleState.CREDENTIAL_UNAVAILABLE: (
-        "Persistent memory is unavailable pending administrator action."
-    ),
-    MemoryLifecycleState.RETRYABLE_UNAVAILABLE: (
-        "Persistent memory is temporarily unavailable."
-    ),
-    MemoryLifecycleState.RESTART_REQUIRED: (
-        "Persistent memory is unavailable pending administrator action."
-    ),
-    MemoryLifecycleState.BLOCKED_REPAIR: (
-        "Persistent memory is unavailable pending administrator action."
-    ),
+    **{state: FENCED_DETAIL for state in FENCED_STATES},
 }
 
 #: Detailed guidance for the people who can act on it. This never reaches an
@@ -433,6 +439,8 @@ def credential_failure_result() -> AdmissionResult:
 
 __all__ = [
     "AUTHORITY_CONFIG_ID",
+    "FENCED_DETAIL",
+    "FENCED_STATES",
     "MEMORY_TABLE_NAME",
     "OPERATOR_GUIDANCE",
     "PUBLIC_DETAILS",

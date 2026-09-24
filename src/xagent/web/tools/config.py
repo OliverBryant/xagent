@@ -4358,17 +4358,17 @@ class WebToolConfig(BaseToolConfig):
                     )
                 access_token = legacy_token.access_token
                 serialized_slack_policy: str | None = None
+                actor_policy = self._mcp_runtime_authorization_policy
                 if (
                     actor_builtin
                     and app_id == "slack"
                     and access_token is None
                     and not legacy_token.credential_present
+                    and actor_policy is not None
                 ):
                     grant = await resolve_slack_actor_runtime_grant(
                         user_id=self._user_id,
-                        resource_owner_key=(
-                            self._mcp_runtime_authorization_policy.resource_owner_key
-                        ),
+                        resource_owner_key=actor_policy.resource_owner_key,
                         execution_identity=self._mcp_actor_execution_identity,
                         scope=self.get_execution_scope(),
                     )

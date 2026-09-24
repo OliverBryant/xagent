@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from xagent.core.agent import ReActPattern
@@ -331,6 +333,8 @@ def make_tool_call(
         "name": name,
         "args": dict(args or {}),
         "id": id if id is not None else f"call_{next(_tool_call_ids)}",
+        "invocation_id": uuid.uuid4().hex,
+        "issued_at": datetime.now(timezone.utc).timestamp(),
     }
 
 

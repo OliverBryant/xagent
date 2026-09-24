@@ -328,7 +328,7 @@ def test_available_memory_records_no_reason_and_no_extra_metadata(
 def test_a_host_resolver_reason_is_not_published_verbatim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Host-supplied text reaches the operator's trace, never a caller."""
+    """Host-supplied text stays operator-only and is safe before persistence."""
     set_trusted_memory_policy_resolver(
         lambda _request: MemoryPolicyDecision(
             enabled=False,
@@ -340,12 +340,13 @@ def test_a_host_resolver_reason_is_not_published_verbatim(
     policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
 
     assert policy.memory_available is False
-    # Unfolded for the operator...
+    # Raw on the short-lived policy for operator diagnostics...
     assert policy.memory_availability_reason.startswith("pgbouncer-7")
-    assert policy.execution_metadata()["memory_availability_reason"].startswith(
-        "pgbouncer-7"
+    # ...folded before checkpoint/trace persistence and for every caller.
+    assert (
+        policy.execution_metadata()["memory_availability_reason"]
+        == agent_runtime_service.GENERIC_MEMORY_AVAILABILITY_REASON
     )
-    # ...folded for everybody else.
     assert (
         policy.public_availability_reason
         == agent_runtime_service.GENERIC_MEMORY_AVAILABILITY_REASON

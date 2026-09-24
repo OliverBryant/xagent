@@ -9,6 +9,7 @@ import lancedb  # type: ignore
 import pyarrow as pa  # type: ignore
 import pytest
 
+import xagent.core.memory.lancedb as lancedb_memory
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.model.embedding import BaseEmbedding
@@ -45,10 +46,12 @@ class BatchFailEmbedding(BaseEmbedding):
 
     def __init__(self, dim: int = 128):
         self._dimension = dim
+        self.batch_calls = 0
 
     def encode(self, text, dimension=None, instruct=None):
         if isinstance(text, str):
             return [0.1] * self._dimension
+        self.batch_calls += 1
         raise RuntimeError("batched embedding failed")
 
     def get_dimension(self):
@@ -74,27 +77,38 @@ def _store(temp_db_dir, embedding_model, name="mem"):
     )
 
 
-def test_add_preserves_rows_on_dimension_change(temp_db_dir):
-    """Writing at dim A, switching to dim B, then add() keeps A-rows and stores B."""
+def test_add_rejects_dimension_change_without_rebuilding(temp_db_dir, monkeypatch):
+    """An ordinary write never changes an admitted table's vector space."""
     store_a = _store(temp_db_dir, MockEmbedding(64))
     added = store_a.add(MemoryNote(content="alpha"))
     assert added.success
     alpha_id = added.memory_id
 
-    # New store over the same table with a different embedding dimension.
-    store_b = _store(temp_db_dir, MockEmbedding(128))
-    new = store_b.add(MemoryNote(content="beta"))
-    assert new.success
+    committed = store_a.add(MemoryNote(content="committed"))
+    assert committed.success
 
-    # The dimension-A row survived the migration...
-    got_alpha = store_b.get(alpha_id)
-    assert got_alpha.success
-    assert got_alpha.content.content == "alpha"
-    # ...and the new dimension-B row was stored.
-    assert store_b.get(new.memory_id).success
-    # Both are retrievable via search at the new dimension.
-    contents = {n.content for n in store_b.search("beta", k=10)}
-    assert {"alpha", "beta"} <= contents
+    # A provider returning a different width must fail the write rather than
+    # re-embed and replace the live table from the request path.
+    store_b = _store(temp_db_dir, MockEmbedding(128))
+    swap_calls = 0
+
+    def forbid_request_time_swap(*_args, **_kwargs):
+        nonlocal swap_calls
+        swap_calls += 1
+        raise AssertionError("ordinary add reached migrate_table_swap")
+
+    # Patch only after both constructors completed: an empty bootstrap table
+    # may be shaped before publication, while this assertion is specifically
+    # about add-error recovery on the populated persistent table.
+    monkeypatch.setattr(lancedb_memory, "migrate_table_swap", forbid_request_time_swap)
+    new = store_b.add(MemoryNote(content="beta"))
+    assert not new.success
+    assert swap_calls == 0
+
+    schema, rows = _table_snapshot(store_a)
+    assert schema.field("vector").type.list_size == 64
+    assert {alpha_id, committed.memory_id} <= rows.keys()
+    assert new.memory_id not in rows
 
 
 def test_add_backfills_missing_non_vector_column(temp_db_dir):
@@ -125,17 +139,18 @@ def test_add_backfills_missing_non_vector_column(temp_db_dir):
     assert store.get("y").success
 
 
-def test_add_migration_failure_leaves_table_intact(temp_db_dir):
-    """If re-embedding fails mid-migration, no data is lost and add() fails."""
+def test_add_dimension_mismatch_never_attempts_reembedding(temp_db_dir):
+    """Request-time mismatch handling cannot enter the batch re-embed path."""
     store_a = _store(temp_db_dir, MockEmbedding(64))
     added = store_a.add(MemoryNote(content="alpha"))
     assert added.success
     alpha_id = added.memory_id
 
-    # Switch to a model that fails the batched re-embed at a new dimension.
-    store_fail = _store(temp_db_dir, BatchFailEmbedding(128))
+    embedding = BatchFailEmbedding(128)
+    store_fail = _store(temp_db_dir, embedding)
     result = store_fail.add(MemoryNote(content="beta"))
     assert not result.success
+    assert embedding.batch_calls == 0
 
     # The original row is untouched and still retrievable via the dim-64 store.
     got_alpha = store_a.get(alpha_id)

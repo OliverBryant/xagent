@@ -47,7 +47,7 @@ from ...core.tools.adapters.vibe.selection_spec import (
 from ...core.utils.setup_metrics import agent_setup
 from ...sandbox import SandboxMountIntent
 from ..dynamic_memory_store import get_memory_store
-from ..memory_lifecycle import MemoryLifecycleState, MemoryUnavailableError
+from ..memory_lifecycle import MemoryUnavailableError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import (
     get_session_local,
@@ -86,6 +86,22 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
+)
+from .memory_availability import (
+    GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
+)
+from .memory_availability import (
+    MEMORY_AVAILABILITY_REASON_METADATA_KEY,
+    MEMORY_AVAILABLE_METADATA_KEY,
+)
+from .memory_availability import (
+    PUBLIC_MEMORY_AVAILABILITY_REASONS as PUBLIC_MEMORY_AVAILABILITY_REASONS,
+)
+from .memory_availability import (
+    caller_facing_execution_metadata as caller_facing_execution_metadata,
+)
+from .memory_availability import (
+    public_memory_availability_reason,
 )
 from .memory_policy import (
     MemoryPolicyRequest,
@@ -204,52 +220,6 @@ def _load_agent_for_task_runtime(
     return agent if int(agent.id) in visible_agent_ids else None
 
 
-#: Availability reasons that may be published to a caller. These are exactly
-#: the lifecycle states ``/api/memory/store-info`` already publishes, so they
-#: carry no path, model name, endpoint or credential material.
-PUBLIC_MEMORY_AVAILABILITY_REASONS = frozenset(
-    state.value for state in MemoryLifecycleState
-)
-
-#: What any other reason becomes. A trusted host resolver's reason is
-#: host-supplied text that nothing vetted for callers, so it reaches the
-#: operator's trace but never a public status payload.
-GENERIC_MEMORY_AVAILABILITY_REASON = "unavailable"
-
-#: Execution-metadata keys. They ride into the task's trace, where an operator
-#: can see per task why memory was disabled.
-MEMORY_AVAILABLE_METADATA_KEY = "memory_available"
-MEMORY_AVAILABILITY_REASON_METADATA_KEY = "memory_availability_reason"
-
-
-def public_memory_availability_reason(reason: str | None) -> str | None:
-    """Fold an availability reason onto something safe to publish."""
-    if reason is None:
-        return None
-    if reason in PUBLIC_MEMORY_AVAILABILITY_REASONS:
-        return reason
-    return GENERIC_MEMORY_AVAILABILITY_REASON
-
-
-def caller_facing_execution_metadata(metadata: Any) -> dict[str, Any]:
-    """A copy of a run's execution metadata that is safe to send to its caller.
-
-    The execution metadata carries the unfolded availability reason for the
-    operator's trace and checkpoint; anything forwarded to the task owner gets
-    it folded like every other caller-facing surface. The input is not mutated.
-    """
-    if not isinstance(metadata, dict):
-        return {}
-    folded = dict(metadata)
-    if MEMORY_AVAILABILITY_REASON_METADATA_KEY in folded:
-        folded[MEMORY_AVAILABILITY_REASON_METADATA_KEY] = (
-            public_memory_availability_reason(
-                folded[MEMORY_AVAILABILITY_REASON_METADATA_KEY]
-            )
-        )
-    return folded
-
-
 @dataclass(frozen=True)
 class AgentServiceMemoryPolicy:
     memory: MemoryStore
@@ -263,19 +233,19 @@ class AgentServiceMemoryPolicy:
         return public_memory_availability_reason(self.memory_availability_reason)
 
     def execution_metadata(self) -> dict[str, Any]:
-        """Operator-facing availability, for the task's execution metadata.
+        """Caller-safe availability for checkpoints and task trace metadata.
 
         Empty while memory is available, so an ordinary task's trace is
-        unchanged. The unfolded reason is used here on purpose: this reaches
-        the operator's tracing backend, not a public API response. Anything
-        that forwards run metadata to the caller must pass it through
-        ``caller_facing_execution_metadata`` first.
+        unchanged. Execution metadata is checkpointed and can later reach
+        owner-facing trace APIs, so a trusted host's arbitrary diagnostic must
+        be folded before persistence. The raw reason remains available on this
+        policy object for operator logging only.
         """
         if self.memory_available:
             return {}
         return {
             MEMORY_AVAILABLE_METADATA_KEY: False,
-            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.memory_availability_reason,
+            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
         }
 
 
@@ -314,6 +284,11 @@ def resolve_agent_service_memory_policy(
         override is not None and not override.available
     )
     if use_in_memory:
+        if override is not None and not override.available:
+            logger.warning(
+                "Trusted memory policy made persistent memory unavailable (%s)",
+                override.reason,
+            )
         return AgentServiceMemoryPolicy(
             memory=InMemoryMemoryStore(),
             memory_enabled=enabled,

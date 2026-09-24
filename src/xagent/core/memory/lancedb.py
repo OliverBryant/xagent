@@ -21,7 +21,6 @@ from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
-    MemorySchemaMismatch,
     classify_memory_schema_mismatch,
     migrate_table_swap,
 )
@@ -114,6 +113,7 @@ class LanceDBMemoryStore(MemoryStore):
         try:
             table = conn.open_table(self._collection_name)
             column_names = set(table.schema.names)
+            row_count = table.count_rows()
         except Exception:
             # Table doesn't exist yet, create it with the basic schema.
             logger.info(f"Creating table {self._collection_name} with basic schema")
@@ -122,11 +122,13 @@ class LanceDBMemoryStore(MemoryStore):
         finally:
             _safe_close_table(table)
 
-        # Table exists. Init's trigger is a missing required non-vector column;
-        # a vector-dimension mismatch is detected and migrated lazily on the
-        # add() path instead. Route the resolution through the shared classifier
-        # and transform-then-swap primitive so we migrate rather than wipe.
-        if not {"id", "text", "metadata"} <= column_names:
+        # The generic vector-store constructor bootstraps a new table with an
+        # empty three-dimensional placeholder. Resolve that empty-table schema
+        # here, before the store can be published or accept a write. Existing
+        # non-empty tables still enter this path only for missing required
+        # non-vector columns; vector-space changes there require explicit
+        # admission/maintenance and are never deferred to add().
+        if row_count == 0 or not {"id", "text", "metadata"} <= column_names:
             logger.warning(
                 f"Table {self._collection_name} has incompatible schema, "
                 "migrating in place"
@@ -364,7 +366,7 @@ class LanceDBMemoryStore(MemoryStore):
         expected_dim: Optional[int],
         *,
         raise_when_compatible: bool,
-        allow_vector_drop: bool = True,
+        allow_vector_rebuild: bool = True,
     ) -> None:
         """Classify and safely resolve a schema mismatch (shared by add/init).
 
@@ -378,12 +380,10 @@ class LanceDBMemoryStore(MemoryStore):
         so a compatible schema means an unexpected error to surface rather than
         silently drop); the init path passes ``False`` (nothing to migrate).
 
-        ``allow_vector_drop=False`` forbids the one rebuild that removes a
-        vector column (``expected_dim is None`` against a table that has one).
-        The ``add()`` path passes it: there ``None`` only means this store
-        cannot produce vectors, not that the table should lose them. Missing
-        non-vector columns are still backfilled in place, and a table with
-        nothing else to resolve is treated as compatible.
+        ``allow_vector_rebuild=False`` makes ordinary writes schema-immutable:
+        the add-error path may backfill missing non-vector columns, but it may
+        never replace or re-embed an admitted table. Vector-space repair stays
+        an explicit, quiesced maintenance/admission operation.
         """
         table = conn.open_table(self._collection_name)
         try:
@@ -394,18 +394,15 @@ class LanceDBMemoryStore(MemoryStore):
         mismatch = classify_memory_schema_mismatch(schema, expected_dim)
         if (
             mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD
-            and expected_dim is None
-            and not allow_vector_drop
+            and not allow_vector_rebuild
         ):
-            # Keep the vectors; resolve only what an additive backfill can.
-            mismatch = MemorySchemaMismatch(
-                kind=(
-                    MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN
-                    if mismatch.missing_columns
-                    else MemoryMismatchKind.NONE
-                ),
-                missing_columns=mismatch.missing_columns,
-                current_dim=mismatch.current_dim,
+            # Keep the live vector schema and rows; resolve only an additive
+            # non-vector backfill, if one is also needed.
+            if mismatch.missing_columns:
+                self._backfill_missing_columns(conn, mismatch.missing_columns)
+                return
+            raise RuntimeError(
+                "add() vector schema mismatch requires offline admission or repair"
             )
 
         if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
@@ -447,7 +444,7 @@ class LanceDBMemoryStore(MemoryStore):
             conn,
             expected_dim,
             raise_when_compatible=True,
-            allow_vector_drop=False,
+            allow_vector_rebuild=False,
         )
 
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:

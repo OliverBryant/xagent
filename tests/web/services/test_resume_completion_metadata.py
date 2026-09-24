@@ -1,13 +1,8 @@
-"""The resumed-task completion event must not carry the raw memory reason.
+"""Persistent and resumed-task metadata must not carry the raw memory reason.
 
-``AgentServiceMemoryPolicy.execution_metadata()`` deliberately records the
-unfolded ``memory_availability_reason`` -- possibly a trusted host resolver's
-arbitrary text -- for the operator's trace and the execution checkpoint. The
-resume path forwards the run's result metadata in its ``task_completed``
-event, which reaches the task owner's socket, so it must fold that reason the
-way every other caller-facing surface does. The raw value stays in the
-execution metadata the trace is built from (pinned in
-``tests/web/test_memory_lifecycle.py``) and in the result itself.
+``AgentServiceMemoryPolicy.execution_metadata()`` is persisted in checkpoints
+and traces, so it folds a trusted host resolver's arbitrary text up front. The
+resume completion path applies the same idempotent caller-facing fold.
 """
 
 from __future__ import annotations
@@ -79,7 +74,10 @@ async def test_resumed_completion_event_folds_the_memory_reason(
         memory_available=False,
         memory_availability_reason=RAW_REASON,
     ).execution_metadata()
-    assert execution_metadata[MEMORY_AVAILABILITY_REASON_METADATA_KEY] == RAW_REASON
+    assert (
+        execution_metadata[MEMORY_AVAILABILITY_REASON_METADATA_KEY]
+        == GENERIC_MEMORY_AVAILABILITY_REASON
+    )
 
     result: dict[str, Any] = {
         "status": "completed",
@@ -120,6 +118,7 @@ async def test_resumed_completion_event_folds_the_memory_reason(
         == GENERIC_MEMORY_AVAILABILITY_REASON
     )
     assert metadata["pattern"] == "react"
-    # Folding is a copy: the run's own metadata, which the checkpoint and the
-    # operator trace keep, still carries the raw reason.
-    assert result["metadata"][MEMORY_AVAILABILITY_REASON_METADATA_KEY] == RAW_REASON
+    assert (
+        result["metadata"][MEMORY_AVAILABILITY_REASON_METADATA_KEY]
+        == GENERIC_MEMORY_AVAILABILITY_REASON
+    )

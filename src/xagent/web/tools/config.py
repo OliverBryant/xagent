@@ -4389,7 +4389,7 @@ class WebToolConfig(BaseToolConfig):
                                 "Slack actor runtime grant requires execution identity"
                             )
                         slack_runtime_refresh_args = (
-                            int(self._user_id),
+                            cast(int, self._user_id),
                             actor_policy.resource_owner_key,
                             execution_identity,
                             self.get_execution_scope(),

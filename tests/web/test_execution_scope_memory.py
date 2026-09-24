@@ -370,7 +370,9 @@ class TestScopedByIdAccess:
             "execution_scope_tenant": "a",
         }
 
-    def test_update_preserves_scope_when_backend_returns_same_note_instance(self, store):
+    def test_update_preserves_scope_when_backend_returns_same_note_instance(
+        self, store
+    ):
         note_a = self._note_in(store, SCOPE_A, "a note")
         stored = store._base_store.notes[note_a.id]
         stored.content = "edited in place"

@@ -442,6 +442,7 @@ Bulk deletion pressures autovacuum and can extend replication lag. Watch `n_dead
 `XAGENT_RETENTION_ENABLED=false` followed by a restart stops the job without changing the configured periods; unsetting the periods does the same. Neither restores deleted rows — recovery from an over-broad period is a database restore, which is what makes the dry run the step worth not skipping.
 
 This change adds no migration and no index.
+
 ## 2026-09-20 — Persistent memory lifecycle enablement
 
 ### Deployment impact

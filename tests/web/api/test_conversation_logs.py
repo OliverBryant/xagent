@@ -958,6 +958,8 @@ def test_detail_on_a_trace_expired_task_is_empty_not_an_error() -> None:
     # distinguished by ``message_type``; they carry no ``event_type`` at all,
     # so asserting on that field could never have failed.
     assert all(entry.get("message_type") != "compaction" for entry in transcript)
+
+
 def test_detail_folds_raw_memory_reason_in_historical_checkpoint() -> None:
     admin = _admin_headers()
     admin_id = _user_id("admin")

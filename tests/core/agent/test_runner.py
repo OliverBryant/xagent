@@ -861,6 +861,39 @@ async def test_runner_still_falls_back_after_an_ordinary_pattern_exception(
 
 
 @pytest.mark.asyncio
+async def test_runner_reports_a_terminal_trace_for_a_custom_pattern_that_never_calls_on_pattern_error(
+    tmp_path: Path,
+) -> None:
+    """A custom pattern that only raises must still get a terminal trace.
+
+    The ``AgentPattern`` interface requires only ``run()``; unlike
+    ``DAGPattern``/``ReActPattern``, a custom pattern is not required to call
+    ``runtime.on_pattern_error()`` itself before letting
+    ``CheckpointPersistenceError`` propagate. Without a fallback report here,
+    the abort would still correctly propagate to the caller, but no terminal
+    ``trace_error`` would ever be recorded -- an audit/trace visibility gap.
+    """
+
+    tracer = RecordingTraceEventTracer()
+    first = CheckpointFailingPattern()
+    agent = Agent(name="writer", patterns=[first])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(task="Durability", execution_id="exec-custom-pattern-trace")
+
+    error_events = [
+        event for event in tracer.events if event["event_type"] == "task_error_general"
+    ]
+    assert error_events
+    assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"
+
+
+@pytest.mark.asyncio
 async def test_runner_returns_aggregate_error_when_all_patterns_fail(
     tmp_path: Path,
 ) -> None:

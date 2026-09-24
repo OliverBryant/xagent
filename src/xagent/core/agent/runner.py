@@ -366,7 +366,7 @@ class AgentRunner:
                             result=normalized,
                         )
                         return normalized
-                    except CheckpointPersistenceError:
+                    except CheckpointPersistenceError as exc:
                         # A checkpoint that did not persist is not a
                         # recoverable pattern failure: the state transition
                         # was never durably committed. Falling through to the
@@ -376,6 +376,25 @@ class AgentRunner:
                         # recovery is missing. Abort the run instead, the same
                         # way ``ExecutionInterrupted`` above leaves the loop.
                         teardown_status = "failed"
+                        if not getattr(runtime, "pattern_error_reported", False):
+                            # The AgentPattern contract only requires
+                            # run(); a custom pattern that raises this
+                            # without calling on_pattern_error() itself
+                            # (as DAGPattern and ReActPattern already do)
+                            # would otherwise abort with no terminal
+                            # trace_error at all. Report it here, exactly
+                            # once, without letting a failure in this
+                            # fallback report mask the original
+                            # persistence error.
+                            try:
+                                await runtime.on_pattern_error(
+                                    context=context, pattern=pattern, error=exc
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "on_pattern_error failed while reporting "
+                                    "a checkpoint durability abort"
+                                )
                         raise
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"

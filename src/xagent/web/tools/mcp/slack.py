@@ -724,8 +724,7 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     fails with not_in_channel; ask a member to `/invite` the bot there.
     """
     try:
-        _channel_access_policy(_WRITE_CAPABILITY)
-        policy = _channel_access_policy()
+        policy = _channel_access_policy(_WRITE_CAPABILITY)
         resolved_channel = (
             _normalize_channel(channel)
             if policy is None

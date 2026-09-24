@@ -310,7 +310,12 @@ class PublicStepProjector:
         self._finished.insert(index, self._finished.pop())
 
     def _reopen_finished_step(
-        self, public_type: str, key: str, origin_step_id: str
+        self,
+        public_type: str,
+        public_key: str,
+        invocation_id: str,
+        origin_step_id: str,
+        pending_key: Tuple[str, str],
     ) -> Optional[Dict[str, Any]]:
         """Pull an already-finalized step back out of the finished history.
 
@@ -351,11 +356,19 @@ class PublicStepProjector:
             index
             for index in range(len(self._finished) - 1, -1, -1)
             if self._finished[index].get("type") == public_type
-            and self._finished[index].get("id") == f"{public_type}:{key}"
+            and self._finished[index].get("id") == f"{public_type}:{public_key}"
         ]
         if not candidates:
             return None
-        if len(candidates) > 1:
+        if invocation_id:
+            candidates = [
+                index
+                for index in candidates
+                if self._finished[index].get("_invocation_id") == invocation_id
+            ]
+            if len(candidates) != 1:
+                return None
+        elif len(candidates) > 1:
             candidates = [
                 index
                 for index in candidates
@@ -370,7 +383,7 @@ class PublicStepProjector:
                 return None
         index = candidates[0]
         step = self._finished[index]
-        self._settlement_reopen_index[(public_type, key)] = index
+        self._settlement_reopen_index[pending_key] = index
         del self._finished[index]
         return step
 
@@ -487,14 +500,16 @@ class PublicStepProjector:
             # of it for compatibility but has no current producer.
             # step_id alone is unsafe because one step may invoke
             # multiple tools.
-            key = (
+            public_key = (
                 _data_get(event, "tool_execution_id")
                 or _data_get(event, "tool_call_id")
                 or _safe_get(event, "step_id")
                 or _safe_get(event, "event_id")
             )
-            if not key:
+            if not public_key:
                 return []
+            invocation_id = str(_data_get(event, "invocation_id") or "")
+            key = invocation_id or str(public_key)
 
             if event_type == "tool_execution_start":
                 # A settlement lifecycle projects a resumed outcome onto a call
@@ -531,10 +546,20 @@ class PublicStepProjector:
                     pending_key = (public_type, str(key))
                     origin_step_id = str(_safe_get(event, "step_id") or "")
                     reopened = self._reopen_finished_step(
-                        public_type, str(key), origin_step_id
+                        public_type,
+                        str(public_key),
+                        invocation_id,
+                        origin_step_id,
+                        pending_key,
                     )
                     if reopened is None:
                         reopened = self._pending.get(pending_key)
+                        if (
+                            reopened is not None
+                            and invocation_id
+                            and reopened.get("_invocation_id") != invocation_id
+                        ):
+                            reopened = None
                     if reopened is not None:
                         placeholder = reopened
                     else:
@@ -542,9 +567,10 @@ class PublicStepProjector:
                             event,
                             public_type=public_type,
                             tool_name=tool_name,
-                            key=str(key),
+                            key=str(public_key),
                         )
                         placeholder["_origin_step_id"] = origin_step_id
+                        placeholder["_invocation_id"] = invocation_id
                         original_started_at = _data_get(event, "original_started_at")
                         if original_started_at is not None:
                             placeholder["started_at"] = datetime.fromtimestamp(
@@ -561,7 +587,7 @@ class PublicStepProjector:
                     event,
                     public_type=public_type,
                     tool_name=tool_name,
-                    key=str(key),
+                    key=str(public_key),
                 )
                 # Internal only -- stripped by Pydantic's default
                 # ``extra="ignore"`` when a step dict is handed to
@@ -569,6 +595,7 @@ class PublicStepProjector:
                 # disambiguate WHICH original call a settlement belongs to
                 # when its key collides with another call's (see there).
                 step["_origin_step_id"] = str(_safe_get(event, "step_id") or "")
+                step["_invocation_id"] = invocation_id
                 self._pending[(public_type, str(key))] = step
                 return [step]
             if event_type == "tool_execution_end":

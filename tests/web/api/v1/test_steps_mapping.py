@@ -2314,6 +2314,80 @@ def test_settlement_delivery_does_not_reopen_a_colliding_step() -> None:
     assert len(tool_steps) == 2
 
 
+def test_settlement_delivery_uses_invocation_id_for_same_step_id_reuse() -> None:
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_same",
+            data={
+                "tool_name": "search",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-a",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_same",
+            data={
+                "tool_name": "search",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-a",
+                "result": {"value": "earlier"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_same",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_same",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+                "result": {"status": "waiting_for_user"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_same",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_same",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+                "settlement_delivery": True,
+                "result": {"value": "settled"},
+            },
+        ),
+    ]
+
+    tool_steps = [
+        step
+        for step in map_trace_events_to_public_steps(events)
+        if step["type"] == "tool_call"
+    ]
+    by_name = {step["data"]["name"]: step for step in tool_steps}
+    assert by_name["search"]["data"]["result"] == {"value": "earlier"}
+    assert by_name["approval_gate"]["data"]["result"] == {"value": "settled"}
+    assert len(tool_steps) == 2
+
+
 def test_settlement_delivery_recovers_started_at_on_the_sse_lane() -> None:
     """The SSE (``retain_finished=False``) lane has no history to fall back on.
 
@@ -2370,8 +2444,7 @@ def test_a_successful_settlement_clears_the_pauses_stale_failure_error() -> None
     ``_finalize_pending`` stamps ``data['error'] = "Tool execution failed"``
     on it. A later successful settlement's own finalize only ever ADDS
     ``result`` (``extra_data_fn`` never clears the opposite outcome key), so
-    without an explicit reset the reopened step ends up with both keys --
-    rogercloud's round-3 finding.
+    without an explicit reset the reopened step ends up with both keys.
     """
 
     events = [

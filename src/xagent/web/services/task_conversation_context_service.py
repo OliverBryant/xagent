@@ -102,6 +102,7 @@ class _PendingToolStart:
     # empty string when absent (legacy rows, or a call whose start event
     # fell outside this query's window).
     turn_id: str = ""
+    invocation_id: str = ""
 
 
 @dataclass
@@ -130,6 +131,7 @@ class _ToolExchange:
     # supersede an unrelated exchange from a different, concurrent step that
     # happens to share it.
     step_id: str = ""
+    invocation_id: str = ""
 
 
 @dataclass
@@ -402,10 +404,15 @@ def _load_tool_exchanges(
             call_id = str(data.get("tool_call_id") or "") or f"recon-{row_id}"
             assistant_content = str(data.get("assistant_content") or "").strip()
             start_turn_id = str(data.get("turn_id") or "")
+            invocation_id = str(data.get("invocation_id") or "")
             start_key: tuple[str, ...] = (
-                (step_discriminator, call_id, start_turn_id)
-                if start_turn_id
-                else (step_discriminator, call_id)
+                ("invocation", invocation_id)
+                if invocation_id
+                else (
+                    (step_discriminator, call_id, start_turn_id)
+                    if start_turn_id
+                    else (step_discriminator, call_id)
+                )
             )
             pending[start_key] = _PendingToolStart(
                 assistant_content=assistant_content,
@@ -413,6 +420,7 @@ def _load_tool_exchanges(
                 tool_params=data.get("tool_params"),
                 sort_key=(row_timestamp, row_id),
                 turn_id=start_turn_id,
+                invocation_id=invocation_id,
             )
             continue
 
@@ -420,13 +428,18 @@ def _load_tool_exchanges(
         # each start is consumed by exactly one end.
         raw_call_id = str(data.get("tool_call_id") or "")
         end_turn_id = str(data.get("turn_id") or "")
+        end_invocation_id = str(data.get("invocation_id") or "")
         start = None
         call_id = raw_call_id
         if raw_call_id:
             end_key: tuple[str, ...] = (
-                (step_discriminator, raw_call_id, end_turn_id)
-                if end_turn_id
-                else (step_discriminator, raw_call_id)
+                ("invocation", end_invocation_id)
+                if end_invocation_id
+                else (
+                    (step_discriminator, raw_call_id, end_turn_id)
+                    if end_turn_id
+                    else (step_discriminator, raw_call_id)
+                )
             )
             start = pending.pop(end_key, None)
         if start is None:
@@ -487,10 +500,18 @@ def _load_tool_exchanges(
             # to supersede the common, unambiguous case. Only gate on it when
             # more than one exchange actually shares this call_id.
             candidates = [
-                exchange for exchange in exchanges if exchange.call_id == raw_call_id
+                exchange
+                for exchange in exchanges
+                if (
+                    exchange.invocation_id == end_invocation_id
+                    if end_invocation_id
+                    else exchange.call_id == raw_call_id
+                )
             ]
             superseded: Optional[_ToolExchange] = None
-            if len(candidates) == 1:
+            if end_invocation_id and len(candidates) == 1:
+                superseded = candidates[0]
+            elif len(candidates) == 1:
                 superseded = candidates[0]
             elif len(candidates) > 1:
                 exact = [
@@ -536,6 +557,8 @@ def _load_tool_exchanges(
                 sort_key=sort_key,
                 turn_id=turn_id,
                 step_id=step_discriminator,
+                invocation_id=end_invocation_id
+                or (start.invocation_id if start else ""),
             )
         )
 

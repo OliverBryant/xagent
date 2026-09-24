@@ -1116,6 +1116,8 @@ class PatternRuntime:
             "tool_params": tool_call.get("args", {}),
             "tool_call_id": tool_call.get("id"),
         }
+        if tool_call.get("invocation_id"):
+            data["invocation_id"] = str(tool_call["invocation_id"])
         assistant_content = tool_call.get("assistant_content")
         if isinstance(assistant_content, str) and assistant_content.strip():
             data["assistant_content"] = assistant_content.strip()
@@ -1153,6 +1155,8 @@ class PatternRuntime:
                 "status": WAITING_FOR_USER_STATUS,
                 "control_state": WAITING_FOR_USER_STATUS,
             }
+            if tool_call.get("invocation_id"):
+                data["invocation_id"] = str(tool_call["invocation_id"])
             if turn_id:
                 data["turn_id"] = turn_id
             await self._emit_trace_event(
@@ -1188,6 +1192,8 @@ class PatternRuntime:
             "result": result,
             "success": True,
         }
+        if tool_call.get("invocation_id"):
+            data["invocation_id"] = str(tool_call["invocation_id"])
         if turn_id:
             data["turn_id"] = turn_id
         await self._emit_trace_event(
@@ -1216,6 +1222,8 @@ class PatternRuntime:
             "tool_name": tool_call.get("name"),
             "tool_call_id": tool_call.get("id"),
         }
+        if tool_call.get("invocation_id"):
+            data["invocation_id"] = str(tool_call["invocation_id"])
         if result is not None:
             data["result"] = result
         failure_code = normalize_tool_failure_code(
@@ -1256,6 +1264,8 @@ class PatternRuntime:
             "interrupted": True,
             "interrupt_reason": cancellation_reason,
         }
+        if tool_call.get("invocation_id"):
+            data["invocation_id"] = str(tool_call["invocation_id"])
         turn_id = self._turn_id_from_payload(tool_call)
         if turn_id:
             data["turn_id"] = turn_id

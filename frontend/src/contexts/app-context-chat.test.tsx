@@ -8800,4 +8800,60 @@ describe("projectAppState ADD_TRACE_EVENT settlement routing", () => {
     // B's message is untouched.
     expect((messageB?.traceEvents ?? []).map((e: any) => e.event_id)).toEqual(["b1"])
   })
+
+  it("routes by invocation when the same step reuses a provider id", () => {
+    const event = (
+      eventType: string,
+      invocationId: string,
+      eventId: string,
+      settlement = false,
+    ) => ({
+      event_id: eventId,
+      event_type: eventType,
+      step_id: "step-same",
+      data: {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: invocationId,
+        ...(settlement ? { settlement_delivery: true } : {}),
+      },
+    }) as any
+
+    let state = createInitialState()
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: event("tool_execution_start", "invocation-a", "a1"),
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "message-a", role: "assistant", content: "A", timestamp: "t1", isResult: true },
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "between", role: "user", content: "continue", timestamp: "t1.5" },
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: event("tool_execution_start", "invocation-b", "b1"),
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "message-b", role: "assistant", content: "B", timestamp: "t2", isResult: true },
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_MESSAGE",
+      payload: { id: "reply", role: "user", content: "Approve", timestamp: "t2.5" },
+    } as any)
+    state = projectAppState(state, {
+      type: "ADD_TRACE_EVENT",
+      payload: event("tool_execution_end", "invocation-a", "a2", true),
+    } as any)
+
+    expect(
+      state.messages.find((message) => message.id === "message-a")?.traceEvents?.map((item: any) => item.event_id),
+    ).toEqual(["a1", "a2"])
+    expect(
+      state.messages.find((message) => message.id === "message-b")?.traceEvents?.map((item: any) => item.event_id),
+    ).toEqual(["b1"])
+  })
 })

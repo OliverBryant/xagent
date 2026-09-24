@@ -769,19 +769,28 @@ describe("processTraceEvents settlement delivery", () => {
     // pair under the original call's step id and the chat reducer routes it
     // to the message that already holds that tool_call_id.
     const events = [
-      resumedStepStart,
-      inStep2("tool_execution_start", {
+      {
+        event_type: "tool_execution_start",
+        step_id: "original-step-outside-window",
+        data: {
         tool_name: "approval_gate",
         tool_call_id: "orphan-call",
+        invocation_id: "orphan-invocation",
         settlement_delivery: true,
-      }),
-      inStep2("tool_execution_end", {
+        },
+      },
+      {
+        event_type: "tool_execution_end",
+        step_id: "original-step-outside-window",
+        data: {
         tool_name: "approval_gate",
         tool_call_id: "orphan-call",
+        invocation_id: "orphan-invocation",
         settlement_delivery: true,
         settlement_status: "succeeded",
         result: { output: "done" },
-      }),
+        },
+      },
     ]
 
     const steps = processTraceEvents(events as never, t)
@@ -790,6 +799,57 @@ describe("processTraceEvents settlement delivery", () => {
     expect(toolActions).toHaveLength(1)
     expect(toolActions[0].status).toBe("completed")
     expect(toolActions[0].data.output).toBe("done")
+  })
+
+  it("uses invocation identity when one step reuses the same provider id", () => {
+    const inSameStep = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-1",
+      data,
+    })
+    const events = [
+      stepStart,
+      inSameStep("tool_execution_start", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "search",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+        result: { output: "earlier" },
+      }),
+      inSameStep("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        result: { output: "Publish?" },
+      }),
+      inSameStep("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        settlement_delivery: true,
+      }),
+      inSameStep("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-b",
+        settlement_delivery: true,
+        result: { output: "settled" },
+      }),
+    ]
+
+    const toolActions = allToolActions(processTraceEvents(events as never, t))
+    expect(toolActions).toHaveLength(2)
+    expect(toolActions.find((action) => action.data.invocation_id === "invocation-a")?.data.output).toBe("earlier")
+    expect(toolActions.find((action) => action.data.invocation_id === "invocation-b")?.data.output).toBe("settled")
   })
 
   it("never closes an unrelated running tool with a settlement result", () => {
@@ -897,8 +957,7 @@ describe("processTraceEvents settlement delivery", () => {
   })
 
   it("does not let a colliding call's settlement overwrite another's via the resolver cache", () => {
-    // rogercloud's round-3 finding: `resolveSettlementTarget`'s cache lookup
-    // (`settlementTargets.get(toolCallId)`) used to be keyed on the BARE
+    // The cache lookup used to be keyed on the BARE
     // call id and returned before the origin-aware cross-step search ever
     // ran. Two DIFFERENT colliding calls (a provider-omitted-id collision
     // across concurrent DAG steps) each settling within the SAME processing

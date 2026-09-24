@@ -156,14 +156,11 @@ interface StepAction {
     error?: any;
     tool_calls?: any;
     tool_call_id?: string;
+    invocation_id?: string;
     sandboxed?: boolean;
     inline?: boolean;
     workforceSummary?: boolean;
     statusLine?: boolean;
-    // A resumed user-interaction settlement is being projected onto this
-    // already-closed call. See the settlement handling in processTraceEvents.
-    settling?: boolean;
-    settlementStatus?: string;
   };
 }
 
@@ -381,14 +378,19 @@ export function processTraceEvents(
     // by "last running tool" mis-attributes results; the id makes it exact.
     // Returns null when the id is absent so callers can fall back to
     // findLastRunningAction (legacy / single-tool events).
-    const findRunningToolByCallId = (step: ProcessedStep, toolCallId?: string) => {
+    const findRunningToolByCallId = (
+      step: ProcessedStep,
+      toolCallId?: string,
+      invocationId?: string,
+    ) => {
       if (!toolCallId) return null;
       for (let i = step.actions.length - 1; i >= 0; i--) {
         const action = step.actions[i];
         if (
           action.type === 'tool' &&
           action.status === 'running' &&
-          action.data?.tool_call_id === toolCallId
+          action.data?.tool_call_id === toolCallId &&
+          (!invocationId || action.data?.invocation_id === invocationId)
         ) {
           return action;
         }
@@ -416,12 +418,20 @@ export function processTraceEvents(
     // the common, unambiguous case. The check only needs to fire when there
     // is genuine ambiguity: more than one action, in DIFFERENT steps, sharing
     // this id.
-    const findToolActionByCallIdAcrossSteps = (toolCallId?: string, originStepId?: string) => {
+    const findToolActionByCallIdAcrossSteps = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
       if (!toolCallId) return null;
       const matches: { stepId: string; action: StepAction }[] = [];
       for (const candidateStep of stepsMap.values()) {
         for (const action of candidateStep.actions) {
-          if (action.type === 'tool' && action.data?.tool_call_id === toolCallId) {
+          if (
+            action.type === 'tool' &&
+            action.data?.tool_call_id === toolCallId &&
+            (!invocationId || action.data?.invocation_id === invocationId)
+          ) {
             matches.push({ stepId: candidateStep.stepId, action });
           }
         }
@@ -433,24 +443,25 @@ export function processTraceEvents(
     };
 
     // Targets registered by a settlement START, consumed by its END/ERROR.
-    // Keyed by (tool_call_id, originStepId) -- NOT the bare id -- so
-    // replaying the same settlement (the backend re-emits it after a restart
-    // to repair a lost pair) resolves to the same action and updates it in
-    // place rather than appending a duplicate, while two DIFFERENT colliding
-    // calls (a provider-omitted-id collision across concurrent DAG steps)
-    // settling within the SAME processing pass populate distinct cache
-    // entries instead of the second one silently reading back the first's
-    // cached target -- rogercloud's round-3 finding: a bare-id cache lookup
-    // returns before the origin-aware cross-step search below ever runs.
+    // New traces use the invocation id. The provider-id/step key is retained
+    // only for historical traces that predate invocation metadata.
     const settlementTargets = new Map<string, StepAction>();
-    const settlementTargetCacheKey = (toolCallId: string, originStepId?: string) =>
-      `${toolCallId}::${originStepId ?? ''}`;
+    const settlementTargetCacheKey = (
+      toolCallId: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => invocationId || `${toolCallId}::${originStepId ?? ''}`;
     const isSettlementEvent = (event: TraceEvent) =>
       event.data?.settlement_delivery === true;
-    const resolveSettlementTarget = (toolCallId?: string, originStepId?: string) => {
+    const resolveSettlementTarget = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
       if (!toolCallId) return null;
-      const cacheKey = settlementTargetCacheKey(toolCallId, originStepId);
-      return settlementTargets.get(cacheKey) || findToolActionByCallIdAcrossSteps(toolCallId, originStepId);
+      const cacheKey = settlementTargetCacheKey(toolCallId, invocationId, originStepId);
+      return settlementTargets.get(cacheKey)
+        || findToolActionByCallIdAcrossSteps(toolCallId, invocationId, originStepId);
     };
 
     orderedEvents.forEach(({ event, index, timestamp }) => {
@@ -511,6 +522,12 @@ export function processTraceEvents(
 
       const step = stepsMap.get(stepId)!;
       const eventId = event.event_id || `event-${index}`;
+      if (isSettlementEvent(event) && !step.stepName) {
+        // The original react_task_start may be outside a truncated history
+        // window. Keep the terminal settlement visible in a named fallback
+        // bucket instead of dropping it in the final step filter.
+        step.stepName = t('traceEventRenderer.taskExecution');
+      }
 
       if ((isWorkforceDelegation || isDelegatedChildEvent) && workerTaskId) {
         const previousExecution = step.agentExecution;
@@ -712,6 +729,7 @@ export function processTraceEvents(
         const toolName = rawToolName || t('traceEventRenderer.unknownTool');
         const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;
+        const invocationId = event.data?.invocation_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
         if (typeof assistantContent === 'string' && assistantContent.trim()) {
@@ -739,7 +757,7 @@ export function processTraceEvents(
         // another step's bucket, this step never ran that tool and must not
         // advertise it.
         const settlementStartTarget = isSettlementEvent(event)
-          ? resolveSettlementTarget(toolCallId, event.step_id ?? undefined)
+          ? resolveSettlementTarget(toolCallId, invocationId, event.step_id ?? undefined)
           : null;
 
         if (toolName && !settlementStartTarget) {
@@ -752,7 +770,7 @@ export function processTraceEvents(
         if (settlementStartTarget) {
           if (toolCallId) {
             settlementTargets.set(
-              settlementTargetCacheKey(toolCallId, event.step_id ?? undefined),
+              settlementTargetCacheKey(toolCallId, invocationId, event.step_id ?? undefined),
               settlementStartTarget
             );
           }
@@ -760,7 +778,7 @@ export function processTraceEvents(
           // settlement END is lost, a card stuck at 'running' reads worse than
           // one still showing its (accurate) pause result.
         } else {
-          step.actions.push({
+          const newAction: StepAction = {
             id: eventId,
             type: 'tool',
             title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
@@ -771,9 +789,17 @@ export function processTraceEvents(
               args: toolArgs,
               code: step.code,
               tool_call_id: toolCallId,
+              invocation_id: invocationId,
               sandboxed: !!event.data?.sandboxed
             }
-          });
+          };
+          step.actions.push(newAction);
+          if (isSettlementEvent(event) && toolCallId) {
+            settlementTargets.set(
+              settlementTargetCacheKey(toolCallId, invocationId, event.step_id ?? undefined),
+              newAction,
+            );
+          }
         }
       }
 
@@ -829,14 +855,15 @@ export function processTraceEvents(
             : undefined;
 
         const endToolCallId = event.data?.tool_call_id as string | undefined;
+        const endInvocationId = event.data?.invocation_id as string | undefined;
         // A settlement END resolves ONLY to its own call. The
         // findLastRunningAction fallback must never apply to it: the resumed
         // step can legitimately have other tools in flight, and closing one of
         // those with this settlement's result would silently attribute an
         // approval to an unrelated tool.
         const action = isSettlementEvent(event)
-          ? resolveSettlementTarget(endToolCallId, event.step_id ?? undefined)
-          : findRunningToolByCallId(step, endToolCallId) ||
+          ? resolveSettlementTarget(endToolCallId, endInvocationId, event.step_id ?? undefined)
+          : findRunningToolByCallId(step, endToolCallId, endInvocationId) ||
             findLastRunningAction(step, 'tool');
         if (action) {
           action.status = 'completed';
@@ -956,7 +983,11 @@ export function processTraceEvents(
           // Same rule as the settlement END above: resolve to the settled call
           // only, never to whichever tool happens to be running.
           const settlementErrorTarget = isSettlementEvent(event)
-            ? resolveSettlementTarget(errorData.tool_call_id as string | undefined, event.step_id ?? undefined)
+            ? resolveSettlementTarget(
+              errorData.tool_call_id as string | undefined,
+              errorData.invocation_id as string | undefined,
+              event.step_id ?? undefined,
+            )
             : null;
           if (isSettlementEvent(event)) {
             runningAction = settlementErrorTarget ?? undefined;
@@ -972,7 +1003,11 @@ export function processTraceEvents(
             }
           } else {
             const lastTool =
-              findRunningToolByCallId(step, errorData.tool_call_id as string | undefined) ||
+              findRunningToolByCallId(
+                step,
+                errorData.tool_call_id as string | undefined,
+                errorData.invocation_id as string | undefined,
+              ) ||
               findLastRunningAction(step, 'tool');
             if (lastTool) runningAction = lastTool;
           }

@@ -2548,6 +2548,93 @@ def test_settlement_delivery_supersedes_the_pause_observation(caplog):
         db_session.close()
 
 
+def test_settlement_supersedes_exact_invocation_when_step_and_call_id_repeat():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="run both calls",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        for offset, tool_name, invocation_id, result in (
+            (0, "search", "invocation-a", {"value": "earlier"}),
+            (2, "publish_post", "invocation-b", {"status": "waiting_for_user"}),
+        ):
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_start",
+                timestamp=_ts(offset),
+                step_id="react_same",
+                turn_id="turn-1",
+                data={
+                    "tool_name": tool_name,
+                    "tool_call_id": "tool_call_0",
+                    "invocation_id": invocation_id,
+                },
+            )
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_end",
+                timestamp=_ts(offset + 1),
+                step_id="react_same",
+                turn_id="turn-1",
+                data={
+                    "tool_name": tool_name,
+                    "tool_call_id": "tool_call_0",
+                    "invocation_id": invocation_id,
+                    "result": result,
+                },
+            )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(4),
+            step_id="react_same",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+                "settlement_delivery": True,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(5),
+            step_id="react_same",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": "invocation-b",
+                "settlement_delivery": True,
+                "result": {"value": "settled"},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        results = {
+            message["tool_name"]: message["raw_result"]
+            for message in messages
+            if message["role"] == "tool"
+        }
+        assert results == {
+            "search": {"value": "earlier"},
+            "publish_post": {"value": "settled"},
+        }
+    finally:
+        db_session.close()
+
+
 def test_settlement_start_is_not_counted_as_a_dangling_start(caplog):
     """The settlement start is skipped, not parked in the pending table.
 

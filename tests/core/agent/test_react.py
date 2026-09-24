@@ -1922,6 +1922,35 @@ async def test_react_pattern_does_not_stream_tool_call_preamble() -> None:
     assert tool_start_event["data"]["assistant_content"] == ("I will use a tool first.")
 
 
+def test_tool_call_preamble_cache_uses_exact_invocation_identity() -> None:
+    pattern = ReActPattern()
+    first = {
+        "id": "tool_call_0",
+        "invocation_id": "invocation-a",
+        "name": "calculator",
+    }
+    second = {
+        "id": "tool_call_0",
+        "invocation_id": "invocation-b",
+        "name": "calculator",
+    }
+
+    pattern._remember_tool_call_content([first], "first preamble")
+    pattern._remember_tool_call_content([second], "second preamble")
+
+    assert pattern._with_tool_call_content(first)["assistant_content"] == (
+        "first preamble"
+    )
+    assert pattern._with_tool_call_content(second)["assistant_content"] == (
+        "second preamble"
+    )
+    pattern._forget_tool_call_content(first)
+    assert "assistant_content" not in pattern._with_tool_call_content(first)
+    assert pattern._with_tool_call_content(second)["assistant_content"] == (
+        "second preamble"
+    )
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_streams_final_answer_control_tool() -> None:
     llm = StreamingFinalAnswerToolLLM()
@@ -6270,10 +6299,14 @@ async def test_react_pattern_emits_runtime_checkpoints() -> None:
         "final",
     ]
     after_llm = runtime.checkpoints[1]
-    assert after_llm["pattern_state"]["pending_tool_calls"] == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "3+3"}}
-    ]
-    assert after_llm["context"]["messages"][1]["tool_calls"][0]["id"] == "call_1"
+    [checkpointed_call] = after_llm["pattern_state"]["pending_tool_calls"]
+    assert checkpointed_call["id"] == "call_1"
+    assert checkpointed_call["name"] == "calculator"
+    assert checkpointed_call["args"] == {"expression": "3+3"}
+    assert checkpointed_call["invocation_id"]
+    context_call = after_llm["context"]["messages"][1]["tool_calls"][0]
+    assert context_call["id"] == "call_1"
+    assert "invocation_id" not in context_call
 
 
 @pytest.mark.asyncio
@@ -6419,9 +6452,11 @@ async def test_react_pattern_interrupts_at_tool_boundary() -> None:
     assert result["status"] == "interrupted"
     assert tool.calls == []
     assert runtime.last_checkpoint["label"] == "interrupted"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_1", "name": "calculator", "args": {"expression": "4+4"}}
-    ]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == "call_1"
+    assert pending_call["name"] == "calculator"
+    assert pending_call["args"] == {"expression": "4+4"}
+    assert pending_call["invocation_id"]
 
 
 @pytest.mark.asyncio
@@ -6548,6 +6583,7 @@ def test_tool_call_record_from_dict_handles_null_args() -> None:
     assert record.args == {}
     assert record.args_hash == ""
     assert record.status == "pending"
+    assert record.invocation_id is None
 
 
 def test_args_hash_is_stable_sha256_digest() -> None:
@@ -7763,6 +7799,128 @@ async def test_settlement_lifecycle_does_not_rebill_the_tool_call(mocker: Any) -
 
 
 @pytest.mark.asyncio
+async def test_same_step_reused_provider_id_settles_the_exact_invocation() -> None:
+    pattern = ReActPattern()
+    [first_call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    [second_call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    assert first_call["id"] == second_call["id"] == "tool_call_0"
+    assert first_call["invocation_id"] != second_call["invocation_id"]
+    first_call.update(step_id="react_same", turn_id="original-turn")
+    second_call.update(step_id="react_same", turn_id="original-turn")
+
+    pattern._record_tool_call(first_call, status="running")
+    pattern._record_tool_call(
+        first_call,
+        status="completed",
+        result={"success": True, "value": "earlier"},
+    )
+    pattern._record_tool_call(second_call, status="running")
+    pattern._record_tool_call(
+        second_call,
+        status="waiting_for_user",
+        result={"success": False, "status": "waiting_for_user"},
+    )
+    first_record = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=first_call["invocation_id"],
+    )
+    second_record = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=second_call["invocation_id"],
+    )
+    assert first_record is not None and second_record is not None
+    assert first_record.issued_at is not None
+    assert second_record.issued_at is not None
+    assert second_record.issued_at >= first_record.issued_at
+
+    context = ExecutionContext(execution_id="same-step-reuse")
+    context.add_tool_result(
+        "approval_gate",
+        first_record.result,
+        "tool_call_0",
+        invocation_id=first_record.invocation_id,
+    )
+    context.add_tool_result(
+        "approval_gate",
+        second_record.result,
+        "tool_call_0",
+        invocation_id=second_record.invocation_id,
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "tool_call_0",
+            "invocation_id": second_call["invocation_id"],
+            "interaction_id": "approval-2",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="same-step-reuse", tracer=tracer)
+    runtime.active_turn_id = "settlement-turn"
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded(
+                    {"success": True, "value": "settled"}
+                )
+            )
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    first_after = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=first_call["invocation_id"],
+    )
+    second_after = pattern._find_tool_record(
+        tool_call_id="tool_call_0",
+        invocation_id=second_call["invocation_id"],
+    )
+    assert first_after is not None and first_after.result["value"] == "earlier"
+    assert second_after is not None and second_after.result["value"] == "settled"
+    assert second_after.settlement_turn_id == "settlement-turn"
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("settlement_delivery") is True
+    ]
+    assert len(settlement_events) == 2
+    assert {event["data"]["invocation_id"] for event in settlement_events} == {
+        second_call["invocation_id"]
+    }
+    assert {event["data"]["original_started_at"] for event in settlement_events} == {
+        second_record.issued_at
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_replays_pending_settlement_traces_at_entry(mocker: Any) -> None:
+    pattern = ReActPattern(max_iterations=1)
+    replay = mocker.patch.object(
+        pattern,
+        "_replay_unemitted_settlement_traces",
+        new=mocker.AsyncMock(),
+    )
+    context = ExecutionContext(execution_id="run-replay-entry")
+    context.add_user_message("Finish")
+
+    await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "Done", "done": True}]),
+        runtime=PatternRuntime(execution_id="run-replay-entry"),
+    )
+
+    replay.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_settled_interaction_remains_retryable_until_checkpoint_succeeds() -> (
     None
 ):
@@ -8438,6 +8596,7 @@ def test_settlement_fence_survives_a_state_round_trip() -> None:
 def test_settlement_ledger_fields_survive_a_record_round_trip() -> None:
     record = ToolCallRecord(
         tool_call_id="call-1",
+        invocation_id="invocation-1",
         tool_name="publish",
         args={"text": "hi"},
         args_hash="hash",
@@ -10809,7 +10968,12 @@ async def test_react_control_send_failure_settles_lifecycle_and_propagates(
         status,
     ]
     assert pattern.tool_ledger["send-1"].error == "send aborted"
-    assert pattern.pending_tool_calls == [call]
+    [pending_call] = pattern.pending_tool_calls
+    assert pending_call["id"] == call["id"]
+    assert pending_call["name"] == call["name"]
+    assert pending_call["args"] == call["args"]
+    assert pending_call["invocation_id"]
+    assert "invocation_id" not in call
     assert context.get_messages_by_role("tool") == []
 
 
@@ -11073,6 +11237,8 @@ async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> Non
         raise asyncio.CancelledError("cancelled after checkpoint")
 
     pattern._trace_tool_interaction_settlement = cancel_in_the_gap  # type: ignore[assignment]
+    settlement_runtime = PatternRuntime(execution_id="cold-start")
+    settlement_runtime.active_turn_id = "approval-turn"
     with pytest.raises(asyncio.CancelledError):
         await pattern._deliver_pending_tool_interaction_responses(
             tools=[
@@ -11081,7 +11247,7 @@ async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> Non
                 )
             ],
             context=context,
-            runtime=PatternRuntime(execution_id="cold-start"),
+            runtime=settlement_runtime,
         )
 
     lost_state = pattern.get_state()
@@ -11091,9 +11257,9 @@ async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> Non
     first = ReActPattern()
     first.load_state(lost_state)
     tracer = TraceEventRecorder()
-    await first._replay_unemitted_settlement_traces(
-        runtime=PatternRuntime(execution_id="cold-start", tracer=tracer)
-    )
+    replay_runtime = PatternRuntime(execution_id="cold-start", tracer=tracer)
+    replay_runtime.active_turn_id = "later-repair-turn"
+    await first._replay_unemitted_settlement_traces(runtime=replay_runtime)
     assert _settlement_trace_events(tracer, "call-1") == [
         "action_start_tool",
         "action_end_tool",
@@ -11106,6 +11272,7 @@ async def test_a_cold_start_replays_only_records_that_still_owe_a_trace() -> Non
     )
     assert replayed_end["data"]["settlement_delivery"] is True
     assert replayed_end["data"]["settlement_status"] == "succeeded"
+    assert replayed_end["data"]["turn_id"] == "approval-turn"
     assert replayed_end["data"]["result"] == {"success": True}
     assert first.tool_ledger["call-1"].settlement_trace_pending is False
 
@@ -11241,7 +11408,7 @@ async def test_a_swallowed_production_style_db_failure_keeps_the_obligation() ->
     only fails the END write when ``require_persisted`` is actually passed.
     If settlement trace events did not request persistence, this write would
     report success and durably clear the obligation on a pair that was never
-    actually written to the database -- rogercloud's round-2 review of #2554.
+    actually written to the database.
     """
 
     class ProductionStyleTracer:
@@ -11300,7 +11467,6 @@ async def test_a_legacy_row_without_issued_at_stays_unknown_on_settlement() -> N
     method runs immediately before the settlement trace is emitted -- and
     that gets threaded downstream as ``original_started_at``, silently
     reintroducing the SSE-lane started_at bug this field exists to fix.
-    rogercloud's round-3 review of #2554.
     """
 
     pattern = ReActPattern()

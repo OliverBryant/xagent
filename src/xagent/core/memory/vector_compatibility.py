@@ -306,12 +306,21 @@ def _validate_existing_vectors(batch: Any, vector_type: _ArrowDataType) -> None:
 
 
 def _is_fully_admitted(table: Any) -> bool:
-    """Report whether this exact table version carries a full-admission marker.
+    """Report whether this table was already migrated by the current validator.
 
-    The marker is written only after one scan validated the required schema, the
-    scope column types, the vector structure, ID/metadata/scope validity and every
-    persisted vector value. Any later commit moves the version it is bound to, so
-    neither a scope-only marker nor a stale one can short-circuit revalidation.
+    The marker is written only by the atomic overwrite that commits one scan's
+    validated rows: the required schema, the scope column types, the vector
+    structure, ID/metadata/scope validity and every persisted vector value. It
+    is keyed on migration state, not on the table version it landed at, so
+    ordinary writes committed after admission keep it valid. Those writes come
+    from the admitted runtime, which writes validated scope columns by
+    construction, and the deployment and rollback contract keeps older-release
+    writers off an admitted table. The table version recorded next to the
+    marker is informational only and must never gate this check.
+
+    A scope-only maintenance marker lives under a different key and never
+    certifies admission, and a marker from an older validator generation is
+    not trusted either: either one sends the table back through a full scan.
     """
     schema = table.schema
     names = set(schema.names)
@@ -330,8 +339,6 @@ def _is_fully_admitted(table: Any) -> bool:
         pa.types.is_fixed_size_list(vector_type)
         and vector_type.value_type == pa.float32()
         and metadata.get(FULL_ADMISSION_METADATA_KEY) == FULL_ADMISSION_VERSION
-        and metadata.get(FULL_ADMISSION_TABLE_VERSION_KEY)
-        == str(table.version).encode()
     )
 
 
@@ -418,6 +425,18 @@ def prepare_lancedb_memory_table(
 ) -> maintenance.MaintenanceOutcome:
     """Atomically add scope/vector columns using one bounded-memory scan.
 
+    A table the current validator already migrated is admitted read-only: this
+    call stages, rewrites and overwrites nothing, and only classifies its vector
+    space from the schema. Workers admit on every boot while siblings may
+    already be serving, so this is the path every restart takes.
+
+    The stage-and-overwrite migration is reserved for a table that genuinely
+    needs it: a legacy table, one without scope columns, or one with no current
+    full-admission marker. The overwrite replaces the table with the staged
+    rows, so a write that commits between the scan and the overwrite is lost.
+    The deployment contract therefore confines it to the first upgrade, with
+    every writer quiesced, or to an explicitly fenced offline repair.
+
     A ``COMPLETE`` outcome carries the vector-space classification of the table
     this call committed or verified, derived under the maintenance lock from the
     schema it actually wrote. Callers must read it from the outcome: re-opening
@@ -438,8 +457,9 @@ def prepare_lancedb_memory_table(
         seen_path = ""
         try:
             if _is_fully_admitted(table):
-                # This table is already the committed state, so its own schema
-                # is what a caller would be admitted over.
+                # Already migrated, so admission is read-only: the table's own
+                # schema is what a caller would be admitted over, and the stored
+                # vector identity is still compared with the authority here.
                 return maintenance.MaintenanceOutcome(
                     maintenance.MaintenanceStatus.COMPLETE,
                     vector_compatibility=classify_vector_compatibility(

@@ -488,6 +488,18 @@ described under "LanceDB memory compatibility" above.
    writing under a vector space another has not admitted.
 4. Confirm the state on each worker with `GET /api/memory/store-info`.
 
+Admission migrates a table at most once. The first admission of a legacy table
+(one without scope columns or without a current full-admission marker) scans
+every row and atomically overwrites the table with the validated result. That
+overwrite replaces whatever the table held when it commits, which is why the
+first upgrade, a release that bumps the validator generation, and any
+explicit repair must run with every writer quiesced.
+Once a table carries the marker, admission is read-only: every later worker
+start, respawn or retry only reads the schema and compares the stored vector
+identity with the authority, and it never stages, rewrites or overwrites the
+table. Ordinary memory writes do not remove the marker, so workers can restart
+while their siblings keep serving.
+
 ### Verification and monitoring
 
 `GET /api/memory/store-info` reports `state`, `mode`, `supports_vector_search`
@@ -498,7 +510,7 @@ and a caller-safe `detail`. The states are:
 | `ready` | Admitted; memory is serving. `mode` is `vector`, or `text_only` when the stored vectors do not match the authority. | None when `mode` is `vector`. When `mode` is `text_only`, see "Serving in text_only mode" below: memory is writable but vector search is off, and restoring it is offline work. |
 | `not_configured` | No authority configured; an ephemeral store is in use. | Configure the authority, then restart every worker. |
 | `credential_unavailable` | The stored credential could not be decrypted or failed its verifier. | Re-set the authority, then restart every worker. |
-| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Stop every API and task-execution memory writer and keep them all stopped until the retried admission has finished, then restart the fleet together. Ordinary memory writes take neither the admission nor the maintenance lock, and any write invalidates the version-bound full-admission marker, so a retry that runs beside a live writer can rescan and overwrite the table while that writer commits. Checking that no process is mid-maintenance is not enough. |
+| `retryable_unavailable` | The admission lock was held, or the backend failed transiently. | Stop every API and task-execution memory writer and keep them all stopped until the retried admission has finished, then restart the fleet together. Ordinary memory writes take neither the admission nor the maintenance lock, and a table that was never fully migrated is rewritten by admission, so a retry that runs beside a live writer on such a table can overwrite a row that writer commits. Checking that no process is mid-maintenance is not enough. |
 | `restart_required` | The authority no longer describes the stored vector space, or maintenance was left incomplete. | Quiesce, re-embed offline if the existing vectors must be kept, restart every worker together. |
 | `blocked_repair` | Storage holds invalid legacy data or an incompatible schema and is fenced off. | Offline repair; see below. |
 

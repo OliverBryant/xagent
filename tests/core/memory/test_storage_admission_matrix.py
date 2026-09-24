@@ -147,12 +147,142 @@ def test_supported_version_atomic_null_vectors_marker_and_bounded_scan(
     scanned.clear()
     assert _admit(connection).state is StorageAdmissionState.ADMITTED
     assert scanned == []
-    # Any later commit moves the version the marker is bound to, so the next
-    # admission revalidates the table instead of trusting the stale marker.
+    # The marker records migration state, so an ordinary commit after
+    # admission leaves the next admission read-only: nothing is rescanned.
     table.delete("id = 'note-0'")
+    version = table.version
     _safe_close_table(table)
     assert _admit(connection).state is StorageAdmissionState.ADMITTED
-    assert scanned == [2, 2]
+    assert scanned == []
+    assert _snapshot(connection)[0] == version
+
+
+def _ordinary_row(identity):
+    """A row as the admitted runtime writes it, scope columns included."""
+    return {
+        "id": identity,
+        "text": f"text-{identity}",
+        "metadata": json.dumps({"user_id": 1}),
+        "vector": [1.0, 2.0, 3.0, 4.0],
+        USER_ID_COLUMN: 1,
+        SCOPE_DIMS_COLUMN: [],
+    }
+
+
+def _ordinary_write(connection, identity):
+    table = connection.open_table("memories")
+    try:
+        table.add([_ordinary_row(identity)])
+    finally:
+        _safe_close_table(table)
+
+
+def _ids(connection):
+    return {row["id"] for row in _snapshot(connection)[2]}
+
+
+def test_readmission_after_an_ordinary_write_is_read_only(tmp_path):
+    """Every worker boot admits; a migrated table must not be rewritten then."""
+    connection = _connection(tmp_path)
+    first = _admit(connection)
+    assert first.state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    version, schema, _rows = _snapshot(connection)
+
+    second = _admit(connection)
+
+    assert second.state is StorageAdmissionState.ADMITTED
+    assert second.admitted.capabilities == first.admitted.capabilities
+    assert second.admitted.vector_compatibility is VectorCompatibility.MATCHING
+    after_version, after_schema, _after_rows = _snapshot(connection)
+    assert after_version == version
+    assert after_schema == schema
+    assert _ids(connection) == {f"note-{index}" for index in range(5)} | {"note-post"}
+
+
+def test_write_committed_during_readmission_survives(tmp_path, monkeypatch):
+    """A sibling that is already serving may commit while a worker admits.
+
+    The concurrent row lands at the first point admission reaches past its
+    initial read of the table: the overwrite, if admission ever rewrote an
+    already-migrated table, or the vector-space classification otherwise.
+    """
+    connection = _connection(tmp_path)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    written = []
+
+    def commit_concurrent_row():
+        if not written:
+            written.append(True)
+            _ordinary_write(connection, "note-concurrent")
+
+    original_create = connection.create_table
+
+    def create_table(*args, **kwargs):
+        if kwargs.get("mode") == "overwrite":
+            commit_concurrent_row()
+        return original_create(*args, **kwargs)
+
+    original_classify = vector_compatibility.classify_vector_compatibility
+
+    def classify(schema, identity):
+        commit_concurrent_row()
+        return original_classify(schema, identity)
+
+    monkeypatch.setattr(connection, "create_table", create_table)
+    monkeypatch.setattr(vector_compatibility, "classify_vector_compatibility", classify)
+
+    outcome = _admit(connection)
+
+    assert written == [True]
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert {"note-post", "note-concurrent"} <= _ids(connection)
+
+
+def test_legacy_table_is_still_migrated_on_first_admission(tmp_path, monkeypatch):
+    connection = _connection(tmp_path)
+    before_version = _snapshot(connection)[0]
+    scanned = []
+    original = vector_compatibility._checkpoint
+
+    def observe(stage, batch=None):
+        if stage == "scan_batch":
+            scanned.append(batch)
+        original(stage, batch)
+
+    monkeypatch.setattr(vector_compatibility, "_checkpoint", observe)
+
+    outcome = _admit(connection)
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert scanned == [2, 2, 1]
+    version, schema, rows = _snapshot(connection)
+    assert version == before_version + 1
+    marker = schema.field(USER_ID_COLUMN).metadata
+    assert marker[FULL_ADMISSION_METADATA_KEY] == FULL_ADMISSION_VERSION
+    assert [row[USER_ID_COLUMN] for row in rows] == list(range(5))
+
+
+def test_identity_drift_after_migration_still_classifies_as_mismatching(tmp_path):
+    """Read-only readmission still compares the stored space with the authority."""
+    connection = _connection(tmp_path)
+    assert _admit(connection).state is StorageAdmissionState.ADMITTED
+    _ordinary_write(connection, "note-post")
+    version, schema, rows = _snapshot(connection)
+
+    outcome = admit_lancedb_memory_storage(
+        DormantLanceDBMemoryHandle(connection, "memories"),
+        FOREIGN_IDENTITY,
+        writers_quiesced=True,
+        batch_size=2,
+    )
+
+    assert outcome.state is StorageAdmissionState.ADMITTED
+    assert outcome.admitted.vector_compatibility is VectorCompatibility.MISMATCHING
+    assert outcome.admitted.capabilities.mode is MemoryStorageMode.TEXT_ONLY
+    assert outcome.admitted.capabilities.vector_search is False
+    assert _snapshot(connection) == (version, schema, rows)
 
 
 def test_invalid_and_mid_commit_failure_leave_original_unchanged(tmp_path, monkeypatch):

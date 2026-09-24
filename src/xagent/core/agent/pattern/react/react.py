@@ -4152,6 +4152,18 @@ class ReActPattern(AgentPattern):
         ``return_exceptions=True`` is an infra-callback/unexpected failure and is
         re-raised to halt the turn exactly like the serial path (I5).
         """
+        # Prepare identity before scheduling so every later batch operation
+        # (back-fill, ledger ordering, and pending-queue reconciliation) sees
+        # the same objects that execution records. The preparation helper
+        # replaces pending entries instead of mutating caller-owned dicts.
+        reserved_ids: set[str] = set()
+        batch = [
+            self._prepare_tool_call_identity(
+                tool_call,
+                reserved_ids=reserved_ids,
+            )
+            for tool_call in batch
+        ]
         semaphore = asyncio.Semaphore(self.tool_max_concurrency)
 
         async def _guarded(tool_call: dict[str, Any]) -> Any:
@@ -5107,6 +5119,49 @@ class ReActPattern(AgentPattern):
             )
         return None
 
+    def _prepare_tool_call_identity(
+        self,
+        tool_call: dict[str, Any],
+        *,
+        reserved_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return an identity-bearing call and replace its pending entry.
+
+        Provider call ids may be absent or reused, so the invocation id is the
+        durable identity. Avoid mutating the input because runtime callbacks
+        can fail before execution and callers retain that object for retry or
+        diagnostics. Concurrent batches reserve generated fallback ids before
+        their tasks start, preventing two id-less calls from choosing the same
+        ledger key.
+        """
+        original_call = tool_call
+        if not tool_call.get("id"):
+            used_ids = {record.tool_call_id for record in self.tool_ledger.values()}
+            used_ids.update(
+                str(candidate.get("id"))
+                for candidate in self.pending_tool_calls
+                if candidate.get("id")
+            )
+            if reserved_ids is not None:
+                used_ids.update(reserved_ids)
+            fallback_index = len(self.tool_ledger)
+            while f"tool_call_{fallback_index}" in used_ids:
+                fallback_index += 1
+            tool_call = {
+                **tool_call,
+                "id": f"tool_call_{fallback_index}",
+            }
+        if reserved_ids is not None:
+            reserved_ids.add(str(tool_call["id"]))
+        if not tool_call.get("invocation_id"):
+            tool_call = {**tool_call, "invocation_id": uuid.uuid4().hex}
+        if tool_call is not original_call:
+            self.pending_tool_calls = [
+                tool_call if candidate is original_call else candidate
+                for candidate in self.pending_tool_calls
+            ]
+        return tool_call
+
     async def _execute_tool_safely(
         self,
         tool_call: dict[str, Any],
@@ -5121,30 +5176,8 @@ class ReActPattern(AgentPattern):
         Control handlers retain their scheduling results. Only ordinary tools
         use the existing tracing, metering and business-error conversion.
         """
-        # Stamp a stable id on the *original* dict before the _with_* transforms
-        # (which may return a copy). _record_tool_call only computes a fallback
-        # key locally; without writing it back, the key drifts between the
-        # running/completed writes as the ledger grows, and the still-id-less
-        # dict that _backfill_result / _reorder_ledger_for_batch read desyncs
-        # from the ledger (I2/I3). No await runs before the first record below,
-        # so concurrent batch members get distinct fallback ids.
+        tool_call = self._prepare_tool_call_identity(tool_call)
         pending_call = tool_call
-        if not tool_call.get("id"):
-            tool_call = {
-                **tool_call,
-                "id": f"tool_call_{len(self.tool_ledger)}",
-            }
-        # Mint once on the original pending-call object before enrichments that
-        # may copy it. A checkpoint replay preserves this value, while a later
-        # model response that reuses the provider id receives a fresh identity.
-        if not tool_call.get("invocation_id"):
-            tool_call = {**tool_call, "invocation_id": uuid.uuid4().hex}
-        if tool_call is not pending_call:
-            self.pending_tool_calls = [
-                tool_call if candidate is pending_call else candidate
-                for candidate in self.pending_tool_calls
-            ]
-            pending_call = tool_call
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)

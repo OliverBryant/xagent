@@ -621,11 +621,11 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
-            raise
-        except CheckpointPersistenceError:
-            # A checkpoint that did not persist is a durability failure, not
-            # a plan-generation failure: converting it to _fail() here would
+        except (RequiredToolCallError, CheckpointPersistenceError):
+            # RequiredToolCallError already carries its own user-facing
+            # failure; re-raising lets the caller apply it directly.
+            # CheckpointPersistenceError is a durability failure, not a
+            # plan-generation failure: converting it to _fail() here would
             # let its own checkpoint write (if it happens to succeed, e.g.
             # after a transient failure) mask the durability error behind an
             # ordinary unsuccessful PatternResult. That result reaches the
@@ -681,13 +681,9 @@ class DAGPattern(AgentPattern):
                         if interrupted is not None:
                             return interrupted
                         raise
-                    except RequiredToolCallError:
-                        raise
-                    except CheckpointPersistenceError:
-                        # See the matching comment on the first plan-generation
-                        # catch above: this must reach the runner's durability
-                        # guard, not become a recoverable _fail() result that a
-                        # fallback pattern could follow.
+                    except (RequiredToolCallError, CheckpointPersistenceError):
+                        # See the matching comment on the first
+                        # plan-generation catch above.
                         raise
                     except Exception as exc:  # noqa: BLE001
                         return await self._fail(
@@ -1585,13 +1581,9 @@ class DAGPattern(AgentPattern):
             if interrupted is not None:
                 return interrupted
             raise
-        except RequiredToolCallError:
-            raise
-        except CheckpointPersistenceError:
+        except (RequiredToolCallError, CheckpointPersistenceError):
             # See the matching comment on the first plan-generation catch
-            # above: this must reach the runner's durability guard, not
-            # become a recoverable _fail() result that a fallback pattern
-            # could follow.
+            # above.
             raise
         except Exception as exc:  # noqa: BLE001
             return await self._fail(

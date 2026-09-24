@@ -228,7 +228,7 @@ class TraceCheckpointStore:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            if self.require_persisted and not self._supports_kwarg(
+            if self.require_persisted and not supports_kwarg(
                 trace_event,
                 "require_persisted",
             ):
@@ -338,9 +338,6 @@ class TraceCheckpointStore:
                 "Checkpoint payload is missing execution_id."
             )
         return str(execution_id)
-
-    def _supports_kwarg(self, method: Any, name: str) -> bool:
-        return supports_kwarg(method, name)
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
         del trace_event

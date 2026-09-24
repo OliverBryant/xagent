@@ -11,6 +11,7 @@ from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     READABLE_CHECKPOINT_TYPES,
+    CheckpointPersistenceError,
 )
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.execution import (
@@ -2608,3 +2609,58 @@ async def test_runtime_send_message_debug_logs_dropped_progress_update(
     assert "no outbound message handler" in logged
     assert "task-123" in logged
     assert "Still working" not in logged
+
+
+class _FailingFinishTraceTracer:
+    """A tracer whose finish_trace hook always fails."""
+
+    async def finish_trace(self, **kwargs: Any) -> None:
+        raise RuntimeError("tracer backend unavailable")
+
+
+class _RecordingReActPattern:
+    __class__ = type("ReActPattern", (), {})  # noqa: A003 - mimic real class name
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_preserves_the_original_error_when_finish_trace_fails() -> (
+    None
+):
+    """A failing ``finish_trace`` hook must not mask the reported error.
+
+    Before this fix, ``on_pattern_error`` awaited the optional
+    ``tracer.finish_trace()`` hook unshielded. If that hook raised, its
+    exception propagated out of ``on_pattern_error`` in place of the
+    original error -- for a ``CheckpointPersistenceError`` durability abort,
+    that would let the runner's typed guard miss it entirely and treat the
+    replacement as an ordinary recoverable pattern exception.
+    """
+
+    runtime = PatternRuntime(
+        tracer=_FailingFinishTraceTracer(), execution_id="exec-finish-trace-fails"
+    )
+    original = CheckpointPersistenceError("after_tool checkpoint failed")
+
+    # Must return normally: the finish_trace failure is swallowed as
+    # best-effort telemetry cleanup, not re-raised in place of ``original``.
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-finish-trace-fails"),
+        pattern=_RecordingReActPattern(),
+        error=original,
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_pattern_error_marks_the_pattern_error_as_reported() -> None:
+    """The runner's fallback terminal-trace report checks this flag."""
+
+    runtime = PatternRuntime(execution_id="exec-reported-flag")
+    assert runtime.pattern_error_reported is False
+
+    await runtime.on_pattern_error(
+        context=ExecutionContext(execution_id="exec-reported-flag"),
+        pattern=_RecordingReActPattern(),
+        error=CheckpointPersistenceError("checkpoint write failed"),
+    )
+
+    assert runtime.pattern_error_reported is True

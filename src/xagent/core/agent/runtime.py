@@ -318,6 +318,12 @@ class PatternRuntime:
     # on_tool_error so tool trace events can be joined to their turn without
     # relying on step_id or timestamp-adjacency heuristics.
     active_turn_id: str | None = None
+    # Set by on_pattern_error() before it does anything else, so the
+    # runner's CheckpointPersistenceError guard can tell whether the
+    # failing pattern already reported its own terminal trace (as
+    # DAGPattern and ReActPattern do) or whether it needs a fallback
+    # report for a custom pattern that only raises.
+    pattern_error_reported: bool = False
     last_final_answer_stream_message_id: str | None = None
     inline_file_delivery: InlineFileDelivery | None = None
     _inline_stream_guards: dict[str, InlineFileStreamGuard] = field(
@@ -1026,6 +1032,12 @@ class PatternRuntime:
         pattern: Any,
         error: Exception,
     ) -> None:
+        # Set before any I/O below, so a pattern is marked as having
+        # reported its own failure even if a later step here raises --
+        # the runner's fallback terminal-trace reporting (see its
+        # ``CheckpointPersistenceError`` guard) checks this to decide
+        # whether it still needs to report the abort itself.
+        self.pattern_error_reported = True
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.ERROR, TraceCategory.GENERAL),
             task_id=self._task_id(context),
@@ -1043,19 +1055,29 @@ class PatternRuntime:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
         if callable(finish_trace):
-            await self._maybe_await(
-                finish_trace(
-                    name=self._pattern_trace_name(pattern),
-                    status="error",
-                    output={"error": str(error)},
-                    metadata={
-                        "execution_id": getattr(
-                            context, "execution_id", self.execution_id
-                        ),
-                        "pattern": pattern.__class__.__name__,
-                    },
+            try:
+                await self._maybe_await(
+                    finish_trace(
+                        name=self._pattern_trace_name(pattern),
+                        status="error",
+                        output={"error": str(error)},
+                        metadata={
+                            "execution_id": getattr(
+                                context, "execution_id", self.execution_id
+                            ),
+                            "pattern": pattern.__class__.__name__,
+                        },
+                    )
                 )
-            )
+            except Exception:
+                # Trace finalization is best-effort here: this method's job
+                # is to report ``error`` (often a CheckpointPersistenceError
+                # durability abort) to the caller. Letting a ``finish_trace``
+                # failure propagate would replace ``error`` with this
+                # unrelated exception, and the runner's typed guard would
+                # then treat the replacement as an ordinary recoverable
+                # pattern exception instead of aborting the run.
+                logger.exception("finish_trace failed while reporting a pattern error")
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         # Count one billable action per tool invocation, at invocation time.

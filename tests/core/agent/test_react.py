@@ -11245,6 +11245,65 @@ async def test_a_swallowed_production_style_db_failure_keeps_the_obligation() ->
 
 
 @pytest.mark.asyncio
+async def test_a_legacy_row_without_issued_at_stays_unknown_on_settlement() -> None:
+    """A checkpoint row that predates ``issued_at`` must not fabricate one.
+
+    ``_record_tool_call`` preserves ``issued_at`` across every rewrite of a
+    row -- but a row already ``waiting_for_user`` from a checkpoint written
+    BEFORE this field existed has ``issued_at=None`` on an EXISTING record,
+    not a first-ever registration. Stamping ``now()`` there (as if it were a
+    fresh call) fabricates a timestamp close to the SETTLEMENT time -- this
+    method runs immediately before the settlement trace is emitted -- and
+    that gets threaded downstream as ``original_started_at``, silently
+    reintroducing the SSE-lane started_at bug this field exists to fix.
+    rogercloud's round-3 review of #2554.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(execution_id="legacy-row")
+    context.add_tool_result(
+        "approval_gate",
+        {"success": False, "status": "waiting_for_user"},
+        "call-1",
+    )
+    # Simulates a row restored via ToolCallRecord.from_dict() from a
+    # checkpoint written before ``issued_at`` existed: waiting_for_user, but
+    # issued_at is None on an EXISTING record -- not the "no record at all"
+    # case _record_tool_call must still stamp now() for.
+    pattern.tool_ledger["call-1"] = _waiting_ledger_record(
+        "call-1", step_id="react_a", issued_at=None
+    )
+    pattern.pending_tool_interaction_responses = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "i-1",
+            "response": "Approve",
+        }
+    ]
+    tracer = TraceEventRecorder()
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[
+            SettlementApprovalTool(
+                resume_result=ToolInteractionSettlement.succeeded({"success": True})
+            )
+        ],
+        context=context,
+        runtime=PatternRuntime(execution_id="legacy-row", tracer=tracer),
+    )
+
+    assert pattern.tool_ledger["call-1"].issued_at is None
+    settlement_events = [
+        event
+        for event in tracer.events
+        if event["data"].get("tool_call_id") == "call-1"
+    ]
+    assert settlement_events, "expected the settlement pair to be traced"
+    for event in settlement_events:
+        assert "original_started_at" not in event["data"]
+
+
+@pytest.mark.asyncio
 async def test_settlement_trace_is_emitted_under_the_original_step_id() -> None:
     """The pair must land in the step that issued the call, not the resumed one.
 

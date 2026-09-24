@@ -896,6 +896,85 @@ describe("processTraceEvents settlement delivery", () => {
     expect(toolActions).toHaveLength(2)
   })
 
+  it("does not let a colliding call's settlement overwrite another's via the resolver cache", () => {
+    // rogercloud's round-3 finding: `resolveSettlementTarget`'s cache lookup
+    // (`settlementTargets.get(toolCallId)`) used to be keyed on the BARE
+    // call id and returned before the origin-aware cross-step search ever
+    // ran. Two DIFFERENT colliding calls (a provider-omitted-id collision
+    // across concurrent DAG steps) each settling within the SAME processing
+    // pass -- e.g. a run-start replay redelivering both -- would have A's
+    // settlement START populate the cache under "tool_call_0", and B's
+    // settlement START/END would then silently read back (and overwrite)
+    // A's cached action instead of resolving to its own.
+    const inStepA = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-a",
+      data,
+    })
+    const inStepB = (event_type: string, data: Record<string, unknown>) => ({
+      event_type,
+      step_id: "step-b",
+      data,
+    })
+    const stepAStart = { event_type: "react_task_start", step_id: "step-a", data: { step_name: "A" } }
+    const stepBStart = { event_type: "react_task_start", step_id: "step-b", data: { step_name: "B" } }
+
+    const events = [
+      stepAStart,
+      inStepA("tool_execution_start", { tool_name: "approval_gate", tool_call_id: "tool_call_0" }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish A?" },
+      }),
+      stepBStart,
+      inStepB("tool_execution_start", { tool_name: "approval_gate", tool_call_id: "tool_call_0" }),
+      inStepB("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        status: "waiting_for_user",
+        result: { output: "Publish B?" },
+      }),
+      // Both settlements redelivered together, A's pair fully processed
+      // before B's starts -- exactly what populates and then would leak
+      // the bare-id cache entry.
+      inStepA("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepA("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "A-approved" },
+      }),
+      inStepB("tool_execution_start", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+      }),
+      inStepB("tool_execution_end", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        settlement_delivery: true,
+        settlement_status: "succeeded",
+        result: { output: "B-approved" },
+      }),
+    ]
+
+    const steps = processTraceEvents(events as never, t)
+    const toolActions = allToolActions(steps)
+
+    expect(toolActions).toHaveLength(2)
+    // A's settled result must survive B's later, differently-originated
+    // settlement -- not get silently overwritten via a shared cache entry.
+    expect(toolActions.find((a) => a.data.output === "A-approved")).toBeTruthy()
+    expect(toolActions.find((a) => a.data.output === "B-approved")).toBeTruthy()
+  })
+
   it("clears the stale pause output when a settlement fails", () => {
     // A rejected/errored settlement produces no new output -- only an error.
     // Without clearing it, ToolOutputDisplay would keep rendering the

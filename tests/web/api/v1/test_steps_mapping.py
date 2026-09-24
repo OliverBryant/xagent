@@ -2360,3 +2360,130 @@ def test_settlement_delivery_recovers_started_at_on_the_sse_lane() -> None:
 
     assert len(finalized) == 1
     assert finalized[0]["started_at"] == original_started
+
+
+def test_a_successful_settlement_clears_the_pauses_stale_failure_error() -> None:
+    """A settled step must not carry both the settled result and a stale error.
+
+    The pause's own ``tool_execution_end`` is always emitted with
+    ``success=False`` (waiting for a human is not success), so
+    ``_finalize_pending`` stamps ``data['error'] = "Tool execution failed"``
+    on it. A later successful settlement's own finalize only ever ADDS
+    ``result`` (``extra_data_fn`` never clears the opposite outcome key), so
+    without an explicit reset the reopened step ends up with both keys --
+    rogercloud's round-3 finding.
+    """
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "call-1"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "success": False,
+                "status": "waiting_for_user",
+                "result": {"message": "Publish?"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "succeeded",
+                "success": True,
+                "result": {"success": True, "post_urn": "urn:1"},
+            },
+        ),
+    ]
+
+    tool_steps = [
+        step
+        for step in map_trace_events_to_public_steps(events)
+        if step["type"] == "tool_call"
+    ]
+
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["status"] == "completed"
+    assert tool_steps[0]["data"]["result"] == {"success": True, "post_urn": "urn:1"}
+    assert "error" not in tool_steps[0]["data"]
+
+
+def test_a_failed_settlement_clears_a_stale_result_key() -> None:
+    """Symmetric case: a failed settlement must not leave a stale ``result``.
+
+    Exercises the OTHER direction of the same clearing logic -- there is no
+    production path that reaches this today (a pause is always recorded as a
+    failure, never a success), but ``_finalize_pending`` is shared by both
+    outcomes and should not silently regress if that ever changes.
+    """
+
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={"tool_name": "approval_gate", "tool_call_id": "call-1"},
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "success": True,
+                "result": {"message": "unexpectedly succeeded"},
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+            },
+        ),
+        _ev(
+            # A failed settlement's terminal event maps to ACTION+ERROR+TOOL
+            # on the wire, i.e. "tool_execution_failed" -- NOT
+            # "tool_execution_end" with success=False (see
+            # get_event_type_mapping in task_event_trace_handler.py).
+            "tool_execution_failed",
+            step_id="react_a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "call-1",
+                "settlement_delivery": True,
+                "settlement_status": "rejected",
+                "error": "The user rejected the tool call.",
+            },
+        ),
+    ]
+
+    tool_steps = [
+        step
+        for step in map_trace_events_to_public_steps(events)
+        if step["type"] == "tool_call"
+    ]
+
+    assert len(tool_steps) == 1
+    assert tool_steps[0]["status"] == "failed"
+    assert tool_steps[0]["data"]["error"] == "The user rejected the tool call."
+    assert "result" not in tool_steps[0]["data"]

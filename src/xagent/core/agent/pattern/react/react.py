@@ -5317,11 +5317,22 @@ class ReActPattern(AgentPattern):
         # survives to the settled row is to read it back from whatever is
         # already there and carry it forward; a fresh ``ToolCallRecord`` with
         # no override would otherwise silently reset it on every rewrite.
+        #
+        # ``existing is None`` is the ONLY condition that means "first ever
+        # registration" and may stamp ``now()``. A row that already exists
+        # but has ``issued_at is None`` is a checkpoint written before this
+        # field shipped -- NOT a fresh call -- and its true start time is
+        # simply unknowable; stamping ``now()`` there would fabricate a
+        # timestamp close to the SETTLEMENT time (this method runs right
+        # before the settlement trace is emitted) and pass it downstream as
+        # ``original_started_at``, silently reintroducing the very bug this
+        # field exists to fix. Preserving ``None`` instead correctly lets
+        # every consumer fall back to its own legacy behavior.
         existing = self.tool_ledger.get(tool_call_id)
         issued_at = (
-            existing.issued_at
-            if existing is not None and existing.issued_at is not None
-            else datetime.now(timezone.utc).timestamp()
+            datetime.now(timezone.utc).timestamp()
+            if existing is None
+            else existing.issued_at
         )
         self.tool_ledger[tool_call_id] = ToolCallRecord(
             tool_call_id=tool_call_id,

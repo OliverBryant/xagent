@@ -433,19 +433,24 @@ export function processTraceEvents(
     };
 
     // Targets registered by a settlement START, consumed by its END/ERROR.
-    // Keyed by tool_call_id, so replaying the same settlement (the backend
-    // re-emits it after a restart to repair a lost pair) resolves to the same
-    // action and updates it in place rather than appending a duplicate. Safe
-    // to key on the bare id here (unlike the cross-step search above) because
-    // this map is populated by THIS SAME settlement's own START within this
-    // single processing pass, so nothing else can plant a colliding entry
-    // under it in between.
+    // Keyed by (tool_call_id, originStepId) -- NOT the bare id -- so
+    // replaying the same settlement (the backend re-emits it after a restart
+    // to repair a lost pair) resolves to the same action and updates it in
+    // place rather than appending a duplicate, while two DIFFERENT colliding
+    // calls (a provider-omitted-id collision across concurrent DAG steps)
+    // settling within the SAME processing pass populate distinct cache
+    // entries instead of the second one silently reading back the first's
+    // cached target -- rogercloud's round-3 finding: a bare-id cache lookup
+    // returns before the origin-aware cross-step search below ever runs.
     const settlementTargets = new Map<string, StepAction>();
+    const settlementTargetCacheKey = (toolCallId: string, originStepId?: string) =>
+      `${toolCallId}::${originStepId ?? ''}`;
     const isSettlementEvent = (event: TraceEvent) =>
       event.data?.settlement_delivery === true;
     const resolveSettlementTarget = (toolCallId?: string, originStepId?: string) => {
       if (!toolCallId) return null;
-      return settlementTargets.get(toolCallId) || findToolActionByCallIdAcrossSteps(toolCallId, originStepId);
+      const cacheKey = settlementTargetCacheKey(toolCallId, originStepId);
+      return settlementTargets.get(cacheKey) || findToolActionByCallIdAcrossSteps(toolCallId, originStepId);
     };
 
     orderedEvents.forEach(({ event, index, timestamp }) => {
@@ -746,7 +751,10 @@ export function processTraceEvents(
 
         if (settlementStartTarget) {
           if (toolCallId) {
-            settlementTargets.set(toolCallId, settlementStartTarget);
+            settlementTargets.set(
+              settlementTargetCacheKey(toolCallId, event.step_id ?? undefined),
+              settlementStartTarget
+            );
           }
           // Deliberately NOT flipping status back to 'running': if the
           // settlement END is lost, a card stuck at 'running' reads worse than

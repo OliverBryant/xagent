@@ -981,6 +981,22 @@ def _finalize_pending(
         return None
     step["status"] = status
     step["completed_at"] = _ts(end_event)
+    # A settlement reopen (see ``PublicStepProjector.feed``) finalizes the
+    # SAME step object a second time. ``extra_data_fn`` below only ever adds
+    # the key for THIS outcome (``result``/``output`` on success, ``error``
+    # on failure) -- it never removes the other one, so a step whose first
+    # finalize wrote one and whose second finalize writes the other would
+    # keep both forever. That is exactly what a settled pause looks like: the
+    # pause's own end is always emitted with ``success=False`` (waiting for a
+    # human is not success), so it stamps ``error: "Tool execution failed"``;
+    # a later successful settlement's ``result`` then merges ALONGSIDE that
+    # stale placeholder instead of replacing it. Clearing every outcome key
+    # first is a no-op for an ordinary (never-reopened) step -- none of them
+    # exist yet -- and correct for a reopened one, since the fresh
+    # ``extra_data_fn`` call below re-derives exactly the key this outcome
+    # needs.
+    for stale_key in ("error", "result", "output"):
+        step["data"].pop(stale_key, None)
     if extra_data_fn is not None:
         try:
             extra = extra_data_fn(end_event) or {}

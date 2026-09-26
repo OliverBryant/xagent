@@ -385,6 +385,27 @@ class TestScopedByIdAccess:
             "execution_scope_tenant": "a",
         }
 
+    def test_update_cannot_add_scope_to_an_unscoped_note(self, store):
+        with UserContext(1):
+            note = _add(store, "an unscoped note")
+        edited = note.model_copy(deep=True)
+        edited.metadata = {"source": "replacement", "execution_scope_tenant": "b"}
+
+        with UserContext(1):
+            assert store.update(edited).success is True
+
+        assert store._base_store.notes[note.id].metadata == {
+            "source": "replacement",
+            "user_id": 1,
+        }
+        # Still unscoped: a strict dimension-less caller keeps seeing it, and
+        # another user still cannot reach it.
+        strict = ExecutionScope(strict_memory_isolation=True)
+        with UserContext(1), ExecutionScopeContext(strict):
+            assert [n.id for n in store.search("unscoped")] == [note.id]
+        with UserContext(2):
+            assert store.get(note.id).success is False
+
     def test_strict_dimensionless_cannot_touch_scoped_note_by_id(self, store):
         note_a = self._note_in(store, SCOPE_A, "a note")
         strict = ExecutionScope(strict_memory_isolation=True)

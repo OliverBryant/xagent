@@ -204,7 +204,7 @@ class UserIsolatedMemoryStore(MemoryStore):
         # call it whenever a user or a gating scope is present. When fully
         # unscoped with no user context, the original no-check path is kept.
         user_id = self._get_current_user_id()
-        existing_isolation_metadata: dict[str, Any] = {}
+        existing_isolation_metadata: Optional[dict[str, Any]] = None
         if note.id and (user_id is not None or self._scope_gates_by_id_access()):
             existing_response = self.get(note.id)
             if not existing_response.success:
@@ -219,7 +219,9 @@ class UserIsolatedMemoryStore(MemoryStore):
         # Isolation metadata is server-owned. A caller may replace ordinary
         # metadata, but cannot move an authenticated note to another owner (or
         # to an invalid/ownerless value), nor add/remove its scope dimensions.
-        if existing_isolation_metadata:
+        # An unscoped note stays unscoped: the stored set is restored even when
+        # it is empty.
+        if existing_isolation_metadata is not None:
             for key in tuple(note.metadata):
                 if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX):
                     note.metadata.pop(key)

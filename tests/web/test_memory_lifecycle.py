@@ -1484,3 +1484,202 @@ def test_vector_mode_still_receives_the_authority_adapter(tmp_path):
         added = store.add(MemoryNote(content="vector mode still embeds"))
     assert added.success
     assert _table_vectors(tmp_path)[added.memory_id] is not None
+
+
+# ---------------------------------------------------------------------------
+# Publication opens the certified table as is
+# ---------------------------------------------------------------------------
+
+
+def _table_state(tmp_path) -> Optional[tuple[Any, ...]]:
+    """Everything admission certifies, read straight off disk."""
+    clear_connection_cache()
+    connection = lancedb.connect(tmp_path)
+    if MEMORY_TABLE_NAME not in connection.table_names():
+        return None
+    table = connection.open_table(MEMORY_TABLE_NAME)
+    try:
+        schema = table.schema
+        return (
+            table.version,
+            [(field.name, str(field.type), field.metadata) for field in schema],
+            schema.metadata,
+        )
+    finally:
+        _safe_close_table(table)
+
+
+def _capture_admission_state(monkeypatch, tmp_path) -> list[Any]:
+    """Record the table state each time storage admission returns."""
+    states: list[Any] = []
+    original = memory_lifecycle._admit_once
+
+    def recording(*args, **kwargs):
+        outcome = original(*args, **kwargs)
+        states.append(_table_state(tmp_path))
+        return outcome
+
+    monkeypatch.setattr(memory_lifecycle, "_admit_once", recording)
+    return states
+
+
+_DRIFTS = {
+    "none": (_snapshot(dimension=DIMENSION), DIMENSION, MemoryStorageMode.VECTOR),
+    "same_width": (
+        _snapshot(model_name="text-embedding-ada-002", dimension=DIMENSION),
+        DIMENSION,
+        MemoryStorageMode.TEXT_ONLY,
+    ),
+    "other_width": (
+        _snapshot(model_name="text-embedding-3-large", dimension=8),
+        8,
+        MemoryStorageMode.TEXT_ONLY,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("table", "drift"),
+    [
+        ("absent", "none"),
+        ("empty", "none"),
+        ("empty", "same_width"),
+        ("empty", "other_width"),
+        ("non_empty", "none"),
+        ("non_empty", "same_width"),
+        ("non_empty", "other_width"),
+    ],
+)
+def test_publication_never_rewrites_the_admitted_table(
+    monkeypatch, tmp_path, table, drift
+):
+    """Nothing between admission and publication may touch the table.
+
+    The empty cases are the regression: building the store through the
+    generic constructor reshaped an empty table after the admission lock was
+    released, dropping the vector column and the admission certificate.
+    """
+    if table == "empty":
+        seeded = admit_authority_storage(
+            _snapshot(dimension=DIMENSION),
+            db_dir=str(tmp_path),
+            embedding_factory=lambda _config: _SizedEmbedding(DIMENSION),
+        )
+        assert seeded.status.state is MemoryLifecycleState.READY
+        clear_connection_cache()
+    elif table == "non_empty":
+        _seed_vector_table(tmp_path)
+
+    snapshot, width, mode = _DRIFTS[drift]
+    admitted_states = _capture_admission_state(monkeypatch, tmp_path)
+    result = admit_authority_storage(
+        snapshot,
+        db_dir=str(tmp_path),
+        embedding_factory=lambda _config: _SizedEmbedding(width),
+    )
+
+    assert result.status.state is MemoryLifecycleState.READY
+    assert result.status.mode is mode
+    assert result.store is not None
+    certified = admitted_states[-1]
+    assert certified is not None
+    assert _table_state(tmp_path) == certified
+    # A later worker start still finds a certified table and admits it
+    # without staging or rewriting anything.
+    again = admit_authority_storage(
+        snapshot,
+        db_dir=str(tmp_path),
+        embedding_factory=lambda _config: _SizedEmbedding(width),
+    )
+    assert again.status.mode is mode
+    assert _table_state(tmp_path) == certified
+
+
+def _tamper_after_admission(monkeypatch, tamper) -> None:
+    original = memory_lifecycle._admit_once
+
+    def tampering(connection, *args, **kwargs):
+        outcome = original(connection, *args, **kwargs)
+        if outcome.admitted is not None:
+            return tamper(connection, outcome)
+        return outcome
+
+    monkeypatch.setattr(memory_lifecycle, "_admit_once", tampering)
+
+
+def test_publication_fails_closed_when_the_admitted_table_is_gone(
+    monkeypatch, tmp_path
+):
+    _seed_vector_table(tmp_path)
+
+    def drop(connection, outcome):
+        connection.drop_table(MEMORY_TABLE_NAME)
+        return outcome
+
+    _tamper_after_admission(monkeypatch, drop)
+    result = _admit(tmp_path)
+
+    assert result.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert result.store is None
+    # Publication must not recreate the table it expected to find.
+    assert _table_state(tmp_path) is None
+
+
+def test_publication_fails_closed_when_the_certificate_is_gone(monkeypatch, tmp_path):
+    _seed_vector_table(tmp_path)
+    tampered: list[Any] = []
+
+    def strip_certificate(connection, outcome):
+        table = connection.open_table(MEMORY_TABLE_NAME)
+        try:
+            data = table.to_arrow()
+        finally:
+            _safe_close_table(table)
+        # Drop only the full-admission marker (carried on the user_id field);
+        # the stored vector-space identity still matches, so the marker check
+        # alone has to catch this.
+        uncertified = pa.schema(
+            [
+                field.remove_metadata() if field.name == "user_id" else field
+                for field in data.schema
+            ],
+            metadata=data.schema.metadata,
+        )
+        connection.create_table(
+            MEMORY_TABLE_NAME, data=data.cast(uncertified), mode="overwrite"
+        )
+        clear_connection_cache()
+        tampered.append(_table_state(tmp_path))
+        return outcome
+
+    _tamper_after_admission(monkeypatch, strip_certificate)
+    result = _admit(tmp_path)
+
+    assert result.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert result.store is None
+    assert _table_state(tmp_path) == tampered[0]
+
+
+def test_publication_fails_closed_when_the_vector_space_moved(monkeypatch, tmp_path):
+    _seed_vector_table(tmp_path)
+
+    def reclassify(_connection, outcome):
+        # Stand in for a table whose vector space no longer classifies the
+        # way admission classified it.
+        from xagent.core.memory.vector_compatibility import VectorCompatibility
+
+        return replace(
+            outcome,
+            admitted=replace(
+                outcome.admitted,
+                vector_compatibility=VectorCompatibility.MISMATCHING,
+            ),
+        )
+
+    _tamper_after_admission(monkeypatch, reclassify)
+    before = _table_state(tmp_path)
+    result = _admit(tmp_path)
+
+    assert result.status.state is MemoryLifecycleState.RETRYABLE_UNAVAILABLE
+    assert result.store is None
+    assert _table_state(tmp_path) == before

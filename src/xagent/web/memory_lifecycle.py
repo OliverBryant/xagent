@@ -402,21 +402,28 @@ def admit_authority_storage(
     # vectors, leaves existing vectors untouched, and answers searches from the
     # lexical fallback. Restoring vector search is an offline re-embed plus an
     # all-worker restart, never a side effect of a user write.
+    #
+    # The store opens the table admission certified rather than going through
+    # the generic constructor, which may reshape an empty table or promote
+    # columns. That would run after the admission lock is released, next to
+    # other workers, and could strip the very certificate admission checked.
     try:
         embedding_model = (
             embedding_factory(config)
             if capabilities.mode is MemoryStorageMode.VECTOR
             else None
         )
-        store = LanceDBMemoryStore(
+        store = LanceDBMemoryStore.open_admitted(
+            outcome.admitted,
+            identity,
             db_dir=directory,
-            collection_name=MEMORY_TABLE_NAME,
             embedding_model=embedding_model,
             similarity_threshold=threshold,
         )
     except Exception:
         # Admission certified the table, but this worker cannot build the
-        # adapter for it. Nothing is published, so no caller can observe a
+        # adapter for it, or the table is no longer the one admission
+        # certified. Nothing is published, so no caller can observe a
         # half-built store.
         logger.exception("Persistent memory store construction failed")
         return AdmissionResult(

@@ -33,7 +33,12 @@ from .scope_columns import (
     encode_scope_dims,
     scope_dim_where_term,
 )
-from .storage_admission import DormantLanceDBMemoryHandle
+from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
+from .vector_compatibility import (
+    EmbeddingIdentity,
+    _is_fully_admitted,
+    classify_vector_compatibility,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,85 @@ class LanceDBMemoryStore(MemoryStore):
             similarity_threshold: Cosine distance threshold for vector search (lower = more strict)
             **embedding_kwargs: Additional arguments for embedding model
         """
+        self._set_up(
+            db_dir,
+            collection_name,
+            embedding_model,
+            similarity_threshold,
+            embedding_kwargs,
+            ensure_table=True,
+        )
+        self._ensure_table_schema()
+
+    @classmethod
+    def open_admitted(
+        cls,
+        admitted: AdmittedLanceDBMemoryStore,
+        identity: EmbeddingIdentity,
+        *,
+        db_dir: str,
+        embedding_model: Optional[BaseEmbedding] = None,
+        similarity_threshold: float = 1.0,
+    ) -> "LanceDBMemoryStore":
+        """Open the table storage admission just certified, without changing it.
+
+        The constructor may create a placeholder table, reshape an empty one
+        and promote scope columns. None of that is safe here: it would run
+        after the admission lock is released, next to other workers, on a
+        table admission has already certified. So this path only opens the
+        table and checks that it is still the one admission certified: the
+        table exists, still carries the full-admission marker and still
+        classifies against ``identity`` the way admission classified it.
+        Anything else raises, and nothing is published.
+        """
+        store = cls.__new__(cls)
+        store._set_up(
+            db_dir,
+            admitted.handle.table_name,
+            embedding_model,
+            similarity_threshold,
+            {},
+            ensure_table=False,
+        )
+        store._verify_admitted_table(admitted, identity)
+        return store
+
+    def _verify_admitted_table(
+        self, admitted: AdmittedLanceDBMemoryStore, identity: EmbeddingIdentity
+    ) -> None:
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Admitted memory table {self._collection_name!r} is missing"
+            ) from exc
+        try:
+            if not _is_fully_admitted(table):
+                raise RuntimeError(
+                    f"Memory table {self._collection_name!r} lost its admission "
+                    "certificate after admission"
+                )
+            compatibility = classify_vector_compatibility(table.schema, identity)
+        finally:
+            _safe_close_table(table)
+        if compatibility is not admitted.vector_compatibility:
+            raise RuntimeError(
+                f"Memory table {self._collection_name!r} changed vector space "
+                "after admission"
+            )
+
+    def _set_up(
+        self,
+        db_dir: str,
+        collection_name: str,
+        embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]],
+        similarity_threshold: float,
+        embedding_kwargs: dict[str, Any],
+        *,
+        ensure_table: bool,
+    ) -> None:
         self._collection_name = collection_name
 
         # Handle different types of embedding_model input
@@ -91,9 +175,10 @@ class LanceDBMemoryStore(MemoryStore):
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
+        self._vector_store = LanceDBVectorStore(
+            db_dir, collection_name, ensure_table=ensure_table
+        )
         self._conn_manager = LanceDBConnectionManager()
-        self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage.

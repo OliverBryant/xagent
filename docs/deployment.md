@@ -498,8 +498,11 @@ explicit repair must run with every writer quiesced.
 Once a table carries the marker, admission is read-only: every later worker
 start, respawn or retry only reads the schema and compares the stored vector
 identity with the authority, and it never stages, rewrites or overwrites the
-table. Ordinary memory writes do not remove the marker, so workers can restart
-while their siblings keep serving.
+table. Publishing the admitted store is read-only as well: the worker opens
+the certified table as is, never creates, reshapes or backfills it, and stays
+fenced if the table no longer matches what admission certified. Ordinary
+memory writes do not remove the marker, so workers can restart while their
+siblings keep serving.
 
 ### Verification and monitoring
 

@@ -313,10 +313,14 @@ def _is_fully_admitted(table: Any) -> bool:
     structure, ID/metadata/scope validity and every persisted vector value. It
     is keyed on migration state, not on the table version it landed at, so
     ordinary writes committed after admission keep it valid. Those writes come
-    from the admitted runtime, which writes validated scope columns by
-    construction, and the deployment and rollback contract keeps older-release
-    writers off an admitted table. The table version recorded next to the
-    marker is informational only and must never gate this check.
+    from the admitted runtime, which writes validated scope columns and
+    server-owned owner/scope metadata by construction. The deployment and
+    rollback contract lets only such compatible writers open an admitted
+    table; an older release that lets callers rewrite owner or scope runs with
+    memory storage detached. The marker cannot protect against a writer that
+    breaks that contract: its rows are well formed, so no rescan could tell
+    that an owner was changed. The table version recorded next to the marker
+    is informational only and must never gate this check.
 
     A scope-only maintenance marker lives under a different key and never
     certifies admission, and a marker from an older validator generation is

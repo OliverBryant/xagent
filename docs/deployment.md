@@ -615,7 +615,20 @@ things follow, and all three are silent:
   old manager falls back to an ephemeral in-memory store. Memory appears to
   work and is discarded when the worker exits.
 
-So gate the rollback on the persisted identity, not just on the fleet version:
+The previous release also lets an authenticated update overwrite a note's
+`user_id` and scope metadata, so a note can silently end up owned by another
+user or placed in another scope, with values that are well formed. The table
+keeps this release's full-admission marker, so the next roll-forward trusts
+those rows. No later scan can undo this: nothing records the original owner,
+so re-admission, clearing the marker or a forced full rescan all accept the
+new values as valid.
+
+So only a **compatible writer** may open the production memory table: a
+runtime that enforces the same server-side owner and scope rules on every
+write as this release does. The previous release is not one. Unless you roll
+back to a build patched to enforce those rules, roll back with memory storage
+detached (see below). With a compatible rollback build, still gate the
+rollback on the persisted identity, not just on the fleet version:
 
 1. **Quiesce every writer.** Stop all API and task-execution workers. Nothing
    below is safe against a live writer.
@@ -650,11 +663,11 @@ So gate the rollback on the persisted identity, not just on the fleet version:
        the expected `embedding_model_id`. `InMemoryMemoryStore` or
        `is_lancedb` `false` means the fallback, not a persistent store.
 
-     With both, stop that instance, discard whatever memory directory it
-     created, reattach the real one, and
-     redeploy the previous version to every worker at once. Leave the
-     authority row in place: the old code ignores it, and the new version
-     needs it on the next roll-forward. Without both, treat the case as
+     With both, and only for a rollback build that is a compatible writer,
+     stop that instance, discard whatever memory directory it created,
+     reattach the real one, and redeploy that build to every worker at once.
+     Leave the authority row in place: the old code ignores it, and the new
+     version needs it on the next roll-forward. Without both, treat the case as
      unprovable and follow the next branch.
    * **They differ, or the persisted identity or the previous release's
      persistence under it cannot be proven** — do **not**
@@ -663,10 +676,16 @@ So gate the rollback on the persisted identity, not just on the fleet version:
      previous release will select, or re-embed the table offline into that
      identity before rolling back. Only then redeploy.
 
-If you must roll the application back before either of those can be done, roll
-back with memory storage detached — move the memory directory aside so the old
-code starts against an empty one — and reattach it only once the identities
-agree. Unrelated functions are unaffected either way; persistent memory is the
-only thing at stake.
+If the rollback build is not a compatible writer, or you must roll the
+application back before either of those can be done, roll back with memory
+storage detached: move the memory directory aside so the old code starts
+against an empty one, and keep the real one out of its reach. Unrelated
+functions are unaffected either way; persistent memory is the only thing at
+stake.
+
+When you roll forward again, reattach only storage that compatible writers
+alone have written: the directory you moved aside, or a verified backup taken
+before the rollback. Notes written while memory was detached are not merged
+back. Reconcile them separately, from a source you trust, if they matter.
 
 Rolling back does not undo an offline repair, and does not need to.

@@ -212,3 +212,24 @@ shared `commandId` identifies the internal deterministic command, whereas its
 nonshared error correlates with the original `messageId`. Nonshared SDK replies
 return a correlation ID, not a new durable deduplication guarantee. Check task
 state before deciding whether to resume or send new input.
+
+## Context cache lifetime
+
+`ContextManager` is a process-wide cache keyed by the execution id, which stays
+the same across runs and owners. It may hold a context only while a run of that
+execution is active in this process, while an injection holds it, or while it
+is fenced by an `outcome_unknown` write. Otherwise the checkpoint is
+authoritative: another process may have extended it since this one last ran the
+task. The last user of an idle context evicts it (`AgentRunner.run` on exit and
+each injection on return), and the next input restores from the checkpoint. A
+context restored that way belongs to no run, so a live input on it returns
+`defer` and the caller takes the deferred path. A reader that started before an
+eviction discards its snapshot and reads again, because the evicted context's
+last write may postdate that read.
+
+Before a completed run publishes its result, the runner writes one more
+checkpoint (`run_end_tail`) when the context changed after the pattern's last
+checkpoint, for example the delivered answer it appended. The write reuses that
+checkpoint's pattern state, is skipped for fenced contexts and for waiting or
+interrupted results, and is best effort: a failure is logged and the result
+stands.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -205,12 +206,25 @@ async def test_concurrent_cold_injections_share_context(live):
         await both.wait()
         return payload
 
+    async def write(**written):
+        nonlocal payload
+        # A real store suspends, letting the other reader publish meanwhile.
+        await asyncio.sleep(0)
+        payload = written
+
     tracer.load_latest_checkpoint.side_effect = read
+    tracer.checkpoint.side_effect = write
     a, b = await asyncio.gather(
-        runner.inject_user_message("atomic", "one", turn_id="one"),
-        runner.inject_user_message("atomic", "two", turn_id="two"),
+        runner.inject_user_message(
+            "atomic", "one", turn_id="one", request_interrupt=False
+        ),
+        runner.inject_user_message(
+            "atomic", "two", turn_id="two", request_interrupt=False
+        ),
     )
-    assert a.context is b.context is runner.context_manager.get_context("atomic")
+    assert a.context is b.context
+    # No run holds the restored context, so the last injection evicts it.
+    assert runner.context_manager.get_context("atomic") is None
     assert {m.content for m in a.context.messages} == {"original", "one", "two"}
     assert {
         m["content"] for m in tracer.checkpoint.call_args.kwargs["context"]["messages"]
@@ -292,7 +306,7 @@ async def test_live_unknown_stops_run_and_explicit_resume_reloads_checkpoint(liv
         tracer.checkpoint.side_effect = None
         result = await runner.resume("atomic")
         assert result["success"]
-        restored = runner.context_manager.get_context("atomic")
+        restored = result["context"]
         assert [m.content for m in restored.messages].count("new") == 1
     finally:
         release.set()
@@ -413,7 +427,14 @@ async def test_live_input_after_result_publication_defers_until_old_run_finishes
         assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
         tracer.checkpoint.assert_not_awaited()
         finish.set()
-        assert (await operation)["success"]
+        finished = await operation
+        assert finished["success"]
+        # The finished run's context was evicted; the deferred input restores
+        # from the checkpoint.
+        assert runner.context_manager.get_context("atomic") is None
+        tracer.load_latest_checkpoint.return_value = {
+            "context": finished["context"].to_dict()
+        }
         # The existing deferred path posts without interrupting the finished run.
         result = await runner.inject_user_message(
             "atomic", "new", turn_id="turn", request_interrupt=False
@@ -763,11 +784,14 @@ async def test_cold_start_adopts_the_lookup_id_when_the_checkpoint_has_none():
     )
     try:
         result = await asyncio.wait_for(
-            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+            runner.inject_user_message(
+                "cold", "new", turn_id="turn", request_interrupt=False
+            ),
+            5,
         )
         assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-        assert manager.get_context("cold") is result.context
         assert result.context.execution_id == "cold"
+        assert manager.get_context("cold") is None
     finally:
         manager._contexts.clear()
 
@@ -795,7 +819,10 @@ async def test_cold_start_without_an_id_still_drops_a_derived_output_language():
     )
     try:
         result = await asyncio.wait_for(
-            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+            runner.inject_user_message(
+                "cold", "new", turn_id="turn", request_interrupt=False
+            ),
+            5,
         )
         # The id is filled in on a copy; the migration must still reach it.
         assert result.context.execution_id == "cold"
@@ -873,3 +900,418 @@ async def test_lost_baseline_on_readback_is_uncertain_not_absent(live):
     result = await runner.inject_user_message("atomic", "new", turn_id="turn")
     assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
     assert [m.content for m in context.messages] == ["original"]
+
+
+# --- Context cache lifetime -------------------------------------------------
+
+
+class _DurableStore:
+    """Checkpoint store whose reads return copies of the latest write."""
+
+    def __init__(self) -> None:
+        self.latest: dict | None = None
+        self.writes: list[str] = []
+        self.reads = 0
+        self.read_hook = None
+        self.fail_labels: set[str] = set()
+        self.ambiguous_labels: set[str] = set()
+        self.reads_fail = False
+
+    async def load_latest_checkpoint(self, execution_id):
+        self.reads += 1
+        if self.reads_fail:
+            raise RuntimeError("read unavailable")
+        snapshot = copy.deepcopy(self.latest)
+        if self.read_hook is not None:
+            hook, self.read_hook = self.read_hook, None
+            return await hook(snapshot)
+        return snapshot
+
+    async def checkpoint(self, **payload):
+        label = payload["label"]
+        if label in self.fail_labels:
+            raise RuntimeError(f"{label} write failed")
+        if label in self.ambiguous_labels:
+            # The write lands but its acknowledgement and read-back are lost.
+            self.latest = copy.deepcopy(payload)
+            self.reads_fail = True
+            raise RuntimeError("ack lost")
+        self.writes.append(label)
+        self.latest = copy.deepcopy(payload)
+
+    def seed(self, execution_id: str, *messages: str) -> None:
+        from xagent.core.agent.context import ExecutionContext
+
+        context = ExecutionContext(execution_id=execution_id)
+        for message in messages:
+            context.add_user_message(message)
+        self.latest = {"type": "checkpoint", "context": context.to_dict()}
+
+    def messages(self) -> list[str]:
+        assert self.latest is not None
+        return [m["content"] for m in self.latest["context"]["messages"]]
+
+
+class _AnsweringPattern:
+    """Checkpoints like a real pattern, then returns an answer the runner appends."""
+
+    def __init__(self, answer: str = "A answer", *, before_return=None) -> None:
+        self.answer = answer
+        self.before_return = before_return
+
+    def get_state(self):
+        return {"marker": "state"}
+
+    async def run(self, *, context, runtime, **kwargs):
+        await runtime.checkpoint("step", context=context, pattern=self)
+        if self.before_return is not None:
+            await self.before_return()
+        return {"success": True, "output": self.answer}
+
+
+@pytest.fixture
+def durable():
+    manager = ContextManager()
+    manager._contexts.clear()
+    getattr(manager, "_cold_starts", {}).clear()
+    store = _DurableStore()
+    runner = AgentRunner(
+        SimpleNamespace(llm=None),
+        tracer=store,
+        context_manager=manager,
+        workspace_enabled=False,
+    )
+    yield runner, store
+    manager._contexts.clear()
+    getattr(manager, "_cold_starts", {}).clear()
+
+
+@pytest.mark.asyncio
+async def test_follow_up_after_another_process_extended_the_checkpoint(durable):
+    from xagent.core.agent.context import ExecutionContext
+
+    runner, store = durable
+    runner.agent.patterns = [_AnsweringPattern()]
+    assert (await runner.run("m1", execution_id="aba"))["success"]
+
+    # Process B takes the task over, answers another turn and checkpoints.
+    other = ExecutionContext.from_dict(store.latest["context"])
+    other.add_user_message("m2 from B")
+    other.add_assistant_message("B answer")
+    store.latest = {**store.latest, "context": other.to_dict()}
+
+    posted = await runner.inject_user_message(
+        "aba", "m3", turn_id="m3", request_interrupt=False
+    )
+    assert posted.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert store.messages() == ["m1", "A answer", "m2 from B", "B answer", "m3"]
+    assert runner.context_manager.get_context("aba") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["memory_session", "resume_workspace"])
+async def test_setup_failure_before_the_run_leaves_no_cached_context(durable, stage):
+    from xagent.core.agent.context import ExecutionContext
+
+    runner, store = durable
+    runner.agent.patterns = [_AnsweringPattern()]
+    kwargs = {}
+    if stage == "memory_session":
+        runner.memory_manager = SimpleNamespace(
+            get_or_create_session=AsyncMock(side_effect=RuntimeError("setup failed"))
+        )
+    else:
+        runner.workspace_enabled = True
+        runner.workspace_manager = SimpleNamespace(
+            get_or_create_workspace=AsyncMock(side_effect=RuntimeError("setup failed"))
+        )
+        seed = ExecutionContext(execution_id="setup")
+        seed.add_user_message("m1")
+        kwargs["checkpoint"] = {"context": seed.to_dict()}
+    with pytest.raises(RuntimeError, match="setup failed"):
+        await runner.run("m1", execution_id="setup", **kwargs)
+    assert runner.context_manager.get_context("setup") is None
+
+
+@pytest.mark.asyncio
+async def test_live_input_without_a_local_run_defers_and_writes_nothing(durable):
+    runner, store = durable
+    store.seed("cold", "m1")
+    posted = await runner.inject_user_message("cold", "live", turn_id="live")
+    assert posted.outcome is UserMessageInjectionOutcome.NOT_POSTED
+    assert store.writes == []
+    assert runner.context_manager.get_context("cold") is None
+
+
+@pytest.mark.asyncio
+async def test_deferred_cold_start_leaves_the_cache_empty(durable):
+    runner, store = durable
+    store.seed("cold", "m1")
+    posted = await runner.inject_user_message(
+        "cold", "later", turn_id="later", request_interrupt=False
+    )
+    assert posted.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert store.messages() == ["m1", "later"]
+    assert runner.context_manager.get_context("cold") is None
+
+
+@pytest.mark.asyncio
+async def test_fenced_run_keeps_its_context_until_deferred_input_reloads(durable):
+    runner, store = durable
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def wait():
+        started.set()
+        await release.wait()
+
+    runner.agent.patterns = [_AnsweringPattern(before_return=wait)]
+    operation = asyncio.create_task(runner.run("m1", execution_id="fence"))
+    try:
+        await started.wait()
+        store.ambiguous_labels.add("user_message_injected")
+        first = await runner.inject_user_message("fence", "uncertain", turn_id="u")
+        assert first.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+        store.ambiguous_labels.clear()
+        store.reads_fail = False
+        release.set()
+        result = await operation
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+    assert result["injection_outcome_unknown"] is True
+    # The fenced context never writes again, not even the tail checkpoint.
+    assert "run_end_tail" not in store.writes
+    fenced = runner.context_manager.get_context("fence")
+    assert fenced is result["context"]
+
+    live = await runner.inject_user_message("fence", "live", turn_id="live")
+    assert live.outcome is UserMessageInjectionOutcome.REJECTED_RETRYABLE
+    assert runner.context_manager.get_context("fence") is fenced
+
+    deferred = await runner.inject_user_message(
+        "fence", "deferred", turn_id="deferred", request_interrupt=False
+    )
+    assert deferred.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert deferred.context is not fenced
+    assert store.messages() == ["m1", "uncertain", "deferred"]
+    assert runner.context_manager.get_context("fence") is None
+
+
+@pytest.mark.asyncio
+async def test_context_stays_cached_while_an_injection_outlives_the_run(durable):
+    runner, store = durable
+    started, release_run = asyncio.Event(), asyncio.Event()
+    in_callback, release_callback = asyncio.Event(), asyncio.Event()
+
+    async def wait():
+        started.set()
+        await release_run.wait()
+
+    async def on_user_message_posted(*, message, **_):
+        if message.content == "I":
+            in_callback.set()
+            await release_callback.wait()
+
+    runner.agent.patterns = [_AnsweringPattern(before_return=wait)]
+    runner.callbacks = [SimpleNamespace(on_user_message_posted=on_user_message_posted)]
+    operation = asyncio.create_task(runner.run("m1", execution_id="held"))
+    injection = None
+    try:
+        await started.wait()
+        injection = asyncio.create_task(
+            runner.inject_user_message("held", "I", turn_id="I")
+        )
+        await in_callback.wait()
+        release_run.set()
+        result = await operation
+        held = runner.context_manager.get_context("held")
+        assert held is result["context"]
+
+        later = await runner.inject_user_message(
+            "held", "J", turn_id="J", request_interrupt=False
+        )
+        assert later.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        assert later.context is held
+        release_callback.set()
+        assert (await injection).outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    finally:
+        release_run.set()
+        release_callback.set()
+        await asyncio.gather(
+            operation, *([injection] if injection else []), return_exceptions=True
+        )
+    assert store.messages() == ["m1", "I", "A answer", "J"]
+    assert runner.context_manager.get_context("held") is None
+
+
+@pytest.mark.asyncio
+async def test_cold_start_reader_racing_an_eviction_reads_again(durable):
+    runner, store = durable
+    store.seed("race", "m1")
+    reading, release = asyncio.Event(), asyncio.Event()
+
+    async def stale_read(snapshot):
+        reading.set()
+        await release.wait()
+        return snapshot
+
+    store.read_hook = stale_read
+    reader = asyncio.create_task(
+        runner.inject_user_message("race", "R", turn_id="R", request_interrupt=False)
+    )
+    try:
+        await reading.wait()
+        other = await runner.inject_user_message(
+            "race", "J", turn_id="J", request_interrupt=False
+        )
+        assert other.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+        assert runner.context_manager.get_context("race") is None
+        release.set()
+        assert (await reader).outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    finally:
+        release.set()
+        await asyncio.gather(reader, return_exceptions=True)
+    # R discarded the snapshot it read before J's write and read again.
+    assert store.reads == 3
+    assert store.messages() == ["m1", "J", "R"]
+    assert runner.context_manager.get_context("race") is None
+    assert runner.context_manager._cold_starts == {}
+
+
+@pytest.mark.asyncio
+async def test_completed_run_persists_the_answer_appended_after_its_checkpoint(
+    durable,
+):
+    runner, store = durable
+    runner.agent.patterns = [_AnsweringPattern()]
+    result = await runner.run("m1", execution_id="tail")
+    assert result["success"]
+    assert store.writes == ["step", "run_end_tail"]
+    assert store.messages() == ["m1", "A answer"]
+    # The pattern state of its last checkpoint is carried over unchanged.
+    assert store.latest["pattern"] == "_AnsweringPattern"
+    assert store.latest["pattern_state"] == {"marker": "state"}
+
+    posted = await runner.inject_user_message(
+        "tail", "next", turn_id="next", request_interrupt=False
+    )
+    assert posted.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert store.messages() == ["m1", "A answer", "next"]
+
+
+class _SelfRecordingPattern:
+    def __init__(self, *, checkpoint: bool) -> None:
+        self.checkpoint = checkpoint
+
+    async def run(self, *, context, runtime, **kwargs):
+        if self.checkpoint:
+            context.add_assistant_message("recorded")
+            await runtime.checkpoint("final", context=context, pattern=self)
+        return {"success": True, "output": "recorded"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("checkpointed", [True, False])
+async def test_tail_checkpoint_is_skipped_without_new_state(durable, checkpointed):
+    runner, store = durable
+    runner.agent.patterns = [_SelfRecordingPattern(checkpoint=checkpointed)]
+    assert (await runner.run("m1", execution_id="same"))["success"]
+    # Unchanged after the pattern's checkpoint, or no checkpoint in this run.
+    assert store.writes == (["final"] if checkpointed else [])
+
+
+@pytest.mark.asyncio
+async def test_tail_checkpoint_failure_keeps_the_result(durable, caplog):
+    runner, store = durable
+    runner.agent.patterns = [_AnsweringPattern()]
+    store.fail_labels.add("run_end_tail")
+    with caplog.at_level("WARNING", logger="xagent.core.agent.runner"):
+        result = await runner.run("m1", execution_id="tail-fails")
+    assert result["success"] is True
+    assert result["output"] == "A answer"
+    assert store.writes == ["step"]
+    assert "Final context checkpoint failed for tail-fails" in caplog.text
+    assert runner.context_manager.get_context("tail-fails") is None
+
+
+@pytest.mark.asyncio
+async def test_waiting_result_is_not_tail_persisted_so_resume_keeps_waiting(durable):
+    from xagent.core.agent import ReActPattern
+
+    runner, store = durable
+
+    class FakeLLM:
+        def __init__(self, responses):
+            self.responses = responses
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.responses.pop(0)
+
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-send",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Choose A or B",'
+                                '"message_type":"question","expect_response":true}'
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    runner.agent = SimpleNamespace(llm=llm, patterns=[ReActPattern(max_iterations=2)])
+    first = await runner.run("Ask", execution_id="waiting")
+    assert first["status"] == "waiting_for_user"
+    # The runner appended the question in memory only; ReAct's checkpoint
+    # records the message count a reply must exceed.
+    assert "run_end_tail" not in store.writes
+
+    resumed = await runner.resume("waiting")
+    assert resumed["status"] == "waiting_for_user"
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_watermark_repersist_skips_a_context_replaced_meanwhile(durable):
+    from xagent.core.agent.context import ExecutionContext
+
+    runner, store = durable
+    store.seed("replaced", "m1")
+    in_callback, release = asyncio.Event(), asyncio.Event()
+
+    async def on_user_message_posted(*, context, **_):
+        in_callback.set()
+        await release.wait()
+        context.metadata["_user_message_trace_watermark"] = "traced"
+
+    runner.callbacks = [SimpleNamespace(on_user_message_posted=on_user_message_posted)]
+    injection = asyncio.create_task(
+        runner.inject_user_message(
+            "replaced", "I", turn_id="I", request_interrupt=False
+        )
+    )
+    try:
+        await in_callback.wait()
+        # A resumed run caches a newer context and checkpoints past I.
+        newer = ExecutionContext.from_dict(store.latest["context"])
+        newer.add_assistant_message("resumed answer")
+        runner.context_manager.set_context(newer)
+        store.latest = {**store.latest, "context": newer.to_dict()}
+        release.set()
+        result = await injection
+    finally:
+        release.set()
+        await asyncio.gather(injection, return_exceptions=True)
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert store.writes == ["user_message_injected"]
+    assert store.messages() == ["m1", "I", "resumed answer"]
+    assert runner.context_manager.get_context("replaced") is newer
+    runner.context_manager.remove_context("replaced")

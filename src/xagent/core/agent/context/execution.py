@@ -493,6 +493,8 @@ class _ContextCheckpointGate:
     def __init__(self) -> None:
         self.injection_uncertain = False
         self.run_finishing = False
+        # Injections holding this context; the runner keeps it cached meanwhile.
+        self.injections_in_flight = 0
         self._shared = 0
         self._exclusive = False
         self._writers_waiting = 0

@@ -289,6 +289,14 @@ class _AutoChildRuntime:
             metadata=child_metadata,
         )
 
+    async def checkpoint_context_tail(
+        self, label: str, *, context: Any
+    ) -> dict[str, Any] | None:
+        # Checkpoints are always written for the root context.
+        return await self.parent.checkpoint_context_tail(
+            label, context=self.root_context
+        )
+
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
         await self.parent.on_tool_start(tool_call=tool_call)
 

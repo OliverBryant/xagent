@@ -934,6 +934,35 @@ class PatternRuntime:
             await self._emit_checkpoint(payload)
             return payload
 
+    async def checkpoint_context_tail(
+        self, label: str, *, context: ExecutionContext
+    ) -> dict[str, Any] | None:
+        """Re-persist the last checkpoint with context changes made after it.
+
+        The runner still edits the context once the pattern's final checkpoint
+        is written (it appends or rewrites the delivered answer). The pattern
+        state is reused from that checkpoint, never rebuilt, because the
+        pattern has already returned. Returns ``None`` when nothing was
+        written: no checkpoint in this run, a fenced context, or no change.
+        """
+        gate = context_checkpoint_gate(context)
+        async with gate.shared():
+            baseline = self.last_checkpoint
+            if baseline is None or gate.injection_uncertain:
+                return None
+            # ``to_dict`` snapshots every container a writer mutates in place,
+            # so the stored payload is an exact record of what was persisted
+            # and equality is precise. It is also the serialization the write
+            # itself needs, so the comparison adds no extra snapshot.
+            context_payload = context.to_dict()
+            if baseline.get("context") == context_payload:
+                return None
+            payload = {**baseline, "label": label, "context": context_payload}
+            await self._emit_checkpoint(payload)
+            self.last_checkpoint = payload
+            self.checkpoints.append(payload)
+            return payload
+
     async def send_message(
         self,
         *,
@@ -2023,11 +2052,11 @@ class PatternRuntime:
         # user Message's own metadata (AgentRunner.inject_user_message's
         # _ensure_user_message_turn_id), which is guaranteed fresh per turn.
         # Deliberately NOT stashed in context.metadata instead: that dict is
-        # scoped to the whole execution/task, not one turn - it's the SAME
-        # object reused across every follow-up message in the task
-        # (inject_user_message calls context_manager.get_context, never
-        # rebuilding it), so a value stored there would persist unchanged
-        # into turn 2, 3, etc., never actually distinguishing runs.
+        # scoped to the whole execution/task, not one turn - it's carried
+        # across every follow-up message in the task (reused from the context
+        # cache while a run or injection holds it, otherwise restored from the
+        # checkpoint), so a value stored there would persist unchanged into
+        # turn 2, 3, etc., never actually distinguishing runs.
         messages = getattr(context, "messages", None) or []
         for message in reversed(messages):
             if getattr(message, "role", None) != "user":

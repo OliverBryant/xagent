@@ -294,134 +294,147 @@ class AgentRunner:
                 checkpoint=checkpoint,
                 execution_id=execution_id,
             )
-        if checkpoint and isinstance(checkpoint.get("context"), dict):
-            reset_output_language_to_request_context(checkpoint)
-            context = ExecutionContext.from_dict(checkpoint["context"])
-            warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
-            self._merge_context_metadata(context, metadata, restored=True)
-            self.context_manager.set_context(context)
-            execution_id = context.execution_id
-            workspace = None
-        else:
-            context, workspace = await self._build_context(
-                task=task,
-                execution_id=execution_id,
-                user_id=user_id,
-                session_id=session_id,
-                workspace_id=workspace_id,
-                allowed_external_dirs=allowed_external_dirs,
-                base_dir=base_dir,
-                metadata=metadata,
-            )
-            replay_messages = initial_messages or []
-            if (
-                replay_messages
-                and str(replay_messages[0].get("role") or "").strip() == "assistant"
-            ):
-                # A task's persisted history can begin with an
-                # assistant-role message today only via a marketplace Hire
-                # flow's seeded persona greeting - there is no other path
-                # that persists an assistant row before any user message.
-                # Anthropic's Messages API (and every claude_compatible
-                # provider routed through it) rejects a request whose first
-                # message isn't role "user", so correct it once here,
-                # before this history is ever replayed into context. This
-                # is deliberately not done in get_messages_for_llm(), which
-                # also serves truncated windows and tool-call/tool-result
-                # pairs that legitimately start mid-conversation.
-                context.add_user_message(
-                    "(conversation start)",
-                    metadata={"_xagent_synthetic": "leading_user_turn"},
+        # The context is cached from here on. A failure before the run's own
+        # ``try`` below would otherwise leave a cached context that looks
+        # live (``run_finishing`` false) although no run will ever consume it.
+        context: ExecutionContext | None = None
+        try:
+            if checkpoint and isinstance(checkpoint.get("context"), dict):
+                reset_output_language_to_request_context(checkpoint)
+                context = ExecutionContext.from_dict(checkpoint["context"])
+                warn_restored_compact_threshold(
+                    context, getattr(self.agent, "llm", None)
                 )
-            for message in replay_messages:
-                role = str(message.get("role") or "").strip()
-                content = str(message.get("content") or "").strip()
-                context_refs = message.get(
-                    CONTEXT_REFS_KEY, message.get("context_refs", ())
-                )
-                if not role:
-                    continue
-                if not (
-                    content
-                    or context_refs
-                    or message.get("tool_calls")
-                    or role == "tool"
-                ):
-                    continue
-                if (
-                    role == "tool"
-                    and message.get("tool_name") is not None
-                    and "raw_result" in message
-                ):
-                    # Replay through add_tool_result so it gets the same
-                    # sanitization/formatting and metadata (raw_result,
-                    # tool_name) as a live tool observation would.
-                    context.add_tool_result(
-                        tool_name=str(message["tool_name"]),
-                        result=message["raw_result"],
-                        tool_call_id=message.get("tool_call_id"),
-                        context_refs=context_refs,
-                    )
-                elif role == "assistant" and message.get("tool_calls"):
-                    context.add_assistant_message(
-                        content,
-                        tool_calls=message["tool_calls"],
-                        context_refs=context_refs,
-                    )
-                else:
-                    context.add_message(
-                        role,
-                        content,
-                        context_refs=context_refs,
-                        tool_calls=message.get("tool_calls"),
-                        tool_call_id=message.get("tool_call_id"),
-                    )
-            if task:
-                context.add_user_message(
-                    task,
-                    metadata=self._initial_user_message_metadata(context),
-                    context_refs=task_context_refs,
-                )
-
-        # A runner registered by post_user_message before the host installed
-        # its handler would otherwise resume handler-less (#1328); an
-        # explicit handler passed to the resumed run wins over the
-        # constructor-time one. Passing None here means "inherit the
-        # constructor-time handler," not "clear it"; no caller clears a
-        # handler today, so there is deliberately no sentinel for that.
-        runtime = runtime or PatternRuntime(
-            tracer=self.tracer,
-            execution_id=execution_id,
-            interrupt_checker=interrupt_checker,
-            outbound_message_handler=(
-                outbound_message_handler
-                if outbound_message_handler is not None
-                else self.outbound_message_handler
-            ),
-        )
-        if self.workspace_enabled and runtime.context_ref_resolver is None:
-            if workspace is None:
-                workspace_base = base_dir or self.workspace_base_dir
-                if context.workspace_path:
-                    workspace_base = str(Path(context.workspace_path).parent)
-                workspace = self.workspace_manager.get_or_create_workspace(
-                    base_dir=workspace_base,
-                    task_id=context.workspace_id or workspace_id or execution_id,
+                self._merge_context_metadata(context, metadata, restored=True)
+                self.context_manager.set_context(context)
+                execution_id = context.execution_id
+                workspace = None
+            else:
+                context, workspace = await self._build_context(
+                    task=task,
+                    execution_id=execution_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    workspace_id=workspace_id,
                     allowed_external_dirs=allowed_external_dirs,
-                    scope_segments=self.scope_segments,
+                    base_dir=base_dir,
+                    metadata=metadata,
                 )
-                if inspect.isawaitable(workspace):
-                    workspace = await workspace
-            runtime.context_ref_resolver = WorkspaceContextReferenceResolver(workspace)
-        if workspace is not None and callable(
-            getattr(workspace, "register_delivery_file", None)
-        ):
-            runtime.inline_file_delivery = InlineFileDelivery(workspace)
-        context_checkpoint_gate(context).run_finishing = False
-        self._active_controls[execution_id] = ExecutionControl(
-            runtime=runtime,
-            task=task,
-        )
+                replay_messages = initial_messages or []
+                if (
+                    replay_messages
+                    and str(replay_messages[0].get("role") or "").strip() == "assistant"
+                ):
+                    # A task's persisted history can begin with an
+                    # assistant-role message today only via a marketplace Hire
+                    # flow's seeded persona greeting - there is no other path
+                    # that persists an assistant row before any user message.
+                    # Anthropic's Messages API (and every claude_compatible
+                    # provider routed through it) rejects a request whose first
+                    # message isn't role "user", so correct it once here,
+                    # before this history is ever replayed into context. This
+                    # is deliberately not done in get_messages_for_llm(), which
+                    # also serves truncated windows and tool-call/tool-result
+                    # pairs that legitimately start mid-conversation.
+                    context.add_user_message(
+                        "(conversation start)",
+                        metadata={"_xagent_synthetic": "leading_user_turn"},
+                    )
+                for message in replay_messages:
+                    role = str(message.get("role") or "").strip()
+                    content = str(message.get("content") or "").strip()
+                    context_refs = message.get(
+                        CONTEXT_REFS_KEY, message.get("context_refs", ())
+                    )
+                    if not role:
+                        continue
+                    if not (
+                        content
+                        or context_refs
+                        or message.get("tool_calls")
+                        or role == "tool"
+                    ):
+                        continue
+                    if (
+                        role == "tool"
+                        and message.get("tool_name") is not None
+                        and "raw_result" in message
+                    ):
+                        # Replay through add_tool_result so it gets the same
+                        # sanitization/formatting and metadata (raw_result,
+                        # tool_name) as a live tool observation would.
+                        context.add_tool_result(
+                            tool_name=str(message["tool_name"]),
+                            result=message["raw_result"],
+                            tool_call_id=message.get("tool_call_id"),
+                            context_refs=context_refs,
+                        )
+                    elif role == "assistant" and message.get("tool_calls"):
+                        context.add_assistant_message(
+                            content,
+                            tool_calls=message["tool_calls"],
+                            context_refs=context_refs,
+                        )
+                    else:
+                        context.add_message(
+                            role,
+                            content,
+                            context_refs=context_refs,
+                            tool_calls=message.get("tool_calls"),
+                            tool_call_id=message.get("tool_call_id"),
+                        )
+                if task:
+                    context.add_user_message(
+                        task,
+                        metadata=self._initial_user_message_metadata(context),
+                        context_refs=task_context_refs,
+                    )
+
+            # A runner registered by post_user_message before the host installed
+            # its handler would otherwise resume handler-less (#1328); an
+            # explicit handler passed to the resumed run wins over the
+            # constructor-time one. Passing None here means "inherit the
+            # constructor-time handler," not "clear it"; no caller clears a
+            # handler today, so there is deliberately no sentinel for that.
+            runtime = runtime or PatternRuntime(
+                tracer=self.tracer,
+                execution_id=execution_id,
+                interrupt_checker=interrupt_checker,
+                outbound_message_handler=(
+                    outbound_message_handler
+                    if outbound_message_handler is not None
+                    else self.outbound_message_handler
+                ),
+            )
+            if self.workspace_enabled and runtime.context_ref_resolver is None:
+                if workspace is None:
+                    workspace_base = base_dir or self.workspace_base_dir
+                    if context.workspace_path:
+                        workspace_base = str(Path(context.workspace_path).parent)
+                    workspace = self.workspace_manager.get_or_create_workspace(
+                        base_dir=workspace_base,
+                        task_id=context.workspace_id or workspace_id or execution_id,
+                        allowed_external_dirs=allowed_external_dirs,
+                        scope_segments=self.scope_segments,
+                    )
+                    if inspect.isawaitable(workspace):
+                        workspace = await workspace
+                runtime.context_ref_resolver = WorkspaceContextReferenceResolver(
+                    workspace
+                )
+            if workspace is not None and callable(
+                getattr(workspace, "register_delivery_file", None)
+            ):
+                runtime.inline_file_delivery = InlineFileDelivery(workspace)
+            context_checkpoint_gate(context).run_finishing = False
+            self._active_controls[execution_id] = ExecutionControl(
+                runtime=runtime,
+                task=task,
+            )
+        except BaseException:
+            if context is not None:
+                self._abandon_unstarted_context(execution_id, context)
+            raise
 
         # Establish the user's request as the turn's goal. The "auto" model
         # routes on this rather than on the scaffolded sub-prompt a given LLM
@@ -445,7 +458,7 @@ class AgentRunner:
                     "execution_id": execution_id,
                     "context": context,
                 }
-                await self._finish_run(context, result)
+                await self._finish_run(context, result, runtime=runtime)
                 return result
 
             tools = [*getattr(self.agent, "tools", []), *(extra_tools or [])]
@@ -478,7 +491,7 @@ class AgentRunner:
                             "context": context,
                             "pattern": pattern.__class__.__name__,
                         }
-                        await self._finish_run(context, normalized)
+                        await self._finish_run(context, normalized, runtime=runtime)
                         return normalized
                     except CheckpointPersistenceError as exc:
                         # A checkpoint that did not persist is not a
@@ -560,7 +573,7 @@ class AgentRunner:
                     )
                     if normalized.get("success"):
                         teardown_status = str(normalized.get("status") or "completed")
-                        await self._finish_run(context, normalized)
+                        await self._finish_run(context, normalized, runtime=runtime)
                         return normalized
                     normalized_status = str(
                         normalized.get("status") or "failed"
@@ -591,7 +604,7 @@ class AgentRunner:
                                 "result while it still has live step tasks."
                             )
                     if normalized_status in {"interrupted", "waiting_for_user"}:
-                        await self._finish_run(context, normalized)
+                        await self._finish_run(context, normalized, runtime=runtime)
                         return normalized
 
                     pattern_errors.append(
@@ -613,7 +626,7 @@ class AgentRunner:
             if len(pattern_errors) == 1:
                 single_result = pattern_errors[0].get("result")
                 if isinstance(single_result, dict):
-                    await self._finish_run(context, single_result)
+                    await self._finish_run(context, single_result, runtime=runtime)
                     return single_result
 
             result = {
@@ -624,16 +637,43 @@ class AgentRunner:
                 "execution_id": execution_id,
                 "context": context,
             }
-            await self._finish_run(context, result)
+            await self._finish_run(context, result, runtime=runtime)
             return result
         finally:
             # Closing admission is synchronous, including cancellation/error exits.
             # An injection already holding the gate may finish; later live inputs
             # must use the deferred owner, which drains that gate before reloading.
             context_checkpoint_gate(context).run_finishing = True
+            # With no run left the checkpoint is authoritative again; another
+            # process may extend it before this one sees the next input.
+            self._release_idle_context(execution_id, context)
             runtime.discard_inline_file_streams()
             self._active_controls.pop(execution_id, None)
             exit_goal(goal_token)
+
+    def _release_idle_context(
+        self, execution_id: str, context: ExecutionContext
+    ) -> None:
+        """Evict a context no run or injection in this process still uses.
+
+        The cache is process-wide and shared across runner instances, so
+        idleness is read from the context's own gate rather than from this
+        runner's active controls. A fenced context stays cached so later input
+        sees the fence instead of cold-starting past the uncertain write.
+        """
+        gate = context_checkpoint_gate(context)
+        if (
+            gate.run_finishing
+            and not gate.injection_uncertain
+            and gate.injections_in_flight == 0
+        ):
+            self.context_manager.discard_context(execution_id, context)
+
+    def _abandon_unstarted_context(
+        self, execution_id: str, context: ExecutionContext
+    ) -> None:
+        context_checkpoint_gate(context).run_finishing = True
+        self._release_idle_context(execution_id, context)
 
     def pause(self, execution_id: str, reason: str | None = None) -> bool:
         control = self._active_controls.get(execution_id)
@@ -700,39 +740,119 @@ class AgentRunner:
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> UserMessageInjectionResult:
+        # The context this call currently uses stays cached until the call
+        # returns, callback and watermark re-persist included; the last
+        # holder of an idle context evicts it.
+        held: list[ExecutionContext] = []
+        try:
+            return await self._inject_user_message(
+                execution_id,
+                message,
+                execution_message=execution_message,
+                display_message=display_message,
+                files=files,
+                turn_id=turn_id,
+                request_interrupt=request_interrupt,
+                reason=reason,
+                held=held,
+            )
+        finally:
+            self._release_injection_hold(execution_id, held)
+
+    def _hold_injection_context(
+        self,
+        execution_id: str,
+        held: list[ExecutionContext],
+        context: ExecutionContext,
+    ) -> None:
+        # Synchronous with the lookup that produced ``context``, so no
+        # eviction can slip in between.
+        if held and held[0] is context:
+            return
+        self._release_injection_hold(execution_id, held)
+        context_checkpoint_gate(context).injections_in_flight += 1
+        held.append(context)
+
+    def _release_injection_hold(
+        self, execution_id: str, held: list[ExecutionContext]
+    ) -> None:
+        while held:
+            previous = held.pop()
+            context_checkpoint_gate(previous).injections_in_flight -= 1
+            self._release_idle_context(execution_id, previous)
+
+    def _restore_context_from_checkpoint(
+        self, execution_id: str, checkpoint: dict[str, Any]
+    ) -> ExecutionContext:
+        if not isinstance(checkpoint.get("context"), dict):
+            raise CheckpointCorruptError(
+                "Stored checkpoint carries no execution context to restore."
+            )
+        # Migrate the payload before copying from it, so the restored
+        # context sees every change whatever the migration rewrites.
+        reset_output_language_to_request_context(checkpoint)
+        context_data = checkpoint["context"]
+        stored_id = context_data.get("execution_id")
+        if not stored_id:
+            # Restore under the key it was loaded by; a generated id
+            # would never match the cache lookup below.
+            context_data = {**context_data, "execution_id": execution_id}
+        elif stored_id != execution_id:
+            raise CheckpointCorruptError(
+                "Stored checkpoint context belongs to a different execution."
+            )
+        context = ExecutionContext.from_dict(context_data)
+        # Only a run caches its context before this lookup, so no run of this
+        # execution is live here: live input must take the deferred path.
+        context_checkpoint_gate(context).run_finishing = True
+        warn_restored_compact_threshold(context, getattr(self.agent, "llm", None))
+        return context
+
+    async def _inject_user_message(
+        self,
+        execution_id: str,
+        message: str | None,
+        *,
+        execution_message: str | None,
+        display_message: str | None,
+        files: list[dict[str, Any]] | None,
+        turn_id: str | None,
+        request_interrupt: bool,
+        reason: str | None,
+        held: list[ExecutionContext],
+    ) -> UserMessageInjectionResult:
         while True:
             context = self.context_manager.get_context(execution_id)
             cold_start_checkpoint: dict[str, Any] | None = None
             if context is None:
-                checkpoint = await self._load_latest_checkpoint(execution_id)
-                if checkpoint is None:
-                    return UserMessageInjectionResult(
-                        context=None,
-                        outcome=UserMessageInjectionOutcome.NOT_POSTED,
+                # An idle context is evicted when its last user returns, which
+                # can land between this read and publishing the result: the
+                # evicted context's final write may postdate the read. The
+                # epoch token makes such a reader discard its snapshot and
+                # read again instead of caching the stale checkpoint.
+                token = self.context_manager.begin_cold_start(execution_id)
+                checkpoint: dict[str, Any] | None = None
+                restored: ExecutionContext | None = None
+                try:
+                    checkpoint = await self._load_latest_checkpoint(execution_id)
+                    if checkpoint is not None:
+                        restored = self._restore_context_from_checkpoint(
+                            execution_id, checkpoint
+                        )
+                finally:
+                    context = self.context_manager.end_cold_start(
+                        execution_id, token, restored
                     )
-                if not isinstance(checkpoint.get("context"), dict):
-                    raise CheckpointCorruptError(
-                        "Stored checkpoint carries no execution context to restore."
-                    )
-                # Migrate the payload before copying from it, so the restored
-                # context sees every change whatever the migration rewrites.
-                reset_output_language_to_request_context(checkpoint)
-                cold_start_checkpoint = checkpoint
-                context_data = checkpoint["context"]
-                stored_id = context_data.get("execution_id")
-                if not stored_id:
-                    # Restore under the key it was loaded by; a generated id
-                    # would never match the cache lookup below.
-                    context_data = {**context_data, "execution_id": execution_id}
-                elif stored_id != execution_id:
-                    raise CheckpointCorruptError(
-                        "Stored checkpoint context belongs to a different execution."
-                    )
-                context = ExecutionContext.from_dict(context_data)
-                warn_restored_compact_threshold(
-                    context, getattr(self.agent, "llm", None)
-                )
-                context = self.context_manager.set_context_if_absent(context)
+                if context is None:
+                    if checkpoint is None:
+                        return UserMessageInjectionResult(
+                            context=None,
+                            outcome=UserMessageInjectionOutcome.NOT_POSTED,
+                        )
+                    continue
+                if context is restored:
+                    cold_start_checkpoint = checkpoint
+            self._hold_injection_context(execution_id, held, context)
 
             # Display-vs-execution split: ``execution_message`` is the prompt
             # the agent runtime sees (may be enriched with file refs / system
@@ -939,9 +1059,15 @@ class AgentRunner:
                 watermark_after and watermark_after != watermark_before
             ) or traced_turn_ids_after != traced_turn_ids_before:
                 async with gate.exclusive(execution_id):
-                    if gate.injection_uncertain:
-                        # A later injection became uncertain during this callback.
-                        # Never overwrite its durable candidate with stale live state.
+                    if (
+                        gate.injection_uncertain
+                        or self.context_manager.get_context(execution_id) is not context
+                    ):
+                        # A later injection became uncertain during this callback,
+                        # or a newer context (a resumed run, a reload past a fence)
+                        # replaced this one. Never overwrite its durable state with
+                        # this stale object; the pending marker stays durable and
+                        # resume catch-up replays it, deduplicated by turn_id.
                         return UserMessageInjectionResult(
                             context=context,
                             outcome=UserMessageInjectionOutcome.POSTED_FRESH,
@@ -1121,25 +1247,31 @@ class AgentRunner:
             system_prompt=getattr(self.agent, "system_prompt", None),
             **context_kwargs,
         )
-        # Snapshotted at task start. On resume the context (and this threshold)
-        # is restored verbatim from the checkpoint, so a context-window or ratio
-        # change made after checkpointing only affects newly started tasks.
-        (
-            context.compact_config.threshold,
-            context.compact_config.threshold_source,
-        ) = self._resolve_compact_threshold()
-        self._merge_context_metadata(context, metadata)
-        if task:
-            context.metadata.setdefault("task", task)
+        try:
+            # Snapshotted at task start. On resume the context (and this
+            # threshold) is restored verbatim from the checkpoint, so a
+            # context-window or ratio change made after checkpointing only
+            # affects newly started tasks.
+            (
+                context.compact_config.threshold,
+                context.compact_config.threshold_source,
+            ) = self._resolve_compact_threshold()
+            self._merge_context_metadata(context, metadata)
+            if task:
+                context.metadata.setdefault("task", task)
 
-        memory_session = await self._resolve_memory_session(
-            execution_id=execution_id,
-            user_id=user_id,
-            session_id=session_id,
-        )
-        if memory_session is not None:
-            memory_id, snapshot = memory_session
-            context.attach_memory_session(memory_id, snapshot)
+            memory_session = await self._resolve_memory_session(
+                execution_id=execution_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if memory_session is not None:
+                memory_id, snapshot = memory_session
+                context.attach_memory_session(memory_id, snapshot)
+        except BaseException:
+            # ``create_context`` already cached it; see the guard in ``run``.
+            self._abandon_unstarted_context(execution_id, context)
+            raise
 
         return context, workspace
 
@@ -1616,7 +1748,11 @@ class AgentRunner:
         )
 
     async def _finish_run(
-        self, context: ExecutionContext, result: dict[str, Any]
+        self,
+        context: ExecutionContext,
+        result: dict[str, Any],
+        *,
+        runtime: PatternRuntime,
     ) -> None:
         # Drain an in-flight injection before publishing a terminal result.
         # Once closed, late live input takes the existing deferred-post path;
@@ -1625,6 +1761,21 @@ class AgentRunner:
         async with gate.shared():
             gate.run_finishing = True
             result["injection_outcome_unknown"] = gate.injection_uncertain
+        # The idle context is evicted when the run returns, so the answer the
+        # runner appended after the pattern's last checkpoint must be durable
+        # for the next input to see it. Only completed runs: a waiting or
+        # interrupted pattern's checkpoint already describes where to resume
+        # (ReAct records its message count), and the question appended here
+        # would read as an answer on a resume without a reply.
+        if result.get("success") is True:
+            try:
+                await runtime.checkpoint_context_tail("run_end_tail", context=context)
+            except Exception:
+                logger.warning(
+                    "Final context checkpoint failed for %s; the result stands",
+                    context.execution_id,
+                    exc_info=True,
+                )
         await self._dispatch_callback(
             "on_run_end", runner=self, context=context, result=result
         )

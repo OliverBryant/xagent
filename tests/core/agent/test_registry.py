@@ -601,7 +601,8 @@ async def test_registry_post_user_message_reports_fresh_vs_replay(
             request_interrupt=False,
         )
         assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
-        assert second.context is first.context
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
         return
 
     assert scenario == "conflicting_content"

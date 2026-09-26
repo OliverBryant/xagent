@@ -932,7 +932,7 @@ class TestMigrations:
         with pytest.raises(RuntimeError, match="ambiguous generation"):
             command.downgrade(
                 postgresql_tester.alembic_cfg,
-                "20260911_global_memory_authority",
+                "20260926_merge_pacing_cleanup",
             )
 
     @pytest.mark.postgresql
@@ -943,7 +943,7 @@ class TestMigrations:
         command.upgrade(postgresql_tester.alembic_cfg, "head")
         command.downgrade(
             postgresql_tester.alembic_cfg,
-            "20260911_global_memory_authority",
+            "20260926_merge_pacing_cleanup",
         )
         columns = set(postgresql_tester.get_column_names("durable_sandbox_lifecycles"))
         assert "create_phase" not in columns

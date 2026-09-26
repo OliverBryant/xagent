@@ -1,7 +1,7 @@
 """Add durable create-operation phases and successor generations.
 
 Revision ID: 20260916_durable_create_operations
-Revises: 20260911_global_memory_authority
+Revises: 20260926_merge_pacing_cleanup
 
 The substrate remains dormant: this migration adds ownership metadata and
 cross-dialect generation fencing but wires no runtime consumer.
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20260916_durable_create_operations"
-down_revision = "20260911_global_memory_authority"
+down_revision = "20260926_merge_pacing_cleanup"
 branch_labels = None
 depends_on = None
 

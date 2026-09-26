@@ -26,7 +26,12 @@ from sqlalchemy.orm import Session
 
 from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
-from ...core.agent.runner import UserMessageInjectionOutcome
+from ...core.agent.runner import (
+    InjectionDisposition,
+    UserMessageInjectionOutcome,
+    classify_injection,
+    track_user_message_injection,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     resolve_execution_scope,
@@ -39,6 +44,11 @@ from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from . import task_execution as task_execution_service
+from .task_admission_execution import (
+    AdmissionWaiting,
+    allow_injected_guidance,
+    require_execution_admission_isolated,
+)
 from .task_execution import (
     ClientVisibleError,
     ClientVisibleValidationError,
@@ -78,7 +88,11 @@ from .client_error_messages import (
     ClientErrorCode,
     client_error_message,
 )
-from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .db_runtime import (
+    drain_async_task_cancellation_safe,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
 from .external_task_cancel import (
     EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
@@ -1384,6 +1398,7 @@ async def handle_task_message(
         message: str,
         *,
         error_code: str | None = None,
+        retry_with_new_id: bool = False,
     ) -> bool:
         """Reject pre-dispatch failures; never confuse persistence with delivery."""
 
@@ -1435,14 +1450,14 @@ async def handle_task_message(
                 rejection_outcome="outcome_unknown",
             )
         else:
+            rejection_unknown = delivery_failure_pool_timeout or delivery_injected
             await finish_delivery(
                 False,
                 message,
                 error_code=error_code,
+                retry_with_new_id=retry_with_new_id and not rejection_unknown,
                 rejection_outcome=(
-                    "outcome_unknown"
-                    if delivery_failure_pool_timeout or delivery_injected
-                    else "not_accepted"
+                    "outcome_unknown" if rejection_unknown else "not_accepted"
                 ),
             )
         return not delivery_failure_pool_timeout
@@ -1825,6 +1840,7 @@ async def handle_task_message(
                     # check (see active_interaction_id_sync's docstring).
                     # Three branches, not a two-way isinstance fold, so
                     # Unavailable stays visible on its own line.
+                    active_interaction_id: int | None
                     if isinstance(active_interaction_read, ActiveInteractionFound):
                         active_interaction_id = active_interaction_read.interaction_id
                     elif isinstance(active_interaction_read, ActiveInteractionAbsent):
@@ -1844,48 +1860,118 @@ async def handle_task_message(
                         assert_never(active_interaction_read)
 
                     posted = UserMessageInjectionOutcome.NOT_POSTED
+                    disposition = InjectionDisposition.DEFER
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
-                            try:
-                                posted = await agent_service.post_user_message(
-                                    str(task_id),
-                                    execution_message=user_message_for_llm,
-                                    display_message=display_user_message,
-                                    files=display_file_refs,
-                                    turn_id=turn_id,
-                                    request_interrupt=True,
-                                    reason="new websocket user message",
-                                )
-                            except CheckpointUnavailableError:
-                                # Fold into the existing not-posted path
-                                # below: the durable message is deferred to
-                                # the resume owner instead of injected live,
-                                # exactly as when there was no exact lease
-                                # or checkpoint to inject into. Distinct
-                                # from corrupt/refused, which are not
-                                # retryable by simply deferring.
-                                posted = UserMessageInjectionOutcome.NOT_POSTED
-                            except CheckpointReadError:
-                                # Corrupt and refused reach here today. The
-                                # base class is deliberate: a read failure
-                                # that is not the retryable-by-deferring
-                                # unavailable case must reject the claimed
-                                # delivery rather than escape this handler
-                                # and orphan it. Use finish_delivery_failure,
-                                # not finish_delivery, so the row is actually
-                                # persisted DELIVERY_FAILED -- otherwise it
-                                # stays DELIVERY_PENDING forever and a retry
-                                # with the same client_message_id loops on
-                                # "still being applied".
-                                task_execution_service.background_task_manager.release_resume_reservation(
-                                    task_id
-                                )
-                                await answer_durable_turn_failure(
-                                    ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
-                                )
-                                return
-                    if posted is UserMessageInjectionOutcome.OUTCOME_UNKNOWN:
-                        delivery_outcome_unknown = True
+                            with track_user_message_injection() as attempt:
+                                try:
+                                    posted = await agent_service.post_user_message(
+                                        str(task_id),
+                                        execution_message=user_message_for_llm,
+                                        display_message=display_user_message,
+                                        files=display_file_refs,
+                                        turn_id=turn_id,
+                                        request_interrupt=True,
+                                        reason="new websocket user message",
+                                    )
+                                except BaseException as injection_error:
+                                    disposition = classify_injection(
+                                        attempt.outcome, error=injection_error
+                                    )
+                                    before_write = (
+                                        disposition
+                                        is InjectionDisposition.FAILED_BEFORE_WRITE
+                                    )
+                                    if before_write and isinstance(
+                                        injection_error, CheckpointUnavailableError
+                                    ):
+                                        # Fold into the existing not-posted
+                                        # path below: the durable message is
+                                        # deferred to the resume owner instead
+                                        # of injected live, exactly as when
+                                        # there was no exact lease or
+                                        # checkpoint to inject into. Distinct
+                                        # from corrupt/refused, which are not
+                                        # retryable by simply deferring.
+                                        disposition = InjectionDisposition.DEFER
+                                    elif before_write and isinstance(
+                                        injection_error, CheckpointReadError
+                                    ):
+                                        # Corrupt and refused reach here today.
+                                        # The base class is deliberate: a read
+                                        # failure that is not the
+                                        # retryable-by-deferring unavailable
+                                        # case must reject the claimed delivery
+                                        # rather than escape this handler and
+                                        # orphan it. Use
+                                        # finish_delivery_failure, not
+                                        # finish_delivery, so the row is
+                                        # actually persisted DELIVERY_FAILED --
+                                        # otherwise it stays DELIVERY_PENDING
+                                        # forever and a retry with the same
+                                        # client_message_id loops on "still
+                                        # being applied".
+                                        task_execution_service.background_task_manager.release_resume_reservation(
+                                            task_id
+                                        )
+                                        await answer_durable_turn_failure(
+                                            ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
+                                        )
+                                        return
+                                    elif (
+                                        disposition is InjectionDisposition.ACCEPTED
+                                        and isinstance(injection_error, Exception)
+                                    ):
+                                        # The turn is durable; only a later
+                                        # projection (such as the registry
+                                        # event) failed. Continue as accepted.
+                                        logger.warning(
+                                            "post-acceptance injection error for "
+                                            "task %s turn %s",
+                                            task_id,
+                                            turn_id,
+                                            exc_info=True,
+                                        )
+                                        posted = attempt.outcome
+                                    elif not (
+                                        disposition
+                                        is InjectionDisposition.NOT_ACCEPTED_RETRYABLE
+                                        and isinstance(injection_error, Exception)
+                                    ):
+                                        # Cancellation (or an unclassified
+                                        # error) keeps propagating; the outer
+                                        # handlers read these flags.
+                                        delivery_outcome_unknown = (
+                                            disposition is InjectionDisposition.UNKNOWN
+                                        )
+                                        delivery_injected = (
+                                            disposition is InjectionDisposition.ACCEPTED
+                                        )
+                                        raise
+                                else:
+                                    disposition = classify_injection(
+                                        attempt.outcome, posted=posted
+                                    )
+                    delivery_outcome_unknown = (
+                        disposition is InjectionDisposition.UNKNOWN
+                    )
+                    if disposition is InjectionDisposition.NOT_ACCEPTED_RETRYABLE:
+                        # Nothing was written (a fenced run, or a read-back that
+                        # proved absence). Deferring would resume a fenced run,
+                        # so reject it and let the sender retry with a new id.
+                        # The run itself is unaffected: no task-wide failure.
+                        task_execution_service.background_task_manager.release_resume_reservation(
+                            task_id
+                        )
+                        await finish_delivery_failure(
+                            client_error_message(
+                                ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                            ),
+                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+                            retry_with_new_id=True,
+                        )
+                        return
+                    if disposition is InjectionDisposition.UNKNOWN:
                         task_execution_service.background_task_manager.release_resume_reservation(
                             task_id
                         )
@@ -1896,13 +1982,19 @@ async def handle_task_message(
                             error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
                         )
                         return
-                    delivery_injected = bool(posted)
+                    delivery_injected = disposition is InjectionDisposition.ACCEPTED
                     if not posted:
                         logger.warning(
                             "Agent execution %s had no exact live lease or "
                             "checkpoint; deferring the durable user message "
                             "until the resume owner is ready",
                             task_id,
+                        )
+                    if posted:
+                        allow_injected_guidance(task_id, task_run_id)
+                    else:
+                        await run_db_io_cancellation_safe(
+                            lambda: require_execution_admission_isolated(task_id)
                         )
                     handoff_snapshot = await task_execution_controller.transition(
                         task_id,
@@ -2455,6 +2547,8 @@ async def handle_task_message(
                 ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
             ):
                 return
+        except AdmissionWaiting:
+            raise
         except RuntimeError as e:
             # RuntimeError is incidental server detail. Reuse the same
             # audience split as the durable-failure arms above: the initiator
@@ -2476,6 +2570,48 @@ async def handle_task_message(
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
+    except asyncio.CancelledError:
+        if delivery_outcome_unknown:
+            task_execution_service.background_task_manager.release_resume_reservation(
+                task_id
+            )
+            cleanup = asyncio.create_task(
+                finish_delivery_failure(
+                    client_error_message(ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN),
+                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                )
+            )
+            await drain_async_task_cancellation_safe(cleanup)
+        elif delivery_injected and delivery_claimed and not delivery_dispatched:
+            # The turn became durable before this cancellation landed. It is
+            # accepted, not unknown: record it so a same-id retry is answered
+            # as accepted instead of waiting on a pending row forever.
+            task_execution_service.background_task_manager.release_resume_reservation(
+                task_id
+            )
+
+            async def finish_accepted_delivery() -> None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after a cancelled accepted "
+                        "injection for task %s turn %s",
+                        task_id,
+                        turn_id,
+                        exc_info=True,
+                    )
+                await finish_delivery(True)
+
+            accepted_cleanup = asyncio.create_task(finish_accepted_delivery())
+            await drain_async_task_cancellation_safe(accepted_cleanup)
+        raise
     except ClientVisiblePermissionError as e:
         log_client_facing_failure(e, "Message permission error: %s")
         message = client_error_message(e.error_code)
@@ -2537,6 +2673,8 @@ async def handle_task_message(
             client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE),
             error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE.value,
         )
+        raise
+    except AdmissionWaiting:
         raise
     except Exception as e:
         # Other errors, re-raise
@@ -3423,7 +3561,7 @@ def _load_command_actor(actor_user_id: int | None) -> _CommandActor:
 
 async def _execute_durable_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one DB-claimed command; personal replies use the host callback.
 
     A runner without an originating connection discards personal replies while
@@ -3469,6 +3607,14 @@ async def _execute_durable_task_command(
             lambda: _load_command_task_run_id(command.task_id)
         )
         if current_run_id != command.target_run_id:
+            if command.kind == TaskCommandKind.PAUSE:
+                from .task_execution_admission import settle_queued_start_for_pause
+
+                settled = await run_db_io_cancellation_safe(
+                    lambda: settle_queued_start_for_pause(command)
+                )
+                if settled is not None:
+                    return settled
             raise TaskCommandRejected(
                 f"Task run changed before {command.kind.value} command "
                 f"{command.command_id} was applied",
@@ -3891,11 +4037,13 @@ async def execute_durable_task_command(
 
 async def _execute_and_report_task_command(
     command: ClaimedTaskCommand,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | None | SettledTaskCommand:
     """Apply one command and expose only terminal transport failures to clients."""
 
     try:
         result = await _execute_durable_task_command(command)
+    except AdmissionWaiting:
+        raise
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= max_command_defers():
             finish_task_command_delivery(command.command_id, command.task_id)

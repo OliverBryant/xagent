@@ -43,7 +43,7 @@ from fastapi.responses import JSONResponse
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from ...config import (
     get_google_drive_download_timeout_seconds,
@@ -62,6 +62,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     FusionConfig,
     IngestionConfig,
     IngestionResult,
+    IngestionStepResult,
     ListCollectionsResult,
     ParseMethod,
     ParseResultResponse,
@@ -117,6 +118,7 @@ from ..services.background_jobs import (
     is_background_job_enqueue_available,
     mark_job_failed,
 )
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.google_drive_download import download_google_workspace_file
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
@@ -135,6 +137,9 @@ from ..services.kb_file_service import (
 )
 from ..services.kb_file_service import (
     get_document_record_file_id as _get_document_record_file_id,
+)
+from ..services.kb_file_service import (
+    list_document_records_for_file_ids as _list_document_records_for_file_ids,
 )
 from ..services.kb_file_service import (
     list_documents_for_user as _list_documents_for_user,
@@ -223,9 +228,9 @@ def _create_file_compensation_restore(
     existing_path: Path,
     backup_path: Optional[Path],
     record_snapshot: dict[str, Any],
+    previous_version: UploadedFileVersionSnapshot,
+    expected_current_version: UploadedFileVersionSnapshot,
     had_existing_file: bool = True,
-    previous_version: UploadedFileVersionSnapshot | None = None,
-    expected_current_version: UploadedFileVersionSnapshot | None = None,
 ) -> Callable[[], None]:
     """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
 
@@ -250,13 +255,7 @@ def _create_file_compensation_restore(
                 .first()
             )
             if refreshed_record is not None:
-                if previous_version is None or expected_current_version is None:
-                    logger.warning(
-                        "Skipping legacy uploaded-file metadata rollback without "
-                        "both previous and applied version receipts: %s",
-                        file_record_id,
-                    )
-                elif had_existing_file:
+                if had_existing_file:
                     UploadedFileStore(rollback_db).upsert_by_storage_path(
                         user_id=previous_version.user_id,
                         file_id=previous_version.file_id,
@@ -299,6 +298,7 @@ def _create_document_compensation(
     is_admin: bool,
     file_record_id: str,
     rag_document_snapshot: Optional["_RagDocumentSnapshot"] = None,
+    status_cleared: Optional[set[str]] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a DOCUMENT-boundary compensation factory.
 
@@ -319,6 +319,10 @@ def _create_document_compensation(
                 rag_snapshot=rag_document_snapshot,
                 file_id=file_record_id,
             )
+            # No RAG snapshot: a normal return means DOCUMENT already cleared status.
+            doc_id = _normalized_doc_id(getattr(ingestion_result, "doc_id", None))
+            if status_cleared is not None and rag_document_snapshot is None and doc_id:
+                status_cleared.add(doc_id)
 
         return _compensate
 
@@ -331,6 +335,7 @@ def _create_status_compensation(
     user_id: int,
     is_admin: bool,
     ingestion_runs_snapshot: Optional["_IngestionRunsSnapshot"] = None,
+    status_cleared: Optional[set[str]] = None,
 ) -> Callable[[Optional[IngestionResult]], Callable[[], None]]:
     """Create a STATUS-boundary compensation factory."""
 
@@ -341,13 +346,8 @@ def _create_status_compensation(
             if ingestion_runs_snapshot is not None:
                 _restore_ingestion_runs_snapshot(ingestion_runs_snapshot)
             elif ingestion_result is not None:
-                doc_id = (
-                    ingestion_result.doc_id
-                    if isinstance(ingestion_result.doc_id, str)
-                    and ingestion_result.doc_id
-                    else None
-                )
-                if doc_id:
+                doc_id = _normalized_doc_id(ingestion_result.doc_id)
+                if doc_id and doc_id not in (status_cleared or ()):
                     clear_ingestion_status(
                         collection_name,
                         doc_id,
@@ -809,11 +809,82 @@ def _get_completed_step_metadata(
     return None
 
 
+def _normalized_doc_id(doc_id: object) -> Optional[str]:
+    return doc_id if isinstance(doc_id, str) and doc_id else None
+
+
 def _ingested_document_identity(result: IngestionResult) -> tuple[bool, Optional[str]]:
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
-    doc_id = result.doc_id if isinstance(result.doc_id, str) and result.doc_id else None
+    doc_id = _normalized_doc_id(result.doc_id)
     return register_created, doc_id
+
+
+def _file_document_registered(collection_name: str, file_id: str) -> bool:
+    doc_id = generate_deterministic_doc_id(collection_name, file_id)
+    return (collection_name, doc_id) in _list_document_refs_for_uploaded_file(file_id)
+
+
+async def _document_existed_before_ingest(
+    collection_name: str, existing_file_record: Optional[UploadedFile]
+) -> bool:
+    if existing_file_record is None:
+        return False
+    file_id = str(existing_file_record.file_id)
+    try:
+        return await asyncio.to_thread(
+            _file_document_registered, collection_name, file_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Unknown counts as existing, so a raised ingest keeps the document.
+        logger.warning(
+            "Could not check for an existing document of %s in %s: %s",
+            file_id,
+            collection_name,
+            exc,
+        )
+        return True
+
+
+async def _raised_ingestion_rollback_result(
+    *,
+    collection_name: str,
+    file_id: str,
+    document_existed_before: bool,
+    message: str,
+) -> IngestionResult:
+    """Rebuild the document identity an ingest lost when it raised."""
+    doc_id = generate_deterministic_doc_id(collection_name, file_id)
+    try:
+        registered = await asyncio.to_thread(
+            _file_document_registered, collection_name, file_id
+        )
+    except Exception:  # noqa: BLE001
+        # Unknown counts as registered: deleting a missing new document stops the
+        # rollback before FILE; a pre-existing one only has its status cleared.
+        logger.warning(
+            "Could not check whether document %s is registered in %s",
+            doc_id,
+            collection_name,
+            exc_info=True,
+        )
+        registered = True
+    completed_steps = (
+        [
+            IngestionStepResult(
+                name="register_document",
+                metadata={"doc_id": doc_id, "created": not document_existed_before},
+            )
+        ]
+        if registered
+        else []
+    )
+    return IngestionResult(
+        status="error",
+        doc_id=doc_id,
+        completed_steps=completed_steps,
+        message=message,
+    )
 
 
 def _restore_ingest_file_backup(
@@ -1350,9 +1421,11 @@ async def _rollback_failed_ingestion(
         )
 
     def _compensate_file() -> None:
+        if uploaded_file_existed_before:
+            return
         if register_created and doc_id:
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
+            remaining_records = _list_document_records_for_file_ids(
+                [file_record_id],
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1370,7 +1443,7 @@ async def _rollback_failed_ingestion(
                 remaining_file_ids=remaining_file_ids,
             )
             db.commit()
-        elif not uploaded_file_existed_before:
+        else:
             UploadedFileStore(db).delete(file_record, delete_local=False)
             db.commit()
 
@@ -1414,8 +1487,12 @@ async def _rollback_failed_ingestion(
                 raise RuntimeError(
                     f"delete collection physical directory during rollback failed: {error_detail}"
                 )
-            remaining_records = vector_store.list_document_records(
-                collection_name=None,
+            # Only this run's own row may go; the directory pass would take any row.
+            own_file_ids = (
+                set() if uploaded_file_existed_before else collection_file_ids
+            )
+            remaining_records = _list_document_records_for_file_ids(
+                own_file_ids,
                 user_id=user_id,
                 is_admin=bool(user.is_admin),
             )
@@ -1429,9 +1506,9 @@ async def _rollback_failed_ingestion(
             delete_collection_uploaded_files(
                 db,
                 user_id=user_id,
-                collection_file_ids=collection_file_ids,
+                collection_file_ids=own_file_ids,
                 remaining_file_ids=remaining_file_ids,
-                collection_dir=physical_cleanup.collection_dir,
+                collection_dir=None,
             )
             if not uploaded_file_existed_before:
                 # The collection cleanup above may already delete+commit the UploadedFile
@@ -1451,14 +1528,15 @@ async def _rollback_failed_ingestion(
             )
             db.commit()
 
-        # Comparing doc_ids, not file_ids: two ingests of the same path share a
-        # file_id, so a file_id match cannot tell a sibling's work from ours.
+        # Compare doc_ids, not file_ids (same-path ingests share a file_id); any
+        # record but the document this run created counts as another's.
         delete_whole_collection = await _rollback_may_delete_collection(
             collection_name=collection_name,
             user_id=user_id,
             collection_existed_before=collection_existed_before,
             other_document_present=any(
-                (
+                not register_created
+                or (
                     record.get("doc_id")
                     if isinstance(record, dict)
                     else getattr(record, "doc_id", None)
@@ -1543,8 +1621,10 @@ async def _rollback_failed_cloud_ingestion(
         )
 
     def _compensate_file() -> None:
-        remaining_records = vector_store.list_document_records(
-            collection_name=None,
+        if uploaded_file_existed_before:
+            return
+        remaining_records = _list_document_records_for_file_ids(
+            [file_record_id] if file_record_id is not None else [],
             user_id=user_id,
             is_admin=bool(user.is_admin),
         )
@@ -2542,16 +2622,19 @@ def _create_new_web_file_handler_result(
             file_record_id=file_record_id,
             persistent_file_path=persistent_file_path,
         )
+        status_cleared: set[str] = set()
         document_compensation = _create_document_compensation(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=is_admin,
             file_record_id=file_record_id,
+            status_cleared=status_cleared,
         )
         status_compensation = _create_status_compensation(
             collection_name=collection_name,
             user_id=user_id,
             is_admin=is_admin,
+            status_cleared=status_cleared,
         )
 
         return FileHandlerResult(
@@ -2582,6 +2665,15 @@ def _create_new_web_file_handler_result(
                     cleanup_error,
                 )
         raise
+
+
+def _existing_uploaded_file_version(record: Any) -> UploadedFileVersionSnapshot:
+    if getattr(record, "id", None) is None:
+        raise ValueError(
+            f"Uploaded file {record.file_id} has no row id; "
+            "cannot take its version receipt"
+        )
+    return snapshot_uploaded_file_version(record)
 
 
 def _refresh_existing_file_if_changed(
@@ -2623,11 +2715,7 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
-    previous_version = (
-        snapshot_uploaded_file_version(existing_record)
-        if getattr(existing_record, "id", None) is not None
-        else None
-    )
+    previous_version = _existing_uploaded_file_version(existing_record)
     if not existing_path.exists():
         try:
             existing_path = ManagedFileRef(existing_record).ensure_local()
@@ -2815,11 +2903,7 @@ def _recreate_missing_existing_file(
 ) -> FileHandlerResult:
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
-    previous_version = (
-        snapshot_uploaded_file_version(existing_record)
-        if getattr(existing_record, "id", None) is not None
-        else None
-    )
+    previous_version = _existing_uploaded_file_version(existing_record)
     ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
         str(existing_record.file_id)
     )
@@ -2889,9 +2973,9 @@ def _recreate_missing_existing_file(
                 .filter(UploadedFile.file_id == str(existing_record.file_id))
                 .first()
             )
-            if refreshed_record is not None and (
-                previous_version is None
-                or snapshot_uploaded_file_version(refreshed_record) != previous_version
+            if (
+                refreshed_record is not None
+                and snapshot_uploaded_file_version(refreshed_record) != previous_version
             ):
                 raise UploadedFileVersionConflict(
                     "Uploaded file changed while recreate setup failed; "
@@ -3323,6 +3407,13 @@ async def _save_collection_config_after_ingest(
             f"chunking settings failed, so {advice}: {exc}",
             file_id=file_id,
         ) from exc
+
+
+def _load_google_credentials(
+    user_id: int, session_factory: sessionmaker[Session]
+) -> Any:
+    with session_factory() as db:
+        return get_google_credentials(user_id, db)
 
 
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
@@ -3847,7 +3938,12 @@ async def ingest(
         .filter(UploadedFile.storage_path == str(file_path))
         .first()
     )
-    uploaded_file_existed_before = existing_file_record is not None
+    existing_file_id = (
+        str(existing_file_record.file_id) if existing_file_record is not None else None
+    )
+    document_existed_before = await _document_existed_before_ingest(
+        safe_collection, existing_file_record
+    )
     had_existing_file = file_path.exists()
     file_backup_path: Optional[Path] = None
     if had_existing_file:
@@ -3956,6 +4052,12 @@ async def ingest(
             mime_type=mime_type,
             file_size=int(total_size),
         )
+        # An insert gets a fresh file_id, so a fresh doc id; only an in-place update
+        # keeps the ones the lookup found.
+        uploaded_file_existed_before = str(file_record.file_id) == existing_file_id
+        document_existed_before = (
+            document_existed_before and uploaded_file_existed_before
+        )
 
         def _run_ingestion() -> KBApiOperationResult[IngestionResult]:
             return run_document_ingestion_with_outcome(
@@ -4046,9 +4148,10 @@ async def ingest(
         raise
     except Exception:
         if file_record is not None:
-            rollback_result = IngestionResult(
-                status="error",
-                doc_id=safe_filename,
+            rollback_result = await _raised_ingestion_rollback_result(
+                collection_name=safe_collection,
+                file_id=str(file_record.file_id),
+                document_existed_before=document_existed_before,
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
@@ -4377,6 +4480,8 @@ async def ingest_cloud(
 
     # Concurrency limit for cloud ingestion to avoid overloading
     semaphore = asyncio.Semaphore(5)
+    actor_user_id = int(actor_user.id)
+    credential_sessions = sessionmaker(bind=db.get_bind().engine, autoflush=False)
 
     async def process_file(
         file_info: CloudFile,
@@ -4402,8 +4507,10 @@ async def ingest_cloud(
                         f"{file_info.fileId}/{file_info.resourceKey}"
                     )
                 try:
-                    creds = await asyncio.to_thread(
-                        get_google_credentials, int(actor_user.id), db
+                    creds = await run_db_io_cancellation_safe(
+                        lambda: _load_google_credentials(
+                            actor_user_id, credential_sessions
+                        )
                     )
                 except HTTPException as e:
                     return KBApiOperationResult(
@@ -4629,11 +4736,18 @@ async def ingest_cloud(
                             )
                         return rollback_execution.operation_result
 
-                    uploaded_file_existed_before = (
+                    existing_file_record = (
                         db.query(UploadedFile)
                         .filter(UploadedFile.storage_path == str(file_path))
                         .first()
-                        is not None
+                    )
+                    existing_file_id = (
+                        str(existing_file_record.file_id)
+                        if existing_file_record is not None
+                        else None
+                    )
+                    document_existed_before = await _document_existed_before_ingest(
+                        safe_collection, existing_file_record
                     )
 
                     file_record = _upsert_uploaded_file_record(
@@ -4643,6 +4757,14 @@ async def ingest_cloud(
                         storage_path=file_path,
                         mime_type=stored_mime_type,
                         file_size=int(file_path.stat().st_size),
+                    )
+                    # An insert gets a fresh file_id, so a fresh doc id; only an
+                    # in-place update keeps the ones the lookup found.
+                    uploaded_file_existed_before = (
+                        str(file_record.file_id) == existing_file_id
+                    )
+                    document_existed_before = (
+                        document_existed_before and uploaded_file_existed_before
                     )
 
                     # Run ingestion (blocking)
@@ -4706,23 +4828,17 @@ async def ingest_cloud(
                             except OSError:
                                 pass
                         return api_result
-                    except RollbackFailureError as rollback_exc:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=str(rollback_exc),
-                                doc_id=source_filename,
-                            ),
-                            operation_outcome=api_result.operation_outcome
-                            if "api_result" in locals()
-                            else None,
-                            rollback_complete=False,
-                        )
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
                             doc_id=source_filename,
                             message=f"Ingestion failed: {str(e)}",
+                        )
+                        raised_result = await _raised_ingestion_rollback_result(
+                            collection_name=safe_collection,
+                            file_id=str(file_record.file_id),
+                            document_existed_before=document_existed_before,
+                            message=rollback_result.message,
                         )
                         rollback_api_result = KBApiOperationResult(
                             result=rollback_result,
@@ -4736,7 +4852,7 @@ async def ingest_cloud(
                                 db=db,
                                 user=_user,
                                 collection_name=safe_collection,
-                                result=rollback_result,
+                                result=raised_result,
                                 file_path=file_path,
                                 file_record=file_record,
                                 collection_existed_before=collection_existed_before,
@@ -4766,16 +4882,6 @@ async def ingest_cloud(
                         )
                     )
 
-            except RollbackFailureError as e:
-                logger.exception("Rollback failed for %s: %s", file_info.fileName, e)
-                return KBApiOperationResult(
-                    result=IngestionResult(
-                        status="error",
-                        message=str(e),
-                        doc_id=source_filename,
-                    ),
-                    rollback_complete=False,
-                )
             except Exception as e:
                 rollback_api_result = KBApiOperationResult(
                     result=IngestionResult(
@@ -4816,7 +4922,28 @@ async def ingest_cloud(
                 return rollback_execution.operation_result
 
     # Run all file processings concurrently
-    api_results = await asyncio.gather(*[process_file(f) for f in request.files])
+    outcomes = await asyncio.gather(
+        *[process_file(f) for f in request.files], return_exceptions=True
+    )
+    api_results: List[KBApiOperationResult[IngestionResult]] = []
+    for file_info, outcome in zip(request.files, outcomes):
+        if isinstance(outcome, BaseException):
+            # gather returns a child's CancelledError as a value; keep it propagating.
+            if not isinstance(outcome, Exception):
+                raise outcome
+            logger.error(
+                "Cloud ingest of %s raised", file_info.fileName, exc_info=outcome
+            )
+            # Only steps before the first ingest write can raise out of process_file;
+            # later steps must catch their own errors or this entry hides their writes.
+            outcome = KBApiOperationResult(
+                result=IngestionResult(
+                    status="error",
+                    message=f"Unexpected error: {outcome}",
+                    doc_id=Path(file_info.fileName).name,
+                )
+            )
+        api_results.append(outcome)
     results = [api_result.result for api_result in api_results]
 
     # `partial` and `error` files were rolled back inside `process_file` above,
@@ -6454,8 +6581,8 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = get_vector_index_store().list_document_records(
-            collection_name=None,
+        remaining_records = _list_document_records_for_file_ids(
+            set().union(*mutation_scope.file_ids_by_owner.values()),
             user_id=user_id,
             is_admin=is_admin,
         )
@@ -7396,7 +7523,8 @@ async def delete_document_api(
 
     if cleanup_candidate_file_ids:
         try:
-            remaining_records = _list_documents_for_user(
+            remaining_records = _list_document_records_for_file_ids(
+                cleanup_candidate_file_ids,
                 user_id=user_id_int,
                 is_admin=bool(_user.is_admin),
             )

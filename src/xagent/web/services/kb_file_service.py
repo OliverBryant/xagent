@@ -10,7 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FILE_STATUS_BATCH_SIZE = 200
+_ORPHAN_LOOKUP_BATCH_SIZE = 200
 _STALE_FILE_STATUSES = {"FAILED", "UNKNOWN", "RUNNING"}
 _DEFAULT_DELETABLE_STALE_STATUSES = {"FAILED"}
 
@@ -199,6 +200,48 @@ def _list_documents_for_user_impl(
         _safe_close_table(table)
 
 
+def _list_document_records_for_file_ids_impl(
+    file_ids: Iterable[str],
+    *,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> List[DocumentRecord]:
+    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
+    normalized_file_ids = sorted({file_id for file_id in file_ids if file_id})
+    conn = get_connection_from_env()
+    ensure_documents_table(conn)
+    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    user_filter = UserPermissions.get_user_filter(
+        scope.user_id, is_admin=scope.is_admin
+    )
+    records: List[DocumentRecord] = []
+    table = None
+    try:
+        table = conn.open_table("documents")
+        for offset in range(0, len(normalized_file_ids), _ORPHAN_LOOKUP_BATCH_SIZE):
+            batch = normalized_file_ids[offset : offset + _ORPHAN_LOOKUP_BATCH_SIZE]
+            combined_filter = _combine_lancedb_filters(
+                _build_file_id_in_filter(batch), user_filter
+            )
+            rows = query_to_list(
+                table.search()
+                .where(combined_filter)
+                .select(["doc_id", "file_id", "user_id"])
+                .limit(-1)
+            )
+            records.extend(
+                DocumentRecord(
+                    doc_id=str(row.get("doc_id") or ""),
+                    file_id=str(row["file_id"]),
+                    user_id=None if row.get("user_id") is None else int(row["user_id"]),
+                )
+                for row in rows
+            )
+    finally:
+        _safe_close_table(table)
+    return records
+
+
 def _build_uploaded_filename_map_impl(
     db: Session, *, user_id: Optional[int], file_ids: List[str]
 ) -> Dict[str, str]:
@@ -286,7 +329,7 @@ def _delete_uploaded_file_if_orphaned_impl(
         db: Database session.
         file_id: The ID of the file to check.
         user_id: User ID for scoping.
-        remaining_file_ids: A set of all file_id values still referenced by other documents.
+        remaining_file_ids: file_id values still referenced by other documents; must include every candidate that still is.
 
     Returns:
         True if the file was deleted, False otherwise.
@@ -345,55 +388,6 @@ def _compensation_incomplete(
         errors=(str(error),),
         effects=effects,
     )
-
-
-def _compensate_new_uploaded_file_impl(
-    db: Session,
-    *,
-    file_id: str,
-    user_id: Optional[int] = None,
-    delete_local: bool = True,
-    local_root: Optional[Path] = None,
-) -> FileCompensationResult:
-    """Idempotently remove a newly created UploadedFile row and artifacts.
-
-    The caller owns commit/rollback timing. This helper flushes through
-    ``UploadedFileStore.delete`` but intentionally does not commit.
-    """
-    normalized_file_id = str(file_id or "").strip()
-    if not normalized_file_id:
-        return _compensation_complete("missing_file_id")
-
-    query = db.query(UploadedFile).filter(UploadedFile.file_id == normalized_file_id)
-    if user_id is not None:
-        scope = resolve_user_scope(user_id=user_id, is_admin=False)
-        if scope.user_id is None:
-            return _compensation_complete("missing_user")
-        query = query.filter(UploadedFile.user_id == scope.user_id)
-    file_record = query.first()
-    if file_record is None:
-        return _compensation_complete("already_removed")
-
-    try:
-        effective_local_root = local_root
-        if delete_local and effective_local_root is None:
-            effective_local_root = get_uploads_dir()
-        UploadedFileStore(db).delete(
-            file_record,
-            delete_local=delete_local,
-            local_root=effective_local_root,
-        )
-        record_user_id = getattr(file_record, "user_id", None)
-        if record_user_id is not None:
-            _file_status_cache.invalidate_user(int(record_user_id))
-        return _compensation_complete("uploaded_file_removed")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to compensate UploadedFile creation: file_id=%s error=%s",
-            normalized_file_id,
-            exc,
-        )
-        return _compensation_incomplete(exc)
 
 
 def _cleanup_local_copied_file_impl(
@@ -1014,6 +1008,20 @@ def list_documents_for_user(
     )
 
 
+def list_document_records_for_file_ids(
+    file_ids: Iterable[str],
+    *,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> List[DocumentRecord]:
+    """Uncapped: documents in the user's scope that reference any of ``file_ids``."""
+    return _get_file_compatibility_facade().list_document_records_for_file_ids(
+        file_ids,
+        user_id=user_id,
+        is_admin=is_admin,
+    )
+
+
 def build_uploaded_filename_map(
     db: Session, *, user_id: Optional[int], file_ids: List[str]
 ) -> Dict[str, str]:
@@ -1091,24 +1099,6 @@ def reconcile_uploaded_files(
         stale_ttl_hours=stale_ttl_hours,
         delete_stale=delete_stale,
         deletable_statuses=deletable_statuses,
-    )
-
-
-def compensate_new_uploaded_file(
-    db: Session,
-    *,
-    file_id: str,
-    user_id: Optional[int] = None,
-    delete_local: bool = True,
-    local_root: Optional[Path] = None,
-) -> FileCompensationResult:
-    """Idempotently remove a newly created UploadedFile row and artifacts."""
-    return _get_file_compatibility_facade().compensate_new_uploaded_file(
-        db,
-        file_id=file_id,
-        user_id=user_id,
-        delete_local=delete_local,
-        local_root=local_root,
     )
 
 

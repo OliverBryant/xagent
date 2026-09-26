@@ -2363,6 +2363,91 @@ class TestOrphanUploadGcConfig:
         assert get_orphan_upload_sweep_interval_seconds() == 900
 
 
+class TestTaskCleanupRetryConfig:
+    """Config for retrying the external cleanup a task deletion owes (#2587)."""
+
+    def test_retry_interval_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", raising=False)
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_retry_interval_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "120")
+        assert get_task_cleanup_retry_interval_seconds() == 120
+
+    def test_retry_interval_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "1")
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_max_attempts_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", raising=False)
+        assert get_task_cleanup_max_attempts() == 8
+
+    def test_max_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "3")
+        assert get_task_cleanup_max_attempts() == 3
+
+    def test_max_attempts_zero_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "0")
+        assert get_task_cleanup_max_attempts() == 8
+
+
+class TestLlmRetryBudgetConfig:
+    """#2605: the two bounds that attempt counting cannot express."""
+
+    def test_deadline_default(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.delenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", raising=False)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_deadline_env_override(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "45.5")
+        assert get_llm_retry_deadline_seconds() == 45.5
+
+    @pytest.mark.parametrize(
+        "value", ["", "   ", "not-a-number", "0", "-5", "nan", "inf"]
+    )
+    def test_deadline_rejects_unusable_values(self, monkeypatch, value):
+        """An unbounded loop is the bug; never let bad config reintroduce it."""
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", value)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_capacity_attempts_default(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.delenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", raising=False)
+        assert get_llm_capacity_max_attempts() == 2
+
+    def test_capacity_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", "1")
+        assert get_llm_capacity_max_attempts() == 1
+
+    @pytest.mark.parametrize("value", ["", "1.5", "not-a-number", "0", "-3"])
+    def test_capacity_attempts_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", value)
+        assert get_llm_capacity_max_attempts() == 2
+
+
 class TestWorkforcePreviewRunReapConfig:
     """PR #1060 review: get_workforce_preview_run_stale_seconds() had no
     test, unlike its sibling TTL config functions above."""
@@ -2684,6 +2769,38 @@ class TestGetSandboxAllowLocalFallbackOnCapacity:
         for value in ("0", "false", "off", "junk"):
             monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
             assert get_sandbox_allow_local_fallback_on_capacity() is False
+
+
+class TestCheckpointGateStallWarningConfig:
+    """Config for reporting a long-held exclusive checkpoint section."""
+
+    def test_defaults_to_30_seconds(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.delenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, raising=False)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, "2.5")
+        assert get_checkpoint_gate_stall_warning_seconds() == 2.5
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-1", "nan", "inf"])
+    def test_invalid_values_fall_back(self, monkeypatch, value):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, value)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
 
 
 class TestCompactThresholdConfig:

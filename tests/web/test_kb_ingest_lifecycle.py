@@ -243,7 +243,6 @@ def test_background_web_cleanup_keeps_early_exception_fallback(
         db,
         payload,
         context="background web ingest",
-        successful_documents=0,
     )
     api_helper.assert_not_called()
 
@@ -383,6 +382,11 @@ async def test_rollback_keeps_collection_whose_config_a_sibling_published(
     monkeypatch.setattr(kb_module, "delete_collection", delete_collection)
     monkeypatch.setattr(kb_module, "_restore_ingest_file_backup", MagicMock())
     monkeypatch.setattr(kb_module, "clear_ingestion_status", MagicMock())
+    monkeypatch.setattr(
+        kb_module,
+        "delete_document",
+        MagicMock(return_value=SimpleNamespace(status="success")),
+    )
 
     async def _published(**kwargs: Any) -> str:
         return '{"chunk_size": 512}'
@@ -403,7 +407,14 @@ async def test_rollback_keeps_collection_whose_config_a_sibling_published(
         db=MagicMock(),
         user=user,
         collection_name="shared-kb",
-        result=IngestionResult(status="error", message="failed", doc_id="my-doc"),
+        result=IngestionResult(
+            status="error",
+            message="failed",
+            doc_id="my-doc",
+            completed_steps=[
+                {"name": "register_document", "metadata": {"created": True}}
+            ],
+        ),
         file_path=Path("/tmp/does-not-matter.pdf"),
         file_record=file_record,
         collection_existed_before=False,

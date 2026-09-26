@@ -4,6 +4,7 @@ import asyncio
 import copy
 import json
 import logging
+import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import tiktoken
 
-from ....config import get_compact_threshold_ratio
+from ....config import (
+    get_checkpoint_gate_stall_warning_seconds,
+    get_compact_threshold_ratio,
+)
 from ...context_ref import (
     CONTEXT_REFS_KEY,
     ContextReference,
@@ -30,6 +34,7 @@ from ...model.chat.types import (
     CONTENT_SOURCE_KEY,
     CONTENT_SOURCE_REASONING_FALLBACK,
 )
+from ...runtime_performance import increment_counter, observe_value
 from ...tools.artifacts import (
     format_tool_result_for_observation,
     sanitize_tool_result_for_public_context,
@@ -486,6 +491,8 @@ class _ContextCheckpointGate:
     """
 
     def __init__(self) -> None:
+        self.injection_uncertain = False
+        self.run_finishing = False
         self._shared = 0
         self._exclusive = False
         self._writers_waiting = 0
@@ -517,7 +524,27 @@ class _ContextCheckpointGate:
                 self._wake()
 
     @asynccontextmanager
-    async def exclusive(self) -> AsyncIterator[None]:
+    async def exclusive(self, owner: str | None = None) -> AsyncIterator[None]:
+        """Hold the gate alone; ``owner`` only labels stall reports.
+
+        Never timed out (see ``get_checkpoint_gate_stall_warning_seconds``):
+        a long hold is reported while it lasts and measured on release.
+        """
+        # Resolve everything that can fail before acquiring, so nothing runs
+        # between taking the gate and the ``finally`` that releases it.
+        loop = asyncio.get_running_loop()
+        interval = get_checkpoint_gate_stall_warning_seconds()
+        stall: list[asyncio.TimerHandle] = []
+
+        def report_stall() -> None:
+            increment_counter("xagent.agent.checkpoint_gate.exclusive.stalls")
+            logger.warning(
+                "Exclusive checkpoint section for %s still held after %.1fs",
+                owner or "unknown execution",
+                time.monotonic() - started,
+            )
+            stall[0] = loop.call_later(interval, report_stall)
+
         self._writers_waiting += 1
         try:
             while self._exclusive or self._shared:
@@ -529,11 +556,20 @@ class _ContextCheckpointGate:
             # acquisitions were blocked, even while other readers remain.
             if not self._exclusive:
                 self._wake()
+        started = time.monotonic()
         try:
+            stall.append(loop.call_later(interval, report_stall))
             yield
         finally:
+            if stall:
+                stall[0].cancel()
             self._exclusive = False
             self._wake()
+            observe_value(
+                "xagent.agent.checkpoint_gate.exclusive.duration",
+                (time.monotonic() - started) * 1_000.0,
+                unit="ms",
+            )
 
 
 def context_checkpoint_gate(context: ExecutionContext) -> _ContextCheckpointGate:
@@ -905,22 +941,24 @@ class ExecutionContext:
         unavailable_count: int = 0,
     ) -> str:
         formatted: Any
-        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
-            formatted = format_tool_result_for_observation(tool_name, result)
-        elif isinstance(result, dict):
-            if "output" in result:
-                formatted = result["output"]
+        if isinstance(result, dict):
+            # The reserved key (and the relative_path inside its records)
+            # stays in result itself for raw_result, but none of the branches
+            # below may render it: the notice appended after the body is the
+            # only place a path may appear. Dropping it once here keeps every
+            # branch -- the artifact formatter's metadata line included --
+            # from seeing it at all.
+            visible = {
+                key: value
+                for key, value in result.items()
+                if key != SPILL_RESERVED_RESULT_KEY
+            }
+            if isinstance(visible.get("artifacts"), list):
+                formatted = format_tool_result_for_observation(tool_name, visible)
+            elif "output" in visible:
+                formatted = visible["output"]
             else:
-                # No "output" key falls back to the whole dict; the reserved
-                # key (and the relative_path inside its records) must not
-                # leak into this rendered text even though it stays in
-                # result itself for raw_result -- the notice below is the
-                # only place a path may appear.
-                formatted = {
-                    key: value
-                    for key, value in result.items()
-                    if key != SPILL_RESERVED_RESULT_KEY
-                }
+                formatted = visible
         else:
             formatted = result
         parts = [f"Tool {tool_name} returned: {formatted}"]

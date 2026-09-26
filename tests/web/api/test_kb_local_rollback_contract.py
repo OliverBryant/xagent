@@ -19,17 +19,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.web.api import test_kb_dir as kb_dir
-from xagent.core.tools.core.RAG_tools.core.schemas import (
-    IngestionConfig,
-    IngestionResult,
+from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+    generate_deterministic_doc_id,
 )
 from xagent.web.api import kb as kb_module
 from xagent.web.api.kb import RollbackFailureError
-from xagent.web.jobs.exceptions import BackgroundJobHandlerError
-from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
-from xagent.web.models.background_job import BackgroundJobType
-from xagent.web.models.uploaded_file import UploadedFile
-from xagent.web.services.background_jobs import create_background_job
 
 test_env = kb_dir.test_env
 temp_uploads = kb_dir.temp_uploads
@@ -40,7 +35,7 @@ WHOLE = [
     "may_delete",
     "delete_collection",
     "physdir",
-    "list:None",
+    "refs:[]",
     "del_coll_files",
     "query",
     "store.delete:refreshed",
@@ -52,7 +47,7 @@ KEPT = [
     "list:coll",
     "may_delete",
     "delete_document",
-    "list:None",
+    "refs:['file-1']",
     "orphan",
     "commit",
     "restore",
@@ -123,6 +118,7 @@ def _install_leaves(
         db, *, user_id, collection_file_ids, remaining_file_ids, collection_dir
     ):
         seen["collection_file_ids"] = collection_file_ids
+        seen["collection_dir"] = collection_dir
         _hit("del_coll_files")
 
     class _FileStore:
@@ -142,6 +138,10 @@ def _install_leaves(
     def _orphan(db, *, file_id, user_id, remaining_file_ids):
         _hit("orphan")
 
+    def _refs(file_ids, *, user_id, is_admin):
+        _hit(f"refs:{sorted(file_ids)}")
+        return []
+
     def _clear_status(collection, doc_id, *, user_id, is_admin):
         _hit("clear_status")
 
@@ -158,6 +158,7 @@ def _install_leaves(
         "_cleanup_failed_new_collection_metadata": _metadata,
         "delete_document": _delete_document,
         "_delete_uploaded_file_if_orphaned": _orphan,
+        "_list_document_records_for_file_ids": _refs,
         "clear_ingestion_status": _clear_status,
         "_restore_ingest_file_backup": _restore,
         "_delete_web_rag_side_effects_for_file_id": lambda **_kw: _hit("web_cleanup"),
@@ -235,7 +236,7 @@ async def _rollback(
         pytest.param(
             {},
             {"uploaded_file_existed_before": True},
-            KEPT,
+            ["list:coll", "may_delete", "delete_document", "restore"],
             id="registered-kept-existing-upload",
         ),
         pytest.param(
@@ -319,6 +320,32 @@ async def test_collection_decision_compares_doc_ids(
         "context": "failed-ingest rollback",
     }
     assert seen["collection_file_ids"] == file_ids
+    assert f"refs:{sorted(file_ids)}" in calls
+
+
+@pytest.mark.parametrize(
+    ("existed", "offered"),
+    [
+        pytest.param(False, {"file-1"}, id="new-row"),
+        pytest.param(True, set(), id="pre-existing-row"),
+    ],
+)
+async def test_whole_collection_offers_only_a_row_this_run_created(
+    monkeypatch, existed, offered
+) -> None:
+    calls: list[str] = []
+    db, seen = _install_leaves(
+        monkeypatch,
+        calls,
+        records=[{"doc_id": "doc-1", "file_id": "file-1"}],
+        may_delete=True,
+    )
+
+    await _rollback(db, uploaded_file_existed_before=existed)
+
+    assert seen["collection_file_ids"] == offered
+    assert seen["collection_dir"] is None
+    assert f"refs:{sorted(offered)}" in calls
 
 
 async def test_collection_existed_before_still_asks_the_decision(monkeypatch) -> None:
@@ -358,7 +385,7 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             id="physical-dir-without-detail",
         ),
         pytest.param(
-            {"may_delete": True, "raises": {"list:None": RuntimeError("list down")}},
+            {"may_delete": True, "raises": {"refs:[]": RuntimeError("list down")}},
             {},
             WHOLE[:5],
             "list down",
@@ -404,6 +431,13 @@ async def test_collection_existed_before_still_asks_the_decision(monkeypatch) ->
             KEPT[:5],
             "disk",
             id="orphan-before-commit",
+        ),
+        pytest.param(
+            {"raises": {"refs:['file-1']": RuntimeError("refs down")}},
+            {},
+            KEPT[:4],
+            "refs down",
+            id="kept-refs",
         ),
         pytest.param(
             {"raises": {"clear_status": RuntimeError("status down")}},
@@ -526,7 +560,7 @@ def test_wrapper_stays_a_coroutine_function() -> None:
     assert inspect.iscoroutinefunction(kb_module._rollback_failed_ingestion)
 
 
-# --- Text surfaced by /ingest and the legacy (non-staged) document job ---
+# --- Text surfaced by /ingest ---
 
 
 def _post_ingest(test_env, filename: str, collection: str, *patches: Any) -> Any:
@@ -597,26 +631,33 @@ def test_ingest_returns_collection_rollback_failure_verbatim(
     }
 
 
-def test_ingest_setup_failure_clears_status_by_filename(test_env, temp_uploads) -> None:
-    """Pins a known pre-existing bug: the filename is used as doc_id. Not intended."""
+def test_ingest_setup_failure_clears_status_by_real_doc_id(
+    test_env, temp_uploads
+) -> None:
     _, _, user, _ = test_env
     clear_status = MagicMock()
+    seen: dict[str, Any] = {}
+
+    def _raise(**kwargs: Any) -> None:
+        seen["file_id"] = kwargs["file_id"]
+        raise RuntimeError("parser crashed")
 
     response = _post_ingest(
         test_env,
         "x.txt",
         "coll",
         _existing_collection(),
-        patch(
-            "xagent.web.api.kb.run_document_ingestion",
-            side_effect=RuntimeError("parser crashed"),
-        ),
+        patch("xagent.web.api.kb.run_document_ingestion", side_effect=_raise),
         patch("xagent.web.api.kb.clear_ingestion_status", clear_status),
     )
 
     assert response.status_code == 500
+    assert not response.json()["detail"].startswith("Failed to fully roll back")
     clear_status.assert_called_once_with(
-        "coll", "x.txt", user_id=int(user.id), is_admin=False
+        "coll",
+        generate_deterministic_doc_id("coll", seen["file_id"]),
+        user_id=int(user.id),
+        is_admin=False,
     )
 
 
@@ -664,88 +705,3 @@ def test_ingest_keeps_failed_result_after_clean_rollback(
 
     assert response.status_code == 500
     assert response.json() == {**ingested.model_dump(mode="json"), "status": "error"}
-
-
-def _run_legacy_job(test_env, tmp_path: Path) -> BackgroundJobHandlerError:
-    _, _, user, session_local = test_env
-    source = tmp_path / "doc.txt"
-    source.write_text("content", encoding="utf-8")
-    file_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-    db = session_local()
-    try:
-        db.add(
-            UploadedFile(
-                file_id=file_id,
-                user_id=int(user.id),
-                filename="doc.txt",
-                storage_path=str(source),
-                mime_type="text/plain",
-                file_size=source.stat().st_size,
-            )
-        )
-        db.commit()
-        job = create_background_job(
-            db,
-            user_id=int(user.id),
-            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
-            payload={
-                "collection": "existing-kb",
-                "source_path": str(source),
-                "file_id": file_id,
-                "filename": "doc.txt",
-                "mime_type": "text/plain",
-                "file_size": source.stat().st_size,
-                "user_id": int(user.id),
-                "is_admin": False,
-                "ingestion_config": IngestionConfig().model_dump(mode="json"),
-                "collection_existed_before": True,
-                "had_existing_file": False,
-            },
-        )
-        with pytest.raises(BackgroundJobHandlerError) as info:
-            handle_kb_ingest_document(db, job)
-        return info.value
-    finally:
-        db.close()
-
-
-def test_legacy_job_returns_rollback_failure_text_verbatim(
-    test_env, tmp_path, monkeypatch
-) -> None:
-    ingested = _result(message="ingestion failed")
-    monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks.run_document_ingestion", lambda **_kw: ingested
-    )
-    monkeypatch.setattr(kb_module, "get_vector_index_store", MagicMock())
-    monkeypatch.setattr(
-        kb_module,
-        "delete_document",
-        lambda *_a: SimpleNamespace(status="error", message="boom"),
-    )
-
-    err = _run_legacy_job(test_env, tmp_path)
-
-    assert str(err) == (
-        "Failed to fully roll back ingest for existing-kb/doc.txt: "
-        "delete document 'doc-1' during rollback failed: boom. "
-        "Original ingestion error: ingestion failed"
-    )
-    assert err.retryable is False
-    assert err.result == ingested.model_dump(mode="json")
-
-
-def test_legacy_job_routes_through_the_patched_wrapper(
-    test_env, tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setattr(
-        "xagent.web.jobs.kb_tasks.run_document_ingestion",
-        lambda **_kw: _result(message="ingestion failed"),
-    )
-
-    with patch(
-        "xagent.web.api.kb._rollback_failed_ingestion",
-        side_effect=RollbackFailureError("x"),
-    ):
-        err = _run_legacy_job(test_env, tmp_path)
-
-    assert str(err) == "x"

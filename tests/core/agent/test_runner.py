@@ -39,14 +39,6 @@ from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 @pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
-
-
-@pytest.fixture(autouse=True)
 def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
     # The once-per-model warning set is process-global; isolate it per test.
     monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())

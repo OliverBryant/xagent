@@ -58,14 +58,6 @@ from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
-
-
 class FakeWorkspace:
     def __init__(self, task_id: str, tmp_path: Path) -> None:
         workspace_dir = tmp_path / task_id

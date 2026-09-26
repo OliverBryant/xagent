@@ -20,7 +20,6 @@ from xagent.core.agent.runtime import ExecutionInterrupted, PatternRuntime
 @pytest.fixture
 def live():
     manager = ContextManager()
-    manager._contexts.clear()
     context = manager.create_context("atomic")
     context.add_user_message("original")
     tracer = SimpleNamespace(
@@ -30,7 +29,6 @@ def live():
         SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
     )
     yield runner, context, tracer
-    manager._contexts.clear()
 
 
 @pytest.mark.asyncio
@@ -774,7 +772,6 @@ def _yielding_reader(checkpoint: dict) -> AsyncMock:
 @pytest.mark.asyncio
 async def test_cold_start_adopts_the_lookup_id_when_the_checkpoint_has_none():
     manager = ContextManager()
-    manager._contexts.clear()
     tracer = SimpleNamespace(
         load_latest_checkpoint=_yielding_reader(_cold_checkpoint(None)),
         checkpoint=AsyncMock(),
@@ -782,18 +779,15 @@ async def test_cold_start_adopts_the_lookup_id_when_the_checkpoint_has_none():
     runner = AgentRunner(
         SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
     )
-    try:
-        result = await asyncio.wait_for(
-            runner.inject_user_message(
-                "cold", "new", turn_id="turn", request_interrupt=False
-            ),
-            5,
-        )
-        assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
-        assert result.context.execution_id == "cold"
-        assert manager.get_context("cold") is None
-    finally:
-        manager._contexts.clear()
+    result = await asyncio.wait_for(
+        runner.inject_user_message(
+            "cold", "new", turn_id="turn", request_interrupt=False
+        ),
+        5,
+    )
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert result.context.execution_id == "cold"
+    assert manager.get_context("cold") is None
 
 
 @pytest.mark.asyncio
@@ -809,7 +803,6 @@ async def test_cold_start_without_an_id_still_drops_a_derived_output_language():
         OUTPUT_LANGUAGE_SOURCE_METADATA_KEY: "detected",
     }
     manager = ContextManager()
-    manager._contexts.clear()
     tracer = SimpleNamespace(
         load_latest_checkpoint=_yielding_reader(checkpoint),
         checkpoint=AsyncMock(),
@@ -817,19 +810,16 @@ async def test_cold_start_without_an_id_still_drops_a_derived_output_language():
     runner = AgentRunner(
         SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
     )
-    try:
-        result = await asyncio.wait_for(
-            runner.inject_user_message(
-                "cold", "new", turn_id="turn", request_interrupt=False
-            ),
-            5,
-        )
-        # The id is filled in on a copy; the migration must still reach it.
-        assert result.context.execution_id == "cold"
-        assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
-        assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
-    finally:
-        manager._contexts.clear()
+    result = await asyncio.wait_for(
+        runner.inject_user_message(
+            "cold", "new", turn_id="turn", request_interrupt=False
+        ),
+        5,
+    )
+    # The id is filled in on a copy; the migration must still reach it.
+    assert result.context.execution_id == "cold"
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
 
 
 @pytest.mark.asyncio
@@ -837,7 +827,6 @@ async def test_cold_start_rejects_a_checkpoint_of_another_execution():
     from xagent.core.agent.checkpoint import CheckpointCorruptError
 
     manager = ContextManager()
-    manager._contexts.clear()
     tracer = SimpleNamespace(
         load_latest_checkpoint=_yielding_reader(_cold_checkpoint("other")),
         checkpoint=AsyncMock(),
@@ -845,14 +834,11 @@ async def test_cold_start_rejects_a_checkpoint_of_another_execution():
     runner = AgentRunner(
         SimpleNamespace(llm=None), tracer=tracer, context_manager=manager
     )
-    try:
-        with pytest.raises(CheckpointCorruptError, match="different execution"):
-            await asyncio.wait_for(
-                runner.inject_user_message("cold", "new", turn_id="turn"), 5
-            )
-        tracer.checkpoint.assert_not_awaited()
-    finally:
-        manager._contexts.clear()
+    with pytest.raises(CheckpointCorruptError, match="different execution"):
+        await asyncio.wait_for(
+            runner.inject_user_message("cold", "new", turn_id="turn"), 5
+        )
+    tracer.checkpoint.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -861,7 +847,6 @@ async def test_write_only_tracer_cannot_prove_a_failed_write_absent():
     from xagent.core.agent.trace import Tracer
 
     manager = ContextManager()
-    manager._contexts.clear()
     context = manager.create_context("write-only")
     context.add_user_message("original")
 
@@ -876,14 +861,11 @@ async def test_write_only_tracer_cannot_prove_a_failed_write_absent():
         tracer=TraceCheckpointStore(tracer),
         context_manager=manager,
     )
-    try:
-        # Tracer exposes load_latest_checkpoint but no handler can read, so its
-        # empty answer must not become "confirmed absent".
-        result = await runner.inject_user_message("write-only", "new", turn_id="t")
-        assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
-        assert [m.content for m in context.messages] == ["original"]
-    finally:
-        manager._contexts.clear()
+    # Tracer exposes load_latest_checkpoint but no handler can read, so its
+    # empty answer must not become "confirmed absent".
+    result = await runner.inject_user_message("write-only", "new", turn_id="t")
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert [m.content for m in context.messages] == ["original"]
 
 
 @pytest.mark.asyncio
@@ -971,19 +953,14 @@ class _AnsweringPattern:
 
 @pytest.fixture
 def durable():
-    manager = ContextManager()
-    manager._contexts.clear()
-    getattr(manager, "_cold_starts", {}).clear()
     store = _DurableStore()
     runner = AgentRunner(
         SimpleNamespace(llm=None),
         tracer=store,
-        context_manager=manager,
+        context_manager=ContextManager(),
         workspace_enabled=False,
     )
     yield runner, store
-    manager._contexts.clear()
-    getattr(manager, "_cold_starts", {}).clear()
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,6 @@ import pytest
 
 from xagent.core.agent import (
     Agent,
-    ContextManager,
     ExecutionContext,
     ExecutionLifecycleStatus,
     PatternRuntime,
@@ -18,14 +17,6 @@ from xagent.core.agent import registry as registry_module
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.registry import ExecutionRegistry
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
-
-
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
 
 
 @dataclass

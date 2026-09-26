@@ -94,7 +94,6 @@ async def stack(request, monkeypatch):
         tracer = Tracer()
         tracer.add_handler(trace_handlers.DatabaseTraceHandler(task_id))
         store = TraceCheckpointStore(tracer, require_persisted=True)
-        manager._contexts.clear()
         context = manager.create_context(EXECUTION_ID)
         context.add_user_message("original")
         runner = AgentRunner(
@@ -109,7 +108,6 @@ async def stack(request, monkeypatch):
                 task_id=task_id,
             )
     finally:
-        manager._contexts.clear()
         if runtime is not None:
             await runtime.close()
         source.dispose()

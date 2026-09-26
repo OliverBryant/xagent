@@ -4254,7 +4254,6 @@ def _fenced_live_runner(execution_id: str):
     from xagent.core.agent.runner import AgentRunner
 
     manager = ContextManager()
-    manager._contexts.clear()
     context = manager.create_context(execution_id)
     context.add_user_message("original")
     context_checkpoint_gate(context).injection_uncertain = True
@@ -4311,31 +4310,28 @@ async def test_deferred_injection_rejected_by_fence_pauses_without_resuming(
     )
     published = AsyncMock()
 
-    try:
-        with (
-            patch("xagent.web.api.websocket.manager", ws_manager),
-            patch(
-                "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+        patch("xagent.web.services.task_events.publish_task_event", published),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            pending_user_message={
+                "execution_message": "Deferred guidance",
+                "display_message": "Deferred guidance",
+                "files": [],
+                "turn_id": "deferred-fenced-reject",
+            },
+            delivery_turn_id="deferred-fenced-reject",
+            delivery_notifier=make_delivery_notifier(
+                _make_command_reply(MagicMock()), "deferred-fenced-reject"
             ),
-            patch("xagent.web.services.task_events.publish_task_event", published),
-        ):
-            await execute_resume_background(
-                task_id=int(task.id),
-                agent_service=agent,
-                task_owner_user_id=int(owner.id),
-                pending_user_message={
-                    "execution_message": "Deferred guidance",
-                    "display_message": "Deferred guidance",
-                    "files": [],
-                    "turn_id": "deferred-fenced-reject",
-                },
-                delivery_turn_id="deferred-fenced-reject",
-                delivery_notifier=make_delivery_notifier(
-                    _make_command_reply(MagicMock()), "deferred-fenced-reject"
-                ),
-            )
-    finally:
-        manager._contexts.clear()
+        )
 
     paused = [
         call.args[0]
@@ -5712,36 +5708,31 @@ async def test_live_injection_rejected_by_fence_is_retryable_not_unknown(
     bg_mgr.running_tasks.get.return_value = None
     resume_background_mock = AsyncMock()
 
-    try:
-        with (
-            patch(
-                "xagent.web.services.agent_service_manager.get_agent_manager",
-                return_value=MagicMock(
-                    get_agent_for_task=AsyncMock(return_value=agent)
-                ),
-            ),
-            patch("xagent.web.api.websocket.manager", ws_manager),
-            patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
-            patch(
-                "xagent.web.services.task_execution.execute_resume_background",
-                resume_background_mock,
-            ),
-            patch(
-                "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
-            ) as close_mock,
-        ):
-            await handle_task_message(
-                _make_command_reply(MagicMock()),
-                int(task.id),
-                {
-                    "message": "Fenced input",
-                    "client_message_id": "fenced-reject-turn",
-                    "user": owner,
-                    "files": [],
-                },
-            )
-    finally:
-        context_manager._contexts.clear()
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background",
+            resume_background_mock,
+        ),
+        patch(
+            "xagent.web.services.task_command_execution.close_legacy_resume_interaction_sync",
+        ) as close_mock,
+    ):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            int(task.id),
+            {
+                "message": "Fenced input",
+                "client_message_id": "fenced-reject-turn",
+                "user": owner,
+                "files": [],
+            },
+        )
 
     agent.post_user_message.assert_awaited_once()
     close_mock.assert_not_called()

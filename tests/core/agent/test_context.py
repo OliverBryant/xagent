@@ -67,14 +67,6 @@ from xagent.core.tools.tool_result_spill import (
 from xagent.web.user_isolated_memory import current_user_id
 
 
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
-
-
 def test_create_context() -> None:
     ctx = ExecutionContext()
     ctx.execution_id = "task-1"

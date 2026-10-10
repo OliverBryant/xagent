@@ -121,7 +121,6 @@ export interface ProviderConfig {
   categoryBaseUrls?: Record<string, string>
   category: string[]
   requires_base_url?: boolean
-  supportsModelListing?: boolean
 }
 
 const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
@@ -302,7 +301,6 @@ export function ModelsPage() {
           categoryBaseUrls: localConfig.categoryBaseUrls,
           category: p.category || ["llm"],
           requires_base_url: p.requires_base_url,
-          supportsModelListing: p.supports_model_listing !== false,
         }
       })
       setProviders(mergedProviders)

@@ -550,8 +550,7 @@ export function ModelManagementDialog({
   }
 
   const fetchModelsForCategory = async (category: string) => {
-    const provider = providers.find(p => p.id === formData.model_provider)
-    if (!shouldFetchProviderModelCatalog(provider?.supportsModelListing)) {
+    if (!shouldFetchProviderModelCatalog(formData.model_provider)) {
       setFetchedModels([])
       return
     }

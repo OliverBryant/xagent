@@ -19,10 +19,10 @@ describe("providerAllowsEmptyApiKey", () => {
 })
 
 describe("shouldFetchProviderModelCatalog", () => {
-  it("skips providers that advertise no catalog support", () => {
-    expect(shouldFetchProviderModelCatalog(false)).toBe(false)
-    expect(shouldFetchProviderModelCatalog(true)).toBe(true)
-    expect(shouldFetchProviderModelCatalog(undefined)).toBe(true)
+  it("skips Bedrock without requiring provider metadata", () => {
+    expect(shouldFetchProviderModelCatalog("bedrock")).toBe(false)
+    expect(shouldFetchProviderModelCatalog("claude")).toBe(true)
+    expect(shouldFetchProviderModelCatalog("openai")).toBe(true)
   })
 })
 

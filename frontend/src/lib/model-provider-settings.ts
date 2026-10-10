@@ -15,9 +15,9 @@ export function providerAllowsEmptyApiKey(
 }
 
 export function shouldFetchProviderModelCatalog(
-  supportsModelListing?: boolean,
+  providerId: string,
 ): boolean {
-  return supportsModelListing !== false
+  return providerId !== "bedrock"
 }
 
 export function buildModelRequestPayload<T extends ModelProviderSettings>(data: T): T {

@@ -448,7 +448,6 @@ export interface Provider {
   requires_base_url?: boolean;
   icon?: string;
   default_base_url?: string;
-  supports_model_listing?: boolean;
 }
 
 export interface ProviderModel {

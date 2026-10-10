@@ -2120,6 +2120,8 @@ const zh = {
       authMode: "认证方式",
       bedrockApiKey: "Amazon Bedrock API 密钥",
       awsCredentialsChain: "AWS 凭证链",
+      awsCredentialsChainAdminOnly: "AWS 凭证链（仅管理员）",
+      awsCredentialsChainAdminRequired: "只有管理员可以保存或测试此凭证链配置。请切换到 API 密钥认证后再更新。",
       abilities: "能力选择",
       description: "描述",
       selectModel: "选择模型名称",

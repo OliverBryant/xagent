@@ -1,10 +1,33 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  bedrockAuthModesForUser,
+  bedrockCredentialsChainRequiresAdmin,
   buildModelRequestPayload,
   providerAllowsEmptyApiKey,
   shouldFetchProviderModelCatalog,
 } from "./model-provider-settings"
+
+describe("Bedrock credential-chain permissions", () => {
+  it("offers the credential chain only to administrators creating a model", () => {
+    expect(bedrockAuthModesForUser(false)).toEqual(["api_key"])
+    expect(bedrockAuthModesForUser(true)).toEqual(["api_key", "credentials_chain"])
+  })
+
+  it("keeps a historical credential-chain value visible so it can be changed", () => {
+    expect(bedrockAuthModesForUser(false, "credentials_chain")).toEqual([
+      "api_key",
+      "credentials_chain",
+    ])
+  })
+
+  it("blocks only a non-admin Bedrock credential-chain submission", () => {
+    expect(bedrockCredentialsChainRequiresAdmin("bedrock", "credentials_chain", false)).toBe(true)
+    expect(bedrockCredentialsChainRequiresAdmin("bedrock", "credentials_chain", true)).toBe(false)
+    expect(bedrockCredentialsChainRequiresAdmin("bedrock", "api_key", false)).toBe(false)
+    expect(bedrockCredentialsChainRequiresAdmin("openai", undefined, false)).toBe(false)
+  })
+})
 
 describe("providerAllowsEmptyApiKey", () => {
   it("allows the AWS credential chain without an API key", () => {

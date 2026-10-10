@@ -49,6 +49,8 @@ import { toast } from "@/components/ui/sonner"
 import { Model, ModelCreate, ProviderConfig, generateModelId, getModelDetailUrl } from "./models"
 import { isContextWindowUnset } from "./model-display-capabilities"
 import {
+  bedrockAuthModesForUser,
+  bedrockCredentialsChainRequiresAdmin,
   buildModelRequestPayload,
   providerAllowsEmptyApiKey,
   shouldFetchProviderModelCatalog,
@@ -151,6 +153,16 @@ export function ModelManagementDialog({
   const [isDeletingModel, setIsDeletingModel] = useState(false)
   const [hasInitializedDefaults, setHasInitializedDefaults] = useState(false)
   const [selectedDefaultConfigTypes, setSelectedDefaultConfigTypes] = useState<string[]>([])
+
+  const bedrockAuthModeOptions = (currentMode?: "api_key" | "credentials_chain") =>
+    bedrockAuthModesForUser(user?.is_admin === true, currentMode).map(mode => ({
+      value: mode,
+      label: mode === "api_key"
+        ? t('models.form.bedrockApiKey')
+        : user?.is_admin
+          ? t('models.form.awsCredentialsChain')
+          : t('models.form.awsCredentialsChainAdminOnly'),
+    }))
 
   const getCategoryForActiveTab = (providerId?: string): string => {
     if (activeTab !== 'audio') return activeTab
@@ -327,6 +339,12 @@ export function ModelManagementDialog({
   }
 
   const [formData, setFormData] = useState<ModelCreate>(getInitialFormData())
+
+  const bedrockChainRequiresAdmin = bedrockCredentialsChainRequiresAdmin(
+    formData.model_provider,
+    formData.bedrock_auth_mode,
+    user?.is_admin === true,
+  )
 
   const abilityOptions = useMemo(() => [
     { value: "chat", label: t('models.abilities.chat') },
@@ -1030,11 +1048,13 @@ export function ModelManagementDialog({
                                 bedrock_auth_mode: value as "api_key" | "credentials_chain",
                                 api_key: value === "credentials_chain" ? "" : formData.api_key,
                               })}
-                              options={[
-                                { value: "api_key", label: t('models.form.bedrockApiKey') },
-                                { value: "credentials_chain", label: t('models.form.awsCredentialsChain') },
-                              ]}
+                              options={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
                             />
+                            {bedrockChainRequiresAdmin && (
+                              <p className="text-sm text-amber-700">
+                                {t('models.form.awsCredentialsChainAdminRequired')}
+                              </p>
+                            )}
                           </div>
                         </div>
                       )}
@@ -1102,6 +1122,7 @@ export function ModelManagementDialog({
                           disabled={
                             (!providerAllowsEmptyApiKey(formData.model_provider, formData.bedrock_auth_mode) && !formData.api_key)
                             || (formData.model_provider === "bedrock" && !formData.bedrock_region?.trim())
+                            || bedrockChainRequiresAdmin
                             || (baseUrlRequired ? !formData.base_url?.trim() : false)
                             || testConnectionStatus === 'testing'
                           }
@@ -1635,11 +1656,13 @@ export function ModelManagementDialog({
                         bedrock_auth_mode: value as "api_key" | "credentials_chain",
                         api_key: value === "credentials_chain" ? "" : formData.api_key,
                       })}
-                      options={[
-                        { value: "api_key", label: t('models.form.bedrockApiKey') },
-                        { value: "credentials_chain", label: t('models.form.awsCredentialsChain') },
-                      ]}
+                      options={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
                     />
+                    {bedrockChainRequiresAdmin && (
+                      <p className="text-sm text-amber-700 mt-1">
+                        {t('models.form.awsCredentialsChainAdminRequired')}
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
@@ -1822,7 +1845,10 @@ export function ModelManagementDialog({
               <Button variant="outline" onClick={closeDialog}>
                 {t('models.dialog.cancel')}
               </Button>
-              <Button onClick={() => submitModelData(formData)}>
+              <Button
+                onClick={() => submitModelData(formData)}
+                disabled={bedrockChainRequiresAdmin}
+              >
                 {editingModel ? t('models.form.update') : t('models.form.create')}
               </Button>
             </div>

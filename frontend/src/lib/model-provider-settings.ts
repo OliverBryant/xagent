@@ -14,6 +14,26 @@ export function providerAllowsEmptyApiKey(
     || (providerId === "bedrock" && bedrockAuthMode === "credentials_chain")
 }
 
+export function bedrockAuthModesForUser(
+  isAdmin: boolean,
+  currentMode?: BedrockAuthMode,
+): BedrockAuthMode[] {
+  if (isAdmin || currentMode === "credentials_chain") {
+    return ["api_key", "credentials_chain"]
+  }
+  return ["api_key"]
+}
+
+export function bedrockCredentialsChainRequiresAdmin(
+  providerId: string,
+  authMode: BedrockAuthMode | undefined,
+  isAdmin: boolean,
+): boolean {
+  return providerId === "bedrock"
+    && authMode === "credentials_chain"
+    && !isAdmin
+}
+
 export function shouldFetchProviderModelCatalog(
   providerId: string,
 ): boolean {

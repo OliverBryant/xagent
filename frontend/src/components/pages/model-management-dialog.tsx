@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useMemo } from "react"
+import React, { useState, useMemo } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -49,16 +49,72 @@ import { toast } from "@/components/ui/sonner"
 import { Model, ModelCreate, ProviderConfig, generateModelId, getModelDetailUrl } from "./models"
 import { isContextWindowUnset } from "./model-display-capabilities"
 import {
+  bedrockDefaults,
   bedrockAuthModesForUser,
-  bedrockCredentialsChainRequiresAdmin,
+  BedrockAuthMode,
   buildModelRequestPayload,
-  providerAllowsEmptyApiKey,
+  hasInvalidModelProviderSettings,
+  isBedrockCredentialChainBlocked,
+  modelToFormData,
   shouldFetchProviderModelCatalog,
 } from "@/lib/model-provider-settings"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { Stepper } from "@/components/ui/stepper"
 
 const SPEECH_ABILITY_VALUES = new Set(["asr", "tts"])
+
+type BedrockSettingsFieldsProps = {
+  region: string
+  authMode: BedrockAuthMode
+  authModeOptions: { value: string; label: string }[]
+  credentialChainBlocked: boolean
+  layout: "stacked" | "grid"
+  onRegionChange: (region: string) => void
+  onAuthModeChange: (authMode: BedrockAuthMode) => void
+}
+
+function BedrockSettingsFields({
+  region,
+  authMode,
+  authModeOptions,
+  credentialChainBlocked,
+  layout,
+  onRegionChange,
+  onAuthModeChange,
+}: BedrockSettingsFieldsProps) {
+  const { t } = useI18n()
+
+  return (
+    <div className={layout === "grid" ? "grid grid-cols-1 md:grid-cols-2 gap-4" : "space-y-4"}>
+      <div className="space-y-2">
+        <Label className={layout === "stacked" ? "text-base" : undefined} htmlFor={`${layout}-bedrock-region`}>
+          {t('models.form.region')}
+        </Label>
+        <Input
+          id={`${layout}-bedrock-region`}
+          placeholder="us-east-1"
+          value={region}
+          onChange={(event) => onRegionChange(event.target.value)}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className={layout === "stacked" ? "text-base" : undefined}>
+          {t('models.form.authMode')}
+        </Label>
+        <Select
+          value={authMode}
+          onValueChange={(value) => onAuthModeChange(value as BedrockAuthMode)}
+          options={authModeOptions}
+        />
+        {credentialChainBlocked && (
+          <p className="text-sm text-amber-700">
+            {t('models.form.awsCredentialsChainAdminRequired')}
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
 
 function getProviderModelAbilities(model?: ProviderModel): string[] {
   const abilities = model?.abilities?.length
@@ -284,26 +340,7 @@ export function ModelManagementDialog({
   const getInitialFormData = (): ModelCreate => {
     if (initialEditingModel) {
       const currentDefaults = getModelDefaultTypes(initialEditingModel.id)
-      return {
-        model_id: initialEditingModel.model_id,
-        category: initialEditingModel.category,
-        model_provider: initialEditingModel.model_provider,
-        model_name: initialEditingModel.model_name,
-        api_key: "",
-        base_url: initialEditingModel.base_url || "",
-        bedrock_region: initialEditingModel.model_provider === "bedrock"
-          ? initialEditingModel.bedrock_region || ""
-          : undefined,
-        bedrock_auth_mode: initialEditingModel.model_provider === "bedrock"
-          ? initialEditingModel.bedrock_auth_mode || "api_key"
-          : undefined,
-        temperature: initialEditingModel.temperature,
-        context_window: initialEditingModel.context_window,
-        dimension: initialEditingModel.dimension,
-        abilities: initialEditingModel.abilities || [],
-        default_config_types: currentDefaults,
-        share_with_users: initialEditingModel.is_shared
-      }
+      return modelToFormData(initialEditingModel, currentDefaults)
     }
 
     // Determine default provider based on activeTab if no initialProviderId is given
@@ -329,8 +366,7 @@ export function ModelManagementDialog({
       model_name: "",
       api_key: "",
       base_url: getDefaultBaseUrlForProvider(defaultProvider, initialCategory),
-      bedrock_region: defaultProvider === "bedrock" ? "us-east-1" : undefined,
-      bedrock_auth_mode: defaultProvider === "bedrock" ? "api_key" : undefined,
+      ...bedrockDefaults(defaultProvider),
       temperature: initialCategory === 'llm' ? undefined : undefined,
       dimension: initialCategory === 'embedding' ? undefined : undefined,
       abilities: getDefaultAbilitiesForProvider(initialCategory, defaultProvider),
@@ -340,11 +376,17 @@ export function ModelManagementDialog({
 
   const [formData, setFormData] = useState<ModelCreate>(getInitialFormData())
 
-  const bedrockChainRequiresAdmin = bedrockCredentialsChainRequiresAdmin(
+  const bedrockCredentialChainBlocked = isBedrockCredentialChainBlocked(
     formData.model_provider,
     formData.bedrock_auth_mode,
     user?.is_admin === true,
   )
+  const showApiKey = formData.model_provider !== "bedrock"
+    || formData.bedrock_auth_mode !== "credentials_chain"
+  const providerSettingsInvalid = hasInvalidModelProviderSettings(formData, {
+    isEditing: Boolean(editingModel),
+    initialBedrockAuthMode: editingModel?.bedrock_auth_mode,
+  })
 
   const abilityOptions = useMemo(() => [
     { value: "chat", label: t('models.abilities.chat') },
@@ -449,22 +491,7 @@ export function ModelManagementDialog({
     setDefaultTargetModel(null)
     setEditingModel(model)
     const currentDefaults = getModelDefaultTypes(model.id)
-    setFormData({
-      model_id: model.model_id,
-      category: model.category,
-      model_provider: model.model_provider,
-      model_name: model.model_name,
-      api_key: "",
-      base_url: model.base_url || "",
-      bedrock_region: model.model_provider === "bedrock" ? model.bedrock_region || "" : undefined,
-      bedrock_auth_mode: model.model_provider === "bedrock" ? model.bedrock_auth_mode || "api_key" : undefined,
-      temperature: model.temperature,
-      context_window: model.context_window,
-      dimension: model.dimension,
-      abilities: model.abilities || [],
-      default_config_types: currentDefaults,
-      share_with_users: model.is_shared
-    })
+    setFormData(modelToFormData(model, currentDefaults))
     setViewMode('form')
   }
 
@@ -488,8 +515,7 @@ export function ModelManagementDialog({
       model_name: "",
       api_key: "",
       base_url: providerConfig?.defaultBaseUrl || "",
-      bedrock_region: managingProviderId === "bedrock" ? "us-east-1" : undefined,
-      bedrock_auth_mode: managingProviderId === "bedrock" ? "api_key" : undefined,
+      ...bedrockDefaults(managingProviderId),
       temperature: category === 'llm' ? undefined : undefined,
       dimension: category === 'embedding' ? undefined : undefined,
       abilities: getDefaultAbilitiesForProvider(category, managingProviderId),
@@ -982,8 +1008,7 @@ export function ModelManagementDialog({
                                     model_name: "",
                                     base_url: getDefaultBaseUrlForProvider(provider.id, prev.category),
                                     api_key: prev.model_provider === provider.id ? prev.api_key : "",
-                                    bedrock_region: provider.id === "bedrock" ? (prev.bedrock_region || "us-east-1") : undefined,
-                                    bedrock_auth_mode: provider.id === "bedrock" ? (prev.bedrock_auth_mode || "api_key") : undefined,
+                                    ...bedrockDefaults(provider.id, prev),
                                     abilities: getDefaultAbilitiesForProvider(prev.category, provider.id),
                                   }))
                                 }}
@@ -1030,36 +1055,22 @@ export function ModelManagementDialog({
                       )}
 
                       {formData.model_provider === "bedrock" && (
-                        <div className="space-y-4">
-                          <div className="space-y-2">
-                            <Label className="text-base">{t('models.form.region')}</Label>
-                            <Input
-                              placeholder="us-east-1"
-                              value={formData.bedrock_region || ""}
-                              onChange={(e) => setFormData({ ...formData, bedrock_region: e.target.value })}
-                            />
-                          </div>
-                          <div className="space-y-2">
-                            <Label className="text-base">{t('models.form.authMode')}</Label>
-                            <Select
-                              value={formData.bedrock_auth_mode || "api_key"}
-                              onValueChange={(value) => setFormData({
-                                ...formData,
-                                bedrock_auth_mode: value as "api_key" | "credentials_chain",
-                                api_key: value === "credentials_chain" ? "" : formData.api_key,
-                              })}
-                              options={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
-                            />
-                            {bedrockChainRequiresAdmin && (
-                              <p className="text-sm text-amber-700">
-                                {t('models.form.awsCredentialsChainAdminRequired')}
-                              </p>
-                            )}
-                          </div>
-                        </div>
+                        <BedrockSettingsFields
+                          region={formData.bedrock_region || ""}
+                          authMode={formData.bedrock_auth_mode || "api_key"}
+                          authModeOptions={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
+                          credentialChainBlocked={bedrockCredentialChainBlocked}
+                          layout="stacked"
+                          onRegionChange={(bedrock_region) => setFormData({ ...formData, bedrock_region })}
+                          onAuthModeChange={(bedrock_auth_mode) => setFormData({
+                            ...formData,
+                            bedrock_auth_mode,
+                            api_key: bedrock_auth_mode === "credentials_chain" ? "" : formData.api_key,
+                          })}
+                        />
                       )}
 
-                      {(formData.model_provider !== "bedrock" || formData.bedrock_auth_mode !== "credentials_chain") && <div className="space-y-2">
+                      {showApiKey && <div className="space-y-2">
                         <Label className="text-base">{t('models.dialog.connect.apiKeyTitle', { provider: selectedProvider?.name || '' })}</Label>
                         <Input
                           type="password"
@@ -1094,10 +1105,16 @@ export function ModelManagementDialog({
                               {t('models.dialog.connect.advancedSettings')}
                             </summary>
                             <div className="mt-4 space-y-2 pl-5">
-                              <Label className="text-base font-medium">{t('models.form.baseUrl')}</Label>
+                              <Label className="text-base font-medium">
+                                {t('models.form.baseUrl')}
+                                {formData.model_provider === "bedrock" ? ` ${t('common.optional')}` : ""}
+                              </Label>
                               <Input
                                 value={formData.base_url || ""}
                                 onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
+                                placeholder={formData.model_provider === "bedrock"
+                                  ? t('models.form.bedrockEndpointPlaceholder')
+                                  : undefined}
                               />
                             </div>
                           </details>
@@ -1120,9 +1137,8 @@ export function ModelManagementDialog({
                             }
                           }}
                           disabled={
-                            (!providerAllowsEmptyApiKey(formData.model_provider, formData.bedrock_auth_mode) && !formData.api_key)
-                            || (formData.model_provider === "bedrock" && !formData.bedrock_region?.trim())
-                            || bedrockChainRequiresAdmin
+                            providerSettingsInvalid
+                            || bedrockCredentialChainBlocked
                             || (baseUrlRequired ? !formData.base_url?.trim() : false)
                             || testConnectionStatus === 'testing'
                           }
@@ -1141,9 +1157,11 @@ export function ModelManagementDialog({
                       <div className="space-y-2">
                         <div className="flex justify-between items-center">
                           <Label className="text-base font-medium">{t('models.form.name')}</Label>
-                          <Button variant="ghost" size="sm" className="h-8 text-primary" onClick={handleFetchModels} disabled={isFetchingModels}>
-                            <RefreshCw className={`w-3 h-3 mr-1 ${isFetchingModels ? 'animate-spin' : ''}`} /> {t('common.refresh')}
-                          </Button>
+                          {shouldFetchProviderModelCatalog(formData.model_provider) && (
+                            <Button variant="ghost" size="sm" className="h-8 text-primary" onClick={handleFetchModels} disabled={isFetchingModels}>
+                              <RefreshCw className={`w-3 h-3 mr-1 ${isFetchingModels ? 'animate-spin' : ''}`} /> {t('common.refresh')}
+                            </Button>
+                          )}
                         </div>
                         <Select
                           value={formData.model_name}
@@ -1619,8 +1637,7 @@ export function ModelManagementDialog({
                         model_name: "",
                         base_url: getDefaultBaseUrlForProvider(value, prev.category),
                         api_key: prev.model_provider === value ? prev.api_key : "",
-                        bedrock_region: value === "bedrock" ? (prev.bedrock_region || "us-east-1") : undefined,
-                        bedrock_auth_mode: value === "bedrock" ? (prev.bedrock_auth_mode || "api_key") : undefined,
+                        ...bedrockDefaults(value, prev),
                         abilities: getDefaultAbilitiesForProvider(prev.category, value),
                       }))
                     }}
@@ -1637,37 +1654,22 @@ export function ModelManagementDialog({
               </div>
 
               {formData.model_provider === "bedrock" && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <Label htmlFor="bedrock_region">{t('models.form.region')}</Label>
-                    <Input
-                      id="bedrock_region"
-                      value={formData.bedrock_region || ""}
-                      onChange={(e) => setFormData({ ...formData, bedrock_region: e.target.value })}
-                      placeholder="us-east-1"
-                    />
-                  </div>
-                  <div>
-                    <Label htmlFor="bedrock_auth_mode">{t('models.form.authMode')}</Label>
-                    <Select
-                      value={formData.bedrock_auth_mode || "api_key"}
-                      onValueChange={(value) => setFormData({
-                        ...formData,
-                        bedrock_auth_mode: value as "api_key" | "credentials_chain",
-                        api_key: value === "credentials_chain" ? "" : formData.api_key,
-                      })}
-                      options={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
-                    />
-                    {bedrockChainRequiresAdmin && (
-                      <p className="text-sm text-amber-700 mt-1">
-                        {t('models.form.awsCredentialsChainAdminRequired')}
-                      </p>
-                    )}
-                  </div>
-                </div>
+                <BedrockSettingsFields
+                  region={formData.bedrock_region || ""}
+                  authMode={formData.bedrock_auth_mode || "api_key"}
+                  authModeOptions={bedrockAuthModeOptions(formData.bedrock_auth_mode)}
+                  credentialChainBlocked={bedrockCredentialChainBlocked}
+                  layout="grid"
+                  onRegionChange={(bedrock_region) => setFormData({ ...formData, bedrock_region })}
+                  onAuthModeChange={(bedrock_auth_mode) => setFormData({
+                    ...formData,
+                    bedrock_auth_mode,
+                    api_key: bedrock_auth_mode === "credentials_chain" ? "" : formData.api_key,
+                  })}
+                />
               )}
 
-              {(formData.model_provider !== "bedrock" || formData.bedrock_auth_mode !== "credentials_chain") && <div>
+              {showApiKey && <div>
                 <Label htmlFor="api_key">{t('models.form.apiKey')}</Label>
                 <Input
                   id="api_key"
@@ -1679,12 +1681,17 @@ export function ModelManagementDialog({
               </div>}
 
               <div>
-                <Label htmlFor="base_url">{t('models.form.baseUrl')}</Label>
+                <Label htmlFor="base_url">
+                  {t('models.form.baseUrl')}
+                  {formData.model_provider === "bedrock" ? ` ${t('common.optional')}` : ""}
+                </Label>
                 <Input
                   id="base_url"
                   value={formData.base_url}
                   onChange={(e) => setFormData({ ...formData, base_url: e.target.value })}
-                  placeholder={t('models.form.baseUrlPlaceholder')}
+                  placeholder={formData.model_provider === "bedrock"
+                    ? t('models.form.bedrockEndpointPlaceholder')
+                    : t('models.form.baseUrlPlaceholder')}
                 />
               </div>
 
@@ -1721,7 +1728,7 @@ export function ModelManagementDialog({
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <Label htmlFor="model_name">{t('models.form.name')}</Label>
-                  {!editingModel && (
+                  {!editingModel && shouldFetchProviderModelCatalog(formData.model_provider) && (
                     <div className="flex items-center gap-2">
                       <Button
                         variant="ghost"
@@ -1847,7 +1854,7 @@ export function ModelManagementDialog({
               </Button>
               <Button
                 onClick={() => submitModelData(formData)}
-                disabled={bedrockChainRequiresAdmin}
+                disabled={providerSettingsInvalid || bedrockCredentialChainBlocked}
               >
                 {editingModel ? t('models.form.update') : t('models.form.create')}
               </Button>

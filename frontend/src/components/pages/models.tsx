@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useMemo, ReactNode } from "react"
+import React, { useState, useEffect, useMemo, ReactNode } from "react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/ui/page-header"
@@ -29,6 +29,7 @@ import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
 import { getProviderDisplayCapabilities } from "./model-display-capabilities"
 import { AutoModelConfigCard } from "./auto-model-config-card"
+import type { BedrockAuthMode, ModelFormData } from "@/lib/model-provider-settings"
 
 const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as const
 const DEFAULT_MODEL_TAB = "llm"
@@ -67,7 +68,12 @@ export function generateModelId(modelName: string, modelProvider: string, userId
   const suffix = randomHex8()
   // Fallback to 'user' if ID is missing to prevent "undefined" in string
   const uid = userId || 'unknown'
-  return `${modelName}-${modelProvider}-${uid}-${suffix}`
+  const arnResourceName = modelName.includes("/")
+    ? modelName.slice(modelName.lastIndexOf("/") + 1)
+    : modelName
+  const randomSuffix = `-${suffix}`
+  const readableIdentity = `${arnResourceName}-${modelProvider}-${uid}`
+  return `${readableIdentity.slice(0, 100 - randomSuffix.length)}${randomSuffix}`
 }
 
 // Interfaces from models-1.tsx
@@ -79,7 +85,7 @@ export interface Model {
   model_name: string
   base_url?: string
   bedrock_region?: string
-  bedrock_auth_mode?: "api_key" | "credentials_chain"
+  bedrock_auth_mode?: BedrockAuthMode
   temperature?: number
   context_window?: number
   dimension?: number
@@ -94,22 +100,7 @@ export interface Model {
   is_shared: boolean
 }
 
-export interface ModelCreate {
-  model_id: string
-  category: string
-  model_provider: string
-  model_name: string
-  api_key: string
-  base_url?: string
-  bedrock_region?: string
-  bedrock_auth_mode?: "api_key" | "credentials_chain"
-  temperature?: number
-  context_window?: number
-  dimension?: number
-  abilities?: string[]
-  share_with_users?: boolean
-  default_config_types?: string[]
-}
+export type ModelCreate = ModelFormData
 
 // Provider Config from models.tsx
 export interface ProviderConfig {

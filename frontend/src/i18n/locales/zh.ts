@@ -2116,6 +2116,7 @@ const zh = {
       apiKeyPlaceholderEdit: "留空以保持不变",
       baseUrl: "基础 URL",
       baseUrlPlaceholder: "https://api.openai.com/v1",
+      bedrockEndpointPlaceholder: "https://bedrock-runtime.us-east-1.amazonaws.com",
       region: "AWS 区域",
       authMode: "认证方式",
       bedrockApiKey: "Amazon Bedrock API 密钥",

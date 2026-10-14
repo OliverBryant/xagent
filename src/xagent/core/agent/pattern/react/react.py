@@ -1325,16 +1325,19 @@ class ReActPattern(AgentPattern):
                     recovery_reason = TRUNCATED_TOOL_ARGUMENTS
                 elif empty_final_answer is not None:
                     recovery_reason = "empty_final_answer"
-                elif empty_plain_text:
-                    recovery_reason = "empty_plain_text"
                 elif settlement_fence:
                     recovery_reason = "settlement_final_answer_required"
-                elif (
-                    protocol_error is not None
-                    and protocol_error.get("code") == "malformed_tool_arguments"
-                ):
-                    # The same repair the raised form of this error gets.
-                    recovery_reason = "malformed_tool_arguments"
+                elif protocol_error is not None:
+                    # Provider protocol errors commonly carry neither content nor
+                    # tool calls. Preserve their own repair path instead of
+                    # misclassifying the envelope as an empty plain-text reply.
+                    recovery_reason = (
+                        "malformed_tool_arguments"
+                        if protocol_error.get("code") == "malformed_tool_arguments"
+                        else None
+                    )
+                elif empty_plain_text:
+                    recovery_reason = "empty_plain_text"
                 else:
                     recovery_reason = None
                 try:

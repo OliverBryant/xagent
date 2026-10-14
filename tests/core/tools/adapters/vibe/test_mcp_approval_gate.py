@@ -118,8 +118,9 @@ def _register_scoped(
     *,
     gate: Any,
     classifier: Any,
-    matcher: Any = lambda ref, name: ref.connector_id == 41
-    and name.endswith("create_post"),
+    matcher: Any = lambda ref, name: (
+        ref.connector_id == 41 and name.endswith("create_post")
+    ),
 ) -> MCPApprovalGateScope:
     handle = register_mcp_approval_gate(
         task_source="external",
@@ -143,9 +144,7 @@ def test_scoped_registration_off_leaves_target_completely_unwrapped(
     )
     target = _Target(concurrency_safe=True)
 
-    (off_tool,) = gate_mcp_tools(
-        [target], connector_ref=ConnectorRef("mcp", 41)
-    )
+    (off_tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
     (on_tool,) = gate_mcp_tools(
         [target],
         connector_ref=ConnectorRef("mcp", 41),
@@ -201,7 +200,9 @@ async def test_scoped_classifier_runs_before_pattern_and_false_passes_through(
         approval_scope=scope,
     )
 
-    with bind_tool_call_execution_context(_context(task_source="external", pattern="dag")):
+    with bind_tool_call_execution_context(
+        _context(task_source="external", pattern="dag")
+    ):
         read_result = await tool.run_json_async({"text": "read"})
         write_result = await tool.run_json_async({"text": "publish"})
 
@@ -221,9 +222,7 @@ async def test_scoped_target_react_enters_gate_after_classification(
         gate_calls.append(call)
         return GateDecision.require_approval("approval-1")
 
-    scope = _register_scoped(
-        registrations, gate=gate, classifier=lambda _: True
-    )
+    scope = _register_scoped(registrations, gate=gate, classifier=lambda _: True)
     target = _Target()
     (tool,) = gate_mcp_tools(
         [target],
@@ -240,7 +239,9 @@ async def test_scoped_target_react_enters_gate_after_classification(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("classifier", [lambda _: 1, lambda _: (_ for _ in ()).throw(RuntimeError("boom"))])
+@pytest.mark.parametrize(
+    "classifier", [lambda _: 1, lambda _: (_ for _ in ()).throw(RuntimeError("boom"))]
+)
 async def test_scoped_classifier_failure_fails_closed(
     registrations: list[Any], classifier: Any
 ) -> None:
@@ -373,9 +374,7 @@ async def test_concurrent_task_scopes_do_not_bleed(registrations: list[Any]) -> 
     async def gate(_: GatedCall) -> GateDecision:
         return GateDecision.require_approval("approval")
 
-    first = _register_scoped(
-        registrations, gate=gate, classifier=lambda _: True
-    )
+    first = _register_scoped(registrations, gate=gate, classifier=lambda _: True)
     second_handle = register_mcp_approval_gate(
         task_source="external-other",
         gate=gate,
@@ -413,10 +412,8 @@ async def test_concurrent_task_scopes_do_not_bleed(registrations: list[Any]) -> 
 
 
 def test_public_facade_exports_scoped_integration_contract() -> None:
-    from xagent.mcp_approval_gate import (
-        MCPApprovalGateScope as PublicScope,
-        mcp_approval_gate_scope as public_scope_factory,
-    )
+    from xagent.mcp_approval_gate import MCPApprovalGateScope as PublicScope
+    from xagent.mcp_approval_gate import mcp_approval_gate_scope as public_scope_factory
 
     assert PublicScope is MCPApprovalGateScope
     assert public_scope_factory is mcp_approval_gate_scope

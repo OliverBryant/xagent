@@ -927,9 +927,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
         self, context: ToolCallExecutionContext | None
     ) -> _RegisteredHooks | None:
         if self._scoped_registration is not None:
-            current = _registration_for(
-                self._scoped_registration.handle.task_source
-            )
+            current = _registration_for(self._scoped_registration.handle.task_source)
             if current is None or current.handle != self._scoped_registration.handle:
                 return None
             return current
@@ -1369,10 +1367,13 @@ def gate_mcp_tools(
             for tool in tools
         ]
 
+    matcher = registration.tool_matcher
+    if matcher is None:
+        raise AssertionError("scoped registration lost its tool matcher")
     wrapped: list[AbstractBaseTool] = []
     for tool in tools:
         try:
-            matches = registration.tool_matcher(ref, tool.name)
+            matches = matcher(ref, tool.name)
             if type(matches) is not bool:
                 raise TypeError("approval tool matcher must return bool")
         except Exception:

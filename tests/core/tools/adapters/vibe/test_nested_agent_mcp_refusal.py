@@ -337,7 +337,9 @@ def test_the_delegated_config_is_actually_wired_to_the_refusal() -> None:
 
         scope = keywords.get("mcp_approval_gate_scope")
         supported = keywords.get("mcp_approval_supported")
-        assert scope is not None and ast.unparse(scope) == "self._mcp_approval_gate_scope"
+        assert (
+            scope is not None and ast.unparse(scope) == "self._mcp_approval_gate_scope"
+        )
         assert supported is not None
         supported_source = ast.unparse(supported)
         assert "self._mcp_approval_gate_scope" in supported_source

@@ -10,9 +10,7 @@ _AUTO_ONLY_CLAUDE_MODEL = re.compile(
     r"^claude-(?:opus-5-5|sonnet-5-5|fable-5(?:-1)?|mythos-5-1)(?:[-.:]|$)",
     re.IGNORECASE,
 )
-_BEDROCK_ANTHROPIC_PREFIX = re.compile(
-    r"^(?:[a-z0-9-]+\.)?anthropic\.", re.IGNORECASE
-)
+_BEDROCK_ANTHROPIC_PREFIX = re.compile(r"^(?:[a-z0-9-]+\.)?anthropic\.", re.IGNORECASE)
 
 
 def is_auto_only_claude_model(model_name: str) -> bool:

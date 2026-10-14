@@ -37,9 +37,7 @@ class TestClaudeLLM:
 
     @pytest.mark.asyncio
     async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):
-        llm = ClaudeLLM(
-            model_name="claude-opus-5-5-20261001", api_key="test-key"
-        )
+        llm = ClaudeLLM(model_name="claude-opus-5-5-20261001", api_key="test-key")
         client = mocker.AsyncMock()
         client.messages.create.return_value = SimpleNamespace(
             stop_reason="end_turn",

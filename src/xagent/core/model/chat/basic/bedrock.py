@@ -60,6 +60,8 @@ _IMAGE_MEDIA_TYPES = {
     "image/gif": "gif",
     "image/webp": "webp",
 }
+
+
 def _safe_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))

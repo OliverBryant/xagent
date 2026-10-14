@@ -1307,9 +1307,7 @@ class ReActPattern(AgentPattern):
                     None if truncated else self._empty_final_answer_call(normalized)
                 )
                 empty_plain_text = (
-                    False
-                    if truncated
-                    else self._empty_plain_text_response(normalized)
+                    False if truncated else self._empty_plain_text_response(normalized)
                 )
                 if empty_final_answer is not None:
                     logger.warning(
@@ -2261,10 +2259,9 @@ class ReActPattern(AgentPattern):
             # not allowed to reintroduce. The empty-answer repair owns
             # responses whose only calls are control tools.
             return False
-        return (
-            self._empty_final_answer_call(normalized) is not None
-            or self._empty_plain_text_response(normalized)
-        )
+        return self._empty_final_answer_call(
+            normalized
+        ) is not None or self._empty_plain_text_response(normalized)
 
     @staticmethod
     def _empty_plain_text_response(normalized: dict[str, Any]) -> bool:

@@ -1160,6 +1160,8 @@ class ToolFactory:
         workspace: Any | None = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
+        approval_scope: Any = None,
+        approval_supported: bool = True,
     ) -> list[Tool]:
         """Create MCP tools while keeping actor session identity host-only."""
         try:
@@ -1316,6 +1318,8 @@ class ToolFactory:
                                     connector_ref=ToolFactory._mcp_connector_refs(
                                         {server_name: configs_by_name[server_name]}
                                     ).get(server_name),
+                                    approval_scope=approval_scope,
+                                    approval_supported=approval_supported,
                                 )
                             )
                         except ConnectorRuntimeError:
@@ -1344,6 +1348,8 @@ class ToolFactory:
                             connector_refs=ToolFactory._mcp_connector_refs(
                                 configs_by_name
                             ),
+                            approval_scope=approval_scope,
+                            approval_supported=approval_supported,
                             sandbox=sandbox,
                             workspace=workspace,
                         )

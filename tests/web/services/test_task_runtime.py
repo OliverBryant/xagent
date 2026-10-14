@@ -21,6 +21,12 @@ from xagent.core.task_runtime import (
     normalize_input_modalities,
     normalize_task_runtime_contribution,
 )
+from xagent.mcp_approval_gate import (
+    GateDecision,
+    mcp_approval_gate_scope,
+    register_mcp_approval_gate,
+    unregister_mcp_approval_gate,
+)
 from xagent.web.services.task_runtime import (
     TaskRuntimeExtensionError,
     build_task_runtime,
@@ -47,6 +53,37 @@ def test_public_task_runtime_facade_exports_provider_contract() -> None:
     assert PublicTaskRuntimeContext is TaskRuntimeContext
     assert PublicTaskRuntimeContribution is TaskRuntimeContribution
     assert public_register_task_extension is register_task_extension
+
+
+def test_runtime_provider_can_contribute_server_resolved_approval_scope() -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    try:
+        scope = mcp_approval_gate_scope(handle)
+        normalized = normalize_task_runtime_contribution(
+            TaskRuntimeContribution(mcp_approval_gate_scope=scope)
+        )
+        from xagent.web.tools.config import WebToolConfig
+
+        config = WebToolConfig(db=None, request=None, user_id=7)
+        config.set_task_runtime_contribution(normalized)
+        resolved = config.get_mcp_approval_gate_scope()
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert normalized.mcp_approval_gate_scope == scope
+    assert resolved == scope
 
 
 @pytest.fixture

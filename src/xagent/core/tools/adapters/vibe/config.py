@@ -529,6 +529,16 @@ class BaseToolConfig(ABC):
         unregistered and dispatch ungated."""
         return None
 
+    def get_mcp_approval_gate_scope(self) -> Any:
+        """Trusted per-task MCP approval scope, or ``None`` when disabled."""
+
+        return None
+
+    def get_mcp_approval_supported(self) -> bool:
+        """Whether this execution can pause and resume connector approval."""
+
+        return True
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""
         return None

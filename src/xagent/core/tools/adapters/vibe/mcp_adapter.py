@@ -3533,6 +3533,8 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
+    approval_scope: Any = None,
+    approval_supported: bool = True,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -3687,6 +3689,8 @@ async def load_mcp_tools_as_agent_tools(
                     server_tools,
                     connection=connection,
                     connector_ref=(connector_refs or {}).get(server_name),
+                    approval_scope=approval_scope,
+                    approval_supported=approval_supported,
                 )
             )
             if server_tools:

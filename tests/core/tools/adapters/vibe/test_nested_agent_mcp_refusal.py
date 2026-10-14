@@ -324,25 +324,21 @@ def test_the_delegated_config_is_actually_wired_to_the_refusal() -> None:
     assert wired, "AgentTool no longer builds a WebToolConfig; update this test"
 
     for call in wired:
-        reason = [kw for kw in call.keywords if kw.arg == "mcp_unavailable_reason"]
-        assert reason, (
+        keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+        reason = keywords.get("mcp_unavailable_reason")
+        assert reason is not None, (
             "a delegated WebToolConfig with no mcp_unavailable_reason lets a "
             "gated parent's child materialize live MCP connectors"
         )
-        value = reason[0].value
-        # ``_nested_mcp_refusal_reason() or self._inherited_mcp_unavailable_reason``:
-        # an ``or`` BoolOp whose first operand is the live-context call and
-        # whose second is the inherited-reason attribute read.
-        assert isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or)
-        assert len(value.values) == 2
-        live_call, inherited_read = value.values
+        reason_source = ast.unparse(reason)
+        assert "_nested_mcp_refusal_reason()" in reason_source
+        assert "self._inherited_mcp_unavailable_reason" in reason_source
+        assert "self._mcp_approval_gate_scope" in reason_source
 
-        assert isinstance(live_call, ast.Call) and isinstance(live_call.func, ast.Name)
-        assert live_call.func.id == "_nested_mcp_refusal_reason"
-
-        assert isinstance(inherited_read, ast.Attribute)
-        assert inherited_read.attr == "_inherited_mcp_unavailable_reason"
-        assert (
-            isinstance(inherited_read.value, ast.Name)
-            and inherited_read.value.id == "self"
-        )
+        scope = keywords.get("mcp_approval_gate_scope")
+        supported = keywords.get("mcp_approval_supported")
+        assert scope is not None and ast.unparse(scope) == "self._mcp_approval_gate_scope"
+        assert supported is not None
+        supported_source = ast.unparse(supported)
+        assert "self._mcp_approval_gate_scope" in supported_source
+        assert "False" in supported_source

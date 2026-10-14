@@ -108,6 +108,7 @@ async def _load_one_wrapped(
     target: _McpTarget,
     *,
     connector_refs: dict[str, ConnectorRef] | None = None,
+    **loader_kwargs: Any,
 ) -> Any:
     """Run the real loader boundary and return the single tool it produced."""
 
@@ -126,6 +127,7 @@ async def _load_one_wrapped(
         result = await load_mcp_tools_as_agent_tools(
             {"linkedin": {"transport": "sse", "url": "https://example.invalid"}},
             connector_refs=connector_refs,
+            **loader_kwargs,
         )
     assert len(result.tools) == 1
     return result.tools[0]
@@ -251,13 +253,20 @@ async def test_config_seam_passes_persisted_server_ids_as_connector_refs() -> No
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
         new=load,
     ):
-        await ToolFactory._create_mcp_tools_from_configs(configs)
+        approval_scope = object()
+        await ToolFactory._create_mcp_tools_from_configs(
+            configs,
+            approval_scope=approval_scope,
+            approval_supported=False,
+        )
 
     connector_refs = load.await_args.kwargs["connector_refs"]
     assert connector_refs == {"linkedin": ConnectorRef("mcp", 12)}
     # All four servers reached the loader; only the persisted one is
     # identifiable, so this is a scoping assertion, not a filtering artifact.
     assert set(load.await_args.args[0]) == {"linkedin", "scratch", "boolish", "zero"}
+    assert load.await_args.kwargs["approval_scope"] is approval_scope
+    assert load.await_args.kwargs["approval_supported"] is False
     # The transport mapping the loader (and, through it, a sandbox guest)
     # receives still carries no persisted identity.
     connections = load.await_args.args[0]

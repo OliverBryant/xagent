@@ -1773,6 +1773,8 @@ class WebToolConfig(BaseToolConfig):
         voice: Optional[str] = None,
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        mcp_approval_gate_scope: Any = None,
+        mcp_approval_supported: bool = True,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1805,6 +1807,8 @@ class WebToolConfig(BaseToolConfig):
         # actor and lifecycle identity on every secret read.
         self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
         self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_approval_gate_scope = mcp_approval_gate_scope
+        self._mcp_approval_supported = bool(mcp_approval_supported)
         self._mcp_actor_stdio_session_identities: dict[
             str, ActorMCPStdioSessionIdentity
         ] = {}
@@ -2706,6 +2710,17 @@ class WebToolConfig(BaseToolConfig):
     def get_mcp_unavailable_reason(self) -> Optional[str]:
         """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
         return self._mcp_unavailable_reason
+
+    def get_mcp_approval_gate_scope(self) -> Any:
+        """Return the explicit inherited scope or this task's contribution."""
+
+        if self._mcp_approval_gate_scope is not None:
+            return self._mcp_approval_gate_scope
+        contribution = self._task_runtime_contribution
+        return getattr(contribution, "mcp_approval_gate_scope", None)
+
+    def get_mcp_approval_supported(self) -> bool:
+        return self._mcp_approval_supported
 
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.

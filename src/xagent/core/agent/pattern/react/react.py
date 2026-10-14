@@ -238,7 +238,7 @@ def _compatible_tool_choice(
     """Keep strict selection when supported, otherwise retain tools in auto mode."""
     normalize = getattr(llm, "compatible_tool_choice", None)
     if callable(normalize):
-        return normalize(tool_choice)
+        return cast(str | dict[str, Any] | None, normalize(tool_choice))
     if getattr(llm, "supports_forced_tool_choice", True):
         return tool_choice
     if tool_choice is None or tool_choice in ("auto", "none"):

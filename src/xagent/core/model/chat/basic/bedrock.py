@@ -8,7 +8,6 @@ import binascii
 import copy
 import json
 import logging
-import re
 import threading
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -32,6 +31,7 @@ from ..exceptions import LLMContextLengthError, LLMRetryableError
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
+from .tool_choice import AUTO_ONLY_TOOL_CHOICE_ABILITY, is_auto_only_claude_model
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +60,6 @@ _IMAGE_MEDIA_TYPES = {
     "image/gif": "gif",
     "image/webp": "webp",
 }
-_AUTO_ONLY_TOOL_CHOICE_MODEL = re.compile(
-    r"^(?:[a-z0-9-]+\.)?anthropic\.claude-"
-    r"(?:opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)(?:[-.:]|$)",
-    re.IGNORECASE,
-)
-
-
 def _safe_int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
@@ -194,12 +187,14 @@ class BedrockLLM(BaseLLM):
         """Whether this Bedrock model accepts ``toolChoice.any/tool``.
 
         Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS additionally
-        names Fable/Mythos 5.1. The anchored pattern also accepts Bedrock's
-        one-segment geographic inference-profile prefix (for example ``au.``
-        or ``us.``) without classifying arbitrary identifiers that merely
-        contain one of the model names.
+        names Fable 5 and Mythos 5.1. The shared matcher accepts bare model ids
+        and the model segment of Bedrock ARNs. Opaque application inference
+        profiles can opt in through the ``auto_tool_choice_only`` ability.
         """
-        return _AUTO_ONLY_TOOL_CHOICE_MODEL.match(self._model_name.strip()) is None
+        return not (
+            AUTO_ONLY_TOOL_CHOICE_ABILITY in self._abilities
+            or is_auto_only_claude_model(self._model_name)
+        )
 
     def _build_client(self) -> Any:
         import boto3
@@ -468,6 +463,7 @@ class BedrockLLM(BaseLLM):
             request["system"] = self._sanitize_unicode_content(system)
         if additional is not None:
             request["additionalModelRequestFields"] = additional
+        tool_choice = self.compatible_tool_choice(tool_choice)
         if tools and tool_choice != "none":
             request["toolConfig"] = {"tools": self._convert_tools(tools)}
             converted_choice = self._convert_tool_choice(tool_choice)

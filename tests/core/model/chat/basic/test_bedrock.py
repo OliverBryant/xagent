@@ -70,8 +70,11 @@ def test_factory_and_metadata_preserve_native_bedrock_settings():
         "anthropic.claude-opus-5-5-v1:0",
         "au.anthropic.claude-opus-5-5",
         "eu.anthropic.claude-sonnet-5-5-v1:0",
+        "anthropic.claude-fable-5-v1:0",
         "us.anthropic.claude-fable-5-1-20261001-v1:0",
         "global.anthropic.claude-mythos-5-1-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5-5-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5-5-v1:0",
     ],
 )
 def test_auto_only_bedrock_models_separate_tools_from_forced_choice(model_name):
@@ -116,6 +119,42 @@ def test_retry_wrapper_preserves_bedrock_forced_choice_capability():
 
     assert llm.supports_forced_tool_choice is False
     assert llm.compatible_tool_choice("required") == "auto"
+
+
+def test_auto_only_ability_overrides_opaque_bedrock_model_id():
+    llm = BedrockLLM(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/opaque-id",
+        abilities=["chat", "tool_calling", "auto_tool_choice_only"],
+    )
+
+    assert llm.supports_forced_tool_choice is False
+    assert llm.compatible_tool_choice("required") == "auto"
+
+
+def test_auto_only_bedrock_request_normalizes_raw_required_choice():
+    llm = BedrockLLM("anthropic.claude-opus-5-5-v1:0")
+    request = llm._request(
+        [{"role": "user", "content": "hello"}],
+        None,
+        None,
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "required",
+        None,
+        None,
+        None,
+        {},
+    )
+
+    assert request["toolConfig"]["toolChoice"] == {"auto": {}}
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,10 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from xagent.core.agent import ExecutionContext, ReActPattern
+from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.service import AgentService
 from xagent.core.model.chat.basic.bedrock import BedrockLLM
+from xagent.core.model.chat.basic.router import RouterLLM
 
 
 def _text_events(text: str) -> list[dict[str, Any]]:
@@ -165,6 +166,37 @@ async def test_agent_service_auto_only_bedrock_runs_tool_then_text_completion() 
     ]
 
 
+@pytest.mark.asyncio
+async def test_react_uses_resolved_router_auto_only_capability(monkeypatch) -> None:
+    client = _ScriptedBedrockClient([_text_events("Resolved naturally.")])
+    downstream = BedrockLLM(
+        "anthropic.claude-opus-5-5-v1:0",
+        region_name="us-east-1",
+        client=client,
+    )
+    router = RouterLLM(
+        downstream_resolver=lambda _model_id: downstream,
+        candidate_models=("bedrock-opus",),
+    )
+
+    async def select_model(_prompt: str, **_kwargs: Any) -> str:
+        return "bedrock-opus"
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(router, "_profile_input_modalities", lambda _model_id: ())
+    context = ExecutionContext(execution_id="resolved-router-auto-only")
+    context.add_user_message("Reply naturally.")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[], llm=router
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "Resolved naturally."
+    assert client.requests[0]["toolConfig"]["toolChoice"] == {"auto": {}}
+
+
 class _ScriptedLLM:
     def __init__(
         self, responses: list[Any], *, supports_forced_tool_choice: bool
@@ -195,7 +227,15 @@ async def test_auto_only_react_retry_and_forced_finalization_stay_in_auto_mode()
         [
             _tool_call("calculator", {"expression": "2+2"}, "work"),
             _tool_call("final_answer", {"answer": " "}, "empty"),
-            {"content": "Recovered naturally.", "done": True},
+            _tool_call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "Recovered through the control tool.",
+                    "outcome": "completed",
+                },
+                "recovered",
+            ),
         ],
         supports_forced_tool_choice=False,
     )
@@ -207,10 +247,101 @@ async def test_auto_only_react_retry_and_forced_finalization_stay_in_auto_mode()
     )
 
     assert result["success"] is True
-    assert result["output"] == "Recovered naturally."
+    assert result["output"] == "Recovered through the control tool."
     assert [call["tool_choice"] for call in llm.calls] == ["auto", "auto", "auto"]
-    assert "plain assistant text" in llm.calls[1]["messages"][0]["content"]
-    assert "plain assistant text" in llm.calls[2]["messages"][0]["content"]
+    assert "plain assistant text" not in llm.calls[1]["messages"][0]["content"]
+    assert "plain assistant text" not in llm.calls[2]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_auto_only_settlement_fence_retries_plain_text_and_preserves_outcome() -> (
+    None
+):
+    llm = _ScriptedLLM(
+        [
+            {"content": "The write was refused.", "done": True},
+            _tool_call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "The write was refused.",
+                    "outcome": "blocked",
+                },
+                "blocked",
+            ),
+        ],
+        supports_forced_tool_choice=False,
+    )
+    pattern = ReActPattern(max_iterations=1)
+    pattern.force_final_answer_next = True
+    pattern.settlement_final_answer_fence = True
+    context = ExecutionContext(execution_id="auto-only-settlement-fence")
+    context.add_user_message("Perform the protected write.")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["completion_outcome"] == "blocked"
+    assert result["output"] == "The write was refused."
+    assert [call["tool_choice"] for call in llm.calls] == ["auto", "auto"]
+    assert all(
+        "plain assistant text" not in call["messages"][0]["content"]
+        for call in llm.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_only_blank_plain_text_uses_protocol_retry() -> None:
+    llm = _ScriptedLLM(
+        [
+            {"content": "  ", "done": True},
+            {"content": "Recovered with text.", "done": True},
+        ],
+        supports_forced_tool_choice=False,
+    )
+    context = ExecutionContext(execution_id="auto-only-blank-text")
+    context.add_user_message("Answer without using the calculator.")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[_Calculator()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "Recovered with text."
+    assert [call["tool_choice"] for call in llm.calls] == ["auto", "auto"]
+
+
+@pytest.mark.asyncio
+async def test_auto_only_repeated_tool_decision_uses_auto_choice() -> None:
+    llm = _ScriptedLLM(
+        [
+            _tool_call(
+                "react_decision",
+                {
+                    "action": "final_answer",
+                    "reason": "Enough work has been completed.",
+                    "missing_verification": "",
+                },
+                "decision",
+            )
+        ],
+        supports_forced_tool_choice=False,
+    )
+    pattern = ReActPattern()
+    pattern.repeated_tool_decision = {
+        "tool_name": "calculator",
+        "consecutive_tool_calls": 4,
+    }
+    context = ExecutionContext(execution_id="auto-only-repeated-decision")
+    context.add_user_message("Calculate several values.")
+
+    await pattern._run_repeated_tool_decision(
+        context=context,
+        llm=llm,
+        runtime=PatternRuntime(execution_id=context.execution_id),
+    )
+
+    assert llm.calls[0]["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio

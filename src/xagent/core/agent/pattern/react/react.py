@@ -75,6 +75,7 @@ from ....file_ref import (
     WORKSPACE_OUTPUT_FILES_TOOL_NAME,
     final_deliverable_file_reference_instructions,
 )
+from ....model.chat.basic.base import compatible_tool_choice_for_llm
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ....tools.adapters.vibe.interaction_types import (
@@ -121,7 +122,7 @@ from ...context.execution import (
 from ...context.memory_tool import build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import evidence_facts, grounding_rule
-from ...language import final_answer_language_rule
+from ...language import effective_output_language, final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
     normalize_tool_failure_code,
@@ -230,20 +231,6 @@ _SETTLED_SETTLEMENT_STATUSES = frozenset({"succeeded"}) | _GUARDED_SETTLEMENT_ST
 # Ledger ``status`` values that mean the row already reached a terminal
 # outcome, so re-delivering a response for it is an idempotent replay.
 _SETTLED_ROW_STATUSES = frozenset({"completed", "failed"})
-
-
-def _compatible_tool_choice(
-    llm: Any, tool_choice: str | dict[str, Any] | None
-) -> str | dict[str, Any] | None:
-    """Keep strict selection when supported, otherwise retain tools in auto mode."""
-    normalize = getattr(llm, "compatible_tool_choice", None)
-    if callable(normalize):
-        return cast(str | dict[str, Any] | None, normalize(tool_choice))
-    if getattr(llm, "supports_forced_tool_choice", True):
-        return tool_choice
-    if tool_choice is None or tool_choice in ("auto", "none"):
-        return tool_choice
-    return "auto"
 
 
 @dataclass
@@ -1123,7 +1110,9 @@ class ReActPattern(AgentPattern):
                 force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
                 form_answer_continuation=form_answer_decision.applied,
-                allow_plain_text_final_answer=not supports_forced_tool_choice,
+                allow_plain_text_final_answer=(
+                    not supports_forced_tool_choice and not force_final_answer_now
+                ),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
             await runtime.on_llm_start(
@@ -1143,7 +1132,7 @@ class ReActPattern(AgentPattern):
                     if tool_schemas
                     else None
                 )
-                effective_tool_choice = _compatible_tool_choice(
+                effective_tool_choice = compatible_tool_choice_for_llm(
                     call_llm, requested_tool_choice
                 )
                 llm_kwargs = {
@@ -1317,6 +1306,11 @@ class ReActPattern(AgentPattern):
                 empty_final_answer = (
                     None if truncated else self._empty_final_answer_call(normalized)
                 )
+                empty_plain_text = (
+                    False
+                    if truncated
+                    else self._empty_plain_text_response(normalized)
+                )
                 if empty_final_answer is not None:
                     logger.warning(
                         "ReAct final_answer carried no answer text; discarding the "
@@ -1333,6 +1327,8 @@ class ReActPattern(AgentPattern):
                     recovery_reason = TRUNCATED_TOOL_ARGUMENTS
                 elif empty_final_answer is not None:
                     recovery_reason = "empty_final_answer"
+                elif empty_plain_text:
+                    recovery_reason = "empty_plain_text"
                 elif settlement_fence:
                     recovery_reason = "settlement_final_answer_required"
                 elif (
@@ -1568,6 +1564,19 @@ class ReActPattern(AgentPattern):
                 return dict(calls[0]["args"])
             return None
 
+        def parse_plain_text_response(response: Any) -> dict[str, Any] | None:
+            normalized = self._normalize_llm_response(response)
+            calls = normalized.get("tool_calls") or []
+            content = normalized.get("content")
+            if not calls and isinstance(content, str) and content.strip():
+                return {
+                    "response_language": effective_output_language(context)
+                    or "Unspecified",
+                    "answer": content,
+                    "outcome": "partial",
+                }
+            return None
+
         schema = self._final_answer_tool_schema()
         schema["function"]["parameters"]["properties"]["outcome"]["enum"] = [
             "partial",
@@ -1580,6 +1589,7 @@ class ReActPattern(AgentPattern):
             messages=messages,
             schema=schema,
             parse_response=parse_response,
+            parse_plain_text_response=parse_plain_text_response,
             metadata={
                 "iteration": self.current_iteration,
                 "phase": "iteration_limit_delivery",
@@ -2043,8 +2053,9 @@ class ReActPattern(AgentPattern):
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
             form_answer_continuation=form_answer_decision.applied,
-            allow_plain_text_final_answer=not getattr(
-                llm, "supports_forced_tool_choice", True
+            allow_plain_text_final_answer=(
+                not getattr(llm, "supports_forced_tool_choice", True)
+                and not force_final_answer
             ),
         )
         if recovery_reason == "unavailable_tool_call":
@@ -2111,6 +2122,15 @@ class ReActPattern(AgentPattern):
                 "whitespace-only answer."
             )
             retry_phase = "empty_final_answer_recovery"
+        elif recovery_reason == "empty_plain_text":
+            retry_instruction = (
+                "The previous response returned no answer text and made no tool "
+                "call, so the user received no reply at all. Retry this turn with "
+                "a non-empty response. If this is a forced final-answer turn, call "
+                "final_answer with a complete answer; otherwise either call an "
+                "appropriate available tool or return a complete plain-text answer."
+            )
+            retry_phase = "empty_final_answer_recovery"
         else:
             retry_instruction = (
                 "The previous response used an invalid tool protocol. Retry the same "
@@ -2159,7 +2179,7 @@ class ReActPattern(AgentPattern):
                 llm,
                 messages=messages,
                 tools=tools,
-                tool_choice=_compatible_tool_choice(llm, "required"),
+                tool_choice=compatible_tool_choice_for_llm(llm, "required"),
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
@@ -2215,6 +2235,8 @@ class ReActPattern(AgentPattern):
             return True
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
+        if force_final_answer and not tool_calls:
+            return True
         if (
             reject_mixed_control_calls
             and len(tool_calls) > 1
@@ -2239,7 +2261,17 @@ class ReActPattern(AgentPattern):
             # not allowed to reintroduce. The empty-answer repair owns
             # responses whose only calls are control tools.
             return False
-        return self._empty_final_answer_call(normalized) is not None
+        return (
+            self._empty_final_answer_call(normalized) is not None
+            or self._empty_plain_text_response(normalized)
+        )
+
+    @staticmethod
+    def _empty_plain_text_response(normalized: dict[str, Any]) -> bool:
+        if normalized.get("tool_calls"):
+            return False
+        content = normalized.get("content")
+        return content is None or not str(content).strip()
 
     def _empty_final_answer_call(
         self, normalized: dict[str, Any]
@@ -5328,7 +5360,7 @@ class ReActPattern(AgentPattern):
                 call_llm,
                 messages=messages,
                 tools=decision_tools,
-                tool_choice=_compatible_tool_choice(call_llm, "required"),
+                tool_choice=compatible_tool_choice_for_llm(call_llm, "required"),
                 thinking={"type": "disabled", "enable": False},
             )
         except LLMCallInterrupted:

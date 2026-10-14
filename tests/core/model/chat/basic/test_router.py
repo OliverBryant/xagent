@@ -169,6 +169,14 @@ async def test_router_normalizes_tool_choice_after_resolving_model(monkeypatch):
 
     assert downstream.tool_choices == ["auto", "auto", "auto"]
 
+    prepared = await router.prepare_for_call(messages)
+    await prepared.chat(messages, tools=[], tool_choice="required")
+    await prepared.vision_chat(messages, tools=[], tool_choice="required")
+    async for _ in prepared.stream_chat(messages, tools=[], tool_choice="required"):
+        pass
+
+    assert downstream.tool_choices[-3:] == ["auto", "auto", "auto"]
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

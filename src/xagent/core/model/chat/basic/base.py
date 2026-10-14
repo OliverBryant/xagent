@@ -7,6 +7,18 @@ from typing import Any, AsyncIterator, List
 from ..types import ChunkType, StreamChunk
 
 
+def compatible_tool_choice_for_llm(
+    llm: Any, tool_choice: str | dict[str, Any] | None
+) -> str | dict[str, Any] | None:
+    """Return the strongest tool choice supported by an arbitrary LLM object."""
+
+    if getattr(llm, "supports_forced_tool_choice", True):
+        return tool_choice
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return tool_choice
+    return "auto"
+
+
 class BaseLLM(ABC):
     """
     Abstract base class for Large Language Models (LLMs) with ability-based support.
@@ -89,24 +101,16 @@ class BaseLLM(ABC):
         Tool calling and forced tool selection are separate capabilities: a
         model can accept tool schemas with ``tool_choice=auto`` while rejecting
         ``required`` or a named tool. Most providers support both, so the
-        default preserves their existing behavior. Retry wrappers store their
-        concrete model in ``_inner``; forwarding here keeps this capability
-        visible without teaching the generic retry utility about chat models.
+        default preserves their existing behavior. Wrappers that do not use
+        the generic retry delegator must explicitly forward this property.
         """
-        inner = getattr(self, "__dict__", {}).get("_inner")
-        if isinstance(inner, BaseLLM):
-            return inner.supports_forced_tool_choice
         return True
 
     def compatible_tool_choice(
         self, tool_choice: str | dict[str, Any] | None
     ) -> str | dict[str, Any] | None:
         """Return the strongest tool choice this model can accept."""
-        if self.supports_forced_tool_choice:
-            return tool_choice
-        if tool_choice is None or tool_choice in ("auto", "none"):
-            return tool_choice
-        return "auto"
+        return compatible_tool_choice_for_llm(self, tool_choice)
 
     @property
     def supports_native_video_input(self) -> bool:

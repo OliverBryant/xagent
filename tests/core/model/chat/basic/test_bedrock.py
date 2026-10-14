@@ -70,7 +70,6 @@ def test_factory_and_metadata_preserve_native_bedrock_settings():
         "anthropic.claude-opus-5-5-v1:0",
         "au.anthropic.claude-opus-5-5",
         "eu.anthropic.claude-sonnet-5-5-v1:0",
-        "anthropic.claude-fable-5-v1:0",
         "us.anthropic.claude-fable-5-1-20261001-v1:0",
         "global.anthropic.claude-mythos-5-1-v1:0",
         "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5-5-v1:0",
@@ -94,6 +93,7 @@ def test_auto_only_bedrock_models_separate_tools_from_forced_choice(model_name):
     [
         "us.anthropic.claude-haiku-5-5-v1:0",
         "us.anthropic.claude-opus-5-v1:0",
+        "anthropic.claude-fable-5-v1:0",
         "custom.vendor.anthropic.claude-opus-5-5-v1:0",
         "amazon.nova-pro-v1:0",
     ],

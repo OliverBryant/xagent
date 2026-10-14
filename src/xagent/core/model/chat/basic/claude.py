@@ -22,7 +22,7 @@ from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
-from .tool_choice import AUTO_ONLY_TOOL_CHOICE_ABILITY, is_auto_only_claude_model
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -264,10 +264,7 @@ class ClaudeLLM(BaseLLM):
 
     @property
     def supports_forced_tool_choice(self) -> bool:
-        return not (
-            AUTO_ONLY_TOOL_CHOICE_ABILITY in self._abilities
-            or is_auto_only_claude_model(self._model_name)
-        )
+        return supports_forced_tool_choice(self._abilities, self._model_name)
 
     def _ensure_client(self) -> None:
         """Ensure the Anthropic client is initialized."""

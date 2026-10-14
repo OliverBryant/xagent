@@ -45,7 +45,10 @@ class BaseLLM(ABC):
     def abilities(self) -> List[str]:
         """
         Get the list of abilities supported by this LLM implementation.
-        Possible abilities: ["chat", "vision", "video", "thinking_mode", "tool_calling"]
+        Possible abilities: ["chat", "vision", "video", "thinking_mode",
+        "tool_calling", "auto_tool_choice_only"]. The last ability marks opaque
+        model identifiers whose provider accepts automatic but not forced tool
+        choice.
 
         Returns:
             List[str]: List of supported abilities

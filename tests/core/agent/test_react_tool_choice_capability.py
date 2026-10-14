@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
+from xagent.core.agent.context.execution import TOOL_EVIDENCE_REMOVED_METADATA_KEY
 from xagent.core.agent.service import AgentService
 from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -205,11 +206,6 @@ class _ScriptedLLM:
         self.calls: list[dict[str, Any]] = []
         self.supports_forced_tool_choice = supports_forced_tool_choice
 
-    def compatible_tool_choice(self, tool_choice: Any) -> Any:
-        if self.supports_forced_tool_choice:
-            return tool_choice
-        return tool_choice if tool_choice in (None, "auto", "none") else "auto"
-
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
@@ -251,6 +247,64 @@ async def test_auto_only_react_retry_and_forced_finalization_stay_in_auto_mode()
     assert [call["tool_choice"] for call in llm.calls] == ["auto", "auto", "auto"]
     assert "plain assistant text" not in llm.calls[1]["messages"][0]["content"]
     assert "plain assistant text" not in llm.calls[2]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supports_forced_tool_choice", [True, False])
+async def test_flash_forced_turn_accepts_nonempty_plain_text(
+    supports_forced_tool_choice: bool,
+) -> None:
+    llm = _ScriptedLLM(
+        [
+            _tool_call("calculator", {"expression": "2+2"}, "work"),
+            {"content": "2+2 = 4.", "done": True},
+        ],
+        supports_forced_tool_choice=supports_forced_tool_choice,
+    )
+    context = ExecutionContext(execution_id="flash-plain-text")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = False
+    context.add_user_message("Calculate 2+2.")
+
+    result = await ReActPattern(max_iterations=2, finalize_after_tool_result=True).run(
+        context=context, tools=[_Calculator()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "2+2 = 4."
+    assert len(llm.calls) == 2
+    assert llm.calls[-1]["tool_choice"] == (
+        "required" if supports_forced_tool_choice else "auto"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_evidence_requires_structured_partial_outcome() -> None:
+    llm = _ScriptedLLM(
+        [
+            {"content": "Some evidence is unavailable.", "done": True},
+            _tool_call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "Some evidence is unavailable.",
+                    "outcome": "partial",
+                },
+                "partial",
+            ),
+        ],
+        supports_forced_tool_choice=False,
+    )
+    pattern = ReActPattern(max_iterations=1)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(execution_id="missing-evidence")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+    context.add_user_message("Summarize the completed work.")
+
+    result = await pattern.run(context=context, tools=[], llm=llm)
+
+    assert result["success"] is True
+    assert result["completion_outcome"] == "partial"
+    assert "Call final_answer" in llm.calls[-1]["messages"][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -309,6 +363,41 @@ async def test_auto_only_blank_plain_text_uses_protocol_retry() -> None:
     assert result["success"] is True
     assert result["output"] == "Recovered with text."
     assert [call["tool_choice"] for call in llm.calls] == ["auto", "auto"]
+
+
+@pytest.mark.asyncio
+async def test_forced_capable_blank_plain_text_retry_requires_tool_call() -> None:
+    llm = _ScriptedLLM(
+        [
+            {"content": "  ", "done": True},
+            _tool_call(
+                "final_answer",
+                {
+                    "response_language": "English",
+                    "answer": "Recovered through final_answer.",
+                    "outcome": "completed",
+                },
+                "recovered",
+            ),
+        ],
+        supports_forced_tool_choice=True,
+    )
+    context = ExecutionContext(execution_id="forced-capable-blank-text")
+    context.add_user_message("Answer without using the calculator.")
+    runtime = PatternRuntime(execution_id=context.execution_id)
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[_Calculator()], llm=llm, runtime=runtime
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "Recovered through final_answer."
+    assert [call["tool_choice"] for call in llm.calls] == ["required", "required"]
+    assert "plain-text answer" not in llm.calls[-1]["messages"][0]["content"]
+    assert any(
+        checkpoint["label"] == "empty_plain_text_recovery"
+        for checkpoint in runtime.checkpoints
+    )
 
 
 @pytest.mark.asyncio

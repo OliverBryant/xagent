@@ -67,6 +67,37 @@ class TestClaudeLLM:
             "type": "auto"
         }
 
+    @pytest.mark.asyncio
+    async def test_auto_only_model_normalizes_stream_tool_choice(self, mocker):
+        llm = ClaudeLLM(model_name="claude-opus-5-5", api_key="test-key")
+        client = mocker.AsyncMock()
+        client.messages.create.return_value = _AsyncEventStream([])
+        llm._client = client
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "hello"}],
+                tools=tools,
+                tool_choice="required",
+            )
+        ]
+
+        assert chunks == []
+        assert client.messages.create.call_args.kwargs["tool_choice"] == {
+            "type": "auto"
+        }
+
     def test_schema_fix_preserves_property_named_type(self):
         """Claude schema fixer must not treat properties maps as schema objects."""
         schema = {

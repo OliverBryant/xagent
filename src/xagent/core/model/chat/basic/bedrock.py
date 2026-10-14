@@ -31,7 +31,7 @@ from ..exceptions import LLMContextLengthError, LLMRetryableError
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
-from .tool_choice import AUTO_ONLY_TOOL_CHOICE_ABILITY, is_auto_only_claude_model
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
 
@@ -188,15 +188,12 @@ class BedrockLLM(BaseLLM):
     def supports_forced_tool_choice(self) -> bool:
         """Whether this Bedrock model accepts ``toolChoice.any/tool``.
 
-        Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS additionally
-        names Fable 5 and Mythos 5.1. The shared matcher accepts bare model ids
+        Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS also names
+        Fable 5.1 and Mythos 5.1. The shared matcher accepts bare model ids
         and the model segment of Bedrock ARNs. Opaque application inference
         profiles can opt in through the ``auto_tool_choice_only`` ability.
         """
-        return not (
-            AUTO_ONLY_TOOL_CHOICE_ABILITY in self._abilities
-            or is_auto_only_claude_model(self._model_name)
-        )
+        return supports_forced_tool_choice(self._abilities, self._model_name)
 
     def _build_client(self) -> Any:
         import boto3

@@ -1093,6 +1093,10 @@ class ReActPattern(AgentPattern):
                 )
                 note_compaction_evidence_loss(context, compact_result)
 
+            require_structured_final_answer = force_final_answer_now and (
+                settlement_fence or tool_evidence_state(context) != "intact"
+            )
+
             # Computed once, after compaction (compaction can change which
             # message is the latest visible user message), at the site that
             # builds this call's real final messages -- not at the routing
@@ -1235,6 +1239,9 @@ class ReActPattern(AgentPattern):
             requires_protocol_retry = self._response_requires_tool_protocol_retry(
                 normalized,
                 force_final_answer=force_final_answer_now,
+                require_structured_final_answer=(
+                    require_structured_final_answer and force_final_answer_now
+                ),
                 reject_mixed_control_calls=protocol_retry_performed,
                 allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
             )
@@ -1338,6 +1345,10 @@ class ReActPattern(AgentPattern):
                     )
                 elif empty_plain_text:
                     recovery_reason = "empty_plain_text"
+                elif require_structured_final_answer and not normalized.get(
+                    "tool_calls"
+                ):
+                    recovery_reason = "structured_final_answer_required"
                 else:
                     recovery_reason = None
                 try:
@@ -1352,6 +1363,10 @@ class ReActPattern(AgentPattern):
                         tool_schemas=normal_tool_schemas,
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
+                        ),
+                        require_structured_final_answer=(
+                            require_structured_final_answer
+                            and not recover_full_tool_set
                         ),
                         recovery_reason=recovery_reason,
                         empty_final_answer=empty_final_answer is not None,
@@ -1373,6 +1388,9 @@ class ReActPattern(AgentPattern):
                 if self._response_requires_tool_protocol_retry(
                     normalized,
                     force_final_answer=force_final_answer_now,
+                    require_structured_final_answer=(
+                        require_structured_final_answer and not recover_full_tool_set
+                    ),
                     reject_mixed_control_calls=recover_full_tool_set,
                     allowed_tool_names=frozenset(self._schema_tool_names(tool_schemas)),
                 ):
@@ -1566,6 +1584,8 @@ class ReActPattern(AgentPattern):
             return None
 
         def parse_plain_text_response(response: Any) -> dict[str, Any] | None:
+            if response_finish_reason(response) in {"length", "max_tokens"}:
+                return None
             normalized = self._normalize_llm_response(response)
             calls = normalized.get("tool_calls") or []
             content = normalized.get("content")
@@ -1874,10 +1894,6 @@ class ReActPattern(AgentPattern):
             delivery_rule = (
                 "Produce the final user-facing answer by calling the final_answer "
                 f"control tool exactly once{source_phrase}. "
-                if not allow_plain_text_final_answer
-                else "Produce the final user-facing answer either by calling the "
-                "final_answer control tool exactly once or by returning the answer "
-                f"as plain assistant text{source_phrase}. "
             )
             instruction = (
                 delivery_rule + f"{evidence_facts_text}"
@@ -2029,6 +2045,7 @@ class ReActPattern(AgentPattern):
         force_final_answer: bool,
         recovery_reason: str | None = None,
         empty_final_answer: bool = False,
+        require_structured_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
         # tool_schemas is the repaired turn's ordinary surface. Whether that
         # turn, if forced, offered reads was decided when it was built
@@ -2076,6 +2093,13 @@ class ReActPattern(AgentPattern):
                 "concise explanation of the recorded outcome."
             )
             retry_phase = "settlement_final_answer_recovery"
+        elif recovery_reason == "structured_final_answer_required":
+            retry_instruction = (
+                "This forced final-answer turn must preserve an explicit completion "
+                "outcome. Call final_answer with the complete user-facing response "
+                "and the appropriate completed, partial, or blocked outcome."
+            )
+            retry_phase = "structured_final_answer_recovery"
         elif recovery_reason == "malformed_tool_arguments":
             retry_instruction = (
                 "The previous response returned malformed JSON arguments for a "
@@ -2126,12 +2150,19 @@ class ReActPattern(AgentPattern):
         elif recovery_reason == "empty_plain_text":
             retry_instruction = (
                 "The previous response returned no answer text and made no tool "
-                "call, so the user received no reply at all. Retry this turn with "
-                "a non-empty response. If this is a forced final-answer turn, call "
-                "final_answer with a complete answer; otherwise either call an "
-                "appropriate available tool or return a complete plain-text answer."
+                "call, so the user received no reply at all. "
+                + (
+                    "Retry by calling final_answer with the complete user-facing "
+                    "response."
+                    if force_final_answer
+                    else "Retry by calling an appropriate available tool with a "
+                    "complete response."
+                    if getattr(llm, "supports_forced_tool_choice", True)
+                    else "Retry with either an appropriate available tool call or "
+                    "a complete non-empty plain-text answer."
+                )
             )
-            retry_phase = "empty_final_answer_recovery"
+            retry_phase = "empty_plain_text_recovery"
         else:
             retry_instruction = (
                 "The previous response used an invalid tool protocol. Retry the same "
@@ -2198,6 +2229,7 @@ class ReActPattern(AgentPattern):
         retry_is_invalid = self._response_requires_tool_protocol_retry(
             normalized,
             force_final_answer=force_final_answer,
+            require_structured_final_answer=require_structured_final_answer,
             reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
             allowed_tool_names=frozenset(self._schema_tool_names(tools)),
         )
@@ -2219,6 +2251,7 @@ class ReActPattern(AgentPattern):
         normalized: dict[str, Any],
         *,
         force_final_answer: bool,
+        require_structured_final_answer: bool | None = None,
         reject_mixed_control_calls: bool = False,
         allowed_tool_names: frozenset[str] | None = None,
     ) -> bool:
@@ -2236,7 +2269,11 @@ class ReActPattern(AgentPattern):
             return True
         allowed_names = allowed_tool_names or frozenset({"final_answer"})
         tool_calls = normalized.get("tool_calls") or []
-        if force_final_answer and not tool_calls:
+        if require_structured_final_answer is None:
+            # Preserve the strict default for direct protocol checks. Runtime
+            # callers always pass the narrower outcome-sensitive decision.
+            require_structured_final_answer = force_final_answer
+        if require_structured_final_answer and not tool_calls:
             return True
         if (
             reject_mixed_control_calls

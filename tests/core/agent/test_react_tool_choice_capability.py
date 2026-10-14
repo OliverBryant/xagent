@@ -124,9 +124,11 @@ async def test_agent_service_auto_only_bedrock_completes_as_plain_text() -> None
     assert [tool["toolSpec"]["name"] for tool in request["toolConfig"]["tools"]] == [
         "final_answer"
     ]
-    assert "or return the final user-facing response as plain assistant text" in str(
-        request["system"]
-    )
+    system_prompt = str(request["system"])
+    assert "prefer calling the final_answer tool exactly once" in system_prompt
+    assert "plain assistant text only when the task is fully complete" in system_prompt
+    assert "Never use plain assistant text for a progress update" in system_prompt
+    assert "partial result, a blocked outcome" in system_prompt
 
 
 @pytest.mark.asyncio
@@ -196,6 +198,9 @@ async def test_react_uses_resolved_router_auto_only_capability(monkeypatch) -> N
     assert result["success"] is True
     assert result["output"] == "Resolved naturally."
     assert client.requests[0]["toolConfig"]["toolChoice"] == {"auto": {}}
+    assert "plain assistant text only when the task is fully complete" in str(
+        client.requests[0]["system"]
+    )
 
 
 class _ScriptedLLM:

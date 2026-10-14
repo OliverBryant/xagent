@@ -1954,9 +1954,14 @@ class ReActPattern(AgentPattern):
                 "exactly once instead of calling another work tool or returning "
                 "plain assistant text. "
                 if not allow_plain_text_final_answer
-                else "When the current task is complete, either call the "
-                "final_answer tool exactly once or return the final user-facing "
-                "response as plain assistant text. "
+                else "When the current task is complete, prefer calling the "
+                "final_answer tool exactly once so the completion outcome is "
+                "explicit. You may return plain assistant text only when the task "
+                "is fully complete and that text is the complete final user-facing "
+                "answer. Never use plain assistant text for a progress update, a "
+                "preamble, a partial result, a blocked outcome, or an explanation "
+                "of missing information; use final_answer with the appropriate "
+                "outcome for a terminal partial or blocked response. "
             )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "

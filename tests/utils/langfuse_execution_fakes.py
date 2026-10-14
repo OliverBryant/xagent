@@ -272,7 +272,21 @@ class DeterministicSingleCallLLM(BaseLLM):
                     }
                 ],
             }
-        return {"type": "text", "content": self._final_answer}
+        return {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {
+                                "response_language": "English",
+                                "answer": self._final_answer,
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         del messages, kwargs

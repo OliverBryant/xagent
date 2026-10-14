@@ -83,6 +83,32 @@ class BaseLLM(ABC):
         return True
 
     @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether the model accepts a request that requires a tool call.
+
+        Tool calling and forced tool selection are separate capabilities: a
+        model can accept tool schemas with ``tool_choice=auto`` while rejecting
+        ``required`` or a named tool. Most providers support both, so the
+        default preserves their existing behavior. Retry wrappers store their
+        concrete model in ``_inner``; forwarding here keeps this capability
+        visible without teaching the generic retry utility about chat models.
+        """
+        inner = getattr(self, "__dict__", {}).get("_inner")
+        if isinstance(inner, BaseLLM):
+            return inner.supports_forced_tool_choice
+        return True
+
+    def compatible_tool_choice(
+        self, tool_choice: str | dict[str, Any] | None
+    ) -> str | dict[str, Any] | None:
+        """Return the strongest tool choice this model can accept."""
+        if self.supports_forced_tool_choice:
+            return tool_choice
+        if tool_choice is None or tool_choice in ("auto", "none"):
+            return tool_choice
+        return "auto"
+
+    @property
     def supports_native_video_input(self) -> bool:
         """Whether this model accepts a video as one multimodal input.
 

@@ -232,6 +232,20 @@ _SETTLED_SETTLEMENT_STATUSES = frozenset({"succeeded"}) | _GUARDED_SETTLEMENT_ST
 _SETTLED_ROW_STATUSES = frozenset({"completed", "failed"})
 
 
+def _compatible_tool_choice(
+    llm: Any, tool_choice: str | dict[str, Any] | None
+) -> str | dict[str, Any] | None:
+    """Keep strict selection when supported, otherwise retain tools in auto mode."""
+    normalize = getattr(llm, "compatible_tool_choice", None)
+    if callable(normalize):
+        return normalize(tool_choice)
+    if getattr(llm, "supports_forced_tool_choice", True):
+        return tool_choice
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return tool_choice
+    return "auto"
+
+
 @dataclass
 class ToolCallRecord:
     """Serializable ledger entry for a tool call."""
@@ -1100,12 +1114,16 @@ class ReActPattern(AgentPattern):
                 context, force_final_answer=force_final_answer_now
             )
             llm_metadata.update(form_answer_decision.trace_metadata())
+            supports_forced_tool_choice = getattr(
+                call_llm, "supports_forced_tool_choice", True
+            )
             messages = self._messages_for_llm(
                 context,
                 has_tools=bool(tool_schemas),
                 force_final_answer=force_final_answer_now,
                 tool_names=self._schema_tool_names(tool_schemas),
                 form_answer_continuation=form_answer_decision.applied,
+                allow_plain_text_final_answer=not supports_forced_tool_choice,
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
             await runtime.on_llm_start(
@@ -1118,12 +1136,15 @@ class ReActPattern(AgentPattern):
             protocol_retry_performed = False
             response_already_traced = False
             try:
-                effective_tool_choice = (
+                requested_tool_choice = (
                     "required"
                     if force_final_answer_now
                     else self.tool_choice
                     if tool_schemas
                     else None
+                )
+                effective_tool_choice = _compatible_tool_choice(
+                    call_llm, requested_tool_choice
                 )
                 llm_kwargs = {
                     "messages": messages,
@@ -1762,6 +1783,7 @@ class ReActPattern(AgentPattern):
         force_final_answer: bool = False,
         tool_names: list[str] | None = None,
         form_answer_continuation: bool = False,
+        allow_plain_text_final_answer: bool = False,
     ) -> list[dict[str, Any]]:
         messages = list(
             context.get_messages_for_llm(
@@ -1838,10 +1860,16 @@ class ReActPattern(AgentPattern):
                     "Do not call any other tool and do not output "
                     "tool-call markup as plain text. "
                 )
-            instruction = (
+            delivery_rule = (
                 "Produce the final user-facing answer by calling the final_answer "
                 f"control tool exactly once{source_phrase}. "
-                f"{evidence_facts_text}"
+                if not allow_plain_text_final_answer
+                else "Produce the final user-facing answer either by calling the "
+                "final_answer control tool exactly once or by returning the answer "
+                f"as plain assistant text{source_phrase}. "
+            )
+            instruction = (
+                delivery_rule + f"{evidence_facts_text}"
                 f"{read_instruction}"
                 f"{tool_rule}{outcome_rule}"
                 "If a "
@@ -1894,14 +1922,21 @@ class ReActPattern(AgentPattern):
                 "them; finish with outcome=blocked and explain that the required "
                 "user choice cannot be obtained in this run. "
             )
+            completion_rule = (
+                "When the current task is complete, call the final_answer tool "
+                "exactly once instead of calling another work tool or returning "
+                "plain assistant text. "
+                if not allow_plain_text_final_answer
+                else "When the current task is complete, either call the "
+                "final_answer tool exactly once or return the final user-facing "
+                "response as plain assistant text. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
                 "that a tool can determine. After a successful tool call, base the "
                 "final answer on the latest tool result instead of repeating the same "
-                "tool work. When the current task is complete, call the final_answer "
-                "tool exactly once instead of calling another work tool or returning "
-                "plain assistant text. Never put final_answer in the same response "
+                f"tool work. {completion_rule}Never put final_answer in the same response "
                 "as any other tool call: run the work tools first, then answer on a "
                 "later turn from their results. Do not write assistant text in the "
                 "same response as a work tool call; call the tool directly. "
@@ -2008,6 +2043,9 @@ class ReActPattern(AgentPattern):
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
             form_answer_continuation=form_answer_decision.applied,
+            allow_plain_text_final_answer=not getattr(
+                llm, "supports_forced_tool_choice", True
+            ),
         )
         if recovery_reason == "unavailable_tool_call":
             retry_instruction = (
@@ -2121,7 +2159,7 @@ class ReActPattern(AgentPattern):
                 llm,
                 messages=messages,
                 tools=tools,
-                tool_choice="required",
+                tool_choice=_compatible_tool_choice(llm, "required"),
                 on_chunk=answer_streamer.handle_chunk,
             )
         except LLMCallInterrupted:
@@ -2208,11 +2246,12 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any] | None:
         """Return the first ``final_answer`` call that carries no answer text.
 
-        Under ``tool_choice="required"`` ``final_answer`` is the only way ReAct
-        can reply, so an empty ``answer`` produces a run that completes with
-        nothing streamed and nothing persisted. Treating it as a tool-protocol
-        violation routes it into the pattern's existing single repair retry
-        instead of finalizing silently.
+        On forced-choice models ``final_answer`` is the only way ReAct can
+        reply. Auto-only models may instead return plain text, but once they
+        choose this tool an empty ``answer`` still produces a run with nothing
+        streamed and nothing persisted. Treating it as a tool-protocol
+        violation routes either path into the pattern's existing single repair
+        retry instead of finalizing silently.
         """
 
         for tool_call in normalized.get("tool_calls") or []:
@@ -5289,7 +5328,7 @@ class ReActPattern(AgentPattern):
                 call_llm,
                 messages=messages,
                 tools=decision_tools,
-                tool_choice="required",
+                tool_choice=_compatible_tool_choice(call_llm, "required"),
                 thinking={"type": "disabled", "enable": False},
             )
         except LLMCallInterrupted:

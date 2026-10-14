@@ -41,11 +41,22 @@ async def request_partial_delivery(
             await runtime.on_llm_start(
                 context=context, messages=messages, tools=[schema], metadata=metadata
             )
+            forced_choice = {
+                "type": "function",
+                "function": {"name": "final_answer"},
+            }
+            normalize_tool_choice = getattr(call_llm, "compatible_tool_choice", None)
+            if callable(normalize_tool_choice):
+                tool_choice = normalize_tool_choice(forced_choice)
+            elif not getattr(call_llm, "supports_forced_tool_choice", True):
+                tool_choice = "auto"
+            else:
+                tool_choice = forced_choice
             response = await runtime.run_llm_call(
                 call_llm,
                 messages=messages,
                 tools=[schema],
-                tool_choice={"type": "function", "function": {"name": "final_answer"}},
+                tool_choice=tool_choice,
                 # Kept small on purpose: the call must finish inside ``timeout``.
                 max_tokens=2048,
             )

@@ -293,7 +293,7 @@ class RouterLLM(BaseLLM):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=tool_choice,
+            tool_choice=prepared.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
@@ -318,7 +318,7 @@ class RouterLLM(BaseLLM):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=tool_choice,
+            tool_choice=prepared.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
@@ -343,7 +343,7 @@ class RouterLLM(BaseLLM):
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=tool_choice,
+            tool_choice=prepared.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
@@ -741,6 +741,10 @@ class _ResolvedRouterLLM(BaseLLM):
     @property
     def supports_json_object_response_format(self) -> bool:
         return self._downstream.supports_json_object_response_format
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return self._downstream.supports_forced_tool_choice
 
     async def chat(
         self,

@@ -8,6 +8,7 @@ import binascii
 import copy
 import json
 import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -59,6 +60,11 @@ _IMAGE_MEDIA_TYPES = {
     "image/gif": "gif",
     "image/webp": "webp",
 }
+_AUTO_ONLY_TOOL_CHOICE_MODEL = re.compile(
+    r"^(?:[a-z0-9-]+\.)?anthropic\.claude-"
+    r"(?:opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)(?:[-.:]|$)",
+    re.IGNORECASE,
+)
 
 
 def _safe_int(value: Any) -> int:
@@ -182,6 +188,18 @@ class BedrockLLM(BaseLLM):
     @property
     def supports_json_object_response_format(self) -> bool:
         return False
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether this Bedrock model accepts ``toolChoice.any/tool``.
+
+        Anthropic documents Opus/Sonnet 5.5 as auto-only, and AWS additionally
+        names Fable/Mythos 5.1. The anchored pattern also accepts Bedrock's
+        one-segment geographic inference-profile prefix (for example ``au.``
+        or ``us.``) without classifying arbitrary identifiers that merely
+        contain one of the model names.
+        """
+        return _AUTO_ONLY_TOOL_CHOICE_MODEL.match(self._model_name.strip()) is None
 
     def _build_client(self) -> Any:
         import boto3

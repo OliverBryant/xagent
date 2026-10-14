@@ -744,7 +744,7 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def supports_forced_tool_choice(self) -> bool:
-        return self._downstream.supports_forced_tool_choice
+        return getattr(self._downstream, "supports_forced_tool_choice", True)
 
     async def chat(
         self,

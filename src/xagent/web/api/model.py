@@ -1321,7 +1321,7 @@ async def test_models(
             # budget so the probe reaches a final answer.
             test_messages = [{"role": "user", "content": test_message}]
             chat_kwargs = _connection_test_chat_kwargs(
-                model.model_provider, model.model_name
+                cast(str, model.model_provider), cast(str, model.model_name)
             )
             await llm.chat(test_messages, **chat_kwargs)
             response_time = time.time() - start_time

@@ -100,7 +100,9 @@ from .memory_availability import (
 from .memory_availability import (
     caller_facing_execution_metadata as caller_facing_execution_metadata,
 )
-from .memory_availability import public_memory_availability_reason
+from .memory_availability import (
+    public_memory_availability_reason,
+)
 from .memory_policy import MemoryPolicyRequest, resolve_trusted_memory_policy
 from .task_execution_context_service import (
     load_task_execution_recovery_state,

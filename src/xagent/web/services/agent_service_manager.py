@@ -12,10 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
-from ...config import (
-    get_external_upload_dirs,
-    get_shared_task_execution_enabled,
-)
+from ...config import get_external_upload_dirs, get_shared_task_execution_enabled
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -39,13 +36,13 @@ from ...core.task_runtime import (
     TaskRuntimeContext,
     TaskRuntimeContribution,
 )
-from ...core.tools.adapters.vibe.mcp_approval_gate import (
-    has_scoped_approval_gate_for_source,
-    mcp_approval_gate_rollback_fence,
-)
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
+)
+from ...core.tools.adapters.vibe.mcp_approval_gate import (
+    has_scoped_approval_gate_for_source,
+    mcp_approval_gate_rollback_fence,
 )
 from ...core.tools.adapters.vibe.selection_spec import (
     should_load_mcp_server_configs,
@@ -56,10 +53,7 @@ from ...sandbox import SandboxMountIntent
 from ..dynamic_memory_store import get_memory_store
 from ..memory_lifecycle import MemoryUnavailableError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
-from ..models.database import (
-    get_session_local,
-    release_db_connection_if_clean,
-)
+from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -78,9 +72,7 @@ from .agent_team_scope import (
     resolve_authorized_agent,
 )
 from .channel_runtime import ChannelTaskMode
-from .chat_history_service import (
-    load_task_transcript_window,
-)
+from .chat_history_service import load_task_transcript_window
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
@@ -108,13 +100,8 @@ from .memory_availability import (
 from .memory_availability import (
     caller_facing_execution_metadata as caller_facing_execution_metadata,
 )
-from .memory_availability import (
-    public_memory_availability_reason,
-)
-from .memory_policy import (
-    MemoryPolicyRequest,
-    resolve_trusted_memory_policy,
-)
+from .memory_availability import public_memory_availability_reason
+from .memory_policy import MemoryPolicyRequest, resolve_trusted_memory_policy
 from .task_execution_context_service import (
     load_task_execution_recovery_state,
     materialize_task_execution_recovery_state,
@@ -159,10 +146,7 @@ from .workforce_runtime import (
     resolve_workforce_task_runtime,
     sync_workforce_run_status_for_task_id_isolated,
 )
-from .workspace_binding import (
-    build_chat_workspace_binding,
-    canonical_workspace_base,
-)
+from .workspace_binding import build_chat_workspace_binding, canonical_workspace_base
 
 logger = logging.getLogger(__name__)
 
@@ -1111,10 +1095,7 @@ def _public_run_denial_channel(quota_config: Mapping[str, Any]) -> str | None:
     value must degrade to "unkeyable → admit this task" here rather than take
     the gate down.
     """
-    from .share_rate_limit import (
-        entity_rate_limit_key,
-        get_share_rate_limiter,
-    )
+    from .share_rate_limit import entity_rate_limit_key, get_share_rate_limiter
 
     auth_mode = quota_config.get("auth_mode")
     limiter = get_share_rate_limiter()
@@ -3771,9 +3752,7 @@ class AgentServiceManager:
                 )
 
         if manage_task_lease and tracker_task_id:
-            from .task_execution_controller import (
-                task_execution_controller,
-            )
+            from .task_execution_controller import task_execution_controller
 
             async with task_execution_controller.command(int(tracker_task_id)):
                 lease = await acquire_task_lease_cancellation_safe(

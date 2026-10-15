@@ -8,8 +8,8 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pydantic import BaseModel

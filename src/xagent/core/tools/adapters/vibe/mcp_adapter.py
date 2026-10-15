@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Dict,
@@ -24,7 +25,6 @@ from typing import (
     Mapping,
     NamedTuple,
     Optional,
-    TYPE_CHECKING,
     Type,
     TypeVar,
     Union,
@@ -57,6 +57,7 @@ from .base import AbstractBaseTool, ToolVisibility
 
 if TYPE_CHECKING:
     from .mcp_approval_gate import MCPApprovalGateScope
+
 from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -3037,9 +3038,7 @@ async def load_execution_scoped_chrome_tools(
     allow_users: Optional[List[str]] = None,
 ) -> SandboxedMCPLoadResult:
     # Lazy web import preserves the existing core-only MCP adapter import path.
-    from .....web.services.chrome_mcp_runtime import (
-        get_chrome_execution_session_pool,
-    )
+    from .....web.services.chrome_mcp_runtime import get_chrome_execution_session_pool
 
     launch = ChromeDaemonLaunchSpec.from_connection(connection)
     pool = get_chrome_execution_session_pool()

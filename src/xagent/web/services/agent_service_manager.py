@@ -42,7 +42,6 @@ from ...core.tools.adapters.vibe.config import (
 )
 from ...core.tools.adapters.vibe.mcp_approval_gate import (
     has_scoped_approval_gate_for_source,
-    mcp_approval_gate_rollback_fence,
 )
 from ...core.tools.adapters.vibe.selection_spec import (
     should_load_mcp_server_configs,
@@ -124,6 +123,7 @@ from .task_runtime import (
     FILE_OPERATION_ACCESS_VERSION_KEY,
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
+    approval_safe_task_runtime_contribution,
     build_task_runtime,
     mcp_runtime_authorization_policy_identity,
     mcp_runtime_authorization_policy_required,
@@ -740,16 +740,26 @@ async def create_default_tools(
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
-    if task_runtime_context is not None and registered_task_extensions():
-        try:
-            workspace = await asyncio.to_thread(
-                ToolFactory.create_workspace,
-                tool_config.get_workspace_config(),
-            )
-            tool_config.set_task_runtime_workspace(workspace)
-            runtime_contribution = await build_task_runtime(
+    if task_runtime_context is not None and (
+        registered_task_extensions()
+        or has_scoped_approval_gate_for_source(task_runtime_context.source)
+    ):
+
+        async def refresh_task_runtime() -> TaskRuntimeContribution:
+            workspace_getter = getattr(tool_config, "get_task_runtime_workspace", None)
+            workspace = workspace_getter() if callable(workspace_getter) else None
+            if workspace is None:
+                workspace = await asyncio.to_thread(
+                    ToolFactory.create_workspace,
+                    tool_config.get_workspace_config(),
+                )
+                tool_config.set_task_runtime_workspace(workspace)
+            return await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
+
+        try:
+            runtime_contribution = await refresh_task_runtime()
         except TaskRuntimeExtensionError as exc:
             # Runtime tools are optional enrichment. A broken out-of-tree
             # provider must not prevent every task from constructing its core
@@ -761,24 +771,25 @@ async def create_default_tools(
                 task_id,
                 exc_info=True,
             )
-            if has_scoped_approval_gate_for_source(task_runtime_context.source):
-                runtime_contribution = TaskRuntimeContribution(
-                    mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
-                        task_source=cast(str, task_runtime_context.source)
-                    )
-                )
+            runtime_contribution = approval_safe_task_runtime_contribution(
+                runtime_contribution,
+                task_source=task_runtime_context.source,
+                resolution_failed=True,
+            )
         except Exception:
             logger.exception(
                 "Ignoring unexpected task runtime setup failure while building "
                 "tools for task %s",
                 task_id,
             )
-            if has_scoped_approval_gate_for_source(task_runtime_context.source):
-                runtime_contribution = TaskRuntimeContribution(
-                    mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
-                        task_source=cast(str, task_runtime_context.source)
-                    )
-                )
+            runtime_contribution = approval_safe_task_runtime_contribution(
+                runtime_contribution,
+                task_source=task_runtime_context.source,
+                resolution_failed=True,
+            )
+        set_runtime_refresher = getattr(tool_config, "set_task_runtime_refresher", None)
+        if callable(set_runtime_refresher):
+            set_runtime_refresher(refresh_task_runtime)
     tool_config.set_task_runtime_contribution(runtime_contribution)
 
     # Use ToolFactory to create proper xagent tools

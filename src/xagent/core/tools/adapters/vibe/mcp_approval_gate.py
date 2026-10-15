@@ -57,8 +57,8 @@ legacy path untouched.
 
 Host contract
 -------------
-Two obligations the gate cannot enforce for the host. Both are load-bearing;
-neither is checked at runtime, so a host that ignores them gets silent
+Three obligations the gate cannot enforce for the host. All are load-bearing;
+none is checked at runtime, so a host that ignores them gets silent
 incorrectness rather than an error.
 
 1. **Persist a dispatch marker before awaiting the executor.** The resume hook
@@ -81,6 +81,15 @@ incorrectness rather than an error.
    must therefore compare the replay context's digest against the value its own
    ledger froze at approval time, and refuse on mismatch. Until it does, the
    "approved call == executed call" property is *not* enforced anywhere.
+
+3. **Pin task-scoped ON state while an approval is pending.** A resumed ReAct
+   run locates the callback on the tool set rebuilt for that turn. If the host
+   flips the durable task flag OFF while one of this gate's interactions is
+   pending, the rebuilt tool is intentionally unwrapped and ReAct falls back to
+   normal replanning instead of dispatching the approved payload. The host must
+   therefore keep the task's gate scope ON until every pending interaction for
+   that task reaches a terminal state. OFF may prevent new prompts only after
+   those interactions are settled or explicitly cancelled.
 
 Legacy integration: which ``task_source`` to register
 ------------------------------------------------------
@@ -265,6 +274,9 @@ class GatedCall:
     canonical_arguments_json: str
     arguments_sha256: str
     execution_context: ToolCallExecutionContext
+    # Exact MCP-advertised name used by the static matcher. ``None`` preserves
+    # compatibility for hosts constructing snapshots outside the MCP loader.
+    raw_tool_name: str | None = None
 
     @classmethod
     def from_arguments(
@@ -274,6 +286,7 @@ class GatedCall:
         tool_name: str,
         arguments: Mapping[str, Any],
         execution_context: ToolCallExecutionContext,
+        raw_tool_name: str | None = None,
     ) -> GatedCall:
         canonical = json.dumps(
             dict(arguments),
@@ -291,6 +304,7 @@ class GatedCall:
             canonical_arguments_json=canonical,
             arguments_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
             execution_context=execution_context,
+            raw_tool_name=raw_tool_name,
         )
 
     @property
@@ -695,18 +709,26 @@ async def _call_classifier(
 ) -> Any:
     """Run a side-effect-free classifier, accepting sync or async policies."""
 
-    if inspect.iscoroutinefunction(classifier):
+    if inspect.iscoroutinefunction(classifier) or inspect.iscoroutinefunction(
+        getattr(type(classifier), "__call__", None)
+    ):
         return await asyncio.wait_for(classifier(call), timeout=timeout_seconds)
-
-    if not _SYNC_CLASSIFIER_SLOTS.acquire(blocking=False):
-        raise RuntimeError("synchronous approval classifier capacity exhausted")
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
+    limiter = _SYNC_CLASSIFIER_SLOTS
+    while not limiter.acquire(blocking=False):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("synchronous approval classifier capacity exhausted")
+        await asyncio.sleep(min(0.005, remaining))
+
     task = asyncio.create_task(asyncio.to_thread(classifier, call))
 
     def release_slot(completed: asyncio.Task[Any]) -> None:
-        _SYNC_CLASSIFIER_SLOTS.release()
+        # Release the exact limiter acquired above. A detached worker can
+        # finish after test or host state has replaced the module global.
+        limiter.release()
         # A timed-out worker remains detached until its synchronous function
         # returns. Retrieve a late exception so asyncio does not report it as
         # an unhandled task failure.
@@ -730,7 +752,8 @@ async def _call_classifier(
             late_result.close()
 
     try:
-        returned = await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        remaining = max(0.0, deadline - loop.time())
+        returned = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
     except (TimeoutError, asyncio.CancelledError):
         task.add_done_callback(discard_late_awaitable)
         raise
@@ -973,12 +996,14 @@ class MCPApprovalGateTool(AbstractBaseTool):
         scoped_registration: _RegisteredHooks | None = None,
         approval_supported: bool = True,
         invalid_scope: bool = False,
+        raw_tool_name: str | None = None,
     ) -> None:
         self._target = target
         self._connector_ref = connector_ref
         self._scoped_registration = scoped_registration
         self._approval_supported = approval_supported
         self._invalid_scope = invalid_scope
+        self._raw_tool_name = raw_tool_name
 
     def _registration(
         self, context: ToolCallExecutionContext | None
@@ -1147,6 +1172,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 tool_name=self.name,
                 arguments=args,
                 execution_context=context,
+                raw_tool_name=self._raw_tool_name,
             )
             protected = True
             if registration.classifier is not None:
@@ -1326,6 +1352,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 tool_name=self.name,
                 arguments=arguments,
                 execution_context=context,
+                raw_tool_name=self._raw_tool_name,
             )
             replay = MCPApprovalReplayContext(
                 interaction_id=host_interaction_id,
@@ -1395,7 +1422,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
         await self._target.load_state_json(state)
 
 
-def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str:
+def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str | None:
     """Recover the MCP-advertised name through direct or sandbox wrappers."""
 
     current: Any = tool
@@ -1409,7 +1436,7 @@ def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str:
         current = getattr(current, "_target", None)
         if current is None:
             break
-    return tool.name
+    return None
 
 
 def gate_mcp_tools(
@@ -1434,7 +1461,14 @@ def gate_mcp_tools(
     if approval_scope is None:
         if _has_scoped_registrations() and not _has_legacy_registrations():
             return list(tools)
-        return [MCPApprovalGateTool(tool, connector_ref=ref) for tool in tools]
+        return [
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=ref,
+                raw_tool_name=_raw_mcp_tool_name(tool),
+            )
+            for tool in tools
+        ]
 
     registration = _registration_for_scope(approval_scope)
     if registration is None or ref is None:
@@ -1445,6 +1479,7 @@ def gate_mcp_tools(
                 scoped_registration=None,
                 approval_supported=approval_supported,
                 invalid_scope=True,
+                raw_tool_name=_raw_mcp_tool_name(tool),
             )
             for tool in tools
         ]
@@ -1455,6 +1490,23 @@ def gate_mcp_tools(
     wrapped: list[AbstractBaseTool] = []
     for tool in tools:
         raw_tool_name = _raw_mcp_tool_name(tool)
+        if raw_tool_name is None:
+            logger.warning(
+                "MCP approval raw tool name unavailable; failing closed for "
+                "tool=%s connector=%s",
+                tool.name,
+                ref,
+            )
+            wrapped.append(
+                MCPApprovalGateTool(
+                    tool,
+                    connector_ref=ref,
+                    scoped_registration=None,
+                    approval_supported=approval_supported,
+                    invalid_scope=True,
+                )
+            )
+            continue
         try:
             matches = matcher(ref, raw_tool_name)
             if type(matches) is not bool:
@@ -1480,7 +1532,11 @@ def gate_mcp_tools(
             # A scoped registration selects only its own protected tools; it
             # must not disable a coexisting legacy source-wide registration.
             wrapped.append(
-                MCPApprovalGateTool(tool, connector_ref=ref)
+                MCPApprovalGateTool(
+                    tool,
+                    connector_ref=ref,
+                    raw_tool_name=raw_tool_name,
+                )
                 if _has_legacy_registrations()
                 else tool
             )
@@ -1491,6 +1547,7 @@ def gate_mcp_tools(
                 connector_ref=ref,
                 scoped_registration=registration,
                 approval_supported=approval_supported,
+                raw_tool_name=raw_tool_name,
             )
         )
     return wrapped

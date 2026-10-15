@@ -698,6 +698,117 @@ async def test_build_runtime_keeps_successful_provider_when_another_fails(
 
 
 @pytest.mark.asyncio
+async def test_unrelated_provider_failure_does_not_overwrite_valid_scope(
+    registered_names: list[str],
+) -> None:
+    class _FailingProvider(_Provider):
+        async def build_runtime(
+            self, context: TaskRuntimeContext
+        ) -> TaskRuntimeContribution:
+            raise RuntimeError("unrelated provider unavailable")
+
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    scope = mcp_approval_gate_scope(handle)
+    _register(
+        "approval_runtime",
+        _Provider(
+            "approval",
+            contribution=TaskRuntimeContribution(mcp_approval_gate_scope=scope),
+        ),
+        registered_names,
+    )
+    _register("unrelated_runtime", _FailingProvider("unrelated"), registered_names)
+    try:
+        contribution = await build_task_runtime(_context(source="external"))
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert contribution.mcp_approval_gate_scope == scope
+
+
+@pytest.mark.asyncio
+async def test_no_registered_provider_fences_scoped_source() -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    try:
+        contribution = await build_task_runtime(_context(source="external"))
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert contribution.mcp_approval_gate_scope == MCPApprovalGateScope(
+        "external", "rollback-fence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_mismatched_scope_fails_closed(
+    registered_names: list[str],
+) -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    external = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    other = register_mcp_approval_gate(
+        task_source="other-source",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    _register(
+        "wrong_source_runtime",
+        _Provider(
+            "wrong-source",
+            contribution=TaskRuntimeContribution(
+                mcp_approval_gate_scope=mcp_approval_gate_scope(other)
+            ),
+        ),
+        registered_names,
+    )
+    try:
+        contribution = await build_task_runtime(_context(source="external"))
+    finally:
+        unregister_mcp_approval_gate(other)
+        unregister_mcp_approval_gate(external)
+
+    assert contribution.mcp_approval_gate_scope == MCPApprovalGateScope(
+        "external", "rollback-fence"
+    )
+
+
+@pytest.mark.asyncio
 async def test_build_failure_fences_registered_scoped_source(
     registered_names: list[str],
 ) -> None:

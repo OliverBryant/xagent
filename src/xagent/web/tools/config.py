@@ -1821,6 +1821,8 @@ class WebToolConfig(BaseToolConfig):
         ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
+        self._task_runtime_refresher: Callable[[], Awaitable[Any]] | None = None
+        self._skip_next_task_runtime_refresh = False
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -2585,6 +2587,29 @@ class WebToolConfig(BaseToolConfig):
 
         return self._task_runtime_contribution
 
+    def set_task_runtime_refresher(
+        self, refresher: Callable[[], Awaitable[Any]]
+    ) -> None:
+        """Re-resolve the detached task contribution on later turns.
+
+        Tool construction already resolved the current turn, so the first
+        policy refresh only clears the skip flag. Subsequent turns replace a
+        transient rollback fence (or a changed ON/OFF scope) from durable host
+        state instead of latching it for the lifetime of a cached AgentService.
+        """
+
+        self._task_runtime_refresher = refresher
+        self._skip_next_task_runtime_refresh = True
+
+    async def _refresh_task_runtime_contribution(self) -> None:
+        refresher = self._task_runtime_refresher
+        if refresher is None:
+            return
+        if self._skip_next_task_runtime_refresh:
+            self._skip_next_task_runtime_refresh = False
+            return
+        self._task_runtime_contribution = await refresher()
+
     def set_task_runtime_workspace(self, workspace: Any) -> None:
         """Retain the workspace already prepared for runtime providers."""
 
@@ -3018,6 +3043,7 @@ class WebToolConfig(BaseToolConfig):
     async def refresh_runtime_policy(self) -> None:
         """Refresh only detached per-turn policy before signature comparison."""
         self.discard_prepared_factory_runtime()
+        await self._refresh_task_runtime_contribution()
         if self._user_id is None or not has_user_tool_policy_hooks():
             policy_snapshot = _ToolRuntimePolicySnapshot()
         else:

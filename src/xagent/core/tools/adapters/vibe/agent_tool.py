@@ -2073,13 +2073,14 @@ class AgentTool(AbstractBaseTool):
         """Return the MCP approval policy inherited by one child config."""
 
         scope = self._mcp_approval_gate_scope
+        legacy_refusal = _nested_mcp_refusal_reason()
         return {
             "mcp_unavailable_reason": (
-                None
-                if scope is not None
-                else (
-                    _nested_mcp_refusal_reason()
-                    or self._inherited_mcp_unavailable_reason
+                legacy_refusal
+                or (
+                    None
+                    if scope is not None
+                    else self._inherited_mcp_unavailable_reason
                 )
             ),
             "mcp_approval_gate_scope": scope,

@@ -411,6 +411,36 @@ async def test_scope_propagates_through_real_child_config_construction(
     assert grandchild.get_mcp_unavailable_reason() is None
 
 
+def test_cross_source_scope_keeps_parent_legacy_nested_refusal(
+    slack_gate: Any,
+) -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    scoped_handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: False,
+    )
+    tool = object.__new__(AgentTool)
+    tool._mcp_approval_gate_scope = mcp_approval_gate_scope(scoped_handle)
+    tool._inherited_mcp_unavailable_reason = None
+    try:
+        with bind_tool_call_execution_context(_parent_context("toby-slack")):
+            kwargs = tool._delegated_mcp_config_kwargs()
+    finally:
+        unregister_mcp_approval_gate(scoped_handle)
+
+    assert kwargs["mcp_approval_gate_scope"].task_source == "external"
+    assert kwargs["mcp_approval_supported"] is False
+    assert kwargs["mcp_unavailable_reason"] == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+
 @pytest.mark.asyncio
 async def test_legacy_inherited_refusal_reaches_real_child_config(
     monkeypatch: pytest.MonkeyPatch,

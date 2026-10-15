@@ -24,6 +24,7 @@ from typing import (
     Mapping,
     NamedTuple,
     Optional,
+    TYPE_CHECKING,
     Type,
     TypeVar,
     Union,
@@ -53,6 +54,9 @@ from ...core.mcp.sessions import (
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateScope
 from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -3533,7 +3537,7 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
-    approval_scope: Any = None,
+    approval_scope: "MCPApprovalGateScope | None" = None,
     approval_supported: bool = True,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.

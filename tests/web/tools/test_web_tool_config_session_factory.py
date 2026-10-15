@@ -621,6 +621,86 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
 
 
 @pytest.mark.asyncio
+async def test_create_default_tools_fences_scoped_source_on_manager_fallback(
+    monkeypatch,
+):
+    from xagent.mcp_approval_gate import (
+        GateDecision,
+        MCPApprovalGateScope,
+        register_mcp_approval_gate,
+        unregister_mcp_approval_gate,
+    )
+    from xagent.web.services.agent_service_manager import create_default_tools
+    from xagent.web.services.task_runtime import TaskRuntimeExtensionError
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            self.runtime_contribution = None
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.runtime_contribution = contribution
+
+        def set_task_runtime_workspace(self, _workspace) -> None:
+            return None
+
+    async def fail_runtime(_context):
+        raise TaskRuntimeExtensionError(
+            "broken_runtime", "build_runtime", RuntimeError("provider unavailable")
+        )
+
+    async def gate(_call):
+        return GateDecision.allow()
+
+    async def resume(**_kwargs):
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: object()
+    )
+    monkeypatch.setattr(ToolFactory, "create_all_tools", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        lambda _config: SimpleNamespace(id="workspace"),
+    )
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "registered_task_extensions",
+        lambda: ("broken_runtime",),
+    )
+    try:
+        _tools, config = await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+            task_runtime_context=TaskRuntimeContext(
+                task_id=11,
+                user_id=7,
+                source="external",
+                session_factory=lambda: object(),
+            ),
+        )
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert config.runtime_contribution.mcp_approval_gate_scope == MCPApprovalGateScope(
+        "external", "rollback-fence"
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_default_tools_isolates_runtime_tool_name_collision(
     monkeypatch,
     caplog,

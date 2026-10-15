@@ -1965,8 +1965,7 @@ class AgentTool(AbstractBaseTool):
         file_operation_access_version: Any = None,
         voice: Optional[str] = None,
         inherited_mcp_unavailable_reason: Optional[str] = None,
-        mcp_approval_gate_scope: Any = None,
-        mcp_approval_supported: bool = True,
+        mcp_approval_gate_scope: "MCPApprovalGateScope | None" = None,
     ):
         """
         Initialize an agent tool.
@@ -2047,7 +2046,6 @@ class AgentTool(AbstractBaseTool):
         self._voice = voice
         self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
         self._mcp_approval_gate_scope = mcp_approval_gate_scope
-        self._mcp_approval_supported = bool(mcp_approval_supported)
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2070,6 +2068,25 @@ class AgentTool(AbstractBaseTool):
     def name(self) -> str:
         """Tool name."""
         return self._tool_name or gen_agent_tool_name(self._agent_id, self._agent_name)
+
+    def _delegated_mcp_config_kwargs(self) -> dict[str, Any]:
+        """Return the MCP approval policy inherited by one child config."""
+
+        scope = self._mcp_approval_gate_scope
+        return {
+            "mcp_unavailable_reason": (
+                None
+                if scope is not None
+                else (
+                    _nested_mcp_refusal_reason()
+                    or self._inherited_mcp_unavailable_reason
+                )
+            ),
+            "mcp_approval_gate_scope": scope,
+            # Delegated executions cannot forward approval interactions. With
+            # a scope they may still classify and execute unprotected reads.
+            "mcp_approval_supported": scope is None,
+        }
 
     def matches_name(self, tool_name: str) -> bool:
         """Match current and historical names without exposing duplicate schemas."""
@@ -2551,23 +2568,7 @@ class AgentTool(AbstractBaseTool):
                 # self._inherited_mcp_unavailable_reason`` makes a refusal
                 # sticky for the rest of the chain once any ancestor hop
                 # triggers it.
-                mcp_unavailable_reason=(
-                    None
-                    if self._mcp_approval_gate_scope is not None
-                    else (
-                        _nested_mcp_refusal_reason()
-                        or self._inherited_mcp_unavailable_reason
-                    )
-                ),
-                mcp_approval_gate_scope=self._mcp_approval_gate_scope,
-                # Nested executions cannot forward interactive approval. The
-                # scope still propagates so the classifier can allow reads and
-                # refuse only protected writes at every descendant depth.
-                mcp_approval_supported=(
-                    False
-                    if self._mcp_approval_gate_scope is not None
-                    else self._mcp_approval_supported
-                ),
+                **self._delegated_mcp_config_kwargs(),
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
@@ -2848,8 +2849,7 @@ def build_published_agent_tools_from_records(
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
     inherited_mcp_unavailable_reason: Optional[str] = None,
-    mcp_approval_gate_scope: Any = None,
-    mcp_approval_supported: bool = True,
+    mcp_approval_gate_scope: "MCPApprovalGateScope | None" = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2940,7 +2940,6 @@ def build_published_agent_tools_from_records(
             voice=voice,
             inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
             mcp_approval_gate_scope=mcp_approval_gate_scope,
-            mcp_approval_supported=mcp_approval_supported,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2967,8 +2966,7 @@ def get_published_agents_tools(
     file_operation_access_version: Any = None,
     voice: Optional[str] = None,
     inherited_mcp_unavailable_reason: Optional[str] = None,
-    mcp_approval_gate_scope: Any = None,
-    mcp_approval_supported: bool = True,
+    mcp_approval_gate_scope: "MCPApprovalGateScope | None" = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -3033,7 +3031,6 @@ def get_published_agents_tools(
             voice=voice,
             inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
             mcp_approval_gate_scope=mcp_approval_gate_scope,
-            mcp_approval_supported=mcp_approval_supported,
         )
 
     except Exception as e:
@@ -3047,6 +3044,8 @@ from .factory import register_tool  # noqa: E402
 
 if TYPE_CHECKING:
     from xagent.web.tools.config import WebToolConfig
+
+    from .mcp_approval_gate import MCPApprovalGateScope
 
 
 @register_tool(categories={"agent"}, selection_gate="published_agent")
@@ -3101,7 +3100,6 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             voice=config.get_voice(),
             inherited_mcp_unavailable_reason=config.get_mcp_unavailable_reason(),
             mcp_approval_gate_scope=config.get_mcp_approval_gate_scope(),
-            mcp_approval_supported=config.get_mcp_approval_supported(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

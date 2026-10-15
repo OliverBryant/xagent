@@ -12,7 +12,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeGuard, TypeVar
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateScope
 
 from ..... import config as _root_config
 
@@ -529,7 +532,7 @@ class BaseToolConfig(ABC):
         unregistered and dispatch ungated."""
         return None
 
-    def get_mcp_approval_gate_scope(self) -> Any:
+    def get_mcp_approval_gate_scope(self) -> "MCPApprovalGateScope | None":
         """Trusted per-task MCP approval scope, or ``None`` when disabled."""
 
         return None

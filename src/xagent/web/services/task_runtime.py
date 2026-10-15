@@ -14,7 +14,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, Literal, cast
 
@@ -508,10 +508,18 @@ async def create_task_extensions(
 async def build_task_runtime(
     context: TaskRuntimeContext,
 ) -> TaskRuntimeContribution:
-    """Build providers independently and merge every successful contribution."""
+    """Build providers, fencing scoped approval when resolution is ambiguous.
+
+    Providers remain fail-soft for ordinary task sources. For a source with a
+    scoped approval registration, however, any provider failure could be the
+    provider that owns the durable ON/OFF bit. Treating that ambiguity as OFF
+    would silently permit protected writes, so the resulting tool set carries
+    an invalid rollback scope and fails closed for this turn.
+    """
 
     contributions: dict[str, TaskRuntimeContribution | None] = {}
     merged = EMPTY_TASK_RUNTIME_CONTRIBUTION
+    approval_resolution_failed = False
     for name, provider in _registered_extension_items():
         try:
             contribution = await _invoke_provider_hook(
@@ -530,8 +538,22 @@ async def build_task_runtime(
                 exc,
                 exc_info=True,
             )
+            approval_resolution_failed = True
             continue
         contributions[name] = normalized
+    if approval_resolution_failed:
+        from ...core.tools.adapters.vibe.mcp_approval_gate import (
+            has_scoped_approval_gate_for_source,
+            mcp_approval_gate_rollback_fence,
+        )
+
+        if has_scoped_approval_gate_for_source(context.source):
+            merged = replace(
+                merged,
+                mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
+                    task_source=cast(str, context.source)
+                ),
+            )
     return merged
 
 

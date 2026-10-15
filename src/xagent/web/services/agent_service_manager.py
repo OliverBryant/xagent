@@ -37,6 +37,11 @@ from ...core.model.providers import is_placeholder_api_key
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     TaskRuntimeContext,
+    TaskRuntimeContribution,
+)
+from ...core.tools.adapters.vibe.mcp_approval_gate import (
+    has_scoped_approval_gate_for_source,
+    mcp_approval_gate_rollback_fence,
 )
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
@@ -770,12 +775,24 @@ async def create_default_tools(
                 task_id,
                 exc_info=True,
             )
+            if has_scoped_approval_gate_for_source(task_runtime_context.source):
+                runtime_contribution = TaskRuntimeContribution(
+                    mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
+                        task_source=cast(str, task_runtime_context.source)
+                    )
+                )
         except Exception:
             logger.exception(
                 "Ignoring unexpected task runtime setup failure while building "
                 "tools for task %s",
                 task_id,
             )
+            if has_scoped_approval_gate_for_source(task_runtime_context.source):
+                runtime_contribution = TaskRuntimeContribution(
+                    mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
+                        task_source=cast(str, task_runtime_context.source)
+                    )
+                )
     tool_config.set_task_runtime_contribution(runtime_contribution)
 
     # Use ToolFactory to create proper xagent tools

@@ -5,6 +5,8 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import inspect
@@ -20,6 +22,7 @@ from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
@@ -42,6 +45,7 @@ from ...core.agent.result import (
     is_oauth_token_required_code,
     normalize_tool_failure_code,
 )
+from ...core.task_runtime import full_task_runtime_contribution
 from ...core.tools.adapters.vibe.config import (
     ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
@@ -91,6 +95,9 @@ from ..services.tool_credentials import (
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ...core.tools.adapters.vibe.mcp_approval_gate import MCPApprovalGateScope
 
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
@@ -1773,7 +1780,7 @@ class WebToolConfig(BaseToolConfig):
         voice: Optional[str] = None,
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
-        mcp_approval_gate_scope: Any = None,
+        mcp_approval_gate_scope: MCPApprovalGateScope | None = None,
         mcp_approval_supported: bool = True,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
@@ -2711,12 +2718,14 @@ class WebToolConfig(BaseToolConfig):
         """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
         return self._mcp_unavailable_reason
 
-    def get_mcp_approval_gate_scope(self) -> Any:
+    def get_mcp_approval_gate_scope(self) -> MCPApprovalGateScope | None:
         """Return the explicit inherited scope or this task's contribution."""
 
         if self._mcp_approval_gate_scope is not None:
             return self._mcp_approval_gate_scope
         contribution = self._task_runtime_contribution
+        if contribution is not None:
+            contribution = full_task_runtime_contribution(contribution)
         return getattr(contribution, "mcp_approval_gate_scope", None)
 
     def get_mcp_approval_supported(self) -> bool:

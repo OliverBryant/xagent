@@ -7,7 +7,8 @@ at their common host-side boundary.
 Task-scoped integration contract
 --------------------------------
 New integrations register once at process startup with ``tool_matcher`` and
-``classifier``. The matcher is synchronous and selects a connector/tool pair;
+``classifier``. The matcher is synchronous and selects a connector/raw MCP
+tool-name pair;
 the classifier is sync or async, receives canonical call arguments, and MUST be
 side-effect-free. The gate hook remains the only hook allowed to create a
 durable approval record or prompt.
@@ -29,6 +30,11 @@ untouched; ``True`` may enter the side-effecting gate only for ReAct. DAG
 refuses a protected call without invoking the gate hook. Classifier exceptions,
 timeouts, malformed return values, stale/forged scopes and missing connector
 identity fail closed.
+
+The matcher receives the exact name advertised by the MCP server, before the
+adapter adds a prefix, sanitizes unsupported characters, or truncates the
+agent-facing name. ``GatedCall.tool_name`` deliberately remains the canonical
+agent-facing tool name for backward compatibility with approval ledgers.
 
 The scope is copied into every delegated ``AgentTool`` configuration. Nested
 runs cannot forward approval interactions, so their matching protected calls
@@ -143,7 +149,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from threading import RLock
+from threading import BoundedSemaphore, RLock
 from typing import Any, Literal, Optional, Type
 from uuid import uuid4
 
@@ -199,6 +205,11 @@ _DISPATCH_OBSERVE_SECONDS = 30.0
 # closing the socket and, for stdio, terminating and reaping the child
 # process - not the remote's answer, which by this point is never coming.
 _DISPATCH_CLEANUP_SECONDS = 5.0
+
+# Timed-out synchronous classifiers keep running in their worker thread: Python
+# cannot safely kill arbitrary host code. Bound the number of such calls so a
+# broken classifier cannot create an unbounded queue of blocked executor work.
+_SYNC_CLASSIFIER_SLOTS = BoundedSemaphore(4)
 
 # Cleanup tasks for dispatches the gate stopped observing. Held in a
 # module-level set purely so the event loop keeps a strong reference: a bare
@@ -548,6 +559,13 @@ def has_approval_gate_for_source(task_source: str | None) -> bool:
     return registration is not None and registration.tool_matcher is None
 
 
+def has_scoped_approval_gate_for_source(task_source: str | None) -> bool:
+    """Whether ``task_source`` has a task-scoped approval registration."""
+
+    registration = _registration_for(task_source)
+    return registration is not None and registration.tool_matcher is not None
+
+
 def _has_legacy_registrations() -> bool:
     with _REGISTRATIONS_LOCK:
         return any(item.tool_matcher is None for item in _REGISTRATIONS.values())
@@ -677,10 +695,49 @@ async def _call_classifier(
 ) -> Any:
     """Run a side-effect-free classifier, accepting sync or async policies."""
 
-    returned = classifier(call)
+    if inspect.iscoroutinefunction(classifier):
+        return await asyncio.wait_for(classifier(call), timeout=timeout_seconds)
+
+    if not _SYNC_CLASSIFIER_SLOTS.acquire(blocking=False):
+        raise RuntimeError("synchronous approval classifier capacity exhausted")
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    task = asyncio.create_task(asyncio.to_thread(classifier, call))
+
+    def release_slot(completed: asyncio.Task[Any]) -> None:
+        _SYNC_CLASSIFIER_SLOTS.release()
+        # A timed-out worker remains detached until its synchronous function
+        # returns. Retrieve a late exception so asyncio does not report it as
+        # an unhandled task failure.
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(release_slot)
+
+    def discard_late_awaitable(completed: asyncio.Task[Any]) -> None:
+        if completed.cancelled():
+            return
+        try:
+            late_result = completed.result()
+        except Exception:
+            return
+        # The call is no longer observing this result, so executing an async
+        # second stage would violate timeout/cancellation semantics. Explicitly
+        # close a native coroutine returned late to avoid leaking it and its
+        # warning.
+        if inspect.iscoroutine(late_result):
+            late_result.close()
+
+    try:
+        returned = await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+    except (TimeoutError, asyncio.CancelledError):
+        task.add_done_callback(discard_late_awaitable)
+        raise
     if not inspect.isawaitable(returned):
         return returned
-    return await asyncio.wait_for(returned, timeout=timeout_seconds)
+    remaining = max(0.0, deadline - loop.time())
+    return await asyncio.wait_for(returned, timeout=remaining)
 
 
 def _connector_ref(connection: Mapping[str, Any]) -> ConnectorRef | None:
@@ -1067,6 +1124,17 @@ class MCPApprovalGateTool(AbstractBaseTool):
         if registration is None:
             # Unregistered or absent source: transparent pass-through.
             return await self._target.run_json_async(args)
+        if self._scoped_registration is not None and (
+            context is None
+            or (
+                context.task_source != registration.handle.task_source
+                and not (not self._approval_supported and context.task_source is None)
+            )
+        ):
+            # Bind a minted scope to its trusted task source before invoking
+            # even the side-effect-free classifier. A scope for source Y must
+            # never weaken or select policy for a call from source X.
+            return dict(_GATE_FAILURE)
         # Scoped registrations classify first. The classifier is contractually
         # side-effect-free: only the gate hook below may mint a durable prompt.
         # This ordering lets non-protected reads pass through unchanged even in
@@ -1104,11 +1172,6 @@ class MCPApprovalGateTool(AbstractBaseTool):
             return await self._target.run_json_async(args)
         if not self._approval_supported:
             return dict(_NESTED_APPROVAL_UNAVAILABLE)
-        if (
-            self._scoped_registration is not None
-            and context.task_source != registration.handle.task_source
-        ):
-            return dict(_GATE_FAILURE)
         if not context.is_complete():
             return dict(_GATE_FAILURE)
         if context.pattern != "react":
@@ -1332,6 +1395,23 @@ class MCPApprovalGateTool(AbstractBaseTool):
         await self._target.load_state_json(state)
 
 
+def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str:
+    """Recover the MCP-advertised name through direct or sandbox wrappers."""
+
+    current: Any = tool
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        mcp_tool = getattr(current, "mcp_tool", None)
+        raw_name = getattr(mcp_tool, "name", None)
+        if isinstance(raw_name, str) and raw_name:
+            return raw_name
+        current = getattr(current, "_target", None)
+        if current is None:
+            break
+    return tool.name
+
+
 def gate_mcp_tools(
     tools: Sequence[AbstractBaseTool],
     *,
@@ -1346,6 +1426,8 @@ def gate_mcp_tools(
     wrap-everything behavior. A valid scoped opt-in wraps only tools selected
     by that registration's static connector/name matcher. Invalid or stale
     scope objects fail closed by wrapping every tool with no registration.
+    Matchers receive raw MCP names; approval calls retain the public
+    agent-facing name exposed by the wrapped tool.
     """
 
     ref = connector_ref or _connector_ref(connection or {})
@@ -1372,8 +1454,9 @@ def gate_mcp_tools(
         raise AssertionError("scoped registration lost its tool matcher")
     wrapped: list[AbstractBaseTool] = []
     for tool in tools:
+        raw_tool_name = _raw_mcp_tool_name(tool)
         try:
-            matches = matcher(ref, tool.name)
+            matches = matcher(ref, raw_tool_name)
             if type(matches) is not bool:
                 raise TypeError("approval tool matcher must return bool")
         except Exception:
@@ -1383,9 +1466,24 @@ def gate_mcp_tools(
                 ref,
                 exc_info=True,
             )
-            matches = True
+            wrapped.append(
+                MCPApprovalGateTool(
+                    tool,
+                    connector_ref=ref,
+                    scoped_registration=None,
+                    approval_supported=approval_supported,
+                    invalid_scope=True,
+                )
+            )
+            continue
         if not matches:
-            wrapped.append(tool)
+            # A scoped registration selects only its own protected tools; it
+            # must not disable a coexisting legacy source-wide registration.
+            wrapped.append(
+                MCPApprovalGateTool(tool, connector_ref=ref)
+                if _has_legacy_registrations()
+                else tool
+            )
             continue
         wrapped.append(
             MCPApprovalGateTool(

@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
     from .....web.services.actor_mcp_runtime import ActorMCPStdioSessionIdentity
     from .mcp_adapter import MCPServerLoadFailure
+    from .mcp_approval_gate import MCPApprovalGateScope
 
     ActorMCPStdioSessionConsumer = Callable[
         ...,
@@ -1160,7 +1161,7 @@ class ToolFactory:
         workspace: Any | None = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
-        approval_scope: Any = None,
+        approval_scope: "MCPApprovalGateScope | None" = None,
         approval_supported: bool = True,
     ) -> list[Tool]:
         """Create MCP tools while keeping actor session identity host-only."""

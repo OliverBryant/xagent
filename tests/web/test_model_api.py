@@ -775,6 +775,11 @@ class TestModelAPI:
             assert llm._fallback_model == "deepseek/deepseek-v4-flash"
             downstream = llm._downstream_resolver("openai/gpt-5.5")
             assert downstream.model_id == first.json()["model_id"]
+            # With a fallback to move to, a candidate gives up after two
+            # attempts; the fallback keeps the saved model's own budget.
+            assert downstream._retry_wrapper.max_retries == 2
+            fallback_downstream = llm._downstream_resolver("deepseek/deepseek-v4-flash")
+            assert fallback_downstream._retry_wrapper.max_retries == 10
 
             first_db_model = db.get(DBModel, first.json()["id"])
             second_db_model = db.get(DBModel, second.json()["id"])

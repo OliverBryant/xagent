@@ -8,6 +8,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from sqlalchemy.orm import Session, joinedload
 
+from ...config import get_auto_primary_max_attempts
 from ...core.model.chat.basic.adapter import (
     attach_chat_retry_wrapper,
     create_base_llm,
@@ -845,6 +846,12 @@ class UserAwareModelStorage:
             raise AutoModelUnavailableError(str(exc)) from exc
 
         profile_ids = list(targets_by_profile)
+        # With a fallback to move to, a failing candidate should give up
+        # quickly instead of spending the whole retry deadline first; the
+        # fallback keeps its own budget because nothing comes after it.
+        primary_max_attempts = (
+            get_auto_primary_max_attempts() if fallback_profile is not None else None
+        )
         configured = router_cfg.model_copy(
             update={
                 "router_config_name": AUTO_ROUTER_CONFIG_NAME,
@@ -858,6 +865,12 @@ class UserAwareModelStorage:
             if target_cfg is None:
                 raise RuntimeError(
                     f"xrouter selected unbound Auto profile {profile_id!r}"
+                )
+            if primary_max_attempts is not None and profile_id != fallback_profile:
+                target_cfg = target_cfg.model_copy(
+                    update={
+                        "max_retries": min(target_cfg.max_retries, primary_max_attempts)
+                    }
                 )
             llm = self.core_storage.create_llm_instance(target_cfg)
             if llm is None:

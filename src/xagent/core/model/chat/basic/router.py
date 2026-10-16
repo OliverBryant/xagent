@@ -14,6 +14,15 @@ prompt embedding when a remote backend is selected. The registry returns
 canonical ids (e.g. `anthropic/claude-opus-4.8`,
 `openai/gpt-5.5`) which configured Auto maps to concrete model records.
 
+When the Auto model has a fallback, a call whose selected model fails with an
+availability failure (provider down, timeout, rate limit, quota, rejected
+credential, missing model) is sent once more to the fallback, and -- except
+after a rate limit -- that configured candidate is skipped in favour of the
+fallback for a cooldown (``XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS``, per
+process). A stream fails over
+only before its first chunk. A failure the request itself caused (context
+length, an invalid request, a tool-protocol violation) never fails over.
+
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
 CallStore, defaulting to ``<storage_root>/xrouter/calls.db``.
@@ -54,15 +63,29 @@ import inspect
 import logging
 import os
 import threading
+import time
 from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
 
-from .....config import get_xrouter_excluded_models
+from .....config import (
+    get_auto_candidate_cooldown_seconds,
+    get_xrouter_excluded_models,
+)
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
 from ....task_runtime import normalize_input_modalities
 from ...providers import default_base_url_for_provider
-from ..types import StreamChunk
+from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
+from .call_boundary import (
+    CREDENTIAL_REJECTED,
+    MODEL_NOT_AVAILABLE,
+    PROVIDER_QUOTA,
+    PROVIDER_UNAVAILABLE,
+    RATE_LIMITED,
+    TIMEOUT,
+    ProviderCallError,
+    classify_provider_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +114,77 @@ _MODALITY_ABILITIES = {
 
 class RouterModalityRoutingError(RuntimeError):
     """The installed router cannot enforce required input modalities."""
+
+
+# Downstream failures that say the selected model cannot serve requests right
+# now -- its provider is down, slow, out of capacity or quota, or no longer
+# accepts the credential or the model name -- rather than that this request
+# is wrong. Only these move a call to the Auto fallback: a request the
+# selected model rejected on its merits (context length, an invalid request,
+# a tool-protocol violation) would fail on the fallback too.
+_FAILOVER_FAILURE_CODES = frozenset(
+    {
+        CREDENTIAL_REJECTED,
+        MODEL_NOT_AVAILABLE,
+        PROVIDER_QUOTA,
+        PROVIDER_UNAVAILABLE,
+        RATE_LIMITED,
+        TIMEOUT,
+    }
+)
+# A rate limit clears within seconds and, on a shared model, one caller's 429
+# says little about the next caller's request, so it moves only the call that
+# hit it; the rest also send the candidate's later calls to the fallback.
+_COOLDOWN_FAILURE_CODES = _FAILOVER_FAILURE_CODES - {RATE_LIMITED}
+
+
+def _failover_code(error: BaseException) -> str | None:
+    """The failure code of a downstream failure that moves the call, if any."""
+    if not isinstance(error, Exception):
+        return None
+    if isinstance(error, ProviderCallError):
+        # An inner call boundary already classified it and dropped the cause.
+        code = error.code
+    else:
+        try:
+            code = classify_provider_failure(error)
+        except Exception:  # noqa: BLE001 - classification must not mask the failure
+            return None
+    return code if code in _FAILOVER_FAILURE_CODES else None
+
+
+class _CandidateCooldowns:
+    """Configured Auto candidates that recently failed, keyed by saved model.
+
+    Per process: each replica learns about an outage from its own first
+    failure. An entry expires on its own, after which the candidate is tried
+    again.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._until: dict[str, float] = {}
+
+    def start(self, key: str, seconds: float) -> None:
+        with self._lock:
+            self._until[key] = time.monotonic() + seconds
+
+    def active(self, key: str) -> bool:
+        with self._lock:
+            until = self._until.get(key)
+            if until is None:
+                return False
+            if time.monotonic() < until:
+                return True
+            del self._until[key]
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._until.clear()
+
+
+_CANDIDATE_COOLDOWNS = _CandidateCooldowns()
 
 
 class _NullStore:
@@ -396,6 +490,20 @@ class RouterLLM(BaseLLM):
             preferred_input_modalities=required_input_modalities,
             advisory_input_modalities=advisory_input_modalities,
         )
+        fallback_model = self._failover_model(model_id, required_input_modalities)
+        if fallback_model is not None and self._cooling_down(downstream):
+            logger.warning(
+                "Auto candidate %s failed recently; using fallback %s",
+                model_id,
+                fallback_model,
+            )
+            try:
+                downstream = self._resolve_downstream(fallback_model)
+            except Exception:  # noqa: BLE001 - the candidate may still answer
+                logger.exception("Could not build Auto fallback %s", fallback_model)
+            else:
+                model_id = fallback_model
+            fallback_model = None
         # A saved target model describes the endpoint that will actually serve
         # the request, so its explicit context window wins over catalog data.
         context_window = getattr(downstream, "context_window", None)
@@ -414,6 +522,7 @@ class RouterLLM(BaseLLM):
             selected_model=model_id,
             context_window=context_window,
             input_modalities=input_modalities,
+            fallback_model=fallback_model,
         )
 
     async def _resolve_route(
@@ -436,8 +545,12 @@ class RouterLLM(BaseLLM):
             select_kwargs["advisory_input_modalities"] = advisory_input_modalities
         model_id = await self._select_model(prompt, **select_kwargs)
         logger.info("xrouter selected routing profile %s", model_id)
+        return model_id, self._resolve_downstream(model_id)
+
+    def _resolve_downstream(self, model_id: str) -> BaseLLM:
+        """Build the concrete LLM that serves one routing profile."""
         if self._downstream_resolver is not None:
-            return model_id, self._downstream_resolver(model_id)
+            return self._downstream_resolver(model_id)
         # Fallback when no downstream resolver was injected: an OpenAI-compatible
         # client using this model's own OpenRouter credentials (or the ambient
         # OPENAI_BASE_URL / OPENAI_API_KEY env when those are unset).
@@ -459,7 +572,36 @@ class RouterLLM(BaseLLM):
             # exclusion.
             abilities=self._raw_abilities,
         )
-        return model_id, create_base_llm(config)
+        return create_base_llm(config)
+
+    def _failover_model(
+        self, selected_model: str, required_input_modalities: tuple[str, ...]
+    ) -> str | None:
+        """The fallback a call routed to ``selected_model`` may move to."""
+        if self._fallback_model is None or self._fallback_model == selected_model:
+            return None
+        try:
+            return self._compatible_fallback(required_input_modalities)
+        except RouterModalityRoutingError:
+            return None
+
+    def _cooldown_key(self, downstream: BaseLLM) -> str | None:
+        # Only a configured candidate names a saved model -- one endpoint and
+        # one credential. Legacy OpenRouter Auto derives every child from the
+        # caller's own key, so its ids are shared across unrelated callers.
+        if not self.uses_configured_candidates:
+            return None
+        key = getattr(downstream, "model_id", "")
+        return str(key) if key else None
+
+    def _start_cooldown(self, downstream: BaseLLM, failure_code: str) -> None:
+        key = self._cooldown_key(downstream)
+        if key is not None and failure_code in _COOLDOWN_FAILURE_CODES:
+            _CANDIDATE_COOLDOWNS.start(key, get_auto_candidate_cooldown_seconds())
+
+    def _cooling_down(self, downstream: BaseLLM) -> bool:
+        key = self._cooldown_key(downstream)
+        return key is not None and _CANDIDATE_COOLDOWNS.active(key)
 
     @staticmethod
     def _profile_context_window(model_id: str) -> int | None:
@@ -684,7 +826,12 @@ class RouterLLM(BaseLLM):
 
 
 class _ResolvedRouterLLM(BaseLLM):
-    """A concrete xrouter selection reused for one logical LLM call."""
+    """A concrete xrouter selection reused for one logical LLM call.
+
+    With a ``fallback_model``, the first call that fails with an availability
+    failure moves this selection to the fallback for good: the call is sent
+    again there, and later calls on this object go there directly.
+    """
 
     def __init__(
         self,
@@ -694,19 +841,53 @@ class _ResolvedRouterLLM(BaseLLM):
         selected_model: str,
         context_window: int | None,
         input_modalities: tuple[str, ...],
+        fallback_model: str | None = None,
     ) -> None:
         self._router = router
+        self._input_modalities = input_modalities
+        self._fallback_model = fallback_model
+        self.context_window = context_window
+        self._bind(downstream, selected_model)
+
+    def _bind(self, downstream: BaseLLM, selected_model: str) -> None:
+        router = self._router
         self._downstream = downstream
         self._selected_model = selected_model
-        self.context_window = context_window
         ability_source = downstream if router.uses_configured_candidates else router
         abilities = list(getattr(ability_source, "abilities", router.abilities))
         if not router.uses_configured_candidates:
-            for modality in input_modalities:
+            for modality in self._input_modalities:
                 ability = _MODALITY_ABILITIES.get(modality)
                 if ability is not None and ability not in abilities:
                     abilities.append(ability)
         self._abilities = abilities
+
+    def _fail_over(self, error: BaseException) -> bool:
+        """Move to the fallback after ``error``; whether the call may go again."""
+        fallback_model = self._fallback_model
+        failure_code = None if fallback_model is None else _failover_code(error)
+        if fallback_model is None or failure_code is None:
+            return False
+        self._fallback_model = None
+        failed_model = self._selected_model
+        self._router._start_cooldown(self._downstream, failure_code)
+        try:
+            fallback = self._router._resolve_downstream(fallback_model)
+        except Exception:  # noqa: BLE001 - the original failure is the one to report
+            logger.exception(
+                "Could not build Auto fallback %s after %s failed",
+                fallback_model,
+                failed_model,
+            )
+            return False
+        logger.warning(
+            "Auto candidate %s failed (%s); sending the call to fallback %s",
+            failed_model,
+            failure_code,
+            fallback_model,
+        )
+        self._bind(fallback, fallback_model)
+        return True
 
     @property
     def model_id(self) -> str:
@@ -746,6 +927,30 @@ class _ResolvedRouterLLM(BaseLLM):
     def supports_forced_tool_choice(self) -> bool:
         return getattr(self._downstream, "supports_forced_tool_choice", True)
 
+    async def _call(
+        self,
+        method: str,
+        messages: list[dict[str, Any]],
+        tool_choice: str | dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> str | dict[str, Any]:
+        try:
+            return await getattr(self._downstream, method)(
+                messages,
+                tool_choice=self.compatible_tool_choice(tool_choice),
+                **kwargs,
+            )
+        except Exception as exc:
+            if not self._fail_over(exc):
+                raise
+        # Outside the handler, so the fallback's own failure does not carry
+        # the first model's error as its context.
+        return await getattr(self._downstream, method)(
+            messages,
+            tool_choice=self.compatible_tool_choice(tool_choice),
+            **kwargs,
+        )
+
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -758,16 +963,19 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._downstream.chat(
+        return await self._call(
+            "chat",
             messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=self.compatible_tool_choice(tool_choice),
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
+            tool_choice,
+            dict(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            ),
         )
 
     async def vision_chat(
@@ -782,16 +990,19 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._downstream.vision_chat(
+        return await self._call(
+            "vision_chat",
             messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice=self.compatible_tool_choice(tool_choice),
-            response_format=response_format,
-            thinking=thinking,
-            output_config=output_config,
-            **kwargs,
+            tool_choice,
+            dict(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                response_format=response_format,
+                thinking=thinking,
+                output_config=output_config,
+                **kwargs,
+            ),
         )
 
     async def stream_chat(
@@ -806,15 +1017,52 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        async for chunk in self._downstream.stream_chat(
-            messages,
+        call_kwargs = dict(
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
-            tool_choice=self.compatible_tool_choice(tool_choice),
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
             **kwargs,
+        )
+        stream = self._downstream.stream_chat(
+            messages,
+            tool_choice=self.compatible_tool_choice(tool_choice),
+            **call_kwargs,
+        )
+        failed_over = False
+        try:
+            started = False
+            try:
+                async for chunk in stream:
+                    # Some adapters report a failed request as an ERROR chunk
+                    # carrying the exception instead of raising it.
+                    if (
+                        not started
+                        and getattr(chunk, "type", None) == ChunkType.ERROR
+                        and isinstance(getattr(chunk, "raw", None), BaseException)
+                        and self._fail_over(chunk.raw)
+                    ):
+                        failed_over = True
+                        break
+                    started = True
+                    yield chunk
+            except Exception as exc:
+                # Once a chunk is out, the caller has part of this model's
+                # answer; a second model cannot continue it.
+                if started or not self._fail_over(exc):
+                    raise
+                failed_over = True
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        if not failed_over:
+            return
+        async for chunk in self._downstream.stream_chat(
+            messages,
+            tool_choice=self.compatible_tool_choice(tool_choice),
+            **call_kwargs,
         ):
             yield chunk

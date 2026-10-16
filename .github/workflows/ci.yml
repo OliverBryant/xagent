@@ -594,7 +594,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+          diagnostic_args=(-v)
+          if [[ "${{ matrix.name }}" == "core" ]]; then
+            diagnostic_args=(-vv --tb=short -x -o faulthandler_timeout=60)
+          fi
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope "${diagnostic_args[@]}"
 
   pytest-slow:
     runs-on: ubuntu-latest

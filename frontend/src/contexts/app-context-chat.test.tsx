@@ -11136,6 +11136,7 @@ describe("projectAppState exact settlement routing", () => {
     event_id: eventId,
     event_type: eventType,
     step_id: stepId,
+    timestamp: eventId,
     data,
   })
   const apply = (state: ProjectState, action: ProjectAction) =>

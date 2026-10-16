@@ -1429,11 +1429,24 @@ def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str | None:
     seen: set[int] = set()
     while id(current) not in seen:
         seen.add(id(current))
-        mcp_tool = getattr(current, "mcp_tool", None)
-        raw_name = getattr(mcp_tool, "name", None)
+        try:
+            attributes = object.__getattribute__(current, "__dict__")
+        except (AttributeError, TypeError):
+            break
+        if not isinstance(attributes, dict):
+            break
+
+        mcp_tool = attributes.get("mcp_tool")
+        try:
+            mcp_attributes = object.__getattribute__(mcp_tool, "__dict__")
+        except (AttributeError, TypeError):
+            mcp_attributes = None
+        raw_name = (
+            mcp_attributes.get("name") if isinstance(mcp_attributes, dict) else None
+        )
         if isinstance(raw_name, str) and raw_name:
             return raw_name
-        current = getattr(current, "_target", None)
+        current = attributes.get("_target")
         if current is None:
             break
     return None

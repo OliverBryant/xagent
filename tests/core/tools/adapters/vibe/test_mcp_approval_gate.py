@@ -165,6 +165,14 @@ def _register_scoped(
     return mcp_approval_gate_scope(handle)
 
 
+def test_raw_name_probe_does_not_invoke_dynamic_proxy_attributes() -> None:
+    class DynamicProxy:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"dynamic attribute probe: {name}")
+
+    assert approval_gate_module._raw_mcp_tool_name(DynamicProxy()) is None
+
+
 def test_scoped_registration_off_leaves_target_completely_unwrapped(
     registrations: list[Any],
 ) -> None:

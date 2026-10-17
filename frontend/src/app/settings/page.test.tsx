@@ -17,6 +17,12 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: i18nState.t, locale: "en", setLocale: i18nState.setLocale }),
 }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest }))
+vi.mock("@/hooks/use-setup-status", () => ({
+  useSetupStatus: () => ({ passwordMinLength: 8 }),
+}))
+vi.mock("@/components/settings/execution-budget", () => ({
+  ExecutionBudgetSettings: () => <section data-testid="execution-budget-settings" />,
+}))
 vi.mock("@/lib/task-runtime-ui-extension", async () => {
   const actual = await vi.importActual<
     typeof import("@/lib/task-runtime-ui-extension")
@@ -108,6 +114,19 @@ describe("SettingsPage auth profile synchronization", () => {
     )
   })
 
+  it("places execution budget after the common account settings", async () => {
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      user: authState.user,
+    }), { headers: { "Content-Type": "application/json" } }))
+
+    render(<SettingsPage />)
+
+    await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+    const budget = screen.getByTestId("execution-budget-settings")
+    expect(budget.parentElement?.lastElementChild).toBe(budget)
+  })
+
   it("does not apply an old profile response to a replacement login", async () => {
     let resolve!: (response: Response) => void
     apiRequest.mockReturnValue(new Promise<Response>(resolvePromise => { resolve = resolvePromise }))
@@ -184,6 +203,7 @@ describe("SettingsPage auth profile synchronization", () => {
     const input = await screen.findByLabelText("settings.email.current")
     await waitFor(() => expect(input).not.toBeDisabled())
     fireEvent.change(input, { target: { value: "pending@example.com" } })
+    fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
     fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
     await waitFor(() => expect(apiRequest).toHaveBeenCalledTimes(2))
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "old@example.com" } } } })

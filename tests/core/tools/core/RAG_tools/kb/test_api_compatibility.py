@@ -16,6 +16,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 from xagent.core.tools.core.RAG_tools.kb import (
     CompensationStep,
     KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     KBCoordinator,
     KBOperationCompatibilityFacade,
@@ -485,10 +486,15 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         def __init__(self) -> None:
             self.list_calls: list[dict[str, object]] = []
             self.rename_calls: list[dict[str, object]] = []
+            self.file_id_calls: list[list[str]] = []
 
         def list_document_records(self, **kwargs: object) -> list[str]:
             self.list_calls.append(kwargs)
             return ["record"]
+
+        def list_document_records_by_file_ids(self, file_ids: list[str]) -> list[str]:
+            self.file_id_calls.append(list(file_ids))
+            return ["by-file"]
 
         def rename_collection_data(self, **kwargs: object) -> list[str]:
             self.rename_calls.append(kwargs)
@@ -528,10 +534,18 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     class StatusStore:
         def __init__(self) -> None:
             self.renamed: list[dict[str, object]] = []
+            self.row_calls: list[tuple[object, ...]] = []
 
         def rename_collection_status(self, **kwargs: object) -> list[str]:
             self.renamed.append(kwargs)
             return ["status warning"]
+
+        def load_ingestion_status_rows(self, doc_refs: object) -> list[str]:
+            self.row_calls.append(("load", doc_refs))
+            return ["status row"]
+
+        def replace_ingestion_status_rows(self, doc_refs: object, rows: object) -> None:
+            self.row_calls.append(("replace", doc_refs, rows))
 
     outer_metadata = MetadataStore()
     outer_vector = VectorStore()
@@ -549,6 +563,9 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
             user_id=7,
             is_admin=False,
         ) == ["record"]
+        assert facade.list_document_records_by_file_ids(["f"]) == ["by-file"]
+        assert facade.load_ingestion_status_rows([("old", "d")]) == ["status row"]
+        facade.replace_ingestion_status_rows([("old", "d")], ["status row"])
         await facade.save_collection_config(
             collection="old",
             config_json="{}",
@@ -590,12 +607,14 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
         assert get_bound_storage_shim_for_current_context() is outer_shim
 
     assert outer_vector.list_calls == []
+    assert outer_vector.file_id_calls == []
     assert outer_vector.rename_calls == []
     assert outer_metadata.saved_configs == []
     assert outer_metadata.loaded_configs == []
     assert outer_metadata.deleted_metadata == []
     assert outer_metadata.renamed == []
     assert outer_status.renamed == []
+    assert outer_status.row_calls == []
 
     assert inner_vector.list_calls == [
         {"collection_name": "old", "user_id": 7, "is_admin": False}
@@ -625,6 +644,10 @@ async def test_api_facade_storage_operations_rebind_storage_context() -> None:
     ]
     assert inner_status.renamed == [
         {"old_name": "old", "new_name": "new", "user_id": 7, "is_admin": False}
+    ]
+    assert inner_status.row_calls == [
+        ("load", [("old", "d")]),
+        ("replace", [("old", "d")], ["status row"]),
     ]
 
 
@@ -1130,3 +1153,18 @@ def test_failed_ingest_cleanup_decision_uses_operation_outcome() -> None:
     # When no opaque rollback_complete flag is set, fall back to
     # operation_outcome.side_effects_may_remain
     assert decision.side_effects_may_remain is False
+
+
+@pytest.mark.parametrize(
+    ("successful_documents", "side_effects_may_remain", "keeps"),
+    [(0, False, False), (1, False, True), (0, True, True), (2, True, True)],
+)
+def test_failed_ingest_cleanup_decision_keeps_new_collection_metadata(
+    successful_documents: int, side_effects_may_remain: bool, keeps: bool
+) -> None:
+    decision = KBApiFailedIngestCleanupDecision(
+        successful_documents=successful_documents,
+        side_effects_may_remain=side_effects_may_remain,
+    )
+
+    assert decision.keeps_new_collection_metadata is keeps

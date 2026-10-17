@@ -95,6 +95,10 @@ def _seed(session_factory) -> tuple[int, int]:
     db = session_factory()
     user_id = make_user(db)
     task_id = make_task(db, user_id=user_id)
+    db.execute(
+        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="attempt-a")
+    )
+    db.commit()
     anchor_id = make_trace_event(db, task_id=task_id)
     db.close()
     return task_id, anchor_id
@@ -1548,7 +1552,7 @@ def test_p_reclaim_survives_a_conflict_on_its_own_calls_insert(
 
 
 def _lease(
-    task_id: int, *, run_id: str = "run-a", attempt_id: str | None = None
+    task_id: int, *, run_id: str = "run-a", attempt_id: str | None = "attempt-a"
 ) -> TaskLease:
     return TaskLease(
         task_id=task_id, runner_id="runner-1", run_id=run_id, attempt_id=attempt_id
@@ -1801,10 +1805,22 @@ def test_cm1_seven_cell_exit_matrix(
     # every environment-dependent built-in attribute (which varies across
     # Python versions and capture setups) appears on both sides and cancels
     # out of the diff; a hand-constructed bare LogRecord does not have that
-    # property.
-    degraded_records = [
-        r for r in caplog.records if r.message == "interaction handoff degraded"
-    ]
+    # property. The attempt-mismatch cell logs its own message (see
+    # test_cm6_attempt_mismatch_logs_its_own_message) with one more `extra`
+    # key, the task row's attempt, so that one cell selects its record by
+    # that message's prefix and expects that key on top of the six.
+    if case == "attempt-mismatch":
+        degraded_records = [
+            r
+            for r in caplog.records
+            if r.message.startswith(
+                "interaction handoff degraded: InteractionAttemptMismatch for task "
+            )
+        ]
+    else:
+        degraded_records = [
+            r for r in caplog.records if r.message == "interaction handoff degraded"
+        ]
     assert len(degraded_records) == 1, degraded_records
     record = degraded_records[0]
     logging.getLogger("xagent.web.services.task_interaction_staging").error(
@@ -1812,7 +1828,10 @@ def test_cm1_seven_cell_exit_matrix(
     )
     baseline = next(r for r in caplog.records if r.message == "caplog baseline probe")
     extra_keys = set(vars(record)) - set(vars(baseline))
-    assert extra_keys == _DEGRADATION_LOG_EXTRA_KEYS
+    expected_extra_keys = set(_DEGRADATION_LOG_EXTRA_KEYS)
+    if case == "attempt-mismatch":
+        expected_extra_keys.add("task_row_attempt_id")
+    assert extra_keys == expected_extra_keys
     assert record.task_id == task_id
     assert record.degradation_signal == expect_signal
 
@@ -2049,7 +2068,7 @@ def test_cm2d_bare_runtime_error_from_with_body_propagates_and_unwinds(
     db.close()
 
 
-def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
+def test_cm3_missing_attempt_cannot_stage(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
@@ -2057,15 +2076,9 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
     anchor = _anchor(anchor_id)
     task = db.get(Task, task_id)
 
-    # attempt_id is None -> assertion is skipped even though task's own
-    # lease_attempt_id disagrees.
-    db.execute(
-        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="whatever")
-    )
-    db.commit()
     lease = _lease(task_id, attempt_id=None)
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
-        result = h.stage(
+        h.stage(
             kind="clarification",
             protocol_version=1,
             request_payload={"prompt": "p"},
@@ -2073,8 +2086,8 @@ def test_cm3_attempt_assertion_gates_on_not_none(tmp_path: Path) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
-    assert result.created is True
-    assert ops_signals.active_degradations() == {}
+    assert db.query(TaskInteractionRequest).count() == 0
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     db.close()
 
 
@@ -2144,6 +2157,70 @@ def test_cm5_in_block_write_is_discarded_with_the_degraded_row(
 
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     assert not _caller_write_survived(db, task_id, "in-block-write")
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("lease_attempt_id", "rendered_lease_attempt"),
+    [
+        pytest.param("attempt-stale", "'attempt-stale'", id="stale-attempt"),
+        pytest.param(None, "None", id="no-attempt"),
+    ],
+)
+def test_cm6_attempt_mismatch_logs_its_own_message(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    lease_attempt_id: str | None,
+    rendered_lease_attempt: str,
+) -> None:
+    """A swallowed attempt mismatch is logged with its own message naming
+    the task, the lease's attempt and the task row's attempt, instead of
+    the message the other swallowed exceptions share. A lease that carries
+    no attempt at all raises the same exception and renders its attempt as
+    ``None``. The expected message is written out here as a literal on
+    purpose, so a change to the production format string is caught rather
+    than mirrored."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    _force_attempt_mismatch(db, task_id)
+    lease = _lease(task_id, attempt_id=lease_attempt_id)
+    db.commit()
+    task = db.get(Task, task_id)
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_staging"
+    )
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+
+    errors = [
+        r
+        for r in caplog.records
+        if r.name == "xagent.web.services.task_interaction_staging"
+        and r.levelno == logging.ERROR
+    ]
+    assert len(errors) == 1, errors
+    message = errors[0].getMessage()
+    assert message == (
+        "interaction handoff degraded: InteractionAttemptMismatch for task "
+        f"{task_id} (lease attempt {rendered_lease_attempt}, "
+        "task row attempt 'attempt-current')"
+    )
+    assert errors[0].lease_attempt_id == lease_attempt_id
+    assert errors[0].task_row_attempt_id == "attempt-current"
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    assert db.query(TaskInteractionRequest).count() == 0
     db.close()
 
 
@@ -2432,7 +2509,7 @@ def test_cm8d_stage_call_that_raises_before_staging_names_no_row(
     db = session_factory()
     anchor = _anchor(anchor_id)
     lease = TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id="attempt-a"
     )
     task = db.get(Task, task_id)
 
@@ -2727,6 +2804,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
         **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
     )
     db.commit()
+    before = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert before == 1
     _mark_caller_write(db, task_id, "sp1-write")
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
@@ -2738,6 +2821,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
+    after = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert after == before
     assert _caller_write_survived(db, task_id, "sp1-write")
     # Exact-set, not `in`, scoped to this module's own signal names -- same
     # idiom as T-CM-1 (test_cm1_seven_cell_exit_matrix): the module-global
@@ -3020,7 +3109,7 @@ def test_cm12_lease_without_run_id_is_rejected_in_stage(tmp_path: Path) -> None:
     db = session_factory()
     anchor = _anchor(anchor_id)
     lease = TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id=None, attempt_id="attempt-a"
     )
     task = db.get(Task, task_id)
 

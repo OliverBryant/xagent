@@ -18,6 +18,11 @@ Two steps, in this order, and nothing else:
    implementation of "what is this waiting task's question" -- decides
    the tier, and this function projects its result down to the tuple.
 
+For legacy transcript questions only, that public projection removes the
+exact generated interaction appendix when the same controls are present.
+The internal reader and canonical transcript are unchanged. Native and V2
+questions already carry raw prompt text, so they do not use this projection.
+
 The marker also decides one thing beyond routing: whether the transcript
 reader may reach a question row a structured publication has already
 relabelled to ``question_superseded``. This function is the only caller
@@ -101,6 +106,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
+from .assistant_question_display import question_content_for_display
 from .chat_history_service import get_latest_waiting_question
 from .ops_signals import (
     INTERACTION_READ_TASK_MARKER_UNRECOGNIZED,
@@ -131,12 +137,24 @@ def get_pending_interaction_question(
     # bool it is at runtime. ``object`` rather than ``int | None`` keeps a
     # malformed persisted value dynamic, so it still fails closed below.
     marker = cast("object | None", task.interaction_protocol_version)
+    if marker is None and task.conversation_storage_version == 2:
+        from .task_execution_event_recovery import read_event_waiting_question
+
+        return read_event_waiting_question(db, int(task.id))
     if marker is None:
         # No native row can belong to this task under a NULL marker, so
         # the interaction table is not queried -- and nothing holds this
         # task's answer slot, so a question row a structured publication
         # already relabelled is still the honest answer.
-        return get_latest_waiting_question(db, int(task.id), allow_superseded=True)
+        question, interactions = get_latest_waiting_question(
+            db, int(task.id), allow_superseded=True
+        )
+        return (
+            question_content_for_display(question, interactions)
+            if question is not None
+            else None,
+            interactions,
+        )
 
     # Only the one recognized marker lets the view's own two fallback
     # branches decide that nothing holds the answer slot. Every other value
@@ -163,4 +181,11 @@ def get_pending_interaction_question(
         # could not read the text at all carry ``question=None`` from the
         # view itself, which is where both slots come out empty.
         return view.question, None
-    return view.question, view.interactions
+    question = view.question
+    if (
+        view.tier == "legacy"
+        and task.conversation_storage_version != 2
+        and question is not None
+    ):
+        question = question_content_for_display(question, view.interactions)
+    return question, view.interactions

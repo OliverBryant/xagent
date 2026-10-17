@@ -14,7 +14,6 @@ from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.deployment import Deployment, DeploymentOwnerType
-from ..models.task import TaskStatus, TraceEvent
 from ..models.trigger import AgentTrigger
 from ..models.user import User
 from ..models.workforce import (
@@ -33,13 +32,15 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.deployments import (
     get_deployment,
     get_or_create_deployment,
     new_share_token,
     new_widget_key,
 )
-from ..services.trace_message_storage import decode_trace_events_data
+from ..services.llm_utils import AutoModelUnavailableError
+from ..services.task_agent_execution import load_agent_execution_detail
 from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.workforce_access import (
     can_create_workforce,
@@ -71,11 +72,7 @@ from ..services.workforce_snapshot import (
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
-from .public_trace_events import (
-    DELEGATED_AGENT_TRACE_SOURCE,
-    is_audit_only_trace_data,
-    normalize_public_trace_event,
-)
+from ..utils.db_timezone import format_datetime_for_api
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
 logger = logging.getLogger(__name__)
@@ -128,6 +125,10 @@ class WorkforceRunRequest(BaseModel):
     execution_mode: str | None = None
     is_preview: bool = False
     is_visible: bool = True
+    # Opening turn starts inside this request, so the zone rides here or the
+    # first answer renders against UTC. Unresolvable names degrade to UTC at
+    # the render site rather than 422 here.
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 class WorkforcePreviewRunRequest(BaseModel):
@@ -138,6 +139,7 @@ class WorkforcePreviewRunRequest(BaseModel):
     message: str = Field(..., min_length=1)
     files: list[str] = Field(default_factory=list)
     execution_mode: str | None = None
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 def _field_supplied(model: BaseModel, field_name: str) -> bool:
@@ -172,7 +174,16 @@ def _agent_status_value(agent: Agent) -> str:
 
 
 def _serialize_datetime(value: Any) -> str | None:
-    return value.isoformat() if value else None
+    """Format a workforce/run timestamp for the API response.
+
+    Delegates to ``format_datetime_for_api`` rather than a bare
+    ``value.isoformat()``: for a tz-aware UTC datetime (the PostgreSQL case)
+    the two produce the identical string, but for SQLite's naive-UTC storage
+    ``format_datetime_for_api`` adds the ``+00:00`` offset a bare
+    ``isoformat()`` omits. Applying it here fixes every field this function
+    serializes, not only the new ``task_expired_at`` (#2565).
+    """
+    return format_datetime_for_api(value)
 
 
 def _serialize_agent(
@@ -284,6 +295,7 @@ def _serialize_workforce_list_item(
                 "id": last_run.id,
                 "task_id": last_run.task_id,
                 "status": last_run.status,
+                "task_expired_at": _serialize_datetime(last_run.task_expired_at),
                 "created_at": _serialize_datetime(last_run.created_at),
             }
             if last_run
@@ -292,121 +304,6 @@ def _serialize_workforce_list_item(
         "created_at": _serialize_datetime(workforce.created_at),
         "updated_at": _serialize_datetime(workforce.updated_at),
     }
-
-
-def _trace_timestamp(value: Any) -> float | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return float(value.timestamp())
-
-
-_AGENT_EXECUTION_METADATA_FIELDS = (
-    "agent_id",
-    "agent_name",
-    "worker_member_id",
-    "worker_alias",
-)
-
-
-def _merge_agent_execution_metadata(
-    metadata: dict[str, Any], data: dict[str, Any]
-) -> None:
-    """Keep the first immutable delegation identity observed in trace order."""
-
-    for key in _AGENT_EXECUTION_METADATA_FIELDS:
-        if key in data and key not in metadata:
-            metadata[key] = data[key]
-
-
-def _derive_agent_execution_status(
-    trace_events: list[dict[str, Any]],
-) -> str | None:
-    """Infer a terminal worker status when its parent summary is missing."""
-
-    status_aliases = {
-        "completed": "completed",
-        "failed": "failed",
-        "interrupted": "interrupted",
-        "waiting_for_user": "waiting_for_user",
-    }
-    for event in reversed(trace_events):
-        event_type = str(event.get("event_type") or "")
-        if event_type == "trace_error":
-            return "failed"
-        if event_type not in {
-            "react_task_end",
-            "task_completion",
-            "dag_execute_end",
-        }:
-            continue
-        data = event.get("data")
-        if not isinstance(data, dict):
-            data = {}
-        result = data.get("result")
-        if not isinstance(result, dict):
-            result = {}
-        for candidate in (result.get("status"), data.get("status")):
-            if isinstance(candidate, str):
-                normalized = status_aliases.get(candidate.strip().lower())
-                if normalized is not None:
-                    return normalized
-        success = result.get("success", data.get("success"))
-        if success is False:
-            return "failed"
-        if success is True or event_type == "task_completion":
-            return "completed"
-    return None
-
-
-def _serialize_agent_execution_traces(
-    db: Session,
-    *,
-    task_id: int,
-    worker_task_id: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id == worker_task_id,
-            TraceEvent.data["source"].as_string() == DELEGATED_AGENT_TRACE_SOURCE,
-            TraceEvent.event_type != "agent_checkpoint",
-        )
-        .order_by(TraceEvent.timestamp, TraceEvent.id)
-        .all()
-    )
-    if not events:
-        raise HTTPException(status_code=404, detail="Agent execution not found")
-
-    decoded = decode_trace_events_data(
-        db,
-        task_id=task_id,
-        data_items=[event.data for event in events],
-        strict=False,
-    )
-    public_events: list[dict[str, Any]] = []
-    metadata: dict[str, Any] = {"worker_task_id": worker_task_id}
-    for event, data in zip(events, decoded):
-        if is_audit_only_trace_data(data):
-            continue
-        if isinstance(data, dict):
-            _merge_agent_execution_metadata(metadata, data)
-        event_type, public_data = normalize_public_trace_event(
-            str(event.event_type), data
-        )
-        public_events.append(
-            {
-                "event_id": event.event_id,
-                "event_type": event_type,
-                "step_id": event.step_id,
-                "timestamp": _trace_timestamp(event.timestamp),
-                "data": public_data,
-                "parent_event_id": event.parent_event_id,
-            }
-        )
-    return public_events, metadata
 
 
 def _load_latest_runs_by_workforce(
@@ -616,7 +513,10 @@ async def create_workforce_from_prompt_endpoint(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    try:
+        result = await create_workforce_from_prompt(db, user, prompt=request.prompt)
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     workforce = _reload_workforce(db, result.workforce)
     return _serialize_workforce_detail(
         workforce, user, get_agent_team_scope(db, int(user.id))
@@ -663,6 +563,7 @@ async def create_workforce_preview_run(
         message=request.message,
         selected_file_ids=request.files,
         execution_mode=request.execution_mode,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,
@@ -713,44 +614,9 @@ async def get_workforce_agent_execution(
     if run is None:
         raise HTTPException(status_code=404, detail="Workforce run not found")
 
-    trace_events, metadata = _serialize_agent_execution_traces(
-        db,
-        task_id=task_id,
-        worker_task_id=worker_task_id,
-    )
-
-    status = _derive_agent_execution_status(trace_events) or "running"
-    if (
-        status == "running"
-        and run.task is not None
-        and run.task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
-    ):
-        status = "interrupted"
-    summary_events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.task_id == task_id,
-            TraceEvent.build_id.is_(None),
-            TraceEvent.data["worker_task_id"].as_string() == worker_task_id,
-        )
-        .order_by(TraceEvent.id)
-        .all()
-    )
-    for event in summary_events:
-        data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
-        summary_type = data.get("event_type")
-        _merge_agent_execution_metadata(metadata, data)
-        if summary_type == "workforce_delegation_end":
-            status = "completed"
-        elif summary_type == "workforce_delegation_error":
-            status = "failed"
-
-    return {
-        **metadata,
-        "task_id": task_id,
-        "status": status,
-        "trace_events": trace_events,
-    }
+    if run.task is None:
+        raise HTTPException(status_code=404, detail="Workforce run task not found")
+    return load_agent_execution_detail(db, run.task, worker_task_id)
 
 
 @router.patch("/{workforce_id}")
@@ -828,7 +694,7 @@ async def archive_or_delete_workforce(
 
         def _load_and_delete_permanently() -> tuple[
             list[WorkforceRunPauseTarget],
-            list[tuple[AgentTrigger, str, dict[str, Any]]],
+            list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
         ]:
             # Offloaded as one unit (load + the cascade-heavy delete
             # itself), not just the delete: a workforce with a large
@@ -1420,6 +1286,7 @@ async def create_workforce_run(
         execution_mode=request.execution_mode,
         is_preview=request.is_preview,
         is_visible=request.is_visible,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,
@@ -1440,7 +1307,12 @@ def _serialize_run_list_item(run: WorkforceRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "task_id": run.task_id,
+        # The run's own outcome, unchanged when retention expires its task.
         "status": run.status,
+        # When the retention purge expired this run's conversation (#2565);
+        # ``task_id`` is null from then on. A null ``task_id`` without it is
+        # a task deleted some other way.
+        "task_expired_at": _serialize_datetime(run.task_expired_at),
         "is_preview": bool(run.is_preview),
         "source": task.source if task is not None else None,
         "task_title": task.title if task is not None else None,

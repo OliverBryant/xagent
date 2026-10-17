@@ -8,11 +8,11 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from ..config import (
     SANDBOX_VOLUMES,
@@ -26,9 +26,10 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
-    get_sandbox_namespace,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_worker_id,
+    get_sandbox_worker_namespace,
     get_storage_root,
     get_uploads_dir,
 )
@@ -38,6 +39,7 @@ from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
 from ..sandbox.base import (
+    ExactGenerationProbe,
     ResolvedSandboxRuntimeSpec,
     Sandbox,
     SandboxAlreadyExistsError,
@@ -54,7 +56,11 @@ from ..sandbox.base import (
     canonical_sandbox_path,
     spec_matches_inspection,
 )
-from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
+from .sandbox_keys import (
+    DURABLE_CHROME_LIFECYCLE_TYPE,
+    USER_LIFECYCLE_TYPE,
+    parse_user_lifecycle_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +175,36 @@ class SandboxLeaseProvider:
         """Return an async context manager for the requested execution mode."""
         return SandboxLease(self, concurrency_safe=concurrency_safe)
 
+    def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
+        """Whether the provider's desired RW mounts cover every guest target.
+
+        ``SandboxManager`` creates all workspace mounts as read-write volumes
+        from backend/host storage into the sandbox.  ``TaskWorkspace`` creates
+        its task-specific directories on that backend storage before the tool
+        factory runs, so directories covered by these mounts are immediately
+        visible in both primary and worker sandboxes without a serialized
+        ``sandbox.exec("mkdir", ...)`` bootstrap.
+
+        Keep this as a positive capability on the lease provider rather than
+        on ``Sandbox`` itself: a raw sandbox supplied by a standalone embedder
+        may have an independent filesystem and must retain the exec fallback.
+        A legacy backend that cannot inspect/reconcile its runtime spec also
+        retains the fallback because its requested volumes are not proof of
+        the mounts on a reused sandbox.
+
+        In sibling-Docker mode this capability proves containment in the
+        reconciled desired guest-mount paths; it cannot independently resolve
+        Docker-host bind sources in the host filesystem namespace. The
+        deployment must keep its backend/host storage mapping and symlink
+        topology consistent.
+        """
+        return self._manager.workspace_dirs_are_host_mounted(
+            self._lifecycle_type,
+            self._lifecycle_id,
+            self._mount_intent,
+            directories,
+        )
+
     async def acquire_worker_slot(self) -> int:
         """Reserve one worker slot, waiting when all workers are busy."""
         return await self._available_slots.get()
@@ -258,38 +294,107 @@ def absolute_backend_mount_path(path: str | Path) -> Path:
     return backend_path
 
 
-def resolve_backend_mount_path(path: str | Path) -> str:
-    """Absolutize a backend-domain path and resolve its symlinks.
+@dataclass(frozen=True)
+class BackendMountPathViews:
+    """The spelling and filesystem identity of one backend-domain path."""
 
-    ``SandboxMountIntent``'s covered/covering/disjoint split is purely
-    lexical, so it cannot tell a directory that is lexically inside a mount
-    root from a symlink at that same lexical position pointing somewhere
-    else entirely. Only the second one is *not* exposed by the root's bind,
-    so folding decisions must be taken against resolved paths -- this is the
-    resolver that answers that question.
+    lexical: Path
+    physical: Path
 
-    The paths that end up mounted deliberately keep their unresolved
-    spelling: the guest mount point has to stay the path the rest of the
-    system (file tools, the workspace allowlist) already refers to.
+
+SandboxMountMappingKind = Literal[
+    "local-physical",
+    "lexical-storage",
+    "physical-storage-alias",
+    "external",
+]
+
+
+@dataclass(frozen=True)
+class SandboxMountProjection:
+    """One backend path projected into host and sandbox path domains."""
+
+    backend: BackendMountPathViews
+    host_source: Path
+    guest_target: Path
+    mapping_kind: SandboxMountMappingKind
+
+
+def backend_mount_path_views(path: str | Path) -> BackendMountPathViews:
+    """Return stable lexical and physical views of one backend path.
+
+    The lexical view is the only safe input for Docker-host translation in
+    sibling mode; the physical view is the identity workspace tools address
+    and therefore the sandbox guest target. A spelling whose lexical cleanup
+    changes its physical meaning (notably ``symlink/..``) cannot safely enter
+    a desired spec, because that spec canonicalizes paths before Docker sees
+    them, so reject it rather than silently mounting a different directory.
     """
-    return os.path.realpath(absolute_backend_mount_path(path))
+    absolute = absolute_backend_mount_path(path)
+    lexical = Path(canonical_sandbox_path(str(absolute)))
+    physical_configured = Path(os.path.realpath(absolute))
+    physical_lexical = Path(os.path.realpath(lexical))
+    if physical_configured != physical_lexical:
+        raise SandboxContractError(
+            f"Backend mount path {str(path)!r} is ambiguous: lexical "
+            f"normalization gives {str(lexical)!r}, resolving to "
+            f"{str(physical_lexical)!r}, while the configured spelling "
+            f"resolves to {str(physical_configured)!r}. Configure the "
+            "physical directory directly instead of using '..' after a symlink."
+        )
+    return BackendMountPathViews(lexical=lexical, physical=physical_lexical)
+
+
+def dedupe_backend_mount_paths(
+    paths: Sequence[str | Path],
+) -> tuple[Path, ...]:
+    """Choose one stable lexical spelling per backend physical directory.
+
+    This helper is deliberately limited to plain backend-domain paths. Callers
+    with additional policy, such as workspace binding's deployment-vs-scope
+    provenance, must keep that policy in their own layer. Docker-host paths
+    must never pass through this function because the backend cannot resolve
+    identities in the host filesystem namespace.
+    """
+    selected: dict[str, Path] = {}
+    for path in paths:
+        views = backend_mount_path_views(path)
+        physical_key = str(views.physical)
+        existing = selected.get(physical_key)
+        if existing is None or str(views.lexical) < str(existing):
+            selected[physical_key] = views.lexical
+    return tuple(selected[key] for key in sorted(selected))
 
 
 class SandboxPathMapper:
-    """Translate backend-visible workspace paths into sandbox volume tuples."""
+    """Translate backend workspace paths into cross-domain volume tuples.
+
+    A backend path has two load-bearing views: its lexical spelling maps to
+    the Docker-host storage root in sibling mode, while its physical identity
+    is the guest target used by ``TaskWorkspace``. The optional host root is
+    deliberately never resolved here because it belongs to the Docker-host
+    namespace, not this backend process's filesystem.
+    """
 
     def __init__(
         self,
         *,
         backend_storage_root: Path,
         host_storage_root: Path | None,
-        sandbox_storage_root: Path | None = None,
     ) -> None:
-        self.backend_storage_root = self._as_backend_path(backend_storage_root)
+        self.backend_storage = backend_mount_path_views(backend_storage_root)
+        # This path belongs to the Docker-host namespace. Preserve its spelling
+        # exactly; the backend cannot safely normalize symlinks or ``..`` in a
+        # filesystem namespace it does not own.
         self.host_storage_root = host_storage_root
-        self.sandbox_storage_root = self._as_backend_path(
-            sandbox_storage_root or self.backend_storage_root
-        )
+        if (
+            self.host_storage_root is not None
+            and not self.host_storage_root.is_absolute()
+        ):
+            raise SandboxContractError(
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT must be an absolute "
+                f"Docker-host path, got {str(host_storage_root)!r}"
+            )
 
     @classmethod
     def from_env(cls) -> "SandboxPathMapper":
@@ -302,42 +407,70 @@ class SandboxPathMapper:
     def uses_host_storage_root(self) -> bool:
         return self.host_storage_root is not None
 
-    @staticmethod
-    def _as_backend_path(path: str | Path) -> Path:
-        return absolute_backend_mount_path(path)
+    @property
+    def backend_storage_root(self) -> Path:
+        return self.backend_storage.lexical
 
-    def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
+    @property
+    def backend_storage_root_physical(self) -> Path:
+        return self.backend_storage.physical
+
+    @staticmethod
+    def _relative_to(path: Path, root: Path) -> Path | None:
         try:
-            return backend_path.relative_to(self.backend_storage_root)
+            return path.relative_to(root)
         except ValueError:
             return None
 
-    def to_host_bind_source(self, backend_path: str | Path) -> Path:
-        path = self._as_backend_path(backend_path)
+    def project(self, backend_path: str | Path) -> SandboxMountProjection:
+        """Project one path once, preserving the boundary between domains.
+
+        Lexical containment has priority in sibling-Docker mode because an
+        internal symlink still has a valid host-side suffix. If the lexical
+        spelling is outside storage, physical containment recovers aliases
+        that point back into storage. Only paths outside storage in both
+        views retain their backend spelling as a Docker-host source.
+        """
+        backend = backend_mount_path_views(backend_path)
         if self.host_storage_root is None:
-            return path
+            return SandboxMountProjection(
+                backend=backend,
+                host_source=backend.physical,
+                guest_target=backend.physical,
+                mapping_kind="local-physical",
+            )
 
-        relative_path = self._relative_to_backend_storage(path)
+        relative_path = self._relative_to(backend.lexical, self.backend_storage_root)
+        mapping_kind: SandboxMountMappingKind = "lexical-storage"
         if relative_path is None:
-            return path
-        return self.host_storage_root / relative_path
-
-    def to_sandbox_target(self, backend_path: str | Path) -> Path:
-        path = self._as_backend_path(backend_path)
-        if self.host_storage_root is None:
-            return path
-
-        relative_path = self._relative_to_backend_storage(path)
+            relative_path = self._relative_to(
+                backend.physical, self.backend_storage_root_physical
+            )
+            mapping_kind = "physical-storage-alias"
         if relative_path is None:
-            return path
-        return self.sandbox_storage_root / relative_path
+            # External directories outside the translated storage root retain
+            # the historical contract that their absolute spelling must also
+            # exist in the Docker-host namespace.
+            return SandboxMountProjection(
+                backend=backend,
+                host_source=backend.lexical,
+                guest_target=backend.physical,
+                mapping_kind="external",
+            )
+        return SandboxMountProjection(
+            backend=backend,
+            host_source=self.host_storage_root / relative_path,
+            guest_target=backend.physical,
+            mapping_kind=mapping_kind,
+        )
 
     def volume_for_backend_path(
         self, backend_path: str | Path, mode: str = "rw"
     ) -> tuple[str, str, str]:
+        projection = self.project(backend_path)
         return (
-            str(self.to_host_bind_source(backend_path)),
-            str(self.to_sandbox_target(backend_path)),
+            str(projection.host_source),
+            str(projection.guest_target),
             mode,
         )
 
@@ -793,6 +926,54 @@ class SandboxManager:
             paths.append((mount_root, True))
 
         return paths
+
+    def workspace_dirs_are_host_mounted(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        mount_intent: SandboxMountIntent | None,
+        directories: Sequence[str],
+    ) -> bool:
+        """Whether the desired workspace mounts cover every guest directory.
+
+        The manager owns both the backend capability result and the mount
+        construction inputs, so the lease provider delegates the answer here
+        instead of reaching through several manager-private attributes.
+
+        A ``True`` result proves containment after projecting backend paths to
+        the reconciled desired guest targets. In sibling-Docker mode it does
+        not prove that the corresponding bind source resolves to the intended
+        directory on the Docker host, whose filesystem namespace this process
+        cannot inspect.
+
+        Raises:
+            SandboxContractError: Backend or Docker-host path mapping is
+                ambiguous or invalid.
+            UploadsDirConfigurationError: The default user uploads root is
+                ambiguous when deriving a user-lifecycle workspace mount.
+        """
+        if not directories:
+            return True
+        if self._backend_probe is not True:
+            return False
+
+        path_mapper = SandboxPathMapper.from_env()
+        mount_roots = tuple(
+            path_mapper.project(backend_path).guest_target
+            for backend_path, _should_create in self._workspace_mount_paths(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+            )
+        )
+        if not mount_roots:
+            return False
+
+        for directory in directories:
+            candidate = path_mapper.project(directory).guest_target
+            if not any(candidate.is_relative_to(root) for root in mount_roots):
+                return False
+        return True
 
     def _prepare_workspace_mounts(
         self,
@@ -1622,6 +1803,8 @@ class SandboxManager:
                     lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
                 except ValueError:
                     continue
+                if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
                 base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
                 if name != base_name:
                     # Workers are deleted with their primary.
@@ -1825,6 +2008,10 @@ class SandboxManager:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
         """
+        if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+            raise SandboxContractError(
+                "durable Chrome sandboxes require delete_durable_sandbox_strict"
+            )
         sandbox_names = await self._find_lifecycle_sandbox_names(
             lifecycle_type,
             lifecycle_id,
@@ -1837,6 +2024,10 @@ class SandboxManager:
         self, lifecycle_type: str, lifecycle_id: str
     ) -> None:
         """Delete worker sandboxes for a lifecycle while preserving the primary."""
+        if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+            raise SandboxContractError(
+                "durable Chrome sandboxes require delete_durable_sandbox_strict"
+            )
         sandbox_names = await self._find_lifecycle_sandbox_names(
             lifecycle_type,
             lifecycle_id,
@@ -1844,6 +2035,103 @@ class SandboxManager:
             include_workers=True,
         )
         await self._delete_sandbox_names(sandbox_names)
+
+    async def delete_durable_sandbox_strict(self, lifecycle_id: str) -> None:
+        """Idempotently delete one fenced physical Chrome lifecycle.
+
+        This is the only destructive seam the durable protocol may use.
+        Backend ``not found`` is confirmation of absence; discovery and all
+        other deletion failures propagate so a caller cannot settle its
+        durable tombstone on an unconfirmed outcome.
+        """
+        if re.fullmatch(r"[0-9a-f]{64}", lifecycle_id) is None:
+            raise ValueError("durable lifecycle id must be a lowercase digest")
+        primary = self.make_sandbox_name(DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id)
+        worker_prefix = self._worker_sandbox_prefix(
+            DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id
+        )
+        listed = await self._service.list_sandboxes()
+        names, malformed = self._match_durable_sandbox_names(
+            listed or [], primary=primary, worker_prefix=worker_prefix
+        )
+        if malformed:
+            raise SandboxContractError(
+                "durable sandbox listing contained a malformed name"
+            )
+        names.add(primary)
+        for name in sorted(names, key=lambda item: item == primary):
+            try:
+                await self._service.delete(name)
+            except SandboxNotFoundError:
+                pass
+            self._cache.pop(name, None)
+            self._config_cache.pop(name, None)
+            self._locks.pop(name, None)
+            self._lease_providers.pop(name, None)
+            self._activity.pop(name, None)
+        self._reconcile_budget.pop(primary, None)
+
+    async def probe_durable_sandbox_strict(
+        self, lifecycle_id: str
+    ) -> ExactGenerationProbe:
+        """Probe one generation without collapsing backend failures to absence.
+
+        The lifecycle digest is embedded in every primary/worker sandbox name,
+        so a successful backend listing is exact-generation evidence.  Docker,
+        Boxlite, and test services all use this same seam; any listing or
+        decoding failure is UNKNOWN and therefore cannot settle ownership.
+        """
+        if re.fullmatch(r"[0-9a-f]{64}", lifecycle_id) is None:
+            raise ValueError("durable lifecycle id must be a lowercase digest")
+        primary = self.make_sandbox_name(DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id)
+        worker_prefix = self._worker_sandbox_prefix(
+            DURABLE_CHROME_LIFECYCLE_TYPE, lifecycle_id
+        )
+        try:
+            listed = await self._service.list_sandboxes()
+            names, malformed = self._match_durable_sandbox_names(
+                listed or [], primary=primary, worker_prefix=worker_prefix
+            )
+            if names:
+                return ExactGenerationProbe.PRESENT
+            if malformed:
+                return ExactGenerationProbe.UNKNOWN
+        except Exception as exc:
+            logger.warning(
+                "Durable sandbox generation probe failed closed for %s: %s",
+                lifecycle_id,
+                exc,
+            )
+            return ExactGenerationProbe.UNKNOWN
+        return ExactGenerationProbe.ABSENT
+
+    @staticmethod
+    def _match_durable_sandbox_names(
+        sandboxes: Iterable[SandboxInfo],
+        *,
+        primary: str,
+        worker_prefix: str,
+    ) -> tuple[set[str], bool]:
+        """Return exact-generation names and whether decoding was malformed.
+
+        The full listing is scanned so a confirmed exact match takes priority
+        over an unrelated malformed entry.  Without a match, any malformed
+        entry prevents an authoritative ABSENT result.
+        """
+        names: set[str] = set()
+        malformed = False
+        for sandbox in sandboxes:
+            try:
+                name = sandbox.name
+            except Exception:
+                malformed = True
+                continue
+            if not isinstance(name, str):
+                malformed = True
+                continue
+            if name == primary or name.startswith(worker_prefix):
+                names.add(name)
+        return names, malformed
 
     async def _find_lifecycle_sandbox_names(
         self,
@@ -1960,6 +2248,8 @@ class SandboxManager:
             try:
                 lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
             except ValueError:
+                continue
+            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
                 continue
             candidates.add(self._base_sandbox_name(lifecycle_type, lifecycle_id))
 
@@ -2081,6 +2371,12 @@ class SandboxManager:
         failed = 0
         stop_seconds = 0.0
         for sb in sandboxes or []:
+            try:
+                lifecycle_type, _ = self.parse_sandbox_name(sb.name)
+            except (TypeError, ValueError):
+                lifecycle_type = None
+            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                continue
             if sb.state != "running":
                 continue
             running += 1
@@ -2151,6 +2447,12 @@ class SandboxManager:
             image, config = self._get_sandbox_image_and_config()
 
             for sb in sandboxes:
+                try:
+                    protected_type, _ = self.parse_sandbox_name(sb.name)
+                except (TypeError, ValueError):
+                    protected_type = None
+                if protected_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
                 if sb.state == "running":
                     running += 1
                 try:
@@ -2396,46 +2698,33 @@ def _check_no_reserved_uploads_conflict(
     guest_uploads_root: str,
     reserved_prefix: str,
 ) -> None:
-    """Reject a configured mount whose guest path IS a reserved per-user dir.
+    """Reject configured mounts at or below a reserved per-user directory.
 
     The per-user workspace mount every task adds by default cannot be
-    enumerated here — user ids are runtime facts — so the exact
-    ``<guest_uploads_root>/<reserved_prefix><id>`` guest path is treated as
-    reserved: a static mount claiming that exact guest path collides with
-    the mount every future task for that user needs there, which today only
-    surfaces as ``SandboxRuntimeConflictError`` at that user's first task
-    rather than here at startup.
-
-    A mount nested *under* a reserved directory (e.g.
-    ``<uploads>/user_1/models``) is a distinct guest path and is NOT
-    rejected: nested bind mounts at different guest paths are legal —
-    ``_check_no_conflicting_volumes`` (the per-create check) and Docker
-    itself only flag exact guest-path collisions, never parent/child
-    nesting — and a deployment-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry
-    landing there is exactly the exception ``_fold_mount_paths`` implements
-    (see ``_MountCandidate``'s ``"deployment"`` provenance in
-    ``workspace_binding.py``): an operator-named mount keeps its own bind
-    regardless of where it falls relative to the reserved subtree. A mount
-    elsewhere under the uploads root (e.g. a shared knowledge-base
-    directory) does not match the reserved shape either and still passes.
+    enumerated here — user ids are runtime facts — so the whole
+    ``<guest_uploads_root>/<reserved_prefix><id>/...`` subtree is reserved.
+    Docker permits a more-specific nested bind, but it would shadow the
+    manager-generated workspace bind and invalidate the guarantee that
+    host-created task directories are immediately visible in the sandbox.
+    Mounts elsewhere under the uploads root (for example a shared knowledge
+    base) remain valid.
     """
     reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
-    prefix_with_sep = guest_uploads_root + "/"
+    prefix_with_sep = guest_uploads_root.rstrip("/") + "/"
     for _host_path, guest_path, _mode in volumes:
         norm_guest = canonical_sandbox_path(guest_path)
         if not norm_guest.startswith(prefix_with_sep):
             continue
         remainder = norm_guest[len(prefix_with_sep) :]
-        if "/" in remainder:
-            # Nested under a reserved directory, not the directory itself.
-            continue
-        if reserved_re.match(remainder):
+        user_component = remainder.split("/", 1)[0]
+        if reserved_re.fullmatch(user_component):
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox mount with guest path {guest_path!r} "
-                "collides with the reserved per-user uploads path "
+                "overlaps the reserved per-user uploads subtree "
                 f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
-                "default workspace mount for that user needs that exact "
-                "guest path."
+                "default workspace mount requires that subtree to remain "
+                "unshadowed. Move the mount elsewhere under the uploads root "
+                "or mount an ancestor instead."
             )
 
 
@@ -2467,15 +2756,12 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     using the same ``host_side_sources`` flag the runtime build path uses)
     and code mounts (``build_code_mount_volumes``) are already host-domain
     triples and are compared as-is. External upload dirs are backend-domain
-    paths: they are absolutized through ``absolute_backend_mount_path`` (the
-    same owner the runtime mount-building path uses, so a relative
-    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry is checked as the directory it
-    actually names) and folded (normalized + deduplicated, the same
-    backend-domain normalization ``SandboxMountIntent`` itself applies)
-    before being converted to host domain through the same
-    ``SandboxPathMapper`` the runtime mount-building path uses. Conflict
-    detection itself always runs in the post-mapper host domain, over the
-    combined triple set from all three sources.
+    paths: they are normalized and deduplicated by backend physical identity
+    through ``dedupe_backend_mount_paths`` before being converted to host
+    domain through the same ``SandboxPathMapper`` the runtime mount-building
+    path uses. One stable lexical spelling is retained for sibling-Docker host
+    translation. Conflict detection itself always runs in the post-mapper host
+    domain, over the combined triple set from all three sources.
 
     Beyond mutual conflicts among the configured mounts, one configured
     mount can also collide with a mount that does not exist yet: every
@@ -2504,9 +2790,7 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     )
     volumes.extend(build_code_mount_volumes())
 
-    folded_external = SandboxMountIntent(
-        extra_mounts=tuple(str(absolute_backend_mount_path(d)) for d in external_dirs)
-    ).extra_mounts
+    folded_external = dedupe_backend_mount_paths(external_dirs)
     for backend_dir in folded_external:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
@@ -2565,8 +2849,8 @@ def _create_boxlite_service() -> Optional[SandboxService]:
 
     from .sandbox_store import DBBoxliteStore
 
-    store = DBBoxliteStore()
-    # Get home directory
+    worker_id = get_sandbox_worker_id()
+    store = DBBoxliteStore(namespace=worker_id)
     home_dir = get_boxlite_home_dir()
 
     service = None
@@ -2585,7 +2869,7 @@ def _create_boxlite_service() -> Optional[SandboxService]:
 
 def _create_docker_service() -> Optional[SandboxService]:
     """Create Docker sandbox service."""
-    namespace = get_sandbox_namespace()
+    namespace = get_sandbox_worker_namespace()
     if namespace is None:
         # Fatal, not a degraded start: without a stable per-deployment
         # namespace, a backend on a shared Docker daemon can discover and
@@ -2607,7 +2891,7 @@ def _create_docker_service() -> Optional[SandboxService]:
 
     from .sandbox_store import DBDockerStore
 
-    store = DBDockerStore()
+    store = DBDockerStore(namespace=namespace if get_sandbox_worker_id() else None)
 
     try:
         service = DockerSandboxService(store=store, namespace=namespace)

@@ -18,6 +18,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce
+from xagent.web.services import task_start
 
 from ..conftest import (
     _admin_headers,
@@ -184,6 +185,43 @@ def _manager_agent_id(workforce_id: int) -> int:
 
 
 # ===== POST /v1/workforces/{id}/runs =====
+
+
+def test_create_run_forwards_timezone_to_the_opening_turn(mock_schedule_bg):
+    """The workforce SDK opener starts its turn inside this HTTP request and
+    has no websocket, so the create body is its only way to declare a zone."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_schedule_bg.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_run_without_timezone_sends_no_context(mock_schedule_bg):
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "coordinate the work"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_schedule_bg.call_args.kwargs["context"] is None
 
 
 def test_create_run_happy_path():
@@ -620,7 +658,6 @@ def test_idempotency_conflict_when_original_task_deleted():
 def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
     """A non-transient workforce turn rejection on append maps to its own
     stable v1 code (not the misleading retryable task_busy)."""
-    from xagent.web.api.v1 import tasks as v1_tasks
     from xagent.web.services.task_orchestrator import TaskTurnError
 
     headers = _admin_headers()
@@ -654,7 +691,7 @@ def test_append_workforce_turn_rejection_maps_to_stable_codes(monkeypatch):
             raise TaskTurnError(reason)
 
         monkeypatch.setattr(
-            v1_tasks.TaskTurnOrchestrator,
+            task_start.TaskTurnOrchestrator,
             "claim_append_turn_no_commit",
             _reject,
         )

@@ -14,6 +14,7 @@ from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import create_access_token, generic_oauth_callback
 from xagent.web.models.database import Base
+from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -39,7 +40,9 @@ class NonJsonResponse(MockResponse):
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
+    # Gmail callback tests exercise the enabled review environment.
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
     db_path = tmp_path / "test.db"
     engine = create_engine(
         f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
@@ -162,6 +165,149 @@ def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(
     )
     assert oauth_account.email == "alice@gmail.com"
     assert calls == [int(user.id)]
+
+
+def test_gmail_reconnect_revives_same_identity_tombstone_in_place(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="alice@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.flush()
+    watch = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(tombstone.id),
+        email="alice@gmail.com",
+        history_id="history-1",
+        topic_name="projects/demo/topics/xagent-gmail-alice",
+        status="failed",
+        last_error=gmail_provisioning.GMAIL_RECONNECT_REQUIRED_ERROR,
+    )
+    db.add(watch)
+    db.commit()
+    tombstone_id = int(tombstone.id)
+    watch_id = int(watch.id)
+
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "reconnected-token",
+                    "refresh_token": "reconnected-refresh",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    provisioned_account_ids: list[int] = []
+
+    def capture_best_effort(_db, *, user_id: int, context: str):
+        account = (
+            _db.query(UserOAuth)
+            .filter(UserOAuth.user_id == user_id, UserOAuth.provider == "gmail")
+            .one()
+        )
+        provisioned_account_ids.append(int(account.id))
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "best_effort_provision_gmail_watches_for_user",
+        capture_best_effort,
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    reconnected = db.query(UserOAuth).filter(UserOAuth.provider == "gmail").one()
+    assert int(reconnected.id) == tombstone_id
+    assert reconnected.access_token == "reconnected-token"
+    assert reconnected.refresh_token == "reconnected-refresh"
+    assert db.get(GmailWatchState, watch_id) is not None
+    assert provisioned_account_ids == [tombstone_id]
+
+
+def test_gmail_reconnect_does_not_reuse_a_different_identity_tombstone(db_session):
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="shared-address@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+
+    matched = auth_api._matching_gmail_reconnect_tombstone(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        connector_key="gmail",
+        provider_user_id="google-user-2",
+        email="shared-address@gmail.com",
+    )
+
+    assert matched is None
+
+
+def test_gmail_reconnect_does_not_reuse_a_verified_tombstone_when_the_new_callback_has_no_id(
+    db_session,
+):
+    """A reconnect whose callback didn't yield a provider_user_id (e.g. a
+    userinfo response missing the configured id field) must not fall back to
+    matching a tombstone by email alone when that tombstone already has its
+    own verified upstream id recorded -- that id proves it belongs to a
+    specific Google identity, and this callback hasn't proven it's the same
+    one.
+    """
+    db, user = db_session
+    tombstone = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-user-1",
+        email="shared-address@gmail.com",
+        access_token="",
+    )
+    db.add(tombstone)
+    db.commit()
+
+    matched = auth_api._matching_gmail_reconnect_tombstone(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        connector_key="gmail",
+        provider_user_id=None,
+        email="shared-address@gmail.com",
+    )
+
+    assert matched is None
 
 
 def test_gmail_callback_succeeds_when_best_effort_watch_provisioning_raises(
@@ -450,52 +596,46 @@ def test_oauth_callback_still_fails_when_the_success_page_cannot_be_rendered(
     assert "Authentication Failed" in response.body.decode()
 
 
-def test_oauth_callback_survives_a_non_integer_user_id_claim(
-    db_session, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "user_id_claim",
+    [
+        pytest.param("7abc", id="non-integer-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(7.9, id="fractional-float"),
+        pytest.param(7.0, id="integral-float"),
+        pytest.param(float("inf"), id="infinite-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(2**31, id="larger-than-database-integer"),
+    ],
+)
+def test_oauth_callback_rejects_an_invalid_user_id_claim_before_exchange(
+    db_session, monkeypatch, user_id_claim: object
 ):
-    """Coercing the state claim is post-commit work, so it belongs in the guard.
-
-    A ``user_id`` claim that is not an integer only becomes observable once the
-    OAuth row is committed, so failing the coercion has to behave like any
-    other post-commit failure rather than rendering a 500 for a connect that
-    already succeeded. Reachable if a deployment is still running on the
-    default ``XAGENT_JWT_SECRET``, which makes the state token forgeable.
-    """
+    """An invalid state owner must fail before provider and database effects."""
     db, _user = db_session
     state = create_access_token(
         data={
             "type": "oauth_state",
-            "user_id": "7abc",
+            "user_id": user_id_claim,
             "provider": "google",
             "app_id": "gmail",
         },
         expires_delta=timedelta(minutes=10),
     )
     request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
-    monkeypatch.setattr(
-        auth_api.requests,
-        "post",
-        Mock(
-            return_value=MockResponse(
-                {
-                    "access_token": "gmail-token",
-                    "refresh_token": "gmail-refresh",
-                    "token_type": "Bearer",
-                    "expires_in": 3600,
-                    "scope": "https://www.googleapis.com/auth/gmail.modify",
-                }
-            )
-        ),
+    token_exchange = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "gmail-token",
+                "refresh_token": "gmail-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "https://www.googleapis.com/auth/gmail.modify",
+            }
+        )
     )
-    monkeypatch.setattr(
-        auth_api.requests,
-        "get",
-        Mock(
-            return_value=MockResponse(
-                {"sub": "google-user-1", "email": "alice@gmail.com"}
-            )
-        ),
-    )
+    monkeypatch.setattr(auth_api.requests, "post", token_exchange)
     provision = Mock()
     monkeypatch.setattr(
         "xagent.web.services.gmail_provisioning."
@@ -503,14 +643,16 @@ def test_oauth_callback_survives_a_non_integer_user_id_claim(
         provision,
     )
 
-    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+    try:
+        response = generic_oauth_callback("google", request, db, _google_provider())
+    except Exception as exc:
+        pytest.fail(f"invalid user ID claim escaped the callback: {exc!r}")
 
-    response = generic_oauth_callback("google", request, db, _google_provider())
-
-    assert response.status_code == 200
-    assert "Authentication Failed" not in response.body.decode()
+    assert response.status_code == 400
+    assert "Invalid or expired state" in response.body.decode()
+    token_exchange.assert_not_called()
     provision.assert_not_called()
-    assert "Post-commit OAuth side effects failed" in caplog.text
+    assert db.query(UserOAuth).count() == 0
 
 
 def test_bare_google_callback_does_not_provision_gmail_watches(db_session, monkeypatch):
@@ -938,6 +1080,67 @@ async def test_meta_expired_token_refresh_uses_fb_exchange_token(
     ]
 
 
+@pytest.mark.asyncio
+async def test_meta_refresh_with_revoked_session_raises_permanent(
+    db_session, monkeypatch
+):
+    """Meta nests its refresh error as an object instead of the standard
+    top-level string `error` code; OAuthException + code 190 is Meta's
+    documented "access token is invalid/expired" signal and must still be
+    recognized as a permanent (not merely transient) failure.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("meta-client-id"),
+            client_secret=encrypt_value("meta-client-secret"),
+            auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+            token_url="https://graph.facebook.com/v25.0/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/meta/callback",
+            userinfo_url="https://graph.facebook.com/v25.0/me?fields=id,email",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["public_profile"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="facebook",
+        access_token="old-long-token",
+        refresh_token=None,
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="meta-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class RevokedAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, **kwargs):
+            return MockResponse(
+                {
+                    "error": {
+                        "message": "Error validating access token: Session has expired.",
+                        "type": "OAuthException",
+                        "code": 190,
+                    }
+                },
+                status_code=400,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", RevokedAsyncClient)
+
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")
+
+
 def test_generic_oauth_batch_skips_non_oauth_app_and_connects_oauth_app(
     db_session, monkeypatch
 ):
@@ -1070,6 +1273,183 @@ def test_bare_meta_login_skips_facebook_but_still_connects_instagram(
     assert "Facebook Pages" not in server_names
 
 
+def test_bare_meta_login_skips_meta_ads(db_session, monkeypatch):
+    """Meta Ads' ads_read scope is new and lives solely on the app row —
+    same situation as Facebook's pages_read_user_content — so a bare Meta
+    login must not activate its UserMCPServer either, or every ads_read tool
+    call would fail against an under-scoped grant while reporting
+    "connected" (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT)."""
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="meta-ads",
+            name="Meta Ads",
+            description="Meta Ads connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["ads_read"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.meta_ads"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    post = Mock(
+        return_value=MockResponse(
+            {"access_token": "short-token", "token_type": "bearer", "expires_in": 3600}
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+    assert response.status_code == 200
+
+    # The bare grant is still created — neither app-scoped server is.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "meta")
+        .one()
+    )
+    assert oauth_account.access_token == "long-token"
+
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "Meta Ads" not in server_names
+    assert "Facebook Pages" not in server_names
+
+
+def test_bare_meta_login_skips_whatsapp_but_still_connects_instagram(
+    db_session, monkeypatch
+):
+    """None of WhatsApp's scopes (business_management, whatsapp_business_*)
+    is in the meta provider's default_scopes; they live solely on the app row
+    -- same situation as Facebook's pages_read_user_content -- so a bare Meta
+    login must not activate its UserMCPServer, or every WhatsApp tool call
+    would fail against an under-scoped grant while reporting "connected"
+    (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT).
+
+    Instagram is registered alongside it as a positive control (mirroring
+    test_bare_meta_login_skips_facebook_but_still_connects_instagram): its
+    required scopes haven't changed, so it must still connect via this same
+    bare flow. Without this, a callback that skipped *every* app-scoped and
+    bare-eligible server alike (e.g. a bug that stopped creating any
+    UserMCPServer at all) would make the assertions below pass vacuously.
+    """
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="whatsapp",
+            name="WhatsApp Business",
+            description="WhatsApp Business connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Communication",
+            oauth_scopes=[
+                "business_management",
+                "whatsapp_business_management",
+                "whatsapp_business_messaging",
+            ],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.whatsapp"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+                # Match the provenance-owned row seeded in production. An
+                # unmarked app_id collision is intentionally treated as an
+                # operator-owned custom connector and must not inherit the
+                # builtin WhatsApp app-scoped OAuth policy.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "whatsapp",
+                    "version": 1,
+                },
+            },
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="instagram",
+            name="Instagram",
+            description="Instagram connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["instagram_basic", "instagram_content_publish"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "meta"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    post = Mock(
+        return_value=MockResponse(
+            {"access_token": "short-token", "token_type": "bearer", "expires_in": 3600}
+        )
+    )
+
+    def get(url, **kwargs):
+        if url.endswith("/oauth/access_token"):
+            return MockResponse(
+                {
+                    "access_token": "long-token",
+                    "token_type": "bearer",
+                    "expires_in": 5184000,
+                }
+            )
+        return MockResponse({"id": "meta-user-1", "email": "alice@example.com"})
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock(side_effect=get))
+
+    response = generic_oauth_callback("meta", request, db, _meta_provider())
+    assert response.status_code == 200
+
+    # The bare grant is still created -- neither app-scoped server is.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "meta")
+        .one()
+    )
+    assert oauth_account.access_token == "long-token"
+
+    server_names = {s.name for s in db.query(MCPServer).all()}
+    assert "WhatsApp Business" not in server_names
+    assert "Instagram" in server_names
+
+
 async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_instagram(
     db_session, monkeypatch
 ):
@@ -1150,6 +1530,25 @@ async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_insta
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
     assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 1
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="meta",
+                provider_user_id="actor-meta",
+                resource_owner_key="actor:meta",
+                access_token="actor-meta-token",
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id="actor-facebook",
+                resource_owner_key="actor:facebook",
+                access_token="actor-facebook-token",
+            ),
+        ]
+    )
+    db.commit()
 
     from xagent.web.api.mcp import delete_mcp_server
 
@@ -1158,9 +1557,31 @@ async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_insta
     )
     await delete_mcp_server(facebook_server.id, current_user=user, db=db)
 
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
+    assert (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == "facebook",
+            UserOAuth.resource_owner_key.is_(None),
+        )
+        .count()
+        == 0
+    )
     # The shared bare grant Instagram still relies on must survive.
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
+    assert (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == "meta",
+            UserOAuth.resource_owner_key.is_(None),
+        )
+        .count()
+        == 1
+    )
+    assert {
+        row.access_token
+        for row in db.query(UserOAuth)
+        .filter(UserOAuth.resource_owner_key.is_not(None))
+        .all()
+    } == {"actor-meta-token", "actor-facebook-token"}
 
 
 async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
@@ -1178,6 +1599,24 @@ async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_
     db.add(
         UserOAuth(user_id=user.id, provider="facebook", access_token="app-scoped-token")
     )
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="meta",
+                provider_user_id="actor-meta",
+                resource_owner_key="actor:meta",
+                access_token="actor-meta-token",
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id="actor-facebook",
+                resource_owner_key="actor:facebook",
+                access_token="actor-facebook-token",
+            ),
+        ]
+    )
     server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
     db.add(server)
     db.commit()
@@ -1188,15 +1627,19 @@ async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_
 
     await delete_mcp_server(server.id, current_user=user, db=db)
 
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 0
+    assert (
+        db.query(UserOAuth).filter(UserOAuth.resource_owner_key.is_(None)).count() == 0
+    )
+    assert {
+        row.access_token
+        for row in db.query(UserOAuth)
+        .filter(UserOAuth.resource_owner_key.is_not(None))
+        .all()
+    } == {"actor-meta-token", "actor-facebook-token"}
 
 
-def test_facebook_server_list_does_not_show_bare_meta_email_as_connected(db_session):
-    """GET /servers must agree with the app-scoped-grant policy: showing a
-    bare "meta" account's email as Facebook's connected_account would tell
-    the user Facebook is connected when _oauth_keys_for_app (and the runtime
-    token resolver) say it isn't."""
+def test_facebook_server_reads_ignore_actor_owned_email(db_session):
+    """Personal server reads must ignore actor-owned OAuth accounts."""
     db, user = db_session
     db.add(
         UserOAuth(
@@ -1206,18 +1649,30 @@ def test_facebook_server_list_does_not_show_bare_meta_email_as_connected(db_sess
             email="alice@example.com",
         )
     )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="facebook",
+            provider_user_id="actor-facebook",
+            resource_owner_key="actor:facebook",
+            access_token="actor-facebook-token",
+            email="actor@example.com",
+        )
+    )
     server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
     db.add(server)
     db.commit()
     db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
     db.commit()
 
-    from xagent.web.api.mcp import get_mcp_servers
+    from xagent.web.api.mcp import get_mcp_server, get_mcp_servers
 
     responses = get_mcp_servers(current_user=user, db=db)
+    response = get_mcp_server(server.id, current_user=user, db=db)
 
     assert len(responses) == 1
     assert responses[0].connected_account is None
+    assert response.connected_account is None
 
 
 def test_facebook_server_list_does_not_show_blanked_token_as_connected(db_session):

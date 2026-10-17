@@ -1,7 +1,7 @@
+import asyncio
 import json
 import logging
 import os
-import time
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -16,13 +16,28 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
+from ..error import is_retryable_http_status
 from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
+from .tool_choice import supports_forced_tool_choice
 
 logger = logging.getLogger(__name__)
+
+
+class ModelCatalogUnavailableError(RuntimeError):
+    """Raised when a compatible endpoint does not implement model listing."""
+
+
+class AnthropicAuthenticationError(ValueError):
+    """Raised when Anthropic rejects a catalog request's credentials."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
@@ -50,6 +65,17 @@ def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
     cache_read = _count("cache_read_input_tokens")
     cache_write = _count("cache_creation_input_tokens")
     return _count("input_tokens") + cache_read + cache_write, cache_read, cache_write
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after a deadline expired, best effort."""
+    close = getattr(stream, "close", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing aborted Claude stream failed (%s)", type(exc).__name__)
 
 
 def _anthropic_stream_tool_calls(
@@ -248,6 +274,10 @@ class ClaudeLLM(BaseLLM):
         """Get the list of abilities supported by this Claude LLM implementation."""
         return self._abilities
 
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return supports_forced_tool_choice(self._abilities, self._model_name)
+
     def _ensure_client(self) -> None:
         """Ensure the Anthropic client is initialized."""
         if self._client is None:
@@ -263,6 +293,11 @@ class ClaudeLLM(BaseLLM):
             client_kwargs: Dict[str, Any] = {
                 "api_key": self.api_key,
                 "timeout": self.timeout,
+                # Retry policy lives in the shared RetryWrapper only; the
+                # anthropic SDK defaults to two retries of its own, which
+                # would nest inside every attempt we make. See
+                # ``OpenAICompatibleLLM._ensure_client``.
+                "max_retries": 0,
             }
 
             if self.base_url:
@@ -287,6 +322,12 @@ class ClaudeLLM(BaseLLM):
         Returns:
             Tuple of (system_message, list of messages in Anthropic format)
         """
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field (role/content/
+        # tool_use blocks), never a ``dict(msg)`` copy, so an internal
+        # marker like ``_xagent_provider_state`` on the input is never read
+        # and cannot leak into the Anthropic request. Switching any branch
+        # here to copy ``msg`` wholesale would reopen that leak.
         anthropic_messages: List[Dict[str, Any]] = []
         system_message = None
 
@@ -567,6 +608,8 @@ class ClaudeLLM(BaseLLM):
             if system_message:
                 completion_params["system"] = system_message
 
+            tool_choice = self.compatible_tool_choice(tool_choice)
+
             # Handle tools
             if tools:
                 completion_params["tools"] = self._convert_tools_to_anthropic_format(
@@ -789,15 +832,10 @@ class ClaudeLLM(BaseLLM):
 
         Raises:
             RuntimeError: If the API call fails
-            TimeoutError: If timeout thresholds are exceeded
+            LLMTimeoutError: First token or token interval deadline expired
         """
         self._ensure_client()
         assert self._client is not None
-
-        # Timeout tracking
-        first_token = True
-        last_token_time = None
-        start_time = time.time()
 
         # Tool call accumulation
         accumulated_tool_calls: Dict[str, Dict] = {}
@@ -840,6 +878,8 @@ class ClaudeLLM(BaseLLM):
             # Set system message
             if system_message:
                 completion_params["system"] = system_message
+
+            tool_choice = self.compatible_tool_choice(tool_choice)
 
             # Handle tools
             if tools:
@@ -917,9 +957,29 @@ class ClaudeLLM(BaseLLM):
                 else:
                     completion_params["system"] = json_instruction
 
+            # Both limits are deadlines on the wait itself, not checks made
+            # when an event arrives: a check on arrival never runs for a
+            # stream that stays silent, and the SDK drops Anthropic's ``ping``
+            # keepalives, so the transport read timeout does not bound it
+            # either (#3058). The first-token deadline also covers opening
+            # the stream.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
             # Make the streaming API call
-            stream = await self._client.messages.create(
-                **completion_params, stream=True
+            stream = await await_before_deadline(
+                self._client.messages.create(**completion_params, stream=True),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
             )
 
             # Process streaming response
@@ -928,29 +988,30 @@ class ClaudeLLM(BaseLLM):
             # 2. We need custom timeout controls during streaming
             # 3. We need unified StreamChunk format across different LLM providers
             # 4. We need to handle tool calls incrementally as they stream in
-            async for event in stream:
-                current_time = time.time()
-
-                # Check first token timeout
-                if first_token:
-                    elapsed = current_time - start_time
-                    if elapsed > self.timeout_config.first_token_timeout:
-                        raise LLMTimeoutError(
-                            f"First token timeout: {elapsed:.2f}s > "
-                            f"{self.timeout_config.first_token_timeout}s"
-                        )
-                    first_token = False
-
-                # Check token interval timeout
-                if last_token_time is not None:
-                    interval = current_time - last_token_time
-                    if interval > self.timeout_config.token_interval_timeout:
-                        raise LLMTimeoutError(
-                            f"Token interval timeout: {interval:.2f}s > "
-                            f"{self.timeout_config.token_interval_timeout}s"
-                        )
-
-                last_token_time = current_time
+            events = aiter(stream)
+            first_event = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_event:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                try:
+                    event = await await_before_deadline(
+                        anext(events),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(stream)
+                    raise
+                first_event = False
 
                 # Parse event based on type
                 if event.type == "content_block_start":
@@ -1124,6 +1185,9 @@ class ClaudeLLM(BaseLLM):
                                     raw=event,
                                 )
 
+        except LLMTimeoutError:
+            # Already logged where the deadline expired.
+            raise
         except Exception as e:
             logger.error(f"Claude streaming API error: {str(e)}")
             # Re-raise LLMRetryableError for retry
@@ -1144,6 +1208,25 @@ class ClaudeLLM(BaseLLM):
                     raise LLMRetryableError(error_msg) from e
 
                 if isinstance(e, APIStatusError):
+                    # ``chat`` turns every APIStatusError into
+                    # LLMRetryableError; streaming swallowed them into an
+                    # ERROR chunk instead, so the shared RetryWrapper never
+                    # saw one and the anthropic SDK's own budget was the only
+                    # cover a streaming call had. That budget is now zero
+                    # (see ``_ensure_client``), so transient statuses have to
+                    # raise -- a 529 Overloaded is exactly the capacity shape
+                    # this policy exists for. Permanent statuses keep the
+                    # ERROR chunk: replaying them cannot help, and ``chat``'s
+                    # blanket retry of 4xx is a separate defect, not one to
+                    # copy here.
+                    status = getattr(e, "status_code", None)
+                    # Same status set the shared predicate uses, so the
+                    # streaming guard and ``retry_on`` cannot drift apart.
+                    if isinstance(status, int) and is_retryable_http_status(status):
+                        raise LLMRetryableError(
+                            f"Claude API status error: {str(e)}"
+                        ) from e
+
                     error_msg = f"Claude API status error: {str(e)}"
                     yield StreamChunk(type=ChunkType.ERROR, content=error_msg, raw=e)
                     return
@@ -1231,7 +1314,7 @@ class ClaudeLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Anthropic Claude API.
 
@@ -1239,6 +1322,8 @@ class ClaudeLLM(BaseLLM):
             api_key: Anthropic API key
             base_url: Base URL for Claude API (optional). If not provided,
                      uses the official Anthropic API.
+            raise_on_error: Raise read failures other than a rejected key
+                instead of answering them with an empty list.
 
         Returns:
             List of available models with their information
@@ -1254,7 +1339,8 @@ class ClaudeLLM(BaseLLM):
         """
         import httpx
 
-        # Use official API if no custom base_url provided
+        # Use official API if no custom base_url provided. Only custom compatible
+        # endpoints may legitimately omit Anthropic's model catalog endpoint.
         if base_url is None:
             base_url = "https://api.anthropic.com"
 
@@ -1262,6 +1348,9 @@ class ClaudeLLM(BaseLLM):
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        is_custom_endpoint = httpx.URL(base_url) != httpx.URL(
+            "https://api.anthropic.com"
+        )
 
         url = base_url + "/v1/models"
         headers = {
@@ -1298,8 +1387,20 @@ class ClaudeLLM(BaseLLM):
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error fetching Claude models: {e.response.status_code}")
             if e.response.status_code == 401:
-                raise ValueError("Invalid Anthropic API key") from e
+                raise AnthropicAuthenticationError(
+                    "Invalid Anthropic API key", status_code=401
+                ) from e
+            if e.response.status_code == 403:
+                raise AnthropicAuthenticationError(
+                    "Anthropic API key is not authorized", status_code=403
+                ) from e
+            if e.response.status_code == 404 and is_custom_endpoint:
+                raise ModelCatalogUnavailableError(
+                    "This Anthropic-compatible endpoint does not provide a model catalog"
+                ) from e
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Claude models: {e}")
+            if raise_on_error:
+                raise
             return []

@@ -110,6 +110,10 @@ def db_session(session_factory):
 def fixtures(db_session):
     user_id = make_user(db_session)
     task_id = make_task(db_session, user_id=user_id)
+    db_session.execute(
+        sa.update(Task).where(Task.id == task_id).values(lease_attempt_id="attempt-a")
+    )
+    db_session.commit()
     anchor_id = make_trace_event(db_session, task_id=task_id)
     return task_id, anchor_id
 
@@ -158,7 +162,7 @@ def _stage_kwargs(anchor: InteractionAnchor, **overrides: Any) -> dict[str, Any]
 
 def _lease(task_id: int) -> TaskLease:
     return TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id="run-a", attempt_id=None
+        task_id=task_id, runner_id="runner-1", run_id="run-a", attempt_id="attempt-a"
     )
 
 
@@ -233,7 +237,10 @@ def test_p_over_length_run_id_rejected_before_sql_via_handoff(
     long_run_id = "x" * 65
     anchor = _anchor(anchor_id)
     lease = TaskLease(
-        task_id=task_id, runner_id="runner-1", run_id=long_run_id, attempt_id=None
+        task_id=task_id,
+        runner_id="runner-1",
+        run_id=long_run_id,
+        attempt_id="attempt-a",
     )
     db = db_session
     task = db.get(Task, task_id)
@@ -357,6 +364,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
         **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
     )
     db.commit()
+    before = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert before == 1
     task = db.get(Task, task_id)
     _mark_caller_write(db, task_id, "pg-sp1-write")
 
@@ -369,6 +382,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
+    after = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert after == before
     assert _caller_write_survived(db, task_id, "pg-sp1-write")
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
 

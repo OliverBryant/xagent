@@ -37,6 +37,7 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.auth_database import auth_db_override
 from tests.shared.db_teardown import drop_all_tables
 from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
@@ -54,6 +55,7 @@ from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import get_db, get_engine
 from xagent.web.services import task_orchestrator as task_orchestrator_service
 from xagent.web.services.a2a_protocol import (
@@ -171,6 +173,7 @@ async def _v1_validation_error_handler(request: Request, exc: RequestValidationE
 
 
 app_for_tests.dependency_overrides[get_db] = _override_get_db
+app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
 client = TestClient(app_for_tests, raise_server_exceptions=False)
 
 
@@ -345,7 +348,7 @@ def _install_one_slot_queue_pool(
     return engine
 
 
-def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
+def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Replace the leaf that starts a real background turn with a no-op task.
 
     The workforce guest create path reaches
@@ -362,10 +365,15 @@ def patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> None:
     anyway.
     """
 
-    def fake_schedule_bg(**_kwargs: Any) -> "asyncio.Task[None]":
+    scheduled: dict[str, Any] = {}
+
+    def fake_schedule_bg(**kwargs: Any) -> "asyncio.Task[None]":
+        scheduled.update(kwargs)
+
         async def noop() -> None:
             return None
 
         return asyncio.create_task(noop())
 
     monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", fake_schedule_bg)
+    return scheduled

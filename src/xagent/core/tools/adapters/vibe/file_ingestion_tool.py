@@ -10,9 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
-from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
-from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +22,17 @@ if TYPE_CHECKING:
 class UploadedFileSnapshot:
     """Scalar upload metadata retained after closing the DB session."""
 
+    id: int | None
     user_id: int
     file_id: str
     filename: str
     storage_path: str
+    storage_backend: str | None
     storage_key: str | None
+    storage_uri: str | None
     storage_status: str | None
     checksum: str | None
+    etag: str | None
 
 
 class CreateKnowledgeBaseFromFileArgs(BaseModel):
@@ -99,13 +101,25 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
 
 def _snapshot_uploaded_file_record(record: Any) -> UploadedFileSnapshot:
     return UploadedFileSnapshot(
+        id=(int(record.id) if getattr(record, "id", None) is not None else None),
         user_id=int(record.user_id),
         file_id=str(record.file_id),
         filename=str(record.filename),
         storage_path=str(record.storage_path),
+        storage_backend=(
+            str(record.storage_backend)
+            if getattr(record, "storage_backend", None) is not None
+            else None
+        ),
         storage_key=getattr(record, "storage_key", None),
+        storage_uri=(
+            str(record.storage_uri)
+            if getattr(record, "storage_uri", None) is not None
+            else None
+        ),
         storage_status=getattr(record, "storage_status", None),
         checksum=getattr(record, "checksum", None),
+        etag=(str(record.etag) if getattr(record, "etag", None) is not None else None),
     )
 
 
@@ -121,8 +135,10 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.models.database import get_db
         from .....web.models.uploaded_file import UploadedFile
         from .....web.services.managed_file_ref import (
+            DurableObjectIntegrityError,
             DurableStorageOperationError,
-            ensure_uploaded_file_local_path,
+            async_ensure_uploaded_file_local_path,
+            log_durable_storage_fault,
         )
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
@@ -172,10 +188,7 @@ async def _create_knowledge_base_from_file_impl(
             collection_name = f"{base_name}_{int(time.time())}"
 
         config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
-        kb_service = AgentKnowledgeBaseService(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+        kb_service = AgentKnowledgeBaseService(user_id=user_id)
         collection_name = await kb_service.prepare_collection(collection_name)
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if every file fails.
@@ -186,13 +199,39 @@ async def _create_knowledge_base_from_file_impl(
 
         for record in file_records:
             try:
-                source_path = ensure_uploaded_file_local_path(record)
-            except DurableStorageOperationError as exc:
+                source_path = await async_ensure_uploaded_file_local_path(record)
+            except DurableObjectIntegrityError:
+                # Must precede the parent arm below, which this subclasses. A
+                # checksum mismatch is permanent corruption, already recorded
+                # at ERROR with both checksums by ``_raise_integrity_error``.
+                # Routing it through the durable-fault logger would add a
+                # "Durable storage unavailable" WARNING on top, which reads as
+                # a transient outage and can trip the alerts that watch for one
+                # -- burying the corruption diagnosis under a wrong one.
                 errors.append(
-                    f"Failed to restore {record.filename} from durable storage: {exc}"
+                    f"Stored copy of {record.filename} failed its integrity "
+                    "check and must be re-uploaded"
                 )
                 continue
-            if not source_path.exists():
+            except DurableStorageOperationError as exc:
+                log_durable_storage_fault(
+                    logger,
+                    "knowledge-base file restore",
+                    exc,
+                    file_id=record.file_id,
+                )
+                # Deliberately does NOT interpolate ``exc``. This string is
+                # joined into the tool result, so it reaches the model and the
+                # conversation transcript, and the provider detail belongs in
+                # the log line above, which is server-side only. (Since #1643
+                # the storage key is on ``storage_key`` rather than in the
+                # message, so it is the provider text -- not the key -- that
+                # interpolating would expose here.)
+                errors.append(
+                    f"Failed to restore {record.filename} from durable storage"
+                )
+                continue
+            if source_path is None or not source_path.exists():
                 errors.append(
                     f"File not found on disk: {record.filename} (file_id={record.file_id})"
                 )
@@ -211,10 +250,18 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 request_context = copy_context()
                 result = await loop.run_in_executor(None, request_context.run, func)
-            except Exception as exc:
-                errors.append(
-                    f"Failed to ingest {record.filename} due to unexpected error: {exc}"
-                )
+            except Exception:
+                # Deliberately does NOT interpolate the exception, for the same
+                # reason as the durable arm above: this string is joined into the
+                # tool result, so it reaches the model and the conversation
+                # transcript. ``HashComputationError`` wraps an OSError whose
+                # message embeds the absolute upload path, and
+                # ``DocumentValidationError`` renders "Source path does not
+                # exist: <path>" -- both under users/<user_id>/uploads/..., so
+                # both carry the owning user's id. The filename is the only part
+                # the model needs; the traceback below keeps everything else,
+                # server-side.
+                errors.append(f"Failed to ingest {record.filename}")
                 logger.exception(
                     "Unexpected error ingesting file %s",
                     record.filename,
@@ -268,8 +315,6 @@ async def _create_knowledge_base_from_file_impl(
                 ),
                 files_ingested=ingested_count,
             ).model_dump()
-        await kb_service.refresh_collection_metadata(collection_name)
-
         return CreateKnowledgeBaseFromFileResult(
             success=True,
             collection_name=collection_name,
@@ -285,30 +330,3 @@ async def _create_knowledge_base_from_file_impl(
             message=str(e),
             files_ingested=0,
         ).model_dump()
-
-
-@register_tool(categories={"knowledge"})
-async def create_file_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
-    """Create file ingestion tools."""
-    return await _get_tool_compatibility_facade().create_file_ingestion_tools(config)
-
-
-async def _create_file_ingestion_tools_impl(
-    config: WebToolConfig,
-) -> list[AbstractBaseTool]:
-    """Create file ingestion tools."""
-    try:
-        user_id = config.get_user_id()
-        is_admin = config.is_admin()
-        if not user_id:
-            return []
-
-        tool = CreateKnowledgeBaseFromFileTool(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        logger.debug("Created CreateKnowledgeBaseFromFileTool for user %s", user_id)
-        return [tool]
-    except Exception as e:
-        logger.warning("Failed to create CreateKnowledgeBaseFromFileTool: %s", e)
-        return []

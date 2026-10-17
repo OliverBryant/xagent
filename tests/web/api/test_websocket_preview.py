@@ -5,26 +5,34 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import QueuePool
 
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web import dynamic_memory_store as dynamic_memory_store_module
-from xagent.web.api import chat as chat_api
+
+# Imported up front so ``chat`` binds the real ``get_db``: the preview tests
+# patch ``database.get_db`` before ``patch("xagent.web.api.chat....")`` would
+# otherwise import ``chat`` for the first time and freeze the mock into it.
+from xagent.web.api import chat as _chat_api  # noqa: F401
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
     ConnectionManager,
     _normalize_file_outputs,
     handle_build_preview_execution,
 )
 from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
+from xagent.web.memory_lifecycle import MemoryLifecycleState
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.schemas.chat import TaskCreateResponse
+from xagent.web.schemas.connector_runtime import ConnectorRuntimeRequirementsModel
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    resolve_agent_service_memory_policy,
+)
 
 
 class _BlockingPreviewWebSocket:
@@ -103,6 +111,9 @@ async def test_handle_build_preview_execution_uses_normal_task_flow():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -158,6 +169,9 @@ async def test_handle_build_preview_execution_does_not_use_preview_sessions():
         title="test message",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -243,6 +257,9 @@ async def test_handle_build_preview_execution_creates_task_when_no_preview_task_
         title="second turn",
         status="pending",
         created_at="2026-05-20T00:00:00Z",
+        connector_runtime_requirements=ConnectorRuntimeRequirementsModel(
+            satisfied=True, secrets_expires_at=None, connectors=[]
+        ),
     )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
@@ -308,56 +325,52 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
 
 
 @pytest.mark.asyncio
-async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
-    tmp_path,
+async def test_memory_policy_without_a_publication_never_opens_a_session(
     monkeypatch,
 ) -> None:
-    """A real QueuePool wait must run off-loop and remain a visible failure."""
+    """An unpublished manager resolves the policy without any database work.
 
-    engine = create_engine(
-        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
-        connect_args={"check_same_thread": False},
-        poolclass=QueuePool,
-        pool_size=1,
-        max_overflow=0,
-        pool_timeout=0.05,
-    )
-    session_factory = sessionmaker(bind=engine)
+    The request path re-reads the authority for one reason only: to check a
+    *published* store for vector-space drift. A worker that never admitted has
+    nothing published and therefore nothing to check, so resolution must
+    short-circuit to a memory-disabled policy instead of opening a session the
+    request path has no business opening.
 
-    def get_test_db():
-        db = session_factory()
-        try:
-            yield db
-        finally:
-            db.close()
+    The off-loop pool-timeout contract this test used to carry lives in
+    ``tests/web/test_memory_lifecycle.py``, on the drift check that still
+    performs the read.
+    """
 
-    monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
+    sessions_opened = 0
+
+    def unexpected_get_db():
+        nonlocal sessions_opened
+        sessions_opened += 1
+        raise AssertionError("memory policy resolution opened a database session")
+
+    monkeypatch.setattr(dynamic_memory_store_module, "get_db", unexpected_get_db)
     memory_manager = DynamicMemoryStoreManager()
-    monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "get_memory_store",
+        memory_manager.get_memory_store,
+    )
 
-    held_connection = engine.connect()
-    stop_ticker = asyncio.Event()
-    ticks = 0
+    policy = await agent_runtime_service.resolve_agent_service_memory_policy_async(
+        agent_config={},
+    )
 
-    async def ticker() -> None:
-        nonlocal ticks
-        while not stop_ticker.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        with pytest.raises(SQLAlchemyTimeoutError):
-            await chat_api.resolve_agent_service_memory_policy_async(
-                agent_config={},
-            )
-    finally:
-        stop_ticker.set()
-        await ticker_task
-        held_connection.close()
-        engine.dispose()
-
-    assert ticks >= 3
+    # Counted rather than left to the raise: ``_read_authority_snapshot`` folds
+    # an unexpected failure into ``AuthorityUnreadable``, so a session opened
+    # here would otherwise be swallowed and the test would still pass.
+    assert sessions_opened == 0
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert (
+        policy.memory_availability_reason
+        == MemoryLifecycleState.RETRYABLE_UNAVAILABLE.value
+    )
 
 
 def test_historical_file_projection_never_writes_unregistered_output(

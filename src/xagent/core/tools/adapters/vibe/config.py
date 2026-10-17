@@ -7,13 +7,24 @@ to the ToolFactory in a unified way.
 """
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeVar
+from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
 
 from ..... import config as _root_config
+
+ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON = (
+    "actor_stdio_session_runtime_unavailable"
+)
+ACTOR_STDIO_SHADOWED_REASON = "actor_stdio_shadowed_by_visible_connection"
+# A delegated sub-agent run cannot pause for approval (a paused child is
+# classified as an unsupported nested interaction), so when the delegating
+# run's task source has an approval gate registered, its children get the
+# selected MCP servers reported as unavailable instead of live and ungated.
+NESTED_DELEGATION_NOT_APPROVABLE_REASON = "nested_delegation_not_approvable"
 
 
 class MCPFailurePolicy(str, Enum):
@@ -65,13 +76,18 @@ async def run_with_tool_runtime_cleanup(
 
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
+        ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+        ACTOR_STDIO_SHADOWED_REASON,
+        NESTED_DELEGATION_NOT_APPROVABLE_REASON,
         "adapter_construction",
+        "auth_rejected",
         "authorization_required",
         "catalog_app_not_found",
         "config_load_failed",
         "initialize",
         "insufficient_scope",
         "invalid_config",
+        "invalid_configuration",
         "invalid_launch_config",
         "list_tools",
         "loader_failed",
@@ -87,19 +103,44 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     }
 )
 _DEFAULT_MCP_UNAVAILABLE_REASON = "mcp_server_unavailable"
+_PUBLIC_CAUSE_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def is_http_status_code(value: object) -> TypeGuard[int]:
+    """Whether ``value`` is an HTTP status a status line can carry.
+
+    Only an exact ``int`` in 100..599 counts: ``bool`` and other ``int``
+    subclasses do not.
+    """
+    return type(value) is int and 100 <= value <= 599
+
+
 _DEFAULT_MCP_SERVER_NAME = "MCP server"
 
 
 @dataclass(frozen=True)
 class MCPUnavailableSummary:
-    """Public-safe identity and classification for one unavailable server."""
+    """Public-safe identity and classification for one unavailable server.
+
+    ``cause_type`` and ``status_code`` describe the exception behind a load
+    failure: a class name (exact ``str`` matching ``_PUBLIC_CAUSE_TYPE_RE``)
+    and an HTTP status (exact ``int`` in 100..599). Either is ``None`` when
+    unknown or when the value does not pass that check.
+    """
 
     server_name: str
     reason: str
+    cause_type: str | None = None
+    status_code: int | None = None
 
     @classmethod
     def from_values(
-        cls, server_name: object, reason: object
+        cls,
+        server_name: object,
+        reason: object,
+        *,
+        cause_type: object = None,
+        status_code: object = None,
     ) -> "MCPUnavailableSummary":
         safe_server_name = (
             server_name if type(server_name) is str else _DEFAULT_MCP_SERVER_NAME
@@ -109,7 +150,18 @@ class MCPUnavailableSummary:
             if type(reason) is str and reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
             else _DEFAULT_MCP_UNAVAILABLE_REASON
         )
-        return cls(server_name=safe_server_name, reason=safe_reason)
+        safe_cause_type = (
+            cause_type
+            if type(cause_type) is str and _PUBLIC_CAUSE_TYPE_RE.fullmatch(cause_type)
+            else None
+        )
+        safe_status_code = status_code if is_http_status_code(status_code) else None
+        return cls(
+            server_name=safe_server_name,
+            reason=safe_reason,
+            cause_type=safe_cause_type,
+            status_code=safe_status_code,
+        )
 
 
 @dataclass(frozen=True)
@@ -134,6 +186,8 @@ def _normalize_mcp_unavailable_summaries(
             safe_summary = MCPUnavailableSummary.from_values(
                 summary.server_name,
                 summary.reason,
+                cause_type=summary.cause_type,
+                status_code=summary.status_code,
             )
         else:
             safe_summary = MCPUnavailableSummary.from_values(None, None)
@@ -165,12 +219,38 @@ class MCPConfigLoadError(RuntimeError):
         super().__init__("MCP server configurations could not be loaded.")
 
 
+_REQUIRED_MCP_UNAVAILABLE_PREFIX = "Required MCP servers are unavailable"
+
+
+def _required_mcp_unavailable_message(
+    summaries: tuple[MCPUnavailableSummary, ...],
+) -> str:
+    """Name each failure by its reason code and HTTP status, never by server.
+
+    The text is broadcast to every viewer of the task, so it carries only
+    allowlisted reason codes and validated integers. Server names stay in
+    ``summaries``.
+    """
+    details: list[str] = []
+    for summary in summaries:
+        detail = summary.reason
+        if summary.status_code is not None:
+            detail = f"{detail} (HTTP {summary.status_code})"
+        if detail not in details:
+            details.append(detail)
+    return f"{_REQUIRED_MCP_UNAVAILABLE_PREFIX}: {', '.join(details)}."
+
+
 class RequiredMCPUnavailableError(RuntimeError):
-    """A selected MCP dependency is unavailable under strict setup policy."""
+    """A selected MCP dependency is unavailable under strict setup policy.
+
+    ``str(error)`` names the reason code and HTTP status of each failure and
+    no server name; the per-server records are in ``summaries``.
+    """
 
     def __init__(self, summaries: Iterable[MCPUnavailableSummary]) -> None:
         self.summaries = _normalize_mcp_unavailable_summaries(summaries)
-        super().__init__("Required MCP servers are unavailable.")
+        super().__init__(_required_mcp_unavailable_message(self.summaries))
 
 
 def enforce_mcp_failure_policy(
@@ -264,6 +344,16 @@ class BaseToolConfig(ABC):
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
         pass
+
+    def get_actor_mcp_stdio_session_identities(self) -> Dict[str, Any]:
+        """Return host-only session identities keyed by exact MCP server name."""
+
+        return {}
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the optional host-side execution-scoped stdio consumer."""
+
+        return None
 
     def get_mcp_failure_policy(self) -> MCPFailurePolicy:
         """Return the MCP setup failure policy for this execution."""
@@ -447,6 +537,27 @@ class BaseToolConfig(ABC):
     def get_agent_call_stack(self) -> List[int]:
         """Get active agent delegation call stack for recursion prevention."""
         return []
+
+    def get_voice(self) -> Optional[str]:
+        """The already-resolved onboarding output-voice preference (see
+        core.agent.voice_policy.apply_output_voice), or None. Threaded into
+        a delegated AgentTool's own system prompt and into any further
+        tool set it builds for a grandchild delegation, so a task's chosen
+        voice reaches every agent this user talks to - not just the
+        top-level one - without core importing a web route module."""
+        return None
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """The reason this config's MCP servers were refused, or None.
+
+        Set when a delegated run's connectors were refused rather than
+        loaded (see ``_nested_mcp_refusal_reason`` in ``agent_tool.py``).
+        Threaded the same way as ``get_voice`` into any further AgentTool
+        this config builds, so the refusal survives past the one hop the
+        ReAct-bound execution context covers: a grandchild delegation binds
+        no ``task_source`` of its own and would otherwise read as
+        unregistered and dispatch ungated."""
+        return None
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""

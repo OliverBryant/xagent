@@ -6,27 +6,55 @@ from datetime import timezone
 from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import (
+    JSON,
+    String,
+    and_,
+    case,
+    cast,
+    func,
+    literal,
+    or_,
+    select,
+    union_all,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, selectinload
+from sqlalchemy.sql import ColumnElement, visitors
+from sqlalchemy.sql.elements import ColumnClause, TextClause
+from sqlalchemy.types import Boolean
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
+from ..models.expired_task import ExpiredTaskTombstone
 from ..models.task import Task, TraceEvent
+from ..models.task_execution_event import TaskExecutionEvent
 from ..models.trigger import AgentTrigger, TriggerRun
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.assistant_question_display import question_content_for_display
+from ..services.assistant_question_replay import QUESTION_MESSAGE_TYPES
+from ..services.conversation_log_sources import (
+    EXTERNAL_TASK_SOURCE,
+    get_external_task_public_context,
+    get_external_task_source_branches,
+)
+from ..services.expired_tasks import find_expired_task
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
-from ..utils.db_timezone import format_datetime_for_api
-from .public_trace_events import (
+from ..services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
+from ..utils.db_timezone import format_datetime_for_api
+from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +85,19 @@ DIRECT_SOURCE_TO_UI_SOURCE = {
 TRIGGER_TYPE_TO_UI_SOURCE = {
     "webhook": SOURCE_WEBHOOK,
 }
-EXTERNAL_TASK_SOURCES = {*DIRECT_SOURCE_TO_UI_SOURCE, "trigger"}
+# ``external`` is stamped by the deployment layer's session transport and
+# covers both REST/SDK and widget-session tasks; the deployment classifies it
+# through ``services.conversation_log_sources`` and unclassified rows default
+# to REST API so they are never dropped from the page.
+EXTERNAL_DEFAULT_UI_SOURCE = SOURCE_REST_API
+# Webhook is excluded: its detail view expects a TriggerRun, which external
+# rows never have.
+EXTERNAL_HOOK_UI_SOURCES = {SOURCE_WIDGET, SOURCE_REST_API, SOURCE_SHARED_LINK}
+EXTERNAL_TASK_SOURCES = {
+    *DIRECT_SOURCE_TO_UI_SOURCE,
+    "trigger",
+    EXTERNAL_TASK_SOURCE,
+}
 
 
 def _status_value(task: Task) -> str:
@@ -99,8 +139,204 @@ def _ui_source_from_values(source: str, trigger_type: str | None) -> str | None:
     return None
 
 
+def _validated_external_source_branches(
+    db: Session,
+) -> list[tuple[ColumnElement[bool], str]]:
+    """Deployment ``(predicate, ui_source)`` pairs, in the order the hook returns them.
+
+    Two-tier fail-soft, matching the hook contract in
+    ``services.conversation_log_sources``: a hook that raises is treated as
+    unregistered, and an entry that is not a ``(boolean SQL predicate over
+    tasks, known ui_source)`` pair is skipped on its own so the
+    deployment's other branches still apply. Rows that only a skipped branch
+    would have matched fall back to the REST API default instead of the page
+    going down.
+    """
+    try:
+        entries = get_external_task_source_branches(db)
+    except Exception as exc:
+        logger.exception("External task source hook failed; using default")
+        _rollback_after_hook_failure(db, exc)
+        return []
+    branches: list[tuple[ColumnElement[bool], str]] = []
+    for entry in entries:
+        try:
+            branch = _validated_source_branch(entry)
+        except Exception as exc:
+            _rollback_after_hook_failure(db, exc)
+            # Hook-supplied objects run their own code inside the checks
+            # (``__clause_element__``, SQL compilation); a failure there is a
+            # malformed entry, not a page outage.
+            logger.warning(
+                "Ignoring external task source branch %r: validation raised",
+                entry,
+                exc_info=True,
+            )
+            continue
+        if branch is not None:
+            branches.append(branch)
+    return branches
+
+
+def _validated_source_branch(entry: Any) -> tuple[ColumnElement[bool], str] | None:
+    """Return ``entry`` as a validated branch, or ``None`` after logging why not."""
+    if not (isinstance(entry, (tuple, list)) and len(entry) == 2):
+        logger.warning(
+            "Ignoring malformed external task source branch %r: expected a "
+            "(predicate, ui_source) pair",
+            entry,
+        )
+        return None
+    predicate, ui_source = entry
+    # ORM attributes such as ``Task.is_visible`` are InstrumentedAttribute
+    # proxies, not ColumnElements; unwrap them so bare columns are judged by
+    # their SQL type like any other expression.
+    clause_element = getattr(predicate, "__clause_element__", None)
+    if callable(clause_element):
+        predicate = clause_element()
+    if not isinstance(predicate, ColumnElement):
+        logger.warning(
+            "Ignoring external task source branch: predicate %r is not a "
+            "SQL expression",
+            predicate,
+        )
+        return None
+    raw_sql = _raw_sql_fragments(predicate)
+    if raw_sql:
+        # text() and literal_column() declare no FROM entries, so the check
+        # below cannot see the tables they name; they fail at execute time
+        # instead ("missing FROM-clause entry" on PostgreSQL).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s embeds raw SQL "
+            "%s; build predicates from Task columns and bound parameters",
+            predicate,
+            ", ".join(repr(fragment) for fragment in raw_sql),
+        )
+        return None
+    if not isinstance(predicate.type, Boolean):
+        # SQLite coerces a non-boolean CASE condition; PostgreSQL raises
+        # "argument of CASE/WHEN must be type boolean" at execute time.
+        logger.warning(
+            "Ignoring external task source branch: predicate %s is not "
+            "boolean-typed (wrap functions with type_=Boolean or cast(Boolean))",
+            predicate,
+        )
+        return None
+    foreign_froms = _foreign_from_names(predicate)
+    if foreign_froms:
+        # A bare cross-table comparison (or a Task alias) adds that FROM entry
+        # to both the list query and the detail query and cartesian-joins
+        # them; other tables must be reached through exists() or in_(subquery).
+        logger.warning(
+            "Ignoring external task source branch: predicate %s adds %s to "
+            "FROM; only the tasks table may appear",
+            predicate,
+            ", ".join(foreign_froms),
+        )
+        return None
+    if not isinstance(ui_source, str) or ui_source not in EXTERNAL_HOOK_UI_SOURCES:
+        logger.warning(
+            "Ignoring external task source branch with unsupported ui_source %r",
+            ui_source,
+        )
+        return None
+    return predicate, ui_source
+
+
+def _rollback_after_hook_failure(db: Session, exc: BaseException) -> None:
+    """Restore the request session after a deployment hook failed on it.
+
+    A hook statement that errors leaves the PostgreSQL transaction aborted,
+    so every later statement in the request would be refused and the
+    fail-soft default could never be rendered. Both endpoints are read-only
+    GETs and call their hooks before any write, so nothing durable is
+    discarded (same reasoning as ``connector_team_scope``'s hook seam). A
+    failure that never reached the database leaves the transaction usable,
+    so only SQLAlchemy errors roll back; this keeps the identity map warm
+    for the rest of the request.
+    """
+    if not isinstance(exc, SQLAlchemyError):
+        return
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "Rolling back after a failed external task hook failed", exc_info=True
+        )
+
+
+def _raw_sql_fragments(predicate: ColumnElement[bool]) -> list[str]:
+    """Raw SQL embedded in ``predicate``: ``text()`` and table-less columns.
+
+    ``literal_column()`` and ``column()`` both produce a ``ColumnClause`` bound
+    to no table, so they contribute no FROM entries and name whatever they
+    like. ``exists()`` renders its projection as ``literal_column("*")``; that
+    one literal is structural and allowed.
+    """
+    fragments: list[str] = []
+    for element in visitors.iterate(predicate):
+        if isinstance(element, TextClause):
+            fragments.append(element.text)
+        elif (
+            isinstance(element, ColumnClause)
+            and element.table is None
+            and element.name != "*"
+        ):
+            fragments.append(str(element.name))
+    return fragments
+
+
+def _foreign_from_names(predicate: ColumnElement[bool]) -> list[str]:
+    """Names of FROM entries other than the ``tasks`` table that ``predicate`` adds.
+
+    Correlated ``exists()`` contributes no FROM entries and ``in_(subquery)``
+    contributes only ``tasks``; a bare ``Task.x == Other.y`` contributes both,
+    and an ``aliased(Task)`` contributes a second ``tasks`` alias.
+    """
+    return [
+        str(getattr(source, "description", None) or source)
+        for source in select(predicate).get_final_froms()
+        if source is not Task.__table__
+    ]
+
+
+def _external_ui_source_case(
+    branches: Sequence[tuple[ColumnElement[bool], str]],
+) -> Any:
+    """Classification of a ``source="external"`` row; shared by list and detail.
+
+    Returns the plain default when no branch is registered: ``case()`` needs
+    at least one WHEN arm, and a bare bound parameter is what the existing
+    arms already use.
+    """
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    return case(*branches, else_=EXTERNAL_DEFAULT_UI_SOURCE)
+
+
+def _external_ui_source_for_task(db: Session, task: Task) -> str:
+    branches = _validated_external_source_branches(db)
+    if not branches:
+        return EXTERNAL_DEFAULT_UI_SOURCE
+    ui_source = (
+        db.query(_external_ui_source_case(branches))
+        .select_from(Task)
+        .filter(Task.id == int(task.id))
+        .scalar()
+    )
+    return str(ui_source or EXTERNAL_DEFAULT_UI_SOURCE)
+
+
 def _ui_source_for_task(db: Session, task: Task) -> str | None:
-    source = str(getattr(task, "source", "") or "")
+    """The second live gate: ``None`` here is a 404 even for an in-scope task.
+
+    Mirrored by ``_tombstone_has_ui_source`` below for a task retention
+    purged; see ``test_live_and_tombstone_predicates_agree`` in
+    ``tests/web/api/test_conversation_logs.py`` -- change the two together.
+    """
+    source = str(task.source or "")
+    if source == EXTERNAL_TASK_SOURCE:
+        return _external_ui_source_for_task(db, task)
     return _ui_source_from_values(source, _trigger_type_for_task(db, task))
 
 
@@ -113,14 +349,101 @@ def _message_sort_key(message: TaskChatMessage) -> tuple[bool, Any, int]:
 
 
 def _apply_external_task_scope(query: Any, user: User) -> Any:
-    """Admins can inspect hidden external conversation logs across all users."""
+    """Admins can inspect hidden external conversation logs across all users.
+
+    Mirrored by ``_tombstone_in_external_task_scope`` below for a task
+    retention purged; ``tests/web/api/test_conversation_logs.py``'s
+    ``test_live_and_tombstone_predicates_agree`` runs both live and
+    post-purge over the same task shapes and checks they agree, so a term
+    changed here without changing there fails that test rather than silently
+    disclosing (or hiding) an expired task. Change the two together.
+    """
     query = query.filter(
         Task.is_visible.is_(False),
         Task.source.in_(sorted(EXTERNAL_TASK_SOURCES)),
+        # MCP actor/OAuth-negotiation turns are stored as hidden external
+        # tasks too (``channel_runtime`` selects them by this key). They are
+        # channel plumbing, not conversations, so keep them off this page as
+        # they were before ``external`` entered the scope. NULL IS NOT TRUE
+        # holds, so rows without the key are unaffected. Spelled through the
+        # shared helper so the expired-task tombstone's stored flag
+        # (``services.expired_tasks``) is this same predicate, not a second
+        # implementation of it.
+        mcp_runtime_authorization_policy_required_clause().isnot(True),
     )
     if not bool(user.is_admin):
         query = query.filter(Task.user_id == int(user.id))
     return query
+
+
+def _tombstone_in_external_task_scope(
+    tombstone: ExpiredTaskTombstone, user: User
+) -> bool:
+    """``_apply_external_task_scope``, applied to an expired task's tombstone.
+
+    The tombstone stores exactly the inputs that filter reads, so this is the
+    same predicate term for term: hidden, an external source, not MCP channel
+    plumbing, and the caller's own unless the caller is an admin. Keep the two
+    in step -- a term added there and not here would let an expired task be
+    disclosed to a caller who could never have seen it live.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_apply_external_task_scope``.
+    """
+    if tombstone.is_visible:
+        return False
+    if tombstone.source not in EXTERNAL_TASK_SOURCES:
+        return False
+    if tombstone.is_channel_plumbing:
+        return False
+    return bool(user.is_admin) or int(tombstone.user_id) == int(user.id)
+
+
+def _tombstone_has_ui_source(tombstone: ExpiredTaskTombstone) -> bool:
+    """The detail route's second gate, ``_ui_source_for_task``, on a tombstone.
+
+    Mirrors ``_ui_source_for_task`` by running the tombstone's stored
+    ``source`` and ``trigger_type`` through the same ``_ui_source_from_values``
+    mapping the live task uses: direct sources map to a UI source
+    unconditionally, and a ``trigger`` row passes only for a webhook trigger
+    type, exactly like the live task's ``AgentTrigger.type``. ``external`` rows
+    are handled separately here because live, ``_external_ui_source_for_task``
+    always resolves to a UI source -- it falls back to the REST API default
+    when no deployment branch matches -- so an external tombstone always
+    passes too.
+
+    ``test_live_and_tombstone_predicates_agree``
+    (``tests/web/api/test_conversation_logs.py``) is what would catch the two
+    drifting apart; change it alongside ``_ui_source_for_task``.
+    """
+    source = str(tombstone.source or "")
+    if source == EXTERNAL_TASK_SOURCE:
+        return True
+    return _ui_source_from_values(source, tombstone.trigger_type) is not None
+
+
+def _missing_conversation_log_error(
+    db: Session, user: User, task_id: int
+) -> HTTPException:
+    """The error for a detail request whose task is not served live.
+
+    ``410 task_expired`` when retention expired the task and the tombstone
+    passes the same gates the live task would have (see
+    ``expired_task_errors``); otherwise this route's ordinary 404, so the
+    answer never reveals that an id the caller could not see ever existed.
+    """
+    tombstone = find_expired_task(db, task_id)
+    if (
+        tombstone is not None
+        and _tombstone_in_external_task_scope(tombstone, user)
+        and _tombstone_has_ui_source(tombstone)
+    ):
+        return task_expired_http_error(
+            tombstone,
+            message="Conversation log expired under the retention policy",
+        )
+    return HTTPException(status_code=404, detail="Conversation log not found")
 
 
 def _apply_task_filters(
@@ -147,7 +470,13 @@ def _apply_task_filters(
 def _base_task_query(db: Session, user: User) -> Any:
     query = db.query(Task).options(
         selectinload(Task.agent),
-        selectinload(Task.chat_messages),
+        selectinload(
+            Task.chat_messages.and_(
+                TaskChatMessage.task_id.in_(
+                    select(Task.id).where(Task.conversation_storage_version == 1)
+                )
+            )
+        ),
     )
     return _apply_external_task_scope(query, user)
 
@@ -187,6 +516,10 @@ def _conversation_source_query(
             )
             for trigger_type_value, ui_source in TRIGGER_TYPE_TO_UI_SOURCE.items()
         ],
+        (
+            Task.source == EXTERNAL_TASK_SOURCE,
+            _external_ui_source_case(_validated_external_source_branches(db)),
+        ),
         else_=None,
     ).label("ui_source")
 
@@ -208,7 +541,9 @@ def _last_activity_at(task: Task) -> Any:
     return task.updated_at or task.created_at
 
 
-def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
+def _serialize_log_summary(
+    task: Task, ui_source: str, *, event_activity: tuple[int, Any] | None = None
+) -> dict[str, Any]:
     agent = task.agent if isinstance(task.agent, Agent) else None
     return {
         "task_id": int(task.id),
@@ -223,12 +558,18 @@ def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
         "agent_logo_url": agent.logo_url if agent else None,
         "created_at": format_datetime_for_api(task.created_at),
         "updated_at": format_datetime_for_api(task.updated_at),
-        "last_activity_at": format_datetime_for_api(_last_activity_at(task)),
+        "last_activity_at": format_datetime_for_api(
+            (event_activity[1] or task.updated_at or task.created_at)
+            if event_activity is not None
+            else _last_activity_at(task)
+        ),
         "input_tokens": task.input_tokens or 0,
         "output_tokens": task.output_tokens or 0,
         "total_tokens": task.total_tokens or 0,
         "llm_calls": task.llm_calls or 0,
-        "message_count": len(getattr(task, "chat_messages", []) or []),
+        "message_count": event_activity[0]
+        if event_activity is not None
+        else len(getattr(task, "chat_messages", []) or []),
     }
 
 
@@ -256,8 +597,10 @@ def _serialize_transcript_with_events(
     # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
-        content = message.content
+        content = str(message.content or "")
         if message.role == "assistant":
+            if message.message_type in QUESTION_MESSAGE_TYPES:
+                content = question_content_for_display(content, message.interactions)
             content = reconcile_assistant_file_references(
                 db,
                 task_id=int(task.id),
@@ -399,7 +742,18 @@ def _serialize_trigger_metadata(
     }
 
 
-def _serialize_public_context(task: Task, ui_source: str) -> dict[str, Any] | None:
+def _serialize_public_context(
+    db: Session, task: Task, ui_source: str
+) -> dict[str, Any] | None:
+    if str(task.source or "") == EXTERNAL_TASK_SOURCE:
+        # The session transport does not populate agent_config with widget or
+        # share details, so external rows carry only deployment-provided context.
+        try:
+            return get_external_task_public_context(db, task, ui_source)
+        except Exception as exc:
+            logger.exception("External task context hook failed; omitting context")
+            _rollback_after_hook_failure(db, exc)
+            return None
     config = _agent_config(task)
     if ui_source == SOURCE_WIDGET:
         return {
@@ -453,13 +807,80 @@ def _source_summary_from_query(
     )
 
 
-def _latest_message_activity_subquery(db: Session) -> Any:
-    return (
-        db.query(
-            TaskChatMessage.task_id.label("task_id"),
-            func.max(TaskChatMessage.created_at).label("last_message_at"),
+def _event_log_message_predicate(db: Session) -> Any:
+    data = TaskExecutionEvent.payload["data"]
+    expects_response: ColumnElement[bool]
+    # Match the transcript reader's Python identity/truthiness checks without
+    # casting arbitrary persisted JSON strings to PostgreSQL booleans.
+    if db.get_bind().dialect.name == "postgresql":
+        audit_only = cast(data["__audit_only__"], JSONB) == literal(True, type_=JSONB)
+        hidden = cast(data["visible"], JSONB) == literal(False, type_=JSONB)
+        expects_response = cast(data["expect_response"], JSONB).not_in(
+            [JSON.NULL, False, 0, "", [], {}]
         )
-        .group_by(TaskChatMessage.task_id)
+    else:
+        audit_only = (
+            func.json_type(TaskExecutionEvent.payload, "$.data.__audit_only__")
+            == "true"
+        )
+        hidden = func.json_type(TaskExecutionEvent.payload, "$.data.visible") == "false"
+        response_type = func.json_type(
+            TaskExecutionEvent.payload, "$.data.expect_response"
+        )
+        expects_response = case(
+            (
+                response_type.in_(["integer", "real"]),
+                data["expect_response"].as_float() != 0,
+            ),
+            else_=cast(data["expect_response"], String).not_in(
+                ["null", "0", '""', "[]", "{}"]
+            ),
+        )
+    return and_(
+        audit_only.is_not(True),
+        or_(
+            TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
+            and_(
+                TaskExecutionEvent.kind == "agent_message",
+                expects_response,
+                hidden.is_not(True),
+                data["message"].as_string().isnot(None),
+                data["message"].as_string() != "",
+            ),
+        ),
+    )
+
+
+def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
+    legacy = (
+        select(
+            TaskChatMessage.task_id.label("task_id"),
+            TaskChatMessage.created_at.label("created_at"),
+        )
+        .join(Task, Task.id == TaskChatMessage.task_id)
+        .where(Task.conversation_storage_version == 1, Task.id.in_(task_ids))
+    )
+    canonical = (
+        select(
+            TaskExecutionEvent.task_id.label("task_id"),
+            TaskExecutionEvent.occurred_at.label("created_at"),
+        )
+        .join(Task, Task.id == TaskExecutionEvent.task_id)
+        .where(
+            Task.conversation_storage_version == 2,
+            TaskExecutionEvent.scope_id == "root",
+            Task.id.in_(task_ids),
+            _event_log_message_predicate(db),
+        )
+    )
+    messages = union_all(legacy, canonical).subquery()
+    return (
+        select(
+            messages.c.task_id,
+            func.max(messages.c.created_at).label("last_message_at"),
+            func.count().label("message_count"),
+        )
+        .group_by(messages.c.task_id)
         .subquery()
     )
 
@@ -506,7 +927,9 @@ async def list_conversation_logs(
 
     total = int(source_counts[normalized_source])
     start = (page - 1) * per_page
-    latest_message_activity = _latest_message_activity_subquery(db)
+    latest_message_activity = _latest_message_activity_subquery(
+        db, filtered_query.with_entities(Task.id).statement.correlate(None)
+    )
     last_activity_at = func.coalesce(
         latest_message_activity.c.last_message_at,
         Task.updated_at,
@@ -517,19 +940,31 @@ async def list_conversation_logs(
             latest_message_activity,
             latest_message_activity.c.task_id == Task.id,
         )
-        .with_entities(Task.id, ui_source)
+        .with_entities(
+            Task.id,
+            ui_source,
+            latest_message_activity.c.message_count,
+            latest_message_activity.c.last_message_at,
+        )
         .order_by(last_activity_at.desc(), Task.id.desc())
         .offset(start)
         .limit(per_page)
         .all()
     )
-    task_ids = [int(task_id) for task_id, _source in page_rows]
-    source_by_task_id = {int(task_id): str(source) for task_id, source in page_rows}
+    task_ids = [int(row[0]) for row in page_rows]
+    source_by_task_id = {int(row[0]): str(row[1]) for row in page_rows}
+    activity_by_task_id = {int(row[0]): (int(row[2] or 0), row[3]) for row in page_rows}
     tasks_by_id = _load_tasks_by_id(db, user, task_ids)
 
     return {
         "logs": [
-            _serialize_log_summary(tasks_by_id[task_id], source_by_task_id[task_id])
+            _serialize_log_summary(
+                tasks_by_id[task_id],
+                source_by_task_id[task_id],
+                event_activity=activity_by_task_id[task_id]
+                if tasks_by_id[task_id].conversation_storage_version == 2
+                else None,
+            )
             for task_id in task_ids
             if task_id in tasks_by_id
         ],
@@ -553,32 +988,88 @@ async def get_conversation_log_detail(
     """Return one hidden external conversation log.
 
     Admin users can inspect hidden external conversation logs across all users.
-    Non-admin users are limited to their own logs.
+    Non-admin users are limited to their own logs. A log the retention purge
+    expired answers ``410 task_expired`` to exactly those callers and 404 to
+    everyone else; the list never includes it.
     """
     query = _base_task_query(db, user).filter(Task.id == task_id)
     task = query.first()
     if task is None:
-        raise HTTPException(status_code=404, detail="Conversation log not found")
+        raise _missing_conversation_log_error(db, user, task_id)
 
     ui_source = _ui_source_for_task(db, task)
     if ui_source is None:
         raise HTTPException(status_code=404, detail="Conversation log not found")
 
-    messages = list(task.chat_messages or [])
+    messages = (
+        list(task.chat_messages or []) if task.conversation_storage_version == 1 else []
+    )
     file_reference_records = load_assistant_file_reference_records(
         db,
         task_id=int(task.id),
         user_id=int(task.user_id),
     )
+    if task.conversation_storage_version == 2:
+        from ..services.task_event_display import load_event_display_snapshot
+
+        view = load_event_display_snapshot(db, int(task.id))
+        transcript = []
+        for message in view.messages:
+            item = dict(message)
+            if item["role"] == "assistant":
+                item["content"] = reconcile_assistant_file_references(
+                    db,
+                    task_id=int(task.id),
+                    user_id=int(task.user_id),
+                    content=item["content"],
+                    records=file_reference_records,
+                )
+            item["created_at"] = format_datetime_for_api(item["created_at"])
+            transcript.append(item)
+        traces = [
+            {
+                key: event[key]
+                for key in (
+                    "event_id",
+                    "event_type",
+                    "step_id",
+                    "timestamp",
+                    "data",
+                    "parent_event_id",
+                )
+            }
+            for event in view.events
+            if event["type"] == "trace_event"
+            and event["event_type"] not in {"user_message", "agent_message"}
+        ]
+        positioned = [(item["id"], item) for item in transcript]
+        for notice in view.compactions:
+            item = dict(notice)
+            position = item.pop("sequence")
+            item["created_at"] = format_datetime_for_api(item["created_at"])
+            positioned.append((position, item))
+        transcript = [item for _, item in sorted(positioned, key=lambda pair: pair[0])]
+        event_activity = (
+            len(view.messages),
+            max((item["created_at"] for item in view.messages), default=None),
+        )
+    else:
+        transcript = _serialize_transcript_with_events(
+            db, task, messages, file_reference_records
+        )
+        traces = _serialize_trace_events(db, int(task.id))
+        event_activity = None
     return {
-        "log": _serialize_log_summary(task, ui_source),
-        "transcript": _serialize_transcript_with_events(
-            db,
-            task,
-            messages,
-            file_reference_records,
-        ),
-        "trace_events": _serialize_trace_events(db, int(task.id)),
+        "log": _serialize_log_summary(task, ui_source, event_activity=event_activity),
+        "transcript": transcript,
+        "trace_events": traces,
+        # When retention last removed this task's trace (#2565). Later turns
+        # write new trace rows, so a non-null value does not mean
+        # ``trace_events`` is empty: it means the events from before this
+        # moment are gone and the timeline may be incomplete.
+        "trace_events_expired_at": format_datetime_for_api(task.traces_expired_at)
+        if task.conversation_storage_version == 1
+        else None,
         "metadata": {
             "task": {
                 "task_id": int(task.id),
@@ -594,7 +1085,7 @@ async def get_conversation_log_detail(
                 "description": task.description,
             },
             "trigger": _serialize_trigger_metadata(db, task),
-            "public_context": _serialize_public_context(task, ui_source),
+            "public_context": _serialize_public_context(db, task, ui_source),
         },
         "read_only": True,
     }

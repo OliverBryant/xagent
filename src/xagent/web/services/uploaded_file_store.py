@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Optional, Sequence, cast
@@ -27,11 +28,17 @@ from ...core.file_storage.keys import (
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
+from .kb_reference_protection import (
+    guard_upload_compensation,
+    notify_file_publication,
+    record_cleanup_fence,
+)
 from .managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
     guess_media_type,
 )
+from .task_file_lifecycle import lock_attachment_task
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +248,8 @@ class UploadedFileVersionSnapshot:
     storage_status: str
     mime_type: str | None
     file_size: int
+    detached_reason: str | None = None
+    detached_at: datetime | None = None
 
 
 class UploadedFileVersionConflict(RuntimeError):
@@ -310,6 +319,8 @@ def snapshot_uploaded_file_version(
             str(file_record.mime_type) if file_record.mime_type is not None else None
         ),
         file_size=int(file_record.file_size or 0),
+        detached_reason=cast(str | None, file_record.detached_reason),
+        detached_at=cast(datetime | None, file_record.detached_at),
     )
 
 
@@ -317,6 +328,8 @@ def _snapshot_staged_uploaded_file_version(
     staged: StagedUploadedFile,
     *,
     row_id: int,
+    detached_reason: str | None = None,
+    detached_at: datetime | None = None,
 ) -> UploadedFileVersionSnapshot:
     return UploadedFileVersionSnapshot(
         row_id=row_id,
@@ -335,6 +348,8 @@ def _snapshot_staged_uploaded_file_version(
         storage_status="available",
         mime_type=staged.mime_type,
         file_size=staged.file_size,
+        detached_reason=detached_reason,
+        detached_at=detached_at,
     )
 
 
@@ -354,6 +369,8 @@ def _uploaded_file_version_match_predicates(
         UploadedFile.file_id == expected.file_id,
         UploadedFile.user_id == expected.user_id,
         _nullable_version_match(UploadedFile.task_id, expected.task_id),
+        _nullable_version_match(UploadedFile.detached_reason, expected.detached_reason),
+        _nullable_version_match(UploadedFile.detached_at, expected.detached_at),
         UploadedFile.filename == expected.filename,
         UploadedFile.storage_path == expected.storage_path,
         _nullable_version_match(
@@ -640,6 +657,18 @@ def settle_uploaded_file_compensation_no_commit(
 
     if presence != "absent":
         return None
+    from .uploaded_file_cleanup import cleanup_complete
+
+    manifest = (
+        db.query(UploadedFile.cleanup_manifest)
+        .filter(
+            UploadedFile.id == row_id,
+            UploadedFile.updated_at == expected_updated_at,
+        )
+        .scalar()
+    )
+    if not cleanup_complete(manifest):
+        return None
     task_filter = (
         UploadedFile.task_id.is_(None)
         if task_id is None
@@ -660,6 +689,8 @@ def settle_uploaded_file_compensation_no_commit(
         updated_at_filter,
     )
     changed = query.delete(synchronize_session=False)
+    if changed == 1:
+        record_cleanup_fence(db, file_id)
     return "deleted" if changed == 1 else None
 
 
@@ -1068,6 +1099,19 @@ def delete_durable_storage_keys(
     return tuple(failed)
 
 
+def upload_path_is_registered_sync(path: Path) -> bool:
+    """Check persistent path ownership without holding a Session over file I/O."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return (
+            db.query(UploadedFile.id)
+            .filter(UploadedFile.storage_path == str(path))
+            .first()
+            is not None
+        )
+
+
 def register_local_uploads_sync(
     registrations: Sequence[LocalUploadRegistration],
 ) -> tuple[UploadedFileRegistrationSnapshot, ...]:
@@ -1143,8 +1187,11 @@ def register_local_uploads_sync(
                 )
 
 
+@guard_upload_compensation
 def compensate_registered_uploads_sync(
     claims: Sequence[RegisteredUploadCompensationClaim],
+    *,
+    _release_claim_locks: Callable[[], None] | None = None,
 ) -> None:
     """Rollback only registrations still owned by the cancelled request.
 
@@ -1165,51 +1212,47 @@ def compensate_registered_uploads_sync(
     if not normalized_claims:
         return
 
+    from .uploaded_file_cleanup import run_uploaded_file_cleanup
+    from .uploaded_file_cleanup_resources import build_cleanup_manifest
+
     SessionLocal = get_session_local()
-    claimed: list[ClaimedRegisteredUploadCompensation] = []
+    planned = []
     with SessionLocal() as db:
         for registration_claim in normalized_claims:
-            claimed_at = datetime.now(timezone.utc)
-            task_filter = (
-                UploadedFile.task_id.is_(None)
-                if registration_claim.expected_task_id is None
-                else UploadedFile.task_id == registration_claim.expected_task_id
-            )
             row = (
-                db.query(UploadedFile.id)
+                db.query(UploadedFile)
                 .filter(
                     UploadedFile.user_id == registration_claim.user_id,
                     UploadedFile.file_id == registration_claim.file_id,
                     UploadedFile.storage_key == registration_claim.expected_storage_key,
                     UploadedFile.storage_status == "available",
-                    task_filter,
+                    UploadedFile.task_id == registration_claim.expected_task_id,
                 )
                 .first()
             )
-            if row is None:
-                continue
+            if row is not None:
+                planned.append(snapshot_uploaded_file_version(row))
+    manifests = [build_cleanup_manifest(snapshot) for snapshot in planned]
+    claimed: list[ClaimedRegisteredUploadCompensation] = []
+    with SessionLocal() as db:
+        for snapshot, manifest in zip(planned, manifests):
+            claimed_at = datetime.now(timezone.utc)
             claimed_count = (
                 db.query(UploadedFile)
-                .filter(
-                    UploadedFile.id == int(row[0]),
-                    UploadedFile.user_id == registration_claim.user_id,
-                    UploadedFile.file_id == registration_claim.file_id,
-                    UploadedFile.storage_key == registration_claim.expected_storage_key,
-                    UploadedFile.storage_status == "available",
-                    task_filter,
-                )
+                .filter(*_uploaded_file_version_match_predicates(snapshot))
                 .update(
                     {
                         UploadedFile.storage_status: "compensating",
                         UploadedFile.updated_at: claimed_at,
+                        UploadedFile.cleanup_manifest: manifest,
                     },
                     synchronize_session=False,
                 )
             )
             if claimed_count == 1:
+                record_cleanup_fence(db, snapshot.file_id)
                 persisted_claimed_at = _load_uploaded_file_compensation_token_no_commit(
-                    db,
-                    row_id=int(row[0]),
+                    db, row_id=snapshot.row_id
                 )
                 if persisted_claimed_at is None:
                     raise RuntimeError(
@@ -1217,52 +1260,50 @@ def compensate_registered_uploads_sync(
                     )
                 claimed.append(
                     ClaimedRegisteredUploadCompensation(
-                        row_id=int(row[0]),
-                        user_id=registration_claim.user_id,
-                        file_id=registration_claim.file_id,
-                        expected_task_id=registration_claim.expected_task_id,
-                        expected_storage_key=(registration_claim.expected_storage_key),
+                        row_id=snapshot.row_id,
+                        user_id=snapshot.user_id,
+                        file_id=snapshot.file_id,
+                        expected_task_id=snapshot.task_id,
+                        expected_storage_key=cast(str, snapshot.storage_key),
                         claimed_at=persisted_claimed_at,
                     )
                 )
         db.commit()
 
-    cleaned: list[ClaimedRegisteredUploadCompensation] = []
-    unresolved: list[ClaimedRegisteredUploadCompensation] = []
-    for claimed_version in claimed:
-        presence = delete_uploaded_file_compensation_object(
-            user_id=claimed_version.user_id,
-            storage_key=claimed_version.expected_storage_key,
-        )
-        if presence == "absent":
-            cleaned.append(claimed_version)
-        else:
-            unresolved.append(claimed_version)
+    if _release_claim_locks is not None:
+        _release_claim_locks()
 
-    if cleaned:
-        cleaned_file_ids: list[str] = []
-        with SessionLocal() as db:
-            for claimed_version in cleaned:
-                settlement = settle_uploaded_file_compensation_no_commit(
-                    db,
-                    row_id=claimed_version.row_id,
-                    user_id=claimed_version.user_id,
-                    file_id=claimed_version.file_id,
-                    task_id=claimed_version.expected_task_id,
-                    storage_key=claimed_version.expected_storage_key,
-                    expected_updated_at=claimed_version.claimed_at,
-                    presence="absent",
-                )
-                if settlement == "deleted":
-                    cleaned_file_ids.append(claimed_version.file_id)
-            db.commit()
-        for file_id in cleaned_file_ids:
-            delete_registered_preview_caches(file_id)
+    unresolved: list[ClaimedRegisteredUploadCompensation] = []
+    first_error: Exception | None = None
+    for claim in claimed:
+        try:
+            outcome = run_uploaded_file_cleanup(
+                session_factory=SessionLocal,
+                row_id=claim.row_id,
+                user_id=claim.user_id,
+                file_id=claim.file_id,
+                task_id=claim.expected_task_id,
+                storage_key=claim.expected_storage_key,
+                expected_updated_at=claim.claimed_at,
+                compensation_delete=delete_uploaded_file_compensation_object,
+            )
+            if outcome not in {"deleted", "stale", "yielded"}:
+                unresolved.append(claim)
+        except Exception as exc:
+            # Finish already-claimed siblings, then preserve the primary error.
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
     if unresolved:
         failed_ids = ", ".join(claim.file_id for claim in unresolved)
+        # No single key: this is a batch compensation failure. The file ids in
+        # the message are #1642's scope, alongside widening the purity scan to
+        # this module.
         raise DurableStorageOperationError(
-            f"Failed to compensate durable uploads: {failed_ids}"
+            f"Failed to compensate durable uploads: {failed_ids}",
+            storage_key=None,
         )
 
 
@@ -1358,6 +1399,7 @@ class UploadedFileStore:
             raise ValueError("Pre-uploaded file must have a durable checksum")
         self.db.add(file_record)
         self.db.flush()
+        notify_file_publication(self.db, str(file_record.file_id))
         return file_record
 
     def upsert_already_durable(
@@ -1380,6 +1422,14 @@ class UploadedFileStore:
         """
 
         if expected is None:
+            if (
+                staged.task_id is not None
+                and lock_attachment_task(
+                    self.db, staged.task_id, owner_user_id=staged.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
             file_record = staged.to_record()
             try:
                 self.add_already_durable(file_record)
@@ -1397,7 +1447,19 @@ class UploadedFileStore:
             raise ValueError("Cannot replace an uploaded file owned by another user")
         if expected.task_id != staged.task_id and not allow_task_rebind:
             raise ValueError("Cannot replace an uploaded file bound to another task")
+        if staged.task_id is not None:
+            if (
+                lock_attachment_task(
+                    self.db, staged.task_id, owner_user_id=staged.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
 
+        detached_reason = (
+            None if staged.task_id is not None else expected.detached_reason
+        )
+        detached_at = None if staged.task_id is not None else expected.detached_at
         statement = (
             update(UploadedFile)
             .where(
@@ -1408,6 +1470,8 @@ class UploadedFileStore:
                 file_id=staged.file_id,
                 user_id=staged.user_id,
                 task_id=staged.task_id,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
                 filename=staged.filename,
                 storage_path=staged.storage_path,
                 storage_backend=staged.storage_backend,
@@ -1441,6 +1505,8 @@ class UploadedFileStore:
             snapshot=_snapshot_staged_uploaded_file_version(
                 staged,
                 row_id=expected.row_id,
+                detached_reason=detached_reason,
+                detached_at=detached_at,
             ),
             superseded_cleanup_claim=cleanup_claim,
         )
@@ -1467,6 +1533,14 @@ class UploadedFileStore:
             raise ValueError("Metadata rollback must preserve uploaded-file identity")
         if replacement.storage_status not in {"available", "legacy"}:
             raise ValueError("Metadata rollback target must be a stable file state")
+        if replacement.task_id is not None:
+            if (
+                lock_attachment_task(
+                    self.db, replacement.task_id, owner_user_id=replacement.user_id
+                )
+                is None
+            ):
+                raise UploadedFileVersionConflict("Attachment task no longer exists")
         statement = (
             update(UploadedFile)
             .where(
@@ -1477,6 +1551,12 @@ class UploadedFileStore:
                 file_id=replacement.file_id,
                 user_id=replacement.user_id,
                 task_id=replacement.task_id,
+                detached_reason=None
+                if replacement.task_id is not None
+                else replacement.detached_reason,
+                detached_at=None
+                if replacement.task_id is not None
+                else replacement.detached_at,
                 filename=replacement.filename,
                 storage_path=replacement.storage_path,
                 storage_backend=replacement.storage_backend,
@@ -1506,7 +1586,11 @@ class UploadedFileStore:
             else None
         )
         return AppliedUploadedFileVersion(
-            snapshot=replacement,
+            snapshot=(
+                replace(replacement, detached_reason=None, detached_at=None)
+                if replacement.task_id is not None
+                else replacement
+            ),
             superseded_cleanup_claim=cleanup_claim,
         )
 
@@ -1822,17 +1906,62 @@ class UploadedFileStore:
         *,
         delete_local: bool = True,
         local_root: Optional[Path] = None,
+        after_commit: Optional[list[tuple[str, Callable[[], None]]]] = None,
     ) -> None:
-        ManagedFileRef(file_record).delete_durable()
+        """Delete the row (flushed, not committed) and its bytes.
+
+        With ``after_commit``, the durable delete and local unlink are queued as
+        ``(label, fn)`` for the caller to run after it commits; without it they run now.
+        """
+        snapshot = snapshot_uploaded_file_version(file_record)
+        deletable = self.db.query(UploadedFile).filter(
+            *_uploaded_file_version_match_predicates(snapshot),
+            UploadedFile.storage_status != "compensating",
+        )
+        if deletable.with_for_update().first() is None:
+            raise UploadedFileVersionConflict(
+                "Uploaded file is unavailable for deletion"
+            )
+        ref = ManagedFileRef(file_record)
+        file_id = str(getattr(file_record, "file_id", "") or "")
+        deferred: list[tuple[str, Callable[[], None]]] = []
+        if after_commit is None:
+            ref.delete_durable()
+        elif ref.has_durable_object:
+            storage = get_user_file_storage(int(file_record.user_id))
+            key = ref.storage_key
+            deferred.append((key, lambda: storage.delete(key)))
+        unlink: Callable[[], None] | None = None
         if delete_local:
-            self._delete_local(file_record, local_root=local_root)
+            unlink = functools.partial(
+                self._delete_local, str(file_record.storage_path), local_root=local_root
+            )
+            if after_commit is None:
+                unlink()
         # Remove any server-side PDF preview cache so derived content doesn't
         # outlive the source upload.  Called here (not only in the HTTP route)
         # so reconcile / orphan-cleanup paths that go through this service also
         # clean up the cache.
-        file_id = str(getattr(file_record, "file_id", "") or "")
-        delete_registered_preview_caches(file_id)
-        self.db.delete(file_record)
+        if after_commit is None:
+            delete_registered_preview_caches(file_id)
+        else:
+
+            def _delete_local_and_previews() -> None:
+                try:
+                    if unlink is not None:
+                        unlink()
+                finally:
+                    delete_registered_preview_caches(file_id)
+
+            deferred.append((file_id, _delete_local_and_previews))
+        if deletable.delete(synchronize_session=False) != 1:
+            raise UploadedFileVersionConflict(
+                "Uploaded file was claimed before deletion"
+            )
+        if after_commit is not None:
+            after_commit.extend(deferred)
+        if file_record in self.db:
+            self.db.expunge(file_record)
         self.db.flush()
 
     @staticmethod
@@ -1867,10 +1996,8 @@ class UploadedFileStore:
         return digest.hexdigest()
 
     @staticmethod
-    def _delete_local(
-        file_record: UploadedFile, *, local_root: Optional[Path] = None
-    ) -> None:
-        local_path = Path(str(file_record.storage_path))
+    def _delete_local(storage_path: str, *, local_root: Optional[Path] = None) -> None:
+        local_path = Path(storage_path)
         if local_root is not None:
             resolved_path = local_path.resolve()
             if not resolved_path.is_relative_to(local_root.resolve()):

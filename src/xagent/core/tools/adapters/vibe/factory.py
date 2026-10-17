@@ -10,6 +10,7 @@ and configuration management.
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -22,8 +23,15 @@ from .....config import get_uploads_dir
 from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from ...core.knowledge_base_scope import KnowledgeBaseScopeError
-from .base import AbstractBaseTool, Tool
+from ...tool_result_spill import (
+    SPILL_READ_TOOL_NAME,
+    SpillRunBudget,
+    SpillTarget,
+    spill_dir_for_workspace,
+)
+from .base import BINDING_AUTHORIZED_CATEGORIES, AbstractBaseTool, Tool
 from .config import (
+    ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
     BaseToolConfig,
     MCPFailurePolicy,
     MCPUnavailableSummary,
@@ -32,13 +40,19 @@ from .config import (
     normalize_tool_allowlist,
     run_with_tool_runtime_cleanup,
 )
-from .connector_runtime import ConnectorRuntimeError
+from .connector_runtime import ConnectorRef, ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
 
 if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
+    from .....web.services.actor_mcp_runtime import ActorMCPStdioSessionIdentity
     from .mcp_adapter import MCPServerLoadFailure
+
+    ActorMCPStdioSessionConsumer = Callable[
+        ...,
+        Any,
+    ]
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +180,8 @@ class ToolRegistry:
                 audio_tool,
                 basic_tools,
                 browser_tools,
+                current_time_tool,
                 custom_api_factory,
-                file_ingestion_tool,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,
@@ -180,7 +194,6 @@ class ToolRegistry:
                 translate_json,
                 video_tool,
                 vision_tool,
-                web_ingestion_tool,
                 workspace_file_tool,
             )
 
@@ -195,9 +208,17 @@ class ToolRegistry:
         spec: ToolSelectionSpec | None,
         selection_gate: str | None,
     ) -> bool:
-        if spec is None or declared_cats is None or spec.categories is None:
+        if selection_gate == "intrinsic":
+            # Always-available tool: assemble for every non-NONE spec, but an
+            # explicit zero-tools agent still gets nothing.
+            return spec is None or not spec.is_none()
+
+        if spec is None or declared_cats is None:
             return True
 
+        # Creator-specific gates remain authoritative in ALL mode. Actor-marked
+        # tasks use an ALL spec with published-agent dispatch explicitly
+        # disabled, and the creator must not be reached at all.
         if selection_gate == "published_agent":
             return spec.includes_published_agent()
 
@@ -209,6 +230,14 @@ class ToolRegistry:
             # or a server-only spec would skip the MCP creator entirely.
             return spec.includes_mcp()
 
+        if spec.categories is None:
+            return True
+
+        # After the gates above: a creator carrying both a gate and a
+        # binding-authorized category must honour its gate first.
+        if declared_cats & BINDING_AUTHORIZED_CATEGORIES:
+            return spec.includes_binding_authorized()
+
         return bool(declared_cats & spec.categories)
 
     @classmethod
@@ -218,8 +247,10 @@ class ToolRegistry:
         When ``config.get_tool_selection_spec()`` returns a spec,
         creators whose declared categories don't intersect
         ``spec.categories`` are skipped at the registry level (no
-        creator call, no I/O). Creators with no declared categories
-        (dynamic ones: MCP / Custom API / Image / Audio) are always
+        creator call, no I/O) -- except a creator declaring a
+        ``BINDING_AUTHORIZED_CATEGORIES`` category, dispatched per
+        ``spec.includes_binding_authorized()``. Creators with no declared
+        categories (dynamic ones: MCP / Custom API / Image / Audio) are always
         dispatched and are responsible for
         short-circuiting internally based on the spec.
 
@@ -241,7 +272,8 @@ class ToolRegistry:
         for creator, declared_cats, selection_gate in cls._tool_creators:
             # Registry-level skip: declared categories known and no
             # intersection with the spec's allowed categories. The helper
-            # keeps the published-agent workforce exception in one place.
+            # keeps both exceptions (published-agent, binding-authorized)
+            # in one place.
             if not cls._should_run_creator(declared_cats, spec, selection_gate):
                 continue
             try:
@@ -755,12 +787,44 @@ class ToolFactory:
             if workspace is None:
                 workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
-                from .sandboxed_tool.sandboxed_tool_wrapper import (
-                    create_workspace_in_sandbox,
+                directories = workspace.get_allowed_dirs()
+                # Mount coverage is sufficient only when the backend-side
+                # directories already exist. TaskWorkspace creates them in
+                # its constructor; MockWorkspace deliberately does not, so it
+                # must retain the historical in-sandbox mkdir fallback.
+                directories_exist_on_backend_storage = all(
+                    Path(directory).is_dir() for directory in directories
                 )
+                # Resolve on the concrete type: getattr(instance, ...) against
+                # unittest.mock.Mock auto-creates an attribute and would make
+                # an unimplemented capability look present. Instance-only
+                # duck-typed capabilities intentionally keep the safe fallback.
+                host_mount_check = getattr(
+                    type(sandbox), "workspace_dirs_are_host_mounted", None
+                )
+                workspace_is_host_mounted = False
+                if directories_exist_on_backend_storage and callable(host_mount_check):
+                    try:
+                        workspace_is_host_mounted = (
+                            host_mount_check(sandbox, directories) is True
+                        )
+                    except Exception:
+                        # This is an optimization probe. If it cannot prove
+                        # coverage, preserve the pre-optimization behavior
+                        # instead of failing task/tool creation.
+                        logger.warning(
+                            "Workspace host-mount coverage check failed; "
+                            "falling back to sandbox directory setup",
+                            exc_info=True,
+                        )
+                if not workspace_is_host_mounted:
+                    from .sandboxed_tool.sandboxed_tool_wrapper import (
+                        create_workspace_in_sandbox,
+                        resolve_primary_sandbox,
+                    )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
-                await create_workspace_in_sandbox(setup_sandbox, workspace)
+                    setup_sandbox = resolve_primary_sandbox(sandbox)
+                    await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools
@@ -783,6 +847,14 @@ class ToolFactory:
         max_chars = config.get_max_output_length()
         max_fields = config.get_max_field_count()
         max_recursion = config.get_max_recursion_depth()
+        spill_target = ToolFactory._resolve_spill_target(tools, max_chars)
+        # One budget per tool-set construction, shared by reference with
+        # every wrapper built below: the 64-file cap accumulates across every
+        # tool result produced while this one set of tools is in use -- not
+        # per tool, not per call, and not per run. It holds a lock, so it must
+        # never be copied, deep-copied, asdict'ed or pickled -- see its
+        # docstring in tool_result_spill.py.
+        spill_run_budget = SpillRunBudget()
 
         filtered_tools: list[Tool] = []
         for tool in tools:
@@ -793,6 +865,14 @@ class ToolFactory:
                     max_chars=max_chars,
                     max_fields=max_fields,
                     max_recursion=max_recursion,
+                    # The stored-result reader never spills its own output:
+                    # its oversized-item shape carries content_preview, which
+                    # is not an envelope field and would be replaced by the
+                    # placeholder, so a read-back would return nothing.
+                    spill_target=(
+                        None if tool.name == SPILL_READ_TOOL_NAME else spill_target
+                    ),
+                    spill_run_budget=spill_run_budget,
                 )
                 filtered_tools.append(wrapper)
             else:
@@ -806,6 +886,70 @@ class ToolFactory:
             )
 
         return filtered_tools
+
+    @staticmethod
+    def _resolve_spill_target(
+        tools: list[Tool], max_chars: int
+    ) -> "SpillTarget | None":
+        """Find this tool set's read_tool_result bound to a real task workspace.
+
+        A stored result is only useful if the model can read it back, so the
+        decision rests on the reader itself: a target is built only when the
+        tool set contains a FunctionTool named SPILL_READ_TOOL_NAME whose
+        function is a bound method on an instance exposing a `workspace`
+        attribute (WorkspaceFileTools), looked at before any tool has been
+        wrapped for output filtering, and only when that workspace is a
+        TaskWorkspace. The tool-listing endpoint binds the file tools to a
+        MockWorkspace, which never creates directories on disk, so it must
+        not get a spill target. The directory comes from
+        spill_dir_for_workspace, the same function the execution context and
+        the stored-result reader use.
+
+        No such reader means no spill target, and the tool set keeps today's
+        truncation behavior unchanged: a deployment with no file tools, one
+        whose tool policy removes read_tool_result by name (a legacy
+        allowed_tools list, a per-user disabled-tools table or a per-user
+        allowlist written before the reader existed, any of which can keep
+        read_file while dropping the reader), or a tool set bound to a mock
+        workspace. A tool with the reader's name that is not a FunctionTool
+        -- a task runtime extension may contribute one when the file tools
+        are disabled -- has no bound method to inspect, so it is treated the
+        same as a reader not bound to a task workspace.
+        """
+        from .function import FunctionTool
+        from .sandboxed_tool.sandbox_config import extract_bound_method_target
+
+        found_reader = False
+        for tool in tools:
+            if getattr(tool, "name", None) != SPILL_READ_TOOL_NAME:
+                continue
+            found_reader = True
+            if not isinstance(tool, FunctionTool):
+                continue
+            target = extract_bound_method_target(tool)
+            if target is None:
+                continue
+            instance, _ = target
+            workspace = getattr(instance, "workspace", None)
+            if not isinstance(workspace, TaskWorkspace):
+                continue
+            return SpillTarget(
+                spill_dir=spill_dir_for_workspace(workspace.workspace_dir),
+                max_chars=max_chars,
+            )
+        if found_reader:
+            logger.info(
+                "Tool result spill disabled: read_tool_result is not bound "
+                "to a task workspace (tools=%d)",
+                len(tools),
+            )
+        else:
+            logger.info(
+                "Tool result spill disabled: no read_tool_result in the tool "
+                "set (tools=%d)",
+                len(tools),
+            )
+        return None
 
     @staticmethod
     async def _wrap_sandbox_tools(tools: list[Tool], sandbox: Any) -> list[Tool]:
@@ -910,10 +1054,11 @@ class ToolFactory:
         *,
         server_name: object,
         server_id: object = None,
-        allow_users: object = None,
         reason: object = None,
         message: object = None,
         failure_code: object = None,
+        cause_type: str | None = None,
+        status_code: int | None = None,
     ) -> Tool:
         """Build the shared server-scoped unavailable MCP tool."""
         from ....agent.result import normalize_tool_failure_code
@@ -922,14 +1067,38 @@ class ToolFactory:
         kwargs: dict[str, Any] = {
             "server_name": server_name if isinstance(server_name, str) else "",
             "server_id": server_id,
-            "allow_users": allow_users if isinstance(allow_users, list) else None,
             "failure_code": normalize_tool_failure_code(failure_code),
         }
         if isinstance(reason, str):
             kwargs["reason"] = reason
         if isinstance(message, str):
             kwargs["message"] = message
+        kwargs["cause_type"] = cause_type
+        kwargs["status_code"] = status_code
         return UnavailableMCPTool(**kwargs)
+
+    @staticmethod
+    def _mcp_connector_refs(
+        configs_by_name: dict[str, dict[str, Any]],
+    ) -> dict[str, ConnectorRef]:
+        """Persisted connector identity per MCP server name.
+
+        The approval gate needs the authoritative persisted server id, which
+        the transport mapping handed to the loader deliberately does not
+        carry (a sandbox guest must never receive host authorization
+        identity). Both loader seams below build the mapping here so they
+        cannot drift apart, and so the bool-safe positive-int check exists
+        once: ``bool`` is an ``int`` subclass, and ``True`` would otherwise
+        become connector id 1 -- some other tenant's server.
+        """
+
+        refs: dict[str, ConnectorRef] = {}
+        for server_name, config in configs_by_name.items():
+            server_id = config.get("id")
+            if type(server_id) is not int or server_id <= 0:
+                continue
+            refs[server_name] = ConnectorRef("mcp", server_id)
+        return refs
 
     @classmethod
     def _unavailable_mcp_tools_from_load_failures(
@@ -937,7 +1106,12 @@ class ToolFactory:
         failures: tuple["MCPServerLoadFailure", ...],
         configs_by_name: dict[str, dict[str, Any]],
     ) -> list[Tool]:
-        """Convert structured load failures to one unavailable tool per server."""
+        """Convert structured load failures to one unavailable tool per server.
+
+        A failure without a ``cause_type`` reports its ``error_type`` as the
+        cause, so the setup summary names the exception class whenever the
+        loader caught one.
+        """
         from .mcp_adapter import mcp_load_failure_message
 
         tools: list[Tool] = []
@@ -955,9 +1129,10 @@ class ToolFactory:
                 cls._create_unavailable_mcp_tool(
                     server_name=failure.server_name,
                     server_id=server_id,
-                    allow_users=config.get("allow_users"),
                     reason=failure.phase.value,
                     message=mcp_load_failure_message(failure.phase),
+                    cause_type=failure.cause_type or failure.error_type,
+                    status_code=failure.status_code,
                 )
             )
         return tools
@@ -973,6 +1148,8 @@ class ToolFactory:
             MCPUnavailableSummary.from_values(
                 tool.server_name,
                 tool.unavailability_reason,
+                cause_type=tool.unavailability_cause_type,
+                status_code=tool.unavailability_status_code,
             )
             for tool in tools
             if isinstance(tool, UnavailableMCPTool)
@@ -982,10 +1159,14 @@ class ToolFactory:
     async def _create_mcp_tools_from_configs(
         mcp_configs: list[dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
+        workspace: Any | None = None,
+        actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
+        actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
     ) -> list[Tool]:
-        """Create MCP tools from configurations."""
+        """Create MCP tools while keeping actor session identity host-only."""
         try:
             from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_approval_gate import gate_mcp_tools
 
             unavailable_tools: list[Tool] = []
             normal_configs: list[dict[str, Any]] = []
@@ -995,12 +1176,10 @@ class ToolFactory:
                 if isinstance(inner_config, dict) and inner_config.get("unavailable"):
                     try:
                         server_name = config.get("name")
-                        allow_users = config.get("allow_users")
                         unavailable_tools.append(
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=inner_config.get("server_id"),
-                                allow_users=allow_users,
                                 reason=inner_config.get("reason"),
                                 message=inner_config.get("message"),
                                 failure_code=inner_config.get("failure_code"),
@@ -1019,6 +1198,8 @@ class ToolFactory:
             if normal_configs:
                 connections: dict[str, Any] = {}
                 configs_by_name: dict[str, dict[str, Any]] = {}
+                session_requests: list[tuple[str, dict[str, Any], Any]] = []
+                session_identities = actor_stdio_session_identities or {}
                 try:
                     # Convert configs to connection format
                     for config in normal_configs:
@@ -1034,7 +1215,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=config.get("name"),
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1046,7 +1226,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1058,7 +1237,6 @@ class ToolFactory:
                                 ToolFactory._create_unavailable_mcp_tool(
                                     server_name=server_name,
                                     server_id=config.get("id"),
-                                    allow_users=config.get("allow_users"),
                                     reason="invalid_config",
                                     message="MCP server configuration is unavailable.",
                                 )
@@ -1098,16 +1276,80 @@ class ToolFactory:
                                     "args"
                                 ].split()
 
-                        connections[server_name] = connection_config
                         configs_by_name[server_name] = config
+                        session_identity = session_identities.get(server_name)
+                        if session_identity is not None:
+                            if actor_stdio_session_consumer is None:
+                                unavailable_tools.append(
+                                    ToolFactory._create_unavailable_mcp_tool(
+                                        server_name=server_name,
+                                        server_id=config.get("id"),
+                                        reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                        message=(
+                                            "MCP server session runtime is unavailable."
+                                        ),
+                                    )
+                                )
+                                continue
+                            session_requests.append(
+                                (server_name, connection_config, session_identity)
+                            )
+                            continue
+                        connections[server_name] = connection_config
+
+                    for server_name, connection, identity in session_requests:
+                        try:
+                            consumed_tools = await actor_stdio_session_consumer(
+                                server_name=server_name,
+                                connection=connection,
+                                session_identity=identity,
+                                sandbox=sandbox,
+                            )
+                            # This consumer bypasses the generic MCP loader
+                            # (it binds a host-only execution scope), so the
+                            # loader's gate wrapping never sees these tools.
+                            # They are ordinary dispatchable MCP adapters, so
+                            # the wrapping has to happen here instead -- with
+                            # the same persisted connector identity the
+                            # loader route carries.
+                            normal_tools.extend(
+                                gate_mcp_tools(
+                                    consumed_tools,
+                                    connector_ref=ToolFactory._mcp_connector_refs(
+                                        {server_name: configs_by_name[server_name]}
+                                    ).get(server_name),
+                                )
+                            )
+                        except ConnectorRuntimeError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Actor stdio session consumer failed for server '%s' (%s)",
+                                server_name,
+                                type(exc).__name__,
+                            )
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=server_name,
+                                    server_id=configs_by_name[server_name].get("id"),
+                                    reason=ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
+                                    message=(
+                                        "MCP server session runtime is unavailable."
+                                    ),
+                                )
+                            )
 
                     # Load MCP tools
                     if connections:
                         load_result = await load_mcp_tools_as_agent_tools(
                             connections,
+                            connector_refs=ToolFactory._mcp_connector_refs(
+                                configs_by_name
+                            ),
                             sandbox=sandbox,
-                        )  # type: ignore[arg-type]
-                        normal_tools = list(load_result.tools)
+                            workspace=workspace,
+                        )
+                        normal_tools.extend(load_result.tools)
                         unavailable_tools.extend(
                             ToolFactory._unavailable_mcp_tools_from_load_failures(
                                 load_result.failures,
@@ -1123,7 +1365,6 @@ class ToolFactory:
                             ToolFactory._create_unavailable_mcp_tool(
                                 server_name=server_name,
                                 server_id=config.get("id"),
-                                allow_users=config.get("allow_users"),
                                 reason="loader_failed",
                                 message="MCP server tools could not be loaded.",
                             )
@@ -1162,7 +1403,10 @@ class ToolFactory:
                 load_user_env_overrides,
                 load_user_env_sources,
             )
-            from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_adapter import (
+                load_mcp_tools_as_agent_tools,
+                model_visible_mcp_tools,
+            )
 
             query = db.query(MCPServer)
             if user_id:
@@ -1209,7 +1453,6 @@ class ToolFactory:
                         cls._create_unavailable_mcp_tool(
                             server_name=getattr(server, "name", ""),
                             server_id=getattr(server, "id", None),
-                            allow_users=[str(user_id)] if user_id is not None else None,
                             reason="runtime_connection_failed",
                             message="MCP server configuration is unavailable.",
                         )
@@ -1221,7 +1464,6 @@ class ToolFactory:
                     configs_by_name[server_name] = {
                         "id": getattr(server, "id", None),
                         "name": server_name,
-                        "allow_users": [str(user_id)] if user_id is not None else None,
                     }
                     continue
                 diagnostic = build.diagnostic or {}
@@ -1234,7 +1476,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=getattr(server, "name", ""),
                         server_id=getattr(server, "id", None),
-                        allow_users=[str(user_id)] if user_id is not None else None,
                         reason=diagnostic.get("code", "runtime_connection_unavailable"),
                         message="MCP server configuration is unavailable.",
                     )
@@ -1249,7 +1490,10 @@ class ToolFactory:
 
             # Load MCP tools
             try:
-                load_result = await load_mcp_tools_as_agent_tools(connections)
+                load_result = await load_mcp_tools_as_agent_tools(
+                    connections,
+                    connector_refs=ToolFactory._mcp_connector_refs(configs_by_name),
+                )
             except ConnectorRuntimeError:
                 raise
             except Exception as e:
@@ -1260,7 +1504,6 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
                         server_id=config.get("id"),
-                        allow_users=config.get("allow_users"),
                         reason="loader_failed",
                         message="MCP server tools could not be loaded.",
                     )
@@ -1282,7 +1525,7 @@ class ToolFactory:
                 mcp_failure_policy,
                 cls._mcp_unavailable_summaries(unavailable_tools),
             )
-            return unavailable_tools + list(load_result.tools)
+            return model_visible_mcp_tools(unavailable_tools + list(load_result.tools))
         except ConnectorRuntimeError:
             raise
         except RequiredMCPUnavailableError:

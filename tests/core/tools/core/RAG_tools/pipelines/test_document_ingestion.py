@@ -792,6 +792,91 @@ def test_process_document_skips_embedding_when_no_pending(
     assert "no pending embeddings" in STATUS_EVENTS[-1]["message"].lower()
 
 
+def _record_commits(monkeypatch: pytest.MonkeyPatch) -> List[Dict[str, object]]:
+    commits: List[Dict[str, object]] = []
+
+    def _commit(**kwargs: object) -> None:
+        statuses = [event["status"] for event in STATUS_EVENTS]
+        commits.append({**kwargs, "statuses": statuses})
+
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+    return commits
+
+
+def _nothing_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    empty = EmbeddingReadResponse(chunks=[], total_count=2, pending_count=0)
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: empty.model_dump()
+    )
+
+
+@pytest.mark.parametrize("nothing_pending", [False, True])
+def test_process_document_commits_vectors_before_recording_success(
+    monkeypatch: pytest.MonkeyPatch, nothing_pending: bool
+) -> None:
+    """Both the embedding path and the early-return path commit, gate included."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+    if nothing_pending:
+        _nothing_pending(monkeypatch)
+    commits = _record_commits(monkeypatch)
+
+    def gate() -> None:
+        return None
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+        user_id=7,
+        is_admin=True,
+        commit_gate=gate,
+    )
+
+    assert result.status == "success"
+    assert commits == [
+        {
+            "collection": "demo",
+            "doc_id": "doc-1",
+            "parse_hash": "hash-1",
+            "model": "embedding-default",
+            "commit_gate": gate,
+            "user_id": 7,
+            "is_admin": True,
+            "statuses": [DocumentProcessingStatus.RUNNING.value],
+        }
+    ]
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.SUCCESS.value
+
+
+@pytest.mark.parametrize("nothing_pending", [False, True])
+def test_process_document_fails_without_success_when_the_commit_fails(
+    monkeypatch: pytest.MonkeyPatch, nothing_pending: bool
+) -> None:
+    _patch_pipeline_dependencies(monkeypatch)
+    if nothing_pending:
+        _nothing_pending(monkeypatch)
+
+    def _commit(**_: object) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "write_vectors_to_db"
+    assert result.message == "commit failed"
+    assert [event["status"] for event in STATUS_EVENTS] == [
+        DocumentProcessingStatus.RUNNING.value,
+        DocumentProcessingStatus.FAILED.value,
+    ]
+
+
 def test_process_document_partial_on_write_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1370,6 +1455,7 @@ def test_process_document_compacts_storage_after_success(
     _patch_pipeline_dependencies(monkeypatch)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = ["documents"]
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1404,6 +1490,7 @@ def test_process_document_succeeds_when_compaction_fails(
     _patch_pipeline_dependencies(monkeypatch)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.side_effect = RuntimeError("optimize exploded")
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1436,6 +1523,7 @@ def test_process_document_compacts_storage_after_failure(
     monkeypatch.setattr(document_ingestion, "chunk_document", _boom)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = []
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1479,6 +1567,7 @@ def test_process_document_compaction_covers_vendor_prefixed_model_ids(
     )
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = []
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1529,4 +1618,5 @@ def test_ingest_tables_are_real_schema_manager_tables() -> None:
         "embeddings",  # named per model tag; the caller appends it
         "main_pointers",  # grows with collection count, not ingest count
         "prompt_templates",  # same
+        "kb_ids",  # same
     }

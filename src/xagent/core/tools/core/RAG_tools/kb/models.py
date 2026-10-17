@@ -18,6 +18,7 @@ from ..storage.contracts import (
     MetadataStore,
     VectorIndexStore,
 )
+from ..storage.vector_backend import KBStorageBackend
 from .operation_compatibility import KBOperation, RollbackStatus
 
 
@@ -27,12 +28,6 @@ class KBAccessMode(StrEnum):
     READ = "read"
     WRITE = "write"
     ADMIN = "admin"
-
-
-class KBStorageBackend(StrEnum):
-    """Collection-level KB storage backend binding."""
-
-    LANCEDB = "lancedb"
 
 
 @dataclass(frozen=True)
@@ -46,6 +41,7 @@ class KBBackendCapabilities:
     supports_search: bool
     supports_versions: bool
     supports_raw_connection: bool
+    supports_async_search: bool
 
     @classmethod
     def lancedb(cls) -> KBBackendCapabilities:
@@ -58,6 +54,27 @@ class KBBackendCapabilities:
             supports_search=True,
             supports_versions=True,
             supports_raw_connection=True,
+            supports_async_search=True,
+        )
+
+    @classmethod
+    def milvus(cls) -> KBBackendCapabilities:
+        """Return what ``MilvusCollectionHandle`` supports.
+
+        Documents, parses and chunks are served by the LanceDB ledger, sync search
+        by Milvus. Embeddings stay off until the family's delete, snapshot and
+        restore methods are implemented. Versions, which here include cascade
+        cleanup, and async search stay off.
+        """
+        return cls(
+            supports_documents=True,
+            supports_parses=True,
+            supports_chunks=True,
+            supports_embeddings=False,
+            supports_search=True,
+            supports_versions=False,
+            supports_raw_connection=False,
+            supports_async_search=False,
         )
 
     @classmethod
@@ -71,6 +88,7 @@ class KBBackendCapabilities:
             supports_search=False,
             supports_versions=False,
             supports_raw_connection=False,
+            supports_async_search=False,
         )
 
 
@@ -92,6 +110,7 @@ class KBContextRequest:
     access_mode: KBAccessMode = KBAccessMode.READ
     allow_create: bool = False
     hide_missing: bool = False
+    deployment_engine_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +164,19 @@ class RollbackFailedIngestionRequest:
 
 
 @dataclass(frozen=True)
+class RollbackFailedUploadIngestionRequest:
+    """Callbacks for ``KBCoordinator.rollback_failed_upload_ingestion`` (#795).
+
+    Local passes ``collection_compensation`` alone or the document/file pair;
+    cloud passes all three and decides inside its collection callback.
+    """
+
+    document_compensation: Optional[Callable[[], Any]] = None
+    file_compensation: Optional[Callable[[], Any]] = None
+    collection_compensation: Optional[Callable[[], Any]] = None
+
+
+@dataclass(frozen=True)
 class RollbackFailedIngestionResult:
     """Outcome of coordinator-owned failed-ingest rollback orchestration."""
 
@@ -155,6 +187,7 @@ class RollbackFailedIngestionResult:
     first_error: Optional[str] = None
     boundary_errors: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    error: Optional[Exception] = None  # upload entry: the failing callback's exception
 
 
 @dataclass(frozen=True)
@@ -169,3 +202,15 @@ class KBVectorStorageCleanupResult:
     preview_only: bool = True
     warnings: tuple[str, ...] = ()
     side_effects_may_remain: bool = False
+
+
+@dataclass(frozen=True)
+class KBDocumentRowsSnapshot:
+    """Rows of some documents in one collection, keyed by table name.
+
+    A non-admin capture holds only the caller's rows on tables with ``user_id``.
+    """
+
+    collection: str
+    doc_ids: tuple[str, ...]
+    rows_by_table: dict[str, list[dict[str, Any]]]

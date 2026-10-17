@@ -15,27 +15,53 @@ import enum
 import json
 import logging
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, false, or_, select, true
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, Session, aliased
 
 from ...config import (
+    get_shared_task_execution_enabled,
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
-from ..models.task import Task, TaskStatus
+from ..models.task import Task, TaskStatus, task_status_predicate
+from ..models.task_admission import TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
+from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
+    caller_is_cancelling,
     is_database_pool_timeout,
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .task_admission_execution import (
+    AdmissionWaiting,
+    admission_execution,
+    return_to_admission_queue,
+)
+from .task_command_terminal_events import (
+    TerminalTaskEventDraft,
+    stage_terminal_event,
+    terminal_event_draft_for_error,
+)
+from .task_dispatch_cap import (
+    CONTROL_KINDS,
+    EXECUTION_OPENING_KINDS,
+    DispatchCapSnapshot,
+    build_dispatch_cap_snapshot,
+)
+from .task_execution_host import consumes_task_commands
 from .task_lease_service import get_runner_id
+
+if TYPE_CHECKING:
+    from .task_coordinator_service import TaskLease as TaskOwnerLease
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +73,54 @@ COMMAND_TERMINAL = (COMMAND_COMPLETED, COMMAND_FAILED)
 
 COMMAND_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 MAX_COMMAND_FAILURES = 5
+# Since the budget was coupled to the lease TTL, this constant is the FLOOR
+# of the effective defer budget, not the budget itself — compare against
+# max_command_defers(), never against this constant directly.
 MAX_COMMAND_DEFERS = 60
+
+
+def max_command_defers() -> int:
+    """The defer budget, a TTL-coupled heuristic rather than a guarantee.
+
+    A deferral's shortest canonical wait is a task lease another holder has
+    not released yet: on a non-RUNNING row the lease cannot be refreshed, so
+    it clears within one TTL. The budget (spent roughly once per second —
+    ``defer_task_command`` re-arms the claim one second out) must outlast
+    that with real margin: a fixed 60 was silently smaller than any raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS``, turning every long park into a
+    terminal failure for an already-accepted command
+    (xorbitsai/xagent-saas#952 B3). Twice the TTL keeps 100% headroom at
+    every setting; the historical constant stays as the floor so short-TTL
+    deployments keep their existing patience. Read per call, not cached:
+    the TTL is env-driven and tests vary it.
+
+    This mitigates rather than closes the exhaustion: a RUNNING row's lease
+    is heartbeat-refreshed for the whole turn, so a command deferring behind
+    a turn longer than the budget still fails terminally. The structural
+    fix — patience as a wall-clock deadline against the command's
+    ``created_at`` instead of a defer count — is #1995.
+    """
+
+    return max(MAX_COMMAND_DEFERS, get_task_lease_ttl_seconds() * 2)
+
+
 DISPATCHER_IDLE_SECONDS = 0.5
 DISPATCHER_CONCURRENCY = 4
+DISPATCHER_RESTART_LIMIT = 3
+DISPATCHER_RESTART_WINDOW_SECONDS = 600.0
+# A failing claim (typically an unreachable database) backs off exponentially
+# from DISPATCHER_IDLE_SECONDS up to this ceiling instead of retrying every
+# idle tick, and repeats of the failure are logged at most once per interval.
+# Both are per worker: with DISPATCHER_CONCURRENCY workers an outage logs up
+# to that many lines per interval, and each line's consecutive_failures counts
+# only that worker's failed claims.
+DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS = 30.0
+DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 
 
 class TaskCommandKind(str, enum.Enum):
+    START = "start"
+    RESUME_INPUT = "resume_input"
     MESSAGE = "message"
     PAUSE = "pause"
     RESUME = "resume"
@@ -70,7 +138,16 @@ class TaskCommandTaskMissing(ValueError):
 
 
 class TaskCommandDeferred(RuntimeError):
-    """The command is durable but its downstream handoff is still pending."""
+    """The command is durable but its downstream handoff is still pending.
+
+    ``resend_safe`` is true only when the failed handoff proves this command
+    never reached the downstream operation. The terminal-event projection can
+    then tell the sender to retry without risking a duplicate.
+    """
+
+    def __init__(self, message: str, *, resend_safe: bool = False) -> None:
+        super().__init__(message)
+        self.resend_safe = resend_safe
 
 
 class TaskCommandRejected(RuntimeError):
@@ -167,6 +244,7 @@ class ClaimedTaskCommand:
     attempt_count: int
     failure_count: int = 0
     defer_count: int = 0
+    admission_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,16 +288,30 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _normalize_command_id(command_id: str) -> str:
+# Command ids reserved for the auto-resume sweeper. Episode bookkeeping does
+# not count a RESUME with this prefix as a person acting (and the sweeper's
+# claim-time check will trust one as its own), so no ingress may stage one.
+# ``reserved=True`` is the sweeper's door into the namespace; it has no
+# production caller until the sweeper lands, and tests exercise it.
+AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
+
+
+def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
     """Strip and validate a caller-supplied command_id.
 
     Shared by every normalization site in this module so the accepted format
-    -- 1-64 URL-safe characters -- cannot drift between them.
+    -- 1-64 URL-safe characters -- cannot drift between them. The
+    ``auto-resume:`` namespace is refused unless ``reserved`` says the caller
+    is the auto-resume sweeper.
     """
 
     normalized = command_id.strip()
     if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
         raise ValueError("command_id must be 1-64 URL-safe characters")
+    if not reserved and normalized.startswith(AUTO_RESUME_COMMAND_PREFIX):
+        raise ValueError(
+            f"command_id prefix {AUTO_RESUME_COMMAND_PREFIX!r} is reserved"
+        )
     return normalized
 
 
@@ -227,6 +319,7 @@ def _matches_existing(
     command: TaskExecutionCommand,
     *,
     actor_user_id: int | None,
+    actor_subject: str | None,
     kind: TaskCommandKind,
     payload: dict[str, Any],
 ) -> bool:
@@ -234,10 +327,112 @@ def _matches_existing(
         command.payload if isinstance(command.payload, dict) else {}
     )
     stored_actor_user_id = getattr(command, "actor_user_id", None)
+    stored_actor_subject = getattr(command, "actor_subject", None)
+    actors_match = (
+        stored_actor_user_id is None and stored_actor_subject is None
+        if actor_user_id is None
+        else actor_subject is not None and stored_actor_subject == actor_subject
+    )
     return (
-        stored_actor_user_id == actor_user_id
+        actors_match
         and str(command.kind) == kind.value
         and _canonical_payload(stored_payload) == _canonical_payload(payload)
+    )
+
+
+def _load_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    if actor_user_id is None:
+        return None
+    stored_subject = db.execute(
+        select(User.actor_subject).where(User.id == actor_user_id)
+    ).scalar_one_or_none()
+    return str(stored_subject) if stored_subject is not None else None
+
+
+def existing_task_command_payload_matches(
+    db: Session,
+    *,
+    task_id: int,
+    command_id: str,
+    actor_user_id: int | None,
+    kind: TaskCommandKind,
+    payload: dict[str, Any],
+) -> bool | None:
+    """Read an existing command's payload identity without staging any writes.
+
+    None means no command exists; False means its actor, kind or payload
+    conflicts. Missing actor identities are not created by this read path.
+    """
+    with db.no_autoflush:
+        existing = (
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == command_id,
+            )
+            .first()
+        )
+        if existing is None:
+            return None
+        return _matches_existing(
+            existing,
+            actor_user_id=actor_user_id,
+            actor_subject=_load_actor_subject(db, actor_user_id),
+            kind=kind,
+            payload=payload,
+        )
+
+
+def _resolve_actor_subject(db: Session, actor_user_id: int | None) -> str | None:
+    stored_subject = _load_actor_subject(db, actor_user_id)
+    if actor_user_id is None or stored_subject is not None:
+        return stored_subject
+    candidate_subject = str(uuid.uuid4())
+    (
+        db.query(User)
+        .filter(
+            User.id == actor_user_id,
+            User.actor_subject.is_(None),
+        )
+        .update(
+            {User.actor_subject: candidate_subject},
+            synchronize_session=False,
+        )
+    )
+    return _load_actor_subject(db, actor_user_id)
+
+
+def command_identity_matches_task(
+    db: Session, task: Task, command: TaskExecutionCommand
+) -> bool:
+    """Revalidate the accepted actor and owner separately at execution time."""
+    from ..models.agent import Agent
+
+    owner = db.get(User, task.user_id)
+    actor = (
+        db.get(User, command.actor_user_id)
+        if command.actor_user_id is not None
+        else None
+    )
+    return bool(
+        owner is not None
+        and owner.actor_subject == command.task_owner_subject
+        and owner.id == command.task_owner_user_id
+        and actor is not None
+        and actor.actor_subject == command.actor_subject
+        and (
+            actor.id == owner.id
+            or actor.is_admin
+            or (
+                task.source == "sdk"
+                and db.execute(
+                    select(Agent.id).where(
+                        Agent.id == task.agent_id, Agent.user_id == actor.id
+                    )
+                ).scalar_one_or_none()
+                is not None
+            )
+        )
     )
 
 
@@ -249,8 +444,15 @@ def stage_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
+    target_run_id: str | None = None,
+    reserved: bool = False,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
+
+    ``reserved`` admits the auto-resume sweeper's command id namespace;
+    every other caller leaves it False, so no ingress can stage one.
 
     Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
     the caller owns the transaction boundary and decides what durability means
@@ -266,10 +468,13 @@ def stage_task_command(
        is not served from the identity map, so it observes a caller's own
        uncommitted CAS-style update to the same row instead of a stale cached
        instance.
-    4. Check for an existing command with this (task_id, command_id) before
+    4. Resolve the actor and task owner's stable internal subjects in this
+       transaction, so idempotency and terminal delivery never treat a reused
+       integer user id as the same identity.
+    5. Check for an existing command with this (task_id, command_id) before
        adding a new row, so a repeated call is idempotent without relying on
        the unique constraint to reject it.
-    5. Add and flush the new row last, so any remaining IntegrityError is
+    6. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself.
 
     Caller obligations:
@@ -278,7 +483,10 @@ def stage_task_command(
        notify_task_command_dispatcher(). Skipping it does not lose the
        command -- the dispatcher's idle poll still recovers it -- but
        delivery silently degrades to up to DISPATCHER_IDLE_SECONDS of added
-       latency instead of an immediate wakeup.
+       latency instead of an immediate wakeup. While a worker is backing off
+       after failed claims, its poll interval grows to at most
+       DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS, which then bounds that latency;
+       a notify only reaches workers in the process that sent it.
     b. On IntegrityError from the command-insert flush in step 5, the caller
        must roll back the whole transaction before issuing any further
        statement on this session -- classify_task_command_conflict below
@@ -292,7 +500,7 @@ def stage_task_command(
        writer, including the dispatcher's claim, blocks for that whole span.
     """
 
-    normalized_id = _normalize_command_id(command_id)
+    normalized_id = _normalize_command_id(command_id, reserved=reserved)
     resolved_task_id = int(task_id)
 
     try:
@@ -306,13 +514,42 @@ def stage_task_command(
     # window across everything it did in between, so existence is re-checked
     # here, by query, before inserting a command that references the row.
     snapshot = db.execute(
-        select(Task.status, Task.runner_id, Task.run_id).where(
-            Task.id == resolved_task_id
+        select(
+            Task.status,
+            Task.runner_id,
+            Task.run_id,
+            Task.state_version,
+            Task.user_id,
+            User.id.label("task_owner_row_id"),
+            User.actor_subject.label("task_owner_subject"),
         )
+        .select_from(Task)
+        .outerjoin(
+            User,
+            and_(
+                User.id == Task.user_id,
+                User.created_at.is_not(None),
+                Task.created_at.is_not(None),
+                User.created_at <= Task.created_at,
+            ),
+        )
+        .where(Task.id == resolved_task_id)
     ).one_or_none()
     if snapshot is None:
         raise TaskCommandTaskMissing(f"Task {task_id} not found")
 
+    actor_subject = _resolve_actor_subject(db, actor_user_id)
+    task_owner_subject = (
+        str(snapshot.task_owner_subject)
+        if snapshot.task_owner_subject is not None
+        else None
+    )
+    if snapshot.task_owner_row_id is not None and task_owner_subject is None:
+        task_owner_subject = (
+            actor_subject
+            if actor_user_id == int(snapshot.user_id)
+            else _resolve_actor_subject(db, int(snapshot.user_id))
+        )
     existing = (
         db.query(TaskExecutionCommand)
         .filter(
@@ -325,6 +562,7 @@ def stage_task_command(
         matches = _matches_existing(
             existing,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )
@@ -344,15 +582,44 @@ def stage_task_command(
     command = TaskExecutionCommand(
         task_id=resolved_task_id,
         actor_user_id=actor_user_id,
+        actor_subject=actor_subject,
+        task_owner_user_id=int(snapshot.user_id),
+        task_owner_subject=task_owner_subject,
         command_id=normalized_id,
         kind=kind.value,
         payload=payload,
-        target_run_id=snapshot.run_id,
+        target_run_id=target_run_id if target_run_id is not None else snapshot.run_id,
+        target_state_version=int(snapshot.state_version or 0),
         target_runner_id=active_runner_id,
+        reply_host_id=reply_host_id,
+        reply_origin=reply_origin,
         status=COMMAND_PENDING,
     )
     db.add(command)
     db.flush()
+    from .task_execution_event_writer import (
+        append_fact_no_commit,
+        uses_execution_events,
+    )
+
+    if uses_execution_events(db, resolved_task_id):
+        append_fact_no_commit(
+            db,
+            task_id=resolved_task_id,
+            kind="command_accepted",
+            key=f"command:{normalized_id}",
+            run_id=snapshot.run_id,
+            payload={
+                "command_id": normalized_id,
+                "kind": kind.value,
+                "payload": payload,
+                "actor_user_id": actor_user_id,
+                "target_state_version": int(snapshot.state_version or 0),
+            },
+        )
+    from .task_execution_admission import stage_task_admission
+
+    stage_task_admission(db, command)
     return StagedTaskCommand(
         staged_db_id=int(command.id),
         client_command_id=normalized_id,
@@ -415,9 +682,11 @@ def classify_task_command_conflict(
         .one_or_none()
     )
     if raced is not None:
+        actor_subject = _load_actor_subject(db, actor_user_id)
         matches = _matches_existing(
             raced,
             actor_user_id=actor_user_id,
+            actor_subject=actor_subject,
             kind=kind,
             payload=payload,
         )
@@ -444,6 +713,8 @@ def enqueue_task_command(
     command_id: str,
     kind: TaskCommandKind,
     payload: dict[str, Any],
+    reply_host_id: str | None = None,
+    reply_origin: str | None = None,
 ) -> EnqueuedTaskCommand:
     """Commit an idempotent command and return only after it is durable.
 
@@ -462,6 +733,8 @@ def enqueue_task_command(
             command_id=command_id,
             kind=kind,
             payload=payload,
+            reply_host_id=reply_host_id,
+            reply_origin=reply_origin,
         )
         # Only a newly created row is worth committing, and the commit stays
         # inside this try so that a constraint failure surfacing there rather
@@ -506,6 +779,14 @@ def enqueue_task_command(
 
 
 def _claim_availability_predicate(now: datetime) -> Any:
+    if get_shared_task_execution_enabled():
+        return and_(
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            or_(
+                TaskExecutionCommand.retry_available_at.is_(None),
+                TaskExecutionCommand.retry_available_at <= now,
+            ),
+        )
     return or_(
         and_(
             TaskExecutionCommand.status == COMMAND_PENDING,
@@ -522,6 +803,15 @@ def _claim_availability_predicate(now: datetime) -> Any:
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
+    if get_shared_task_execution_enabled():
+        # An empty immutable target must not let another worker steal live
+        # owner commands and spend the defer budget waiting for that owner.
+        return or_(
+            Task.runner_id == runner_id,
+            Task.runner_id.is_(None),
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at < now,
+        )
     return or_(
         TaskExecutionCommand.target_runner_id.is_(None),
         TaskExecutionCommand.target_runner_id == runner_id,
@@ -533,32 +823,111 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
 
 
 def _unfinished_earlier_command() -> Any:
+    from .task_execution_admission import waiting_admission
+
     earlier = aliased(TaskExecutionCommand)
     return exists(
         select(1).where(
             earlier.task_id == TaskExecutionCommand.task_id,
             earlier.id < TaskExecutionCommand.id,
             earlier.status.notin_(COMMAND_TERMINAL),
+            ~and_(
+                TaskExecutionCommand.kind.in_(("cancel", "pause")),
+                earlier.status == COMMAND_PENDING,
+                waiting_admission(earlier.id),
+            ),
         )
     )
 
 
 def _claimable_query(
-    db: Session, *, runner_id: str, command_db_id: int | None
+    db: Session,
+    *,
+    runner_id: str,
+    command_db_id: int | None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> Query[Any]:
+    from .task_execution_admission import admission_eligible
+
     now = _utc_now()
     query = (
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
+            # Keep START dormant until the entire shared host is enabled.
+            (
+                true()
+                if get_shared_task_execution_enabled()
+                else TaskExecutionCommand.kind.notin_(
+                    (TaskCommandKind.START.value, TaskCommandKind.RESUME_INPUT.value)
+                )
+            ),
             _claim_availability_predicate(now),
+            admission_eligible(),
             ~_unfinished_earlier_command(),
             _command_routing_predicate(runner_id, now),
         )
     )
+    if cap is not None and cap.closed:
+        # Without a free slot only what needs none is worth claiming: a
+        # control of any task, or a command of a task that already holds a slot.
+        query = query.filter(
+            or_(
+                TaskExecutionCommand.kind.in_(sorted(CONTROL_KINDS)),
+                TaskExecutionCommand.task_id.in_(sorted(cap.active_ids)),
+            )
+        )
     if command_db_id is not None:
         query = query.filter(TaskExecutionCommand.id == command_db_id)
     return query.order_by(TaskExecutionCommand.id.asc())
+
+
+def command_processing_predicates(
+    db: Session,
+    command_db_id: int,
+    runner_id: str,
+    *,
+    expected_attempt_count: int | None = None,
+    require_live_claim: bool = False,
+    owner_lease: TaskOwnerLease | None = None,
+) -> tuple[Any, ...]:
+    """Authorize a command write in the same transaction as its task owner.
+
+    Attempt count isolates retries inside an owner; only the task has a lease.
+    Legacy local execution retains its existing command claim contract.
+    """
+    predicates = [
+        TaskExecutionCommand.id == command_db_id,
+        TaskExecutionCommand.status == COMMAND_PROCESSING,
+    ]
+    if get_shared_task_execution_enabled():
+        from .task_coordinator_runtime import current_task_coordinator
+        from .task_coordinator_service import lock_task_lease_no_commit
+
+        task_id = db.scalar(
+            select(TaskExecutionCommand.task_id).where(
+                TaskExecutionCommand.id == command_db_id
+            )
+        )
+        if owner_lease is None:
+            coordinator = (
+                current_task_coordinator(task_id) if task_id is not None else None
+            )
+            owner_lease = coordinator.lease if coordinator is not None else None
+        if (
+            owner_lease is None
+            or owner_lease.task_id != task_id
+            or owner_lease.runner_id != runner_id
+            or not lock_task_lease_no_commit(db, owner_lease)
+        ):
+            return (false(),)
+    else:
+        predicates.append(TaskExecutionCommand.claimed_by == runner_id)
+        if require_live_claim:
+            predicates.append(TaskExecutionCommand.claim_expires_at > _utc_now())
+    if expected_attempt_count is not None:
+        predicates.append(TaskExecutionCommand.attempt_count == expected_attempt_count)
+    return tuple(predicates)
 
 
 def claim_task_command(
@@ -566,18 +935,40 @@ def claim_task_command(
     *,
     runner_id: str | None = None,
     command_db_id: int | None = None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> ClaimedTaskCommand | None:
     """Atomically claim the oldest eligible command for this worker."""
 
+    if not consumes_task_commands():
+        return None
     resolved_runner_id = runner_id or get_runner_id()
     candidate = _claimable_query(
         db,
         runner_id=resolved_runner_id,
         command_db_id=command_db_id,
+        cap=cap,
     ).first()
     if candidate is None:
         return None
 
+    shared = get_shared_task_execution_enabled()
+    if shared:
+        from .task_coordinator_runtime import current_task_coordinator
+        from .task_coordinator_service import lock_task_lease_no_commit
+
+        coordinator = current_task_coordinator(int(candidate.task_id))
+        if (
+            coordinator is None
+            or coordinator.lease is None
+            or coordinator.lease.runner_id != resolved_runner_id
+            or not lock_task_lease_no_commit(db, coordinator.lease)
+        ):
+            return None
+        from .task_execution_admission import reserve_task_admission
+
+        if not reserve_task_admission(db, int(candidate.id), coordinator.lease):
+            db.rollback()
+            return None
     now = _utc_now()
     expires = now + timedelta(seconds=get_task_lease_ttl_seconds())
     routable_task = exists(
@@ -597,8 +988,9 @@ def claim_task_command(
         .update(
             {
                 TaskExecutionCommand.status: COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by: resolved_runner_id,
-                TaskExecutionCommand.claim_expires_at: expires,
+                TaskExecutionCommand.claimed_by: None if shared else resolved_runner_id,
+                TaskExecutionCommand.claim_expires_at: None if shared else expires,
+                TaskExecutionCommand.retry_available_at: None,
                 TaskExecutionCommand.attempt_count: (
                     TaskExecutionCommand.attempt_count + 1
                 ),
@@ -611,14 +1003,15 @@ def claim_task_command(
     if claimed != 1:
         db.rollback()
         return None
-    db.commit()
     fresh = (
         db.query(TaskExecutionCommand)
         .filter(TaskExecutionCommand.id == int(candidate.id))
+        .populate_existing()
         .one()
     )
+    admission_required = db.get(TaskAdmissionTicket, fresh.id) is not None
     payload: dict[str, Any] = fresh.payload if isinstance(fresh.payload, dict) else {}
-    return ClaimedTaskCommand(
+    command = ClaimedTaskCommand(
         id=int(fresh.id),
         task_id=int(fresh.task_id),
         actor_user_id=(
@@ -629,15 +1022,24 @@ def claim_task_command(
         payload=payload,
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
+        admission_required=admission_required,
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )
+    accepted_at = cast(datetime, fresh.created_at)
+    db.commit()
+    if admission_required:
+        from .task_admission_observation import record_command_admission
+
+        record_command_admission(command.id, command.attempt_count, accepted_at)
+    return command
 
 
 def _claim_task_command_isolated(
     *,
     runner_id: str,
     command_db_id: int | None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> ClaimedTaskCommand | None:
     """Claim in a worker-owned short session and return a detached snapshot."""
 
@@ -649,6 +1051,7 @@ def _claim_task_command_isolated(
             db,
             runner_id=runner_id,
             command_db_id=command_db_id,
+            cap=cap,
         )
 
 
@@ -722,6 +1125,48 @@ async def _claim_heartbeat(
     return TaskCommandClaimHeartbeatOutcome(pool_timeout=pool_timeout)
 
 
+def finish_task_command_no_commit(
+    db: Session,
+    command_db_id: int,
+    runner_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+    expected_attempt_count: int | None = None,
+    require_live_claim: bool = False,
+    owner_lease: TaskOwnerLease | None = None,
+) -> bool:
+    """Stage completion; START commits this together with its execution lease."""
+    now = _utc_now()
+    query = db.query(TaskExecutionCommand).filter(
+        *command_processing_predicates(
+            db,
+            command_db_id,
+            runner_id,
+            expected_attempt_count=expected_attempt_count,
+            require_live_claim=require_live_claim,
+            owner_lease=owner_lease,
+        ),
+    )
+    updated = query.update(
+        {
+            TaskExecutionCommand.status: COMMAND_COMPLETED,
+            TaskExecutionCommand.result: result,
+            TaskExecutionCommand.error: None,
+            TaskExecutionCommand.claimed_by: None,
+            TaskExecutionCommand.claim_expires_at: None,
+            TaskExecutionCommand.completed_at: now,
+            TaskExecutionCommand.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+    if updated == 1:
+        from .task_execution_admission import settle_cancelled_admissions
+
+        settle_cancelled_admissions(db, command_db_id)
+        stage_terminal_event(db, command_db_id=command_db_id)
+    return updated == 1
+
+
 def finish_task_command(
     command_db_id: int,
     runner_id: str,
@@ -731,32 +1176,25 @@ def finish_task_command(
 ) -> bool:
     from ..models.database import get_session_local
 
-    SessionLocal = get_session_local()
-    now = _utc_now()
-    with SessionLocal() as db:
-        query = db.query(TaskExecutionCommand).filter(
-            TaskExecutionCommand.id == command_db_id,
-            TaskExecutionCommand.status == COMMAND_PROCESSING,
-            TaskExecutionCommand.claimed_by == runner_id,
-        )
-        if expected_attempt_count is not None:
-            query = query.filter(
-                TaskExecutionCommand.attempt_count == expected_attempt_count
-            )
-        updated = query.update(
-            {
-                TaskExecutionCommand.status: COMMAND_COMPLETED,
-                TaskExecutionCommand.result: result,
-                TaskExecutionCommand.error: None,
-                TaskExecutionCommand.claimed_by: None,
-                TaskExecutionCommand.claim_expires_at: None,
-                TaskExecutionCommand.completed_at: now,
-                TaskExecutionCommand.updated_at: now,
-            },
-            synchronize_session=False,
+    with get_session_local()() as db:
+        updated = finish_task_command_no_commit(
+            db,
+            command_db_id,
+            runner_id,
+            result=result,
+            expected_attempt_count=expected_attempt_count,
         )
         db.commit()
-        return updated == 1
+        return updated
+
+
+def _records_message_outcome_unknown(result: Any) -> bool:
+    from .chat_history_service import DELIVERY_OUTCOME_UNKNOWN
+
+    return (
+        isinstance(result, dict)
+        and result.get("delivery_outcome") == DELIVERY_OUTCOME_UNKNOWN
+    )
 
 
 def fail_task_command(
@@ -767,6 +1205,7 @@ def fail_task_command(
     force_terminal: bool = False,
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Retry a failed claim, or make it terminal after bounded attempts."""
 
@@ -775,13 +1214,40 @@ def fail_task_command(
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
+        handoff = None
+        if get_shared_task_execution_enabled():
+            handoff = (
+                db.query(TaskExecutionCommand)
+                .filter(
+                    TaskExecutionCommand.id == command_db_id,
+                    TaskExecutionCommand.kind.in_(
+                        (
+                            TaskCommandKind.START.value,
+                            TaskCommandKind.RESUME_INPUT.value,
+                        )
+                    ),
+                )
+                .first()
+            )
+        if handoff is not None:
+            # Match acceptance/handoff lock order: task, then command.
+            db.execute(
+                select(Task.id).where(Task.id == handoff.task_id).with_for_update()
+            ).first()
+        ownership = command_processing_predicates(
+            db,
+            command_db_id,
+            runner_id,
+            expected_attempt_count=expected_attempt_count,
+        )
         snapshot_query = db.query(
             TaskExecutionCommand.failure_count,
             TaskExecutionCommand.attempt_count,
+            TaskExecutionCommand.result,
         ).filter(
             TaskExecutionCommand.id == command_db_id,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
-            TaskExecutionCommand.claimed_by == runner_id,
+            *ownership,
         )
         if expected_attempt_count is not None:
             snapshot_query = snapshot_query.filter(
@@ -792,6 +1258,11 @@ def fail_task_command(
             return False
         observed_failure_count = int(snapshot.failure_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
+        if result is None and _records_message_outcome_unknown(snapshot.result):
+            # A MESSAGE attempt recorded that its turn's ``dispatched`` row
+            # means "outcome unknown" before it failed. That record is the
+            # retry's only way to tell it from an accepted turn; keep it.
+            result = snapshot.result
         failure_count = observed_failure_count + 1
         terminal = force_terminal or failure_count >= MAX_COMMAND_FAILURES
         updated = (
@@ -799,7 +1270,7 @@ def fail_task_command(
             .filter(
                 TaskExecutionCommand.id == command_db_id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner_id,
+                *ownership,
                 TaskExecutionCommand.failure_count == observed_failure_count,
                 TaskExecutionCommand.attempt_count == observed_attempt_count,
             )
@@ -812,7 +1283,11 @@ def fail_task_command(
                     TaskExecutionCommand.error: error[:4000],
                     TaskExecutionCommand.result: result,
                     TaskExecutionCommand.claimed_by: None,
-                    TaskExecutionCommand.claim_expires_at: (
+                    (
+                        TaskExecutionCommand.retry_available_at
+                        if get_shared_task_execution_enabled()
+                        else TaskExecutionCommand.claim_expires_at
+                    ): (
                         None
                         if terminal
                         else now + timedelta(seconds=min(2**failure_count, 30))
@@ -823,6 +1298,17 @@ def fail_task_command(
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            if handoff is not None:
+                if handoff.kind == TaskCommandKind.START.value:
+                    from .task_start_consumer import settle_failed_start_no_commit
+
+                    settle_failed_start_no_commit(db, handoff)
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -837,6 +1323,7 @@ def defer_task_command(
     reason: str,
     *,
     expected_attempt_count: int | None = None,
+    terminal_event: TerminalTaskEventDraft | None = None,
 ) -> bool:
     """Release a claim for retry without consuming the failure budget."""
 
@@ -845,13 +1332,19 @@ def defer_task_command(
     SessionLocal = get_session_local()
     now = _utc_now()
     with SessionLocal() as db:
+        ownership = command_processing_predicates(
+            db,
+            command_db_id,
+            runner_id,
+            expected_attempt_count=expected_attempt_count,
+        )
         snapshot_query = db.query(
             TaskExecutionCommand.defer_count,
             TaskExecutionCommand.attempt_count,
         ).filter(
             TaskExecutionCommand.id == command_db_id,
             TaskExecutionCommand.status == COMMAND_PROCESSING,
-            TaskExecutionCommand.claimed_by == runner_id,
+            *ownership,
         )
         if expected_attempt_count is not None:
             snapshot_query = snapshot_query.filter(
@@ -863,13 +1356,13 @@ def defer_task_command(
         observed_defer_count = int(snapshot.defer_count or 0)
         observed_attempt_count = int(snapshot.attempt_count or 0)
         defer_count = observed_defer_count + 1
-        terminal = defer_count >= MAX_COMMAND_DEFERS
+        terminal = defer_count >= max_command_defers()
         updated = (
             db.query(TaskExecutionCommand)
             .filter(
                 TaskExecutionCommand.id == command_db_id,
                 TaskExecutionCommand.status == COMMAND_PROCESSING,
-                TaskExecutionCommand.claimed_by == runner_id,
+                *ownership,
                 TaskExecutionCommand.defer_count == observed_defer_count,
                 TaskExecutionCommand.attempt_count == observed_attempt_count,
             )
@@ -887,15 +1380,23 @@ def defer_task_command(
                         )[:4000]
                     ),
                     TaskExecutionCommand.claimed_by: None,
-                    TaskExecutionCommand.claim_expires_at: (
-                        None if terminal else now + timedelta(seconds=1)
-                    ),
+                    (
+                        TaskExecutionCommand.retry_available_at
+                        if get_shared_task_execution_enabled()
+                        else TaskExecutionCommand.claim_expires_at
+                    ): (None if terminal else now + timedelta(seconds=1)),
                     TaskExecutionCommand.updated_at: now,
                     TaskExecutionCommand.completed_at: now if terminal else None,
                 },
                 synchronize_session=False,
             )
         )
+        if updated == 1 and terminal:
+            stage_terminal_event(
+                db,
+                command_db_id=command_db_id,
+                draft=terminal_event,
+            )
         db.commit()
         if updated != 1:
             return False
@@ -910,6 +1411,10 @@ def retry_failed_task_command(
 ) -> bool:
     """Reset one failed command without retargeting its immutable execution."""
 
+    from .task_execution_admission import prepare_task_admission_retry
+
+    prepare_task_admission_retry(db, command_db_id)
+
     now = _utc_now()
     updated = (
         db.query(TaskExecutionCommand)
@@ -920,6 +1425,7 @@ def retry_failed_task_command(
         .update(
             {
                 TaskExecutionCommand.status: COMMAND_PENDING,
+                TaskExecutionCommand.retry_available_at: None,
                 TaskExecutionCommand.failure_count: 0,
                 TaskExecutionCommand.defer_count: 0,
                 TaskExecutionCommand.error: None,
@@ -966,9 +1472,49 @@ def task_has_live_foreign_runner(
         )
 
 
-CommandExecutor = Callable[[ClaimedTaskCommand], Awaitable[dict[str, Any] | None]]
+def task_has_live_runner(
+    task_id: int,
+    *,
+    expected_run_id: str | None,
+) -> bool:
+    """Return whether the target run currently has an unexpired task lease.
+
+    ``expected_run_id`` is required and has no wildcard: an omitted default
+    would let a lease belonging to a different run stand in as idempotency
+    evidence for the run actually being asked about. An explicit ``None``
+    means the row's own run id is NULL, matching how ``expected_run_id`` reads
+    on ``BackgroundTaskManager.resume_admission_state``. Callers that really
+    do want "any run" should ask ``task_has_live_foreign_runner`` instead.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    now = _utc_now()
+    with SessionLocal() as db:
+        query = db.query(Task.id).filter(
+            Task.id == task_id,
+            Task.status == TaskStatus.RUNNING,
+            Task.runner_id.is_not(None),
+            Task.lease_expires_at.is_not(None),
+            Task.lease_expires_at >= now,
+        )
+        return query.filter(Task.run_id == expected_run_id).first() is not None
+
+
+@dataclass(frozen=True)
+class SettledTaskCommand:
+    """The handler already committed its terminal command disposition."""
+
+    result: dict[str, Any] | None = None
+
+
+CommandExecutor = Callable[
+    [ClaimedTaskCommand], Awaitable[dict[str, Any] | None | SettledTaskCommand]
+]
 CommandDisposition = Callable[[], bool]
 _dispatcher_wakeup: asyncio.Event | None = None
+_dispatcher_slot_freed: asyncio.Event | None = None
 _dispatcher_task: asyncio.Task[Any] | None = None
 _dispatcher_loop: asyncio.AbstractEventLoop | None = None
 _prompt_dispatch_tasks: set[asyncio.Task[bool]] = set()
@@ -979,6 +1525,36 @@ def notify_task_command_dispatcher() -> None:
     loop = _dispatcher_loop
     if wakeup is not None and loop is not None and not loop.is_closed():
         loop.call_soon_threadsafe(wakeup.set)
+
+
+def notify_dispatcher_slot_freed() -> None:
+    """Tell the dispatcher an execution ended or was cancelled.
+
+    Separate from ``notify_task_command_dispatcher``: a freed slot says nothing
+    about the database, so only an idle wait listens to it.
+    """
+
+    slot_freed = _dispatcher_slot_freed
+    loop = _dispatcher_loop
+    if slot_freed is not None and loop is not None and not loop.is_closed():
+        loop.call_soon_threadsafe(slot_freed.set)
+
+
+async def _wait_for_work(
+    wakeup: asyncio.Event, slot_freed: asyncio.Event | None, timeout: float
+) -> None:
+    """Sleep until a new command is announced, a slot frees, or ``timeout``."""
+
+    waiters = {asyncio.ensure_future(wakeup.wait())}
+    if slot_freed is not None:
+        waiters.add(asyncio.ensure_future(slot_freed.wait()))
+    try:
+        await asyncio.wait(
+            waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
 
 
 async def _persist_task_command_disposition(
@@ -1019,37 +1595,282 @@ async def _persist_task_command_disposition(
     return persisted
 
 
+def _owner_lease_recovery_settled(runner_id: str, now: datetime) -> Any:
+    """Skip tasks whose RUNNING owner is another runner with an expired lease.
+
+    Such a task needs lease recovery before acquisition. Our own owner can
+    still process commands: expiry alone does not revoke its immutable lease
+    identity.
+    """
+    return or_(
+        Task.runner_id == runner_id,
+        task_status_predicate.ne(TaskStatus.RUNNING),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at >= now,
+    )
+
+
+def _dispatcher_candidate_query(
+    db: Session,
+    *,
+    runner_id: str,
+    command_db_id: int | None,
+    shared: bool,
+    cap: DispatchCapSnapshot | None = None,
+) -> Query[Any]:
+    """The database part of the dispatcher's candidate selection.
+
+    ``_claimable_query``, plus the owner lease-recovery filter when
+    ``shared``. The shared dispatcher's scan and
+    ``count_claimable_task_commands`` both build on this, so a database
+    predicate added here reaches both. Process-local state stays with the
+    caller: the scan passes its dispatch-cap snapshot through ``cap`` and adds
+    the busy-task list and the reply-first kind order itself; the count passes
+    neither.
+    Without shared execution ``claim_task_command`` looks up with
+    ``_claimable_query`` alone, so a predicate for both modes belongs there.
+    """
+    query = _claimable_query(
+        db, runner_id=runner_id, command_db_id=command_db_id, cap=cap
+    )
+    if shared:
+        query = query.filter(_owner_lease_recovery_settled(runner_id, _utc_now()))
+    return query
+
+
+def _find_command_candidate(
+    command_db_id: int | None,
+    busy_task_ids: tuple[int, ...] = (),
+    cap: DispatchCapSnapshot | None = None,
+) -> tuple[int, int, TaskCommandKind] | None:
+    from ..models.database import get_session_local
+
+    runner_id = get_runner_id()
+    with get_session_local()() as db:
+
+        def first_candidate(kind: TaskCommandKind | None = None) -> Any:
+            # This scan serves only shared execution (dispatch_one_task_command).
+            query = _dispatcher_candidate_query(
+                db,
+                runner_id=runner_id,
+                command_db_id=command_db_id,
+                shared=True,
+                cap=cap,
+            )
+            if kind is not None:
+                query = query.filter(TaskExecutionCommand.kind == kind.value)
+            return query.filter(
+                TaskExecutionCommand.task_id.notin_(busy_task_ids)
+            ).first()
+
+        row = None
+        if command_db_id is None and (cap is None or not cap.closed):
+            # A reply to a waiting task is served before any other claimable
+            # command, oldest first. That deliberately includes older pause
+            # and cancel commands of other tasks; each waits behind at most
+            # one reply per waiting task, because the shared claimable query
+            # still enforces each task's own order. This order applies to the
+            # scan only: an admission ticket can still keep a reply behind
+            # older work waiting in the same bucket. With the cap closed a
+            # reply that needs a new slot is not claimable, so the narrow
+            # query decides.
+            row = first_candidate(TaskCommandKind.RESUME_INPUT)
+        if row is None:
+            row = first_candidate()
+        return (
+            (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
+        )
+
+
+def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
+    """Count the commands that pass the dispatcher's database checks.
+
+    Builds on the same query as the dispatcher's candidate scan
+    (``_dispatcher_candidate_query``), seen from ``runner_id``: claim
+    availability, team admission, the earlier-unfinished-command gate and
+    runner routing, plus the START/RESUME_INPUT exclusion without shared
+    execution and the owner lease-recovery filter with it. Whether shared
+    execution is on, and so which variant of each predicate applies, comes
+    from the calling process's ``get_shared_task_execution_enabled()``, not
+    from the worker that would claim. Without shared execution the
+    dispatcher claims through ``claim_task_command``, whose lookup is
+    ``_claimable_query`` alone, which is what this applies in that mode.
+
+    The result is an upper bound on what a dispatcher in ``runner_id`` could
+    claim now. Process-local state is not applied: the per-process dispatch
+    cap (``DispatchCapSnapshot``), which narrows the shared scan while closed
+    and reserves a slot once a candidate that opens an execution is picked,
+    and the busy-task list.
+    Neither are the checks made after a candidate is picked: whether the
+    process consumes commands at all (``consumes_task_commands()``), task
+    owner acquisition and lease checks, and the admission reservation that
+    rechecks capacity under lock. Each of them can only turn a counted
+    command away.
+
+    This is not a backlog depth either. Only the first unfinished command of
+    each task passes, except that a cancel or pause may pass an earlier
+    command that still waits for admission. Under team admission a ticketed
+    command passes when its ticket already holds a slot under the task's
+    current owner, or when no older ticket of its bucket waits for the next
+    slot, the bucket has a free slot and startup pacing allows it. An older
+    ticket queued behind its own task's earlier command, or guidance joining
+    a running execution, does not wait for a slot (``_older_waiter``). A
+    command without a ticket is not gated by admission, and a guidance
+    message that joins its task's running execution passes whatever its
+    ticket says.
+
+    The query runs in ``db``. Unlike the dispatcher's ``first()`` lookup, a
+    count evaluates the correlated admission and earlier-command subqueries
+    for every candidate row, so callers that need a bound should set a
+    statement timeout on that session.
+    """
+    return (
+        _dispatcher_candidate_query(
+            db,
+            runner_id=runner_id,
+            command_db_id=None,
+            shared=get_shared_task_execution_enabled(),
+        )
+        .order_by(None)
+        .count()
+    )
+
+
 async def dispatch_one_task_command(
     executor: CommandExecutor,
     *,
     command_db_id: int | None = None,
+) -> bool:
+    if not get_shared_task_execution_enabled():
+        return await _dispatch_task_command(executor, command_db_id=command_db_id)
+    if not consumes_task_commands():
+        return False
+    from types import SimpleNamespace
+
+    from .task_coordinator_runtime import (
+        _CoordinatorClosed,
+        _CoordinatorInterrupted,
+        get_task_coordinator_registry,
+    )
+    from .task_execution import background_task_manager
+
+    registry = get_task_coordinator_registry()
+    skipped_task_ids = set(registry.busy_command_tasks())
+    while True:
+        cap = build_dispatch_cap_snapshot()
+        candidate = await run_db_io_cancellation_safe(
+            lambda: _find_command_candidate(command_db_id, tuple(skipped_task_ids), cap)
+        )
+        if candidate is None:
+            return False
+        selected_id, task_id, kind = candidate
+        reservation = None
+        if kind.value in EXECUTION_OPENING_KINDS:
+            reservation = background_task_manager.reserve_dispatch_slot(
+                task_id, limit=cap.limit
+            )
+            if reservation is None:
+                # The cap filled after the snapshot. An execution end signals
+                # the dispatcher, which retries then. Releasing another
+                # attempt's reservation signals nothing, so when the slot was
+                # held by an attempt that ends without starting an execution,
+                # the retry waits for the idle interval or the next notify.
+                return False
+        try:
+            coordinator = await registry.ensure(task_id)
+        except BaseException:
+            background_task_manager.release_dispatch_slot(reservation)
+            raise
+        if coordinator is not None and not coordinator._command_tasks:
+            break
+        # Ownership can change after candidate selection. Skip this task
+        # without spending its business retry budget; keep the exclusion
+        # local to this scan so a later dispatch can reconsider it.
+        background_task_manager.release_dispatch_slot(reservation)
+        skipped_task_ids.add(task_id)
+
+    async def apply() -> bool:
+        try:
+            return await _dispatch_task_command(
+                executor, command_db_id=selected_id, cap=cap
+            )
+        except BaseException:
+            coordinator.require_recovery()
+            raise
+
+    try:
+        return await coordinator.execute_command(
+            SimpleNamespace(task_id=task_id, kind=kind), apply
+        )
+    except (TaskCommandDeferred, _CoordinatorClosed):
+        # Ownership health is not a business attempt or deferral.
+        return False
+    except _CoordinatorInterrupted:
+        logger.warning(
+            "task_id=%s component=task-command-dispatcher command application "
+            "was cancelled by something other than the dispatcher (task owner "
+            "close or a cancellation inside the command); any claim it held is "
+            "left for recovery (command_db_id=%s, kind=%s)",
+            task_id,
+            selected_id,
+            kind.value,
+        )
+        return False
+    finally:
+        background_task_manager.release_dispatch_slot(reservation)
+
+
+async def _dispatch_task_command(
+    executor: CommandExecutor,
+    *,
+    command_db_id: int | None = None,
+    cap: DispatchCapSnapshot | None = None,
 ) -> bool:
     runner_id = get_runner_id()
     command = await run_db_io_cancellation_safe(
         lambda: _claim_task_command_isolated(
             runner_id=runner_id,
             command_db_id=command_db_id,
+            cap=cap,
         )
     )
     if command is None:
         return False
 
     stop_event = asyncio.Event()
-    heartbeat = asyncio.get_running_loop().create_task(
-        _claim_heartbeat(command.id, runner_id, command.attempt_count, stop_event)
+    heartbeat = (
+        None
+        if get_shared_task_execution_enabled()
+        else asyncio.get_running_loop().create_task(
+            _claim_heartbeat(command.id, runner_id, command.attempt_count, stop_event)
+        )
     )
+    already_completed = False
     disposition_name: str | None = None
     disposition_operation: CommandDisposition | None = None
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
     heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
-        result = await executor(command)
+        with admission_execution(
+            command.id, command.task_id, command.admission_required
+        ):
+            result = await executor(command)
+    except AdmissionWaiting:
+        disposition_name = "return_to_admission_queue"
+
+        def persist_admission_wait() -> bool:
+            return return_to_admission_queue(
+                command.id, runner_id, command.attempt_count
+            )
+
+        disposition_operation = persist_admission_wait
     except asyncio.CancelledError:
         # Leave the processing claim intact. Another worker may reclaim it only
         # after the claim expires, which avoids concurrent replay on shutdown.
         raise
     except TaskCommandDeferred as exc:
         reason = str(exc)
+        terminal_event = terminal_event_draft_for_error(exc)
 
         def persist_deferral() -> bool:
             return defer_task_command(
@@ -1057,6 +1878,7 @@ async def dispatch_one_task_command(
                 runner_id,
                 reason,
                 expected_attempt_count=command.attempt_count,
+                terminal_event=terminal_event,
             )
 
         disposition_name = "defer_task_command"
@@ -1067,6 +1889,16 @@ async def dispatch_one_task_command(
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
 
+        # An executor that bound its own presentation draft wins; the neutral
+        # literal is only the fallback. The other two dispositions already
+        # read the bound draft — hardcoding here silently discarded the
+        # external input executor's identity-withholding draft
+        # (xorbitsai/xagent-saas#952 M3).
+        rejection_event = terminal_event_draft_for_error(exc) or TerminalTaskEventDraft(
+            message_code=None,
+            resend_safe=False,
+        )
+
         def persist_rejection() -> bool:
             return fail_task_command(
                 command.id,
@@ -1075,6 +1907,7 @@ async def dispatch_one_task_command(
                 force_terminal=True,
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
+                terminal_event=rejection_event,
             )
 
         disposition_name = "fail_task_command"
@@ -1104,6 +1937,7 @@ async def dispatch_one_task_command(
                 command.attempt_count,
             )
             error = str(exc)
+            terminal_event = terminal_event_draft_for_error(exc)
 
             def persist_failure() -> bool:
                 return fail_task_command(
@@ -1111,6 +1945,7 @@ async def dispatch_one_task_command(
                     runner_id,
                     error,
                     expected_attempt_count=command.attempt_count,
+                    terminal_event=terminal_event,
                 )
 
             disposition_name = "fail_task_command"
@@ -1118,6 +1953,7 @@ async def dispatch_one_task_command(
     else:
 
         def persist_completion() -> bool:
+            assert not isinstance(result, SettledTaskCommand)
             return finish_task_command(
                 command.id,
                 runner_id,
@@ -1125,16 +1961,20 @@ async def dispatch_one_task_command(
                 expected_attempt_count=command.attempt_count,
             )
 
-        disposition_name = "finish_task_command"
-        disposition_operation = persist_completion
+        if isinstance(result, SettledTaskCommand):
+            already_completed = True
+        else:
+            disposition_name = "finish_task_command"
+            disposition_operation = persist_completion
     finally:
         stop_event.set()
-        heartbeat_outcome, heartbeat_cancellation = await await_task_settlement(
-            heartbeat
-        )
+        if heartbeat is not None:
+            heartbeat_outcome, heartbeat_cancellation = await await_task_settlement(
+                heartbeat
+            )
 
     with propagate_deferred_cancellation(heartbeat_cancellation):
-        if heartbeat_outcome.requires_ttl_recovery:
+        if heartbeat_outcome.requires_ttl_recovery and not already_completed:
             logger.error(
                 "task_id=%s component=task-command-heartbeat claim is unresolved; "
                 "retaining command claim for expiry (command_id=%s, kind=%s, "
@@ -1148,11 +1988,23 @@ async def dispatch_one_task_command(
             )
             return True
         if disposition_name is not None and disposition_operation is not None:
-            await _persist_task_command_disposition(
+            persisted = await _persist_task_command_disposition(
                 command,
                 disposition=disposition_name,
                 operation=disposition_operation,
             )
+            if not persisted:
+                from .task_coordinator_runtime import current_task_coordinator
+
+                coordinator = current_task_coordinator(command.task_id)
+                if coordinator is not None:
+                    coordinator.require_recovery()
+        elif not already_completed and get_shared_task_execution_enabled():
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(command.task_id)
+            assert coordinator is not None
+            coordinator.require_recovery()
         return True
 
 
@@ -1167,6 +2019,10 @@ async def dispatch_task_command_promptly(
     checkpoint work continues in its own task, allowing the socket receive loop
     to accept the next pause/message command instead of blocking behind it.
     """
+
+    if not consumes_task_commands():
+        notify_task_command_dispatcher()
+        return
 
     task = asyncio.get_running_loop().create_task(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
@@ -1195,45 +2051,111 @@ def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:
         )
 
 
+def _dispatcher_clock() -> float:
+    return time.monotonic()
+
+
+def _dispatcher_failure_backoff_seconds(consecutive_failures: int) -> float:
+    """Return the retry delay after ``consecutive_failures`` (>= 1) failures."""
+
+    exponent = min(max(consecutive_failures, 1) - 1, 16)
+    return min(
+        DISPATCHER_IDLE_SECONDS * float(1 << exponent),
+        DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS,
+    )
+
+
 async def _run_task_command_dispatcher_worker(executor: CommandExecutor) -> None:
+    # Invariant: this loop exits only when the worker task itself is cancelled
+    # (or when stop_task_command_dispatcher cleared the wakeup event).
+    # A CancelledError raised from inside dispatch that nobody aimed at this
+    # task (for example a shared await on another task that was cancelled)
+    # must not end the loop. It is not a failed claim, so it does not feed the
+    # failure backoff below.
+    async def idle_wait(
+        wakeup: asyncio.Event, timeout: float = DISPATCHER_IDLE_SECONDS
+    ) -> None:
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+
+    consecutive_failures = 0
+    suppressed_failures = 0
+    last_failure_logged_at: float | None = None
     while True:
         wakeup = _dispatcher_wakeup
+        slot_freed = _dispatcher_slot_freed
         if wakeup is None:
             return
         # Clear before checking for work. A notify that arrives during the DB
         # claim remains set, so an empty claim cannot erase that wakeup and
-        # sleep while work is waiting.
+        # sleep while work is waiting. The slot-freed event follows the same
+        # rule.
         wakeup.clear()
+        if slot_freed is not None:
+            slot_freed.clear()
         try:
             processed = await dispatch_one_task_command(executor)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
+        except asyncio.CancelledError as exc:
+            if caller_is_cancelling():
+                raise
             logger.error(
-                "component=task-command-dispatcher command dispatch failed; "
-                "worker continuing: %s",
-                exc,
+                "component=task-command-dispatcher dispatch raised a "
+                "cancellation not aimed at this worker; worker continuing",
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
-            try:
-                await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
-            except asyncio.TimeoutError:
-                pass
+            await idle_wait(wakeup)
             continue
+        except Exception as exc:  # noqa: BLE001
+            consecutive_failures += 1
+            retry_in = _dispatcher_failure_backoff_seconds(consecutive_failures)
+            now = _dispatcher_clock()
+            if (
+                last_failure_logged_at is None
+                or now - last_failure_logged_at
+                >= DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS
+            ):
+                logger.error(
+                    "component=task-command-dispatcher command dispatch failed; "
+                    "worker continuing (consecutive_failures=%s "
+                    "suppressed_since_last_log=%s retry_in=%.2fs): %s",
+                    consecutive_failures,
+                    suppressed_failures,
+                    retry_in,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                last_failure_logged_at = now
+                suppressed_failures = 0
+            else:
+                suppressed_failures += 1
+            # A notify still cuts the backoff short: notifies follow a
+            # committed command write, so new work is a strong hint that the
+            # database is reachable again.
+            await idle_wait(wakeup, retry_in)
+            continue
+        if consecutive_failures:
+            logger.info(
+                "component=task-command-dispatcher dispatch recovered after "
+                "%s consecutive failure(s)",
+                consecutive_failures,
+            )
+            consecutive_failures = 0
+            suppressed_failures = 0
+            last_failure_logged_at = None
         if processed:
             continue
-        try:
-            await asyncio.wait_for(wakeup.wait(), timeout=DISPATCHER_IDLE_SECONDS)
-        except asyncio.TimeoutError:
-            pass
+        await _wait_for_work(wakeup, slot_freed, DISPATCHER_IDLE_SECONDS)
 
 
 async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
     """Recover queued commands without serializing unrelated tasks."""
 
-    global _dispatcher_loop, _dispatcher_wakeup
+    global _dispatcher_loop, _dispatcher_wakeup, _dispatcher_slot_freed
     _dispatcher_loop = asyncio.get_running_loop()
     _dispatcher_wakeup = asyncio.Event()
+    _dispatcher_slot_freed = asyncio.Event()
     workers = [
         asyncio.create_task(_run_task_command_dispatcher_worker(executor))
         for _ in range(DISPATCHER_CONCURRENCY)
@@ -1246,16 +2168,106 @@ async def run_task_command_dispatcher(executor: CommandExecutor) -> None:
         await asyncio.gather(*workers, return_exceptions=True)
 
 
-def start_task_command_dispatcher(executor: CommandExecutor) -> asyncio.Task[Any]:
+def _observe_dispatcher_exit(task: asyncio.Task[Any]) -> None:
+    if task is not _dispatcher_task:
+        return  # stopped through stop_task_command_dispatcher
+    try:
+        task.result()
+    except asyncio.CancelledError as error:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher ended by a cancellation "
+            "outside stop_task_command_dispatcher",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    except BaseException as error:  # noqa: BLE001
+        logger.critical(
+            "component=task-command-dispatcher dispatcher exited unexpectedly",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.critical(
+            "component=task-command-dispatcher dispatcher returned while still registered"
+        )
+
+
+def start_task_command_dispatcher(
+    executor: CommandExecutor,
+) -> asyncio.Task[Any] | None:
     global _dispatcher_task
+    if not consumes_task_commands():
+        return None
     if _dispatcher_task is not None and not _dispatcher_task.done():
         return _dispatcher_task
     _dispatcher_task = asyncio.create_task(run_task_command_dispatcher(executor))
+    _dispatcher_task.add_done_callback(_observe_dispatcher_exit)
     return _dispatcher_task
+
+
+async def supervise_task_command_dispatcher(
+    executor: CommandExecutor, stop: asyncio.Event
+) -> None:
+    """Keep the already-started dispatcher running until ``stop`` is set.
+
+    For worker entry points only. It never performs the first start (callers
+    start the dispatcher first). An unexpected exit is restarted in place.
+    An unexpected exit after DISPATCHER_RESTART_LIMIT restarts within
+    DISPATCHER_RESTART_WINDOW_SECONDS raises RuntimeError instead. Whether the
+    process is restarted afterwards is up to whatever runs it: the built-in
+    worker pool stops the whole group when any child exits.
+    """
+
+    loop = asyncio.get_running_loop()
+    restarts: list[float] = []
+    while True:
+        dispatcher = _dispatcher_task
+        if dispatcher is None or dispatcher.done() or dispatcher.get_loop() is not loop:
+            if consumes_task_commands():
+                logger.warning(
+                    "component=task-command-dispatcher no running dispatcher to "
+                    "supervise; command consumption is not supervised in this "
+                    "process"
+                )
+            await stop.wait()
+            return
+        waiter = asyncio.create_task(stop.wait())
+        try:
+            await asyncio.wait(
+                {waiter, dispatcher}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+        if stop.is_set():
+            return
+        if _dispatcher_task is not dispatcher:
+            logger.info(
+                "component=task-command-dispatcher dispatcher stopped explicitly; "
+                "supervision ends"
+            )
+            await stop.wait()
+            return
+        now = loop.time()
+        restarts = [t for t in restarts if now - t < DISPATCHER_RESTART_WINDOW_SECONDS]
+        if len(restarts) >= DISPATCHER_RESTART_LIMIT:
+            raise RuntimeError(
+                f"Task command dispatcher exited unexpectedly {len(restarts) + 1} "
+                f"times within {DISPATCHER_RESTART_WINDOW_SECONDS:g} seconds; exiting"
+            )
+        restarts.append(now)
+        logger.error(
+            "component=task-command-dispatcher restarting dispatcher "
+            "(restart %s of %s within %gs)",
+            len(restarts),
+            DISPATCHER_RESTART_LIMIT,
+            DISPATCHER_RESTART_WINDOW_SECONDS,
+        )
+        start_task_command_dispatcher(executor)
 
 
 async def stop_task_command_dispatcher() -> None:
     global _dispatcher_loop, _dispatcher_task, _dispatcher_wakeup
+    global _dispatcher_slot_freed
     prompt_tasks = list(_prompt_dispatch_tasks)
     for prompt_task in prompt_tasks:
         prompt_task.cancel()
@@ -1266,6 +2278,7 @@ async def stop_task_command_dispatcher() -> None:
     task = _dispatcher_task
     _dispatcher_task = None
     _dispatcher_wakeup = None
+    _dispatcher_slot_freed = None
     _dispatcher_loop = None
     if task is not None and not task.done():
         task.cancel()

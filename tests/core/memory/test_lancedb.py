@@ -431,9 +431,27 @@ def test_embedding_fallback(memory_store):
         results = fallback_store.search("Test content", k=5)
         assert len(results) >= 1
         assert results[0].content == "Test content for fallback"
-
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_list_all_propagates_terminal_search_failure(temp_db_dir, monkeypatch):
+    class BrokenConnection:
+        def open_table(self, _: str):
+            raise RuntimeError("memory table unavailable")
+
+    store = LanceDBMemoryStore(
+        db_dir=temp_db_dir,
+        collection_name="terminal_list_failure",
+    )
+    monkeypatch.setattr(
+        store._vector_store,
+        "get_raw_connection",
+        lambda: BrokenConnection(),
+    )
+
+    with pytest.raises(RuntimeError, match="memory table unavailable"):
+        store.list_all()
 
 
 def test_large_content_handling(memory_store):
@@ -640,7 +658,11 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
         },
     )
 
-    with caplog.at_level(logging.WARNING, logger="xagent.core.memory.lancedb"):
+    # The text fallback streams through retrieval_compatibility, which owns
+    # the skip-and-log for a malformed row.
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.memory.retrieval_compatibility"
+    ):
         results = store.search("note", k=10)
 
     contents = {r.content for r in results}
@@ -649,7 +671,7 @@ def test_text_fallback_skips_malformed_row(temp_db_dir, caplog):
     assert any(
         "Skipping malformed memory row" in record.getMessage()
         and "malformed-ts" in record.getMessage()
-        and "text search" in record.getMessage()
+        and "streaming scan" in record.getMessage()
         for record in caplog.records
     )
 

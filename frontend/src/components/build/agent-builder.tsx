@@ -18,11 +18,16 @@ import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { OfficialMcpSettingsDialog, type AppIntegration } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { createFileChipHTML } from "@/components/chat/FileChip"
+import { readSendDisposition, readSendErrorCode, readSendReason } from "@/components/chat/clarification-delivery"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
+import type { TranslationKey } from "@/i18n/translations"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { useFileMention } from "@/hooks/use-file-mention"
 import { FileMentionDropdown } from "@/components/chat/FileMentionDropdown"
@@ -51,11 +56,14 @@ import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
+import { isMcpSelectionConnected, needsReconnect } from "@/lib/mcp-connection-status"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
 import { AgentFlowView } from "./agent-flow-view"
+import { useBuilderCatalog, type AgentModelConfig, type Model } from "./use-builder-catalog"
+import { BuilderListStatus } from "./builder-list-status"
 import {
   AgentTrigger,
   AgentTriggerType,
@@ -78,61 +86,22 @@ import {
   type UnsharedKnowledgeBase,
 } from "@/lib/team-sharing-sanitizers"
 
-interface KnowledgeBase {
-  name: string
-  [key: string]: any
-}
-
-interface Skill {
-  name: string
-  description?: string
-  when_to_use?: string
-  tags?: string[]
-  [key: string]: any
-}
-
-interface Tool {
-  name: string
-  description: string
-  type: string
-  category: string
-  enabled: boolean
-  [key: string]: any
-}
-
-interface Model {
-  id: number
-  model_id: string
-  model_name: string
-  model_provider: string
-  category: string
-  base_url?: string
-  is_default?: boolean
-  is_small_fast?: boolean
-  is_visual?: boolean
-  is_compact?: boolean
-}
-
-interface UserDefaultModel {
-  id: number
-  config_type: string
-  model: {
-    id: number
-    model_id: string
-    model_name: string
-    model_provider: string
-  }
-}
-
-interface AgentModelConfig {
-  general: number | null
-  small_fast: number | null
-  visual: number | null
-  compact: number | null
-}
-
 interface AgentBuilderProps {
   agentId?: string
+}
+
+interface PreviewAttachment {
+  file_id: string
+  name: string
+  size: number
+  type?: string
+}
+
+interface PreviewRecord {
+  taskId: number
+  configKey: string | null
+  message: string
+  files: Array<File | PreviewAttachment>
 }
 
 interface TemplateRequirements {
@@ -268,6 +237,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   // Set once loadAgent decides to load an owner-scoped MCP list for an admin
   // cross-user view, so the mount-time self-scoped fetch won't clobber it.
   const ownerScopedMcpRef = useRef(false)
+  const seededGeneralRef = useRef<number | null>(null)
   const router = useRouter()
   const searchParams = useSearchParams()
   const templateId = searchParams.get("template")
@@ -360,14 +330,26 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const hasUnresolvedConnectors = unsharedConnectors.some((c) => c.reason === "unresolved")
   const [templateRequirements, setTemplateRequirements] = useState<TemplateRequirements | null>(null)
 
-  // Data State
-  const [models, setModels] = useState<Model[]>([])
-  const [kbs, setKbs] = useState<KnowledgeBase[]>([])
-  const [skills, setSkills] = useState<Skill[]>([])
-  const [tools, setTools] = useState<Tool[]>([])
-  const [mcpServers, setMcpServers] = useState<any[]>([])
+  // Data State: each picker's list loads, fails and retries on its own.
+  const {
+    models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
+    kbs, kbsStatus, reloadKbs,
+    skills, skillsStatus, retrySkills,
+    tools, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    mcpServers, setMcpServers, mcpSettled,
+  } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
-  const [isInitialDataLoaded, setIsInitialDataLoaded] = useState(false)
+  // Catalog entry whose settings dialog runs the reconnect login (#2931).
+  const [reconnectApp, setReconnectApp] = useState<AppIntegration | null>(null)
+  const refreshConnectors = () => {
+    refreshMcpApps().catch(console.error)
+    // Keep the current list unless the refresh returns one: an error
+    // body here would break every connector lookup at render.
+    apiRequest(`${getApiUrl()}/api/mcp/servers`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (Array.isArray(data)) setMcpServers(data) })
+      .catch(console.error)
+  }
 
   const refreshTriggerSummary = useCallback(async () => {
     if (!localAgentId) {
@@ -706,9 +688,48 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const previewTaskIdRef = useRef<number | null>(null)
+  // A reset or new send invalidates in-flight history loads and older sends.
+  const previewGenerationRef = useRef(0)
+  // Bumped by invalidatePreviewTask on config changes; a mismatch still sends the in-flight message but won't cache its task.
+  const previewConfigGenerationRef = useRef(0)
+  // Only an accepted send for the current configuration can complete the guide.
+  // Keep this reactive: invalidating the cached task must also remove its checkmark.
+  const [previewCompletionTaskId, setPreviewCompletionTaskId] = useState<number | null>(null)
+  const [lastPreview, setLastPreview] = useState<PreviewRecord | null>(null)
+  const lastPreviewRef = useRef<PreviewRecord | null>(null)
+  const [previewHistoryLoading, setPreviewHistoryLoading] = useState(false)
+  const [previewHistoryError, setPreviewHistoryError] = useState(false)
+  const [previewSendError, setPreviewSendError] = useState<string | null>(null)
+  const [previewHistoryRetry, setPreviewHistoryRetry] = useState(0)
+  const [previewSending, setPreviewSending] = useState(false)
+  const previewSendingRef = useRef(false)
+  const previewSendSettledRef = useRef<Promise<void> | null>(null)
+
+  const bindPreviewTask = async (agentId: string | number) => {
+    // Saving may finish while a new preview is still uploading. Associate
+    // the settled record, not a staging task that could be rolled back.
+    await previewSendSettledRef.current
+    // Builder-chat callbacks can outlive the render that started the chat.
+    const record = lastPreviewRef.current
+    if (!record) return
+    try {
+      const binding = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/preview-task`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task_id: record.taskId }),
+      })
+      if (!binding.ok) throw new Error("Preview association failed")
+    } catch (error) {
+      console.error("Failed to associate preview:", error)
+      toast.error(t("builds.preview.errors.linkFailed"))
+    }
+  }
 
   const resetPreviewSession = useCallback(() => {
+    previewGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
+    setPreviewSendError(null)
     closeFilePreview()
     dispatch({ type: "CLEAR_MESSAGES" })
     dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
@@ -720,7 +741,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, dispatch, setTaskId])
 
   const invalidatePreviewTask = useCallback(() => {
+    previewConfigGenerationRef.current += 1
     previewTaskIdRef.current = null
+    setPreviewCompletionTaskId(null)
+    setPreviewSendError(null)
   }, [])
 
   useEffect(() => {
@@ -730,113 +754,88 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }, [resetPreviewSession])
 
+  // Save/reload re-creates arrays and model objects without necessarily changing
+  // execution config. Compare the values sent to preview, not their references.
+  const previewConfigKey = JSON.stringify({
+    instructions,
+    executionMode,
+    models: [modelConfig.general, modelConfig.small_fast, modelConfig.visual, modelConfig.compact]
+      .map(id => id ? String(id) : null),
+    knowledgeBases: [...selectedKbs].sort(),
+    skills: [...selectedSkills].sort(),
+    toolCategories: [...new Set(buildToolCategories())].sort(),
+  })
+
   useEffect(() => {
-    if (!previewTaskIdRef.current) {
+    invalidatePreviewTask()
+  }, [previewConfigKey, invalidatePreviewTask])
+
+  const openPreviewRecord = useCallback((record: PreviewRecord) => {
+    closeFilePreview()
+    setPreviewSendError(null)
+    previewTaskIdRef.current = record.taskId
+    setPreviewCompletionTaskId(record.taskId)
+    // The normal task socket restores messages, execution status and files.
+    setTaskId(record.taskId, { navigate: false })
+  }, [closeFilePreview, setTaskId])
+
+  const loadedAgentId = originalData?.id
+  // previewConfigKey reads the model seed and the MCP list; opening a record
+  // before either lands would have it invalidated straight away. This waits
+  // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
+  const previewInputsSettled = modelDefaultsSettled && mcpSettled
+  useEffect(() => {
+    if (!localAgentId || !previewInputsSettled || String(loadedAgentId) !== localAgentId || readOnly) return
+    // Saving a new agent must not replace its currently visible preview.
+    if (lastPreview !== null) {
+      setPreviewHistoryLoading(false)
       return
     }
-    invalidatePreviewTask()
-  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, invalidatePreviewTask])
-
-  // Fetch Data
-  useEffect(() => {
-    const fetchData = async () => {
+    let active = true
+    const generation = previewGenerationRef.current
+    setPreviewHistoryLoading(true)
+    setPreviewHistoryError(false)
+    const load = async () => {
       try {
-        const [kbRes, skillsRes, toolsRes, modelsRes, userDefaultsRes, mcpRes] = await Promise.all([
-          apiRequest(`${getApiUrl()}/api/kb/collections`),
-          apiRequest(`${getApiUrl()}/api/skills/`),
-          apiRequest(`${getApiUrl()}/api/tools/available`),
-          apiRequest(`${getApiUrl()}/api/models/?category=llm`),
-          apiRequest(`${getApiUrl()}/api/models/user-default`),
-          apiRequest(`${getApiUrl()}/api/mcp/servers`)
-        ])
-
-        if (kbRes.ok) {
-          const kbData = await kbRes.json()
-          setKbs(kbData.collections || [])
+        const response = await apiRequest(`${getApiUrl()}/api/agents/${localAgentId}/preview-task`)
+        if (!response.ok) throw new Error("Preview history request failed")
+        const data = await response.json()
+        if (!active || generation !== previewGenerationRef.current || !data?.task_id) return
+        const record: PreviewRecord = {
+          taskId: data.task_id,
+          configKey: data.config_key,
+          message: data.message,
+          files: data.attachments,
         }
-
-        if (skillsRes.ok) {
-          const skillsData = await skillsRes.json()
-          console.log("Skills API response:", skillsData)
-          setSkills(skillsData || [])
-        } else {
-          console.error("Skills API failed:", skillsRes.status, await skillsRes.text())
-        }
-
-        if (toolsRes.ok) {
-          const toolsData = await toolsRes.json()
-          // Filter only enabled tools
-          setTools((toolsData.tools || []).filter((t: Tool) => t.enabled))
-        }
-
-        if (mcpRes.ok && !ownerScopedMcpRef.current) {
-          // Skip when an admin cross-user view has taken over the MCP list
-          // (loadAgent fetches the owner's servers); otherwise this mount fetch
-          // could resolve last and clobber the owner list with the admin's own.
-          const mcpData = await mcpRes.json()
-          // Re-check after the await: loadAgent may have claimed the owner-scoped
-          // list during the JSON parse, and we must not clobber it.
-          if (!ownerScopedMcpRef.current) setMcpServers(mcpData || [])
-        }
-
-        let availableModels: Model[] = []
-        if (modelsRes.ok) {
-          availableModels = await modelsRes.json()
-          setModels(availableModels || [])
-        }
-
-        if (userDefaultsRes.ok) {
-          const userDefaults = await userDefaultsRes.json()
-
-          // Set model config based on user defaults (only for new agent)
-          if (!isEditMode) {
-            const config: AgentModelConfig = {
-              general: null,
-              small_fast: null,
-              visual: null,
-              compact: null,
-            }
-
-            for (const m of userDefaults) {
-              if (m.config_type === 'general') config.general = m.model.id
-              else if (m.config_type === 'small_fast') config.small_fast = m.model.id
-              else if (m.config_type === 'visual') config.visual = m.model.id
-              else if (m.config_type === 'compact') config.compact = m.model.id
-            }
-
-            // Fallback: If no general model set, pick first available LLM
-            if (!config.general && availableModels.length > 0) {
-              // models endpoint was called with ?category=llm so these should be LLMs
-              const firstLlm = availableModels[0]
-              if (firstLlm) {
-                config.general = firstLlm.id
-              }
-            }
-
-            setModelConfig(config)
-          }
-        }
+        lastPreviewRef.current = record
+        setLastPreview(record)
+        openPreviewRecord(record)
       } catch (error) {
-        console.error("Failed to fetch data:", error)
+        console.error("Failed to load preview history:", error)
+        if (active && generation === previewGenerationRef.current) setPreviewHistoryError(true)
       } finally {
-        setIsInitialDataLoaded(true)
+        if (active) setPreviewHistoryLoading(false)
       }
     }
+    void load()
+    return () => { active = false }
+  }, [localAgentId, previewInputsSettled, loadedAgentId, readOnly, previewHistoryRetry, openPreviewRecord, lastPreview])
 
-    fetchData()
-  }, [])
-
-  const refreshKbs = async () => {
-    try {
-      const kbRes = await apiRequest(`${getApiUrl()}/api/kb/collections`)
-      if (kbRes.ok) {
-        const kbData = await kbRes.json()
-        setKbs(kbData.collections || [])
-      }
-    } catch (error) {
-      console.error("Failed to refresh KBs:", error)
-    }
-  }
+  // Server-side creation paths persisted no model config, which rendered "--"
+  // and tripped the required-model guard on save. Seeds only once both the
+  // viewer's default and a model list containing it have landed.
+  useEffect(() => {
+    // Not in a read-only cross-user view: the default below is the viewer's,
+    // so seeding there would render someone else's model as this agent's.
+    if (!isEditMode || readOnly || !originalData) return
+    if (seededGeneralRef.current !== null || modelConfig.general) return
+    const seeded = userDefaultGeneral
+    // Only an id the dropdown can actually show: seeding one that is missing
+    // from the fetched list renders an empty Select while counting as dirty.
+    if (!seeded || !models.some(m => m.id === seeded)) return
+    seededGeneralRef.current = seeded
+    setModelConfig(prev => ({ ...prev, general: seeded }))
+  }, [isEditMode, readOnly, originalData, modelConfig.general, models, userDefaultGeneral])
 
   // Load agent data in edit mode
   useEffect(() => {
@@ -857,6 +856,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           if (!active) return
           setOriginalData(agent)
           setReadOnly(agent.can_edit === false)
+          // Same synchronous block as originalData: React 18 does not batch
+          // across the await below, so leaving this after it lets the seed
+          // effect run against a committed originalData and then be clobbered
+          // -- with the ref already stamped, it would never seed again.
+          if (agent.models) {
+            setModelConfig({
+              general: agent.models.general || null,
+              small_fast: agent.models.small_fast || null,
+              visual: agent.models.visual || null,
+              compact: agent.models.compact || null,
+            })
+          }
           setName(agent.name || "")
           setDescription(agent.description || "")
           setInstructions(agent.instructions || "")
@@ -885,7 +896,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const ownerMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers?user_id=${agent.user_id}`)
             if (!active) return
             if (ownerMcpRes.ok) {
-              setMcpServers((await ownerMcpRes.json()) || [])
+              // A non-list body would break every connector lookup at render.
+              const ownerServers = await ownerMcpRes.json()
+              if (Array.isArray(ownerServers)) setMcpServers(ownerServers)
             }
           } else if (ownerScopedMcpRef.current) {
             // Switching back to a self-owned agent after an admin cross-user view:
@@ -895,22 +908,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             const selfMcpRes = await apiRequest(`${getApiUrl()}/api/mcp/servers`)
             if (!active) return
             if (selfMcpRes.ok) {
-              setMcpServers((await selfMcpRes.json()) || [])
+              const selfServers = await selfMcpRes.json()
+              if (Array.isArray(selfServers)) setMcpServers(selfServers)
             }
           }
 
           setLogoUrl(agent.logo_url || null)
           setLogoRemoved(false)
-
-          // Load models
-          if (agent.models) {
-            setModelConfig({
-              general: agent.models.general || null,
-              small_fast: agent.models.small_fast || null,
-              visual: agent.models.visual || null,
-              compact: agent.models.compact || null,
-            })
-          }
         } else if (response.status === 404) {
           setNotFound(true)
         }
@@ -1062,6 +1066,39 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   })
 
+  // Depends on mcpServers/officialApps having loaded: a preview sent earlier
+  // falls back to the raw MCP selectors.
+  function buildToolCategories(): string[] {
+    const categories = [...selectedToolCategories]
+    if (selectedKbs.length > 0 && !categories.includes("knowledge")) {
+      categories.push("knowledge")
+    }
+    if (hasSshBindings && !categories.includes("ssh")) {
+      categories.push("ssh")
+    }
+
+    // Add selected MCP servers back into tool_categories, resolved to the
+    // real connected MCPServer row's name -- see resolveMcpToolSelector for
+    // why a hard-coded id/name fallback can't work for every app. Deduped:
+    // two distinct selectedMcpServers entries can resolve to the same real
+    // row, and the backend persists tool_categories verbatim (agents.py),
+    // so an unresolved duplicate here lands in the DB and stays there.
+    const resolvedMcpSelectors = new Set(
+      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
+    )
+    resolvedMcpSelectors.forEach(selector => categories.push(`mcp:${selector}`))
+    return categories
+  }
+
+  // Same as buildToolCategories() being non-empty, without resolving MCP selectors (which warns).
+  const hasConfiguredTools =
+    selectedToolCategories.length > 0 || selectedKbs.length > 0 || hasSshBindings || selectedMcpServers.length > 0
+  // load_skill is appended outside tool selection, so a zero-tool agent still gets it.
+  const alwaysAvailableToolNames = [
+    ...(hasConfiguredTools ? intrinsicToolNames : []),
+    ...(skillLoaderTool && selectedSkills.length > 0 ? [skillLoaderTool] : []),
+  ]
+
   // Helper function for category descriptions
   function getCategoryDescription(category: string): string {
     const descriptions: Record<string, string> = {
@@ -1104,25 +1141,49 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     return labels[category] || category
   }
 
-  const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
+  const handlePreviewSendMessage = async (content: string, config?: any, files?: Array<File | PreviewAttachment>, fresh = false) => {
+    if (previewSendingRef.current) {
+      // Reject, rather than acknowledge, so ChatInput retains its draft/files.
+      throw Object.assign(new Error("Preview send is already pending"), { errorCode: "task_busy" })
+    }
+    previewSendingRef.current = true
+    let settleSend!: () => void
+    previewSendSettledRef.current = new Promise<void>(resolve => { settleSend = resolve })
+    setPreviewSending(true)
+    setPreviewHistoryError(false)
+    setPreviewSendError(null)
+    const generationAtStart = ++previewGenerationRef.current
+    const configGenerationAtStart = previewConfigGenerationRef.current
+    const previousTaskId = previewTaskIdRef.current
+    setPreviewCompletionTaskId(null)
+    let failureKey: TranslationKey = "builds.preview.errors.requestFailed"
+    let createdRecord: PreviewRecord | null = null
+    let sendStarted = false
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `preview-error-${Date.now()}`,
-            role: "assistant",
-            content: t("builds.preview.errors.noModel"),
-            timestamp: Date.now().toString(),
-            isResult: true,
-          }
-        })
-        return
+        failureKey = "builds.preview.errors.noModel"
+        throw new Error("Preview requires a general model")
       }
 
-      let previewTaskId = previewTaskIdRef.current
-      const processedFiles = (files || []).map(f => ({
+      let previewTaskId = !fresh && lastPreview?.configKey === previewConfigKey
+        ? previewTaskIdRef.current : null
+      // Uploads are task-bound. A fresh run needs its own copies, never a moved
+      // file_id or broader cross-task access. Download checks existing access;
+      // the normal send path uploads each copy into the new task's scope.
+      const sendFiles = files ? await Promise.all(files.map(async file => {
+        if (file instanceof File) {
+          return fresh ? new File([file], file.name, { type: file.type }) : file
+        }
+        const response = await apiRequest(`${getApiUrl()}/api/files/download/${encodeURIComponent(file.file_id)}`)
+        if (!response.ok) {
+          failureKey = "builds.preview.errors.filesUnavailable"
+          throw new Error("Original preview attachment is unavailable")
+        }
+        return new File([await response.arrayBuffer()], file.name, { type: file.type || "" })
+      })) : undefined
+      if (previewGenerationRef.current !== generationAtStart) return
+      const processedFiles = (sendFiles || []).map(f => ({
         file_id: (f as any).file_id,
         name: f.name,
         size: f.size,
@@ -1134,28 +1195,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
       }
 
-      const finalToolCategories = [...selectedToolCategories]
-      // Match handleCreate below: a preview session with a knowledge base
-      // selected must include "knowledge" too, or it runs with different
-      // categories than the agent it's a preview of.
-      if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
-        finalToolCategories.push("knowledge")
-      }
-      // Resolve each selection to the real, connected MCPServer row's name
-      // (see resolveMcpToolSelector for why a name/id fallback alone isn't
-      // enough -- the backend uses either convention depending on app
-      // type). Depends on mcpServers/officialApps having loaded; if a
-      // preview message is sent before they do, this falls back to the raw
-      // selector for every MCP tool (matching pre-existing behavior for
-      // this call site, not just this connector). Deduped: two distinct
-      // selectedMcpServers entries can resolve to the same real row.
-      const resolvedMcpSelectors = new Set(
-        selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
-      )
-      resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
-      if (hasSshBindings && !finalToolCategories.includes("ssh")) {
-        finalToolCategories.push("ssh")
-      }
+      const finalToolCategories = buildToolCategories()
 
       if (!previewTaskId) {
         const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
@@ -1177,6 +1217,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               tool_categories: finalToolCategories,
               is_preview: true,
               preview_agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,
+              // Compare the selected configuration, not resolved default model
+              // ids. This is history metadata, never an execution instruction.
+              preview_config_key: previewConfigKey,
             },
             execution_mode: executionMode,
             is_visible: false,
@@ -1188,11 +1231,19 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
 
         const taskData = await response.json()
+        if (previewGenerationRef.current !== generationAtStart) return
         previewTaskId = Number(taskData.task_id)
         if (!Number.isFinite(previewTaskId)) {
           throw new Error("Preview task creation returned an invalid task id")
         }
-        previewTaskIdRef.current = previewTaskId
+        // Config edited mid-create: this message still goes to the pre-edit task, the next send starts a fresh one.
+        if (previewConfigGenerationRef.current === configGenerationAtStart) {
+          previewTaskIdRef.current = previewTaskId
+        }
+        const record = { taskId: previewTaskId, configKey: previewConfigKey, message: backendMessage, files: sendFiles || [] }
+        createdRecord = record
+        lastPreviewRef.current = record
+        setLastPreview(record)
 
         // Close any file preview opened from the previous preview task before switching context.
         closeFilePreview()
@@ -1224,19 +1275,71 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
       }
 
-      await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
+      sendStarted = true
+      await sendMessage(backendMessage, {
+        force: true,
+        targetTaskId: previewTaskId,
+        ...(typeof config?.clientMessageId === "string" ? { clientMessageId: config.clientMessageId } : {}),
+      }, sendFiles)
+      if (
+        previewGenerationRef.current === generationAtStart
+        && previewConfigGenerationRef.current === configGenerationAtStart
+      ) {
+        setPreviewCompletionTaskId(previewTaskId)
+      }
     } catch (error) {
       console.error("Preview failed:", error)
-      dispatch({
-        type: "ADD_MESSAGE",
-        payload: {
-          id: `preview-error-${Date.now()}`,
-          role: "assistant",
-          content: t("builds.preview.errors.requestFailed"),
-          timestamp: Date.now().toString(),
-          isResult: true,
+      const disposition = readSendDisposition(error)
+      const notSent = !sendStarted || disposition === "not_sent"
+      const rollbackCreatedTask = createdRecord !== null
+        && lastPreviewRef.current === createdRecord
+        && (notSent || disposition === "rejected")
+      if (rollbackCreatedTask) {
+        // Only discard this send's new staging record. A rejection on an
+        // existing task can follow an accepted/unknown turn and must keep it.
+        // Clear invalidates the visible session, not this history rollback.
+        lastPreviewRef.current = lastPreview
+        setLastPreview(lastPreview)
+      }
+      if (previewGenerationRef.current === generationAtStart) {
+        if (notSent || rollbackCreatedTask) {
+          if (rollbackCreatedTask) {
+            // Restore via the normal history socket, without deleting tasks
+            // or touching earlier uploads. Never reopen a cleared session.
+            previewTaskIdRef.current = previewConfigGenerationRef.current === configGenerationAtStart
+              ? previousTaskId : null
+            setTaskId(state.taskId, { navigate: false })
+            dispatch({ type: "SET_CURRENT_TASK", payload: state.currentTask })
+            dispatch({ type: "SET_PROCESSING", payload: state.isProcessing })
+            if (!state.taskId) dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+          }
+          if (previewConfigGenerationRef.current === configGenerationAtStart) {
+            setPreviewCompletionTaskId(previewCompletionTaskId)
+          }
+          if (notSent && failureKey === "builds.preview.errors.requestFailed") {
+            failureKey = "builds.preview.errors.notSent"
+          }
         }
-      })
+        if (disposition === "outcome_unknown") {
+          failureKey = "clientErrors.messageOutcomeUnknown"
+        } else if (disposition === "rejected") {
+          failureKey = "builds.preview.errors.rejected"
+        }
+        // A send error is UI state, not an assistant result in the old task.
+        const code = readSendErrorCode(error)
+        const reason = disposition === "outcome_unknown" ? ""
+          : code ? t(clientErrorTranslationKey(code)) : readSendReason(error)
+        setPreviewSendError([t(failureKey), reason].filter(Boolean).join(" "))
+        // The composer must preserve its draft/attempt ID without a second toast.
+        throw Object.assign(typeof error === "object" && error !== null ? error : new Error(String(error)), { notificationHandled: true })
+      }
+      // ChatInput and TaskConversationPanel clear text/files only on success.
+      throw error
+    } finally {
+      previewSendingRef.current = false
+      previewSendSettledRef.current = null
+      settleSend()
+      setPreviewSending(false)
     }
   }
 
@@ -1269,7 +1372,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     })
   }
 
-  const isDirty = useMemo(() => {
+  const isDirtyBeyondGeneralModel = useMemo(() => {
     if (!originalData) return false
 
     // Helper to normalize arrays for comparison
@@ -1309,15 +1412,33 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const originalNonMcpCategories = (originalData.tool_categories || []).filter((c: string) => !c.startsWith('mcp:'))
     if (normalize(nonMcpCategories) !== normalize(originalNonMcpCategories)) return true
 
-    // Compare models
+    // Compare models. The general slot is compared outside this memo: the
+    // seed has to leave Update enabled (that is the only flow that persists
+    // it) while not blocking Publish.
     const origModels = originalData.models || {}
-    if ((modelConfig.general || null) !== (origModels.general || null)) return true
     if ((modelConfig.small_fast || null) !== (origModels.small_fast || null)) return true
     if ((modelConfig.visual || null) !== (origModels.visual || null)) return true
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
   }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+
+  const generalModelDiffers =
+    (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
+  // Enables Update, so the seeded value has a way into the database: Publish
+  // posts no body and never persists models.
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  // ...but a slot holding the seeded value is not an edit worth blocking
+  // Publish over, for the very agents the seed exists to unblock. Picking the
+  // seeded model by hand is indistinguishable from the seed itself, which is
+  // harmless: either way the delegation resolves the same default. The
+  // stored-slot test retires the exemption once an Update has persisted a
+  // model, so re-picking the seeded one is then an ordinary unsaved edit.
+  const seedStillUnsaved = !(originalData?.models || {}).general
+  const publishBlockedByEdits =
+    isDirtyBeyondGeneralModel ||
+    (generalModelDiffers &&
+      !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
   // After a successful save, align server-side ownership with the chosen control:
   // promote a personal agent to team (with visibility) or demote a team agent back
@@ -1462,24 +1583,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       return
     }
 
-    let finalToolCategories = [...selectedToolCategories]
-    if (selectedKbs.length > 0 && !finalToolCategories.includes("knowledge")) {
-      finalToolCategories.push("knowledge")
-    }
-    if (hasSshBindings && !finalToolCategories.includes("ssh")) {
-      finalToolCategories.push("ssh")
-    }
-
-    // Add selected MCP servers back into tool_categories, resolved to the
-    // real connected MCPServer row's name -- see resolveMcpToolSelector for
-    // why a hard-coded id/name fallback can't work for every app. Deduped:
-    // two distinct selectedMcpServers entries can resolve to the same real
-    // row, and the backend persists tool_categories verbatim (agents.py),
-    // so an unresolved duplicate here lands in the DB and stays there.
-    const resolvedMcpSelectors = new Set(
-      selectedMcpServers.map(server => resolveMcpToolSelector(server, mcpServers, officialApps))
-    )
-    resolvedMcpSelectors.forEach(selector => finalToolCategories.push(`mcp:${selector}`))
+    const finalToolCategories = buildToolCategories()
 
     setIsCreating(true)
 
@@ -1569,6 +1673,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         } else {
           const newAgent = await response.json()
           setCreatedAgent(newAgent)
+          // Preview uploads must not block saving triggers or ownership.
+          void bindPreviewTask(newAgent.id)
 
           // Staged triggers (configured before the agent existed, #928) go
           // through the regular trigger API now that a real agent id exists.
@@ -1786,7 +1892,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const isTemplateEntry = Boolean(templateId) && !isEditMode
-  const isTemplateRequirementsPending = isTemplateEntry && (!isInitialDataLoaded || loadingAgent || !templateRequirements)
+  // Of the catalog lists, only MCP feeds the requirement checks below.
+  const isTemplateRequirementsPending = isTemplateEntry && (!mcpSettled || loadingAgent || !templateRequirements)
   const isTemplateBuildFlow = isTemplateEntry && !isTemplateRequirementsPending
   const templateMissingKb = Boolean(
     isTemplateBuildFlow &&
@@ -1807,29 +1914,26 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const isSelected = selectedMcpServers.some((name) => mcpNameMatches(name, serverName))
       const connectedServer = findMatchingMcpServer(mcpServers, serverName)
       const connectedApp = findMatchingMcpApp(officialApps, serverName)
-      const isConnected = Boolean(connectedServer || connectedApp?.is_connected)
+      const isConnected = isMcpSelectionConnected(connectedServer, connectedApp)
       return !isSelected || !isConnected
     })
   )
-  const useTemplateSpecificHighlights =
-    templateMissingKb || templateMissingSkills || templateMissingTools || templateMissingMcp
   const describeStepCompleted = Boolean(name.trim() && description.trim() && instructions.trim())
-  const configStepCompleted = isTemplateRequirementsPending
-    ? false
-    : isTemplateBuildFlow
-      ? !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
-      : (
-        selectedKbs.length > 0 ||
-        selectedSkills.length > 0 ||
-        selectedToolCategories.length > 0 ||
-        selectedMcpServers.length > 0
-      )
-  const previewStepCompleted = state.messages.some((message) => message.role === "user")
-  const shouldHighlightConfigStep = !configStepCompleted
-  const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
-  const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep
-  const shouldHighlightToolsSection = useTemplateSpecificHighlights ? templateMissingTools : shouldHighlightConfigStep
-  const shouldHighlightConnectorSection = useTemplateSpecificHighlights ? templateMissingMcp : shouldHighlightConfigStep
+  // Plain agents need a model, not an arbitrary optional tool or connector.
+  // Templates still require their declared capabilities before this step completes.
+  const configStepCompleted = Boolean(modelConfig.general)
+    && !isTemplateRequirementsPending
+    && (!isTemplateBuildFlow || (
+      !templateMissingKb && !templateMissingSkills && !templateMissingTools && !templateMissingMcp
+    ))
+  const previewStepCompleted = previewCompletionTaskId !== null
+    && lastPreview?.configKey === previewConfigKey
+    && state.taskId === previewCompletionTaskId
+    && state.currentTask?.id === String(previewCompletionTaskId)
+    && state.currentTask?.status === "completed"
+    && state.currentTask.completionOutcome !== "partial"
+    && state.currentTask.completionOutcome !== "blocked"
+    && !state.isProcessing
 
   const buildSteps = [
     {
@@ -2005,11 +2109,22 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <Button
                     variant="secondary"
                     onClick={handlePublish}
-                    disabled={isCreating || loadingAgent || isDirty}
+                    disabled={isCreating || loadingAgent || publishBlockedByEdits}
                   >
                     {t("builds.editor.header.publish")}
                   </Button>
                 )
+              )}
+              {isEditMode && originalData?.status === "published" && (
+                <Button
+                  variant="secondary"
+                  onClick={() => router.push(`/agent/${localAgentId}`)}
+                  disabled={isCreating || loadingAgent || publishBlockedByEdits || failedStagedTriggers.length > 0 || createdWebhookSecrets.length > 0}
+                  title={publishBlockedByEdits ? t("builds.editor.header.saveBeforeChat") : undefined}
+                >
+                  <MessageSquare className="mr-2 h-4 w-4" />
+                  {t("builds.editor.header.startChat")}
+                </Button>
               )}
             </>
           )}
@@ -2245,7 +2360,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Model Selection */}
-        <div ref={modelSectionRef} className="space-y-4">
+        <div ref={modelSectionRef} className={cn(getConfigSectionClasses(!modelConfig.general), "space-y-4")}>
           <div className="flex items-center justify-between">
             <Label>{t("builds.configForm.model.label")}</Label>
             <Button
@@ -2279,9 +2394,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               />
             </div>
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.model.noData")}
-            </div>
+            <BuilderListStatus status={modelsStatus} onRetry={retryModels}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.model.noData")}
+              </div>
+            </BuilderListStatus>
           )}
 
           <Dialog open={isModelConfigOpen} onOpenChange={setIsModelConfigOpen}>
@@ -2372,7 +2489,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         </div>
 
         {/* Knowledge Base - Multi Select */}
-        <div className={getConfigSectionClasses(shouldHighlightKbSection)}>
+        <div className={getConfigSectionClasses(templateMissingKb)}>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <Label>{t("builds.configForm.knowledgeBase.label")}</Label>
@@ -2424,10 +2541,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             placeholder={t("builds.configForm.knowledgeBase.placeholder")}
             disabled={readOnly}
           />
+          {/* The picker stays mounted so saved KBs remain visible; a reload
+              after creating a KB keeps the loaded list without a status line. */}
+          {kbs.length === 0 && kbsStatus !== "ready" && (
+            <BuilderListStatus status={kbsStatus} onRetry={reloadKbs}>{null}</BuilderListStatus>
+          )}
         </div>
 
         {/* Skills - Multi Select */}
-        <div className={getConfigSectionClasses(shouldHighlightSkillsSection)}>
+        <div className={getConfigSectionClasses(templateMissingSkills)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("builds.configForm.skills.label")}</Label>
             <InfoTooltip content={t("builds.configForm.model.tips.skills")} />
@@ -2461,14 +2583,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               disabled={readOnly}
             />
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.skills.noData")}
-            </div>
+            <BuilderListStatus status={skillsStatus} onRetry={retrySkills}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.skills.noData")}
+              </div>
+            </BuilderListStatus>
           )}
         </div>
 
         {/* Tools - Multi Select by Category */}
-        <div className={getConfigSectionClasses(shouldHighlightToolsSection)}>
+        <div className={getConfigSectionClasses(templateMissingTools)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("builds.configForm.tools.label")}</Label>
             <InfoTooltip content={t("builds.configForm.model.tips.tools")} />
@@ -2502,15 +2626,25 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               disabled={readOnly}
             />
           ) : (
-            <div className="text-sm text-muted-foreground">
-              {t("builds.configForm.tools.noData")}
-            </div>
+            <BuilderListStatus status={toolsStatus} onRetry={retryTools}>
+              <div className="text-sm text-muted-foreground">
+                {t("builds.configForm.tools.noData")}
+              </div>
+            </BuilderListStatus>
           )}
-          {selectedToolCategories.length > 0 && (
+          {/* The tool count is meaningless until the tools list has loaded. */}
+          {toolsStatus === "ready" && selectedToolCategories.length > 0 && (
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,
                 tools: tools.filter(t => selectedToolCategories.includes(t.category)).length
+              })}
+            </div>
+          )}
+          {alwaysAvailableToolNames.length > 0 && (
+            <div className="text-xs text-muted-foreground">
+              {t("builds.configForm.tools.alwaysAvailable", {
+                tools: alwaysAvailableToolNames.join(", "),
               })}
             </div>
           )}
@@ -2647,7 +2781,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         )}
 
-        <div className={getConfigSectionClasses(shouldHighlightConnectorSection)}>
+        <div className={getConfigSectionClasses(templateMissingMcp)}>
           <div className="flex items-center gap-1.5">
             <Label>{t("tools.mcp.dialog.connector")}</Label>
           </div>
@@ -2655,12 +2789,25 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             {selectedMcpServers.map((serverName, index) => {
               const connectedServer = findMatchingMcpServer(mcpServers, serverName)
               const matchingApp = findMatchingMcpApp(officialApps, serverName)
-              const isConnected = Boolean(connectedServer || matchingApp?.is_connected)
+              // The row stays listed after its grant stops working, so its
+              // presence alone is not "connected". Display only: the row must
+              // stay in mcpServers, which resolves the saved mcp: selector.
+              const reconnectNeeded = needsReconnect(connectedServer)
+              const isConnected = isMcpSelectionConnected(connectedServer, matchingApp)
               const isSupported = Boolean(matchingApp)
+              // An admin viewing another user's agent sees the owner's rows; a
+              // login started here would reconnect the admin's own account.
+              // builtin_oauth matches the gate the reconnect dialog applies.
+              const canReconnect = reconnectNeeded
+                && matchingApp?.auth_type === "builtin_oauth"
+                && !readOnly
+                && !ownerScopedMcpRef.current
 
               let statusDesc = ""
 
-              if (connectedServer) {
+              if (reconnectNeeded) {
+                statusDesc = t("tools.mcp.needsReconnectDescription")
+              } else if (connectedServer) {
                 statusDesc = connectedServer.description || ""
               } else if (matchingApp?.is_connected) {
                 statusDesc = matchingApp.description || ""
@@ -2675,10 +2822,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
-                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>
+                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && !reconnectNeeded && "opacity-50 bg-muted/50")}>
                   <div className="bg-slate-100 p-1.5 rounded">
                     {icon ? (
-                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && "grayscale")} />
+                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && !reconnectNeeded && "grayscale")} />
                     ) : (
                       <span className="text-xl">🔌</span>
                     )}
@@ -2686,7 +2833,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <div>
                     <div className="text-sm font-medium flex items-center gap-2">
                       {server.name}
-                      {!isConnected && (
+                      {reconnectNeeded ? (
+                        <NeedsReconnectBadge />
+                      ) : !isConnected && (
                         <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded font-normal whitespace-nowrap">
                           {t("tools.mcp.mcpUnavailable")}
                         </span>
@@ -2694,7 +2843,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                     </div>
                     <div className="text-xs text-muted-foreground">{server.description}</div>
                   </div>
-                  <div className="ml-auto">
+                  <div className="ml-auto flex items-center gap-1">
+                    {canReconnect && matchingApp && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={() => setReconnectApp({ ...matchingApp, connection_status: connectedServer.connection_status })}
+                      >
+                        {t("tools.mcp.dialog.reconnect")}
+                      </Button>
+                    )}
                     <Button
                       type="button"
                       variant="ghost"
@@ -2897,6 +3057,38 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </Button>
         </div>
       </div>
+      {previewHistoryLoading && (
+        <div className="px-4 py-2 text-xs text-muted-foreground" role="status">{t("builds.preview.historyLoading")}</div>
+      )}
+      {previewHistoryError && (
+        <div className="flex items-center gap-2 border-b px-4 py-2 text-xs" role="alert">
+          <span>{t("builds.preview.errors.historyFailed")}</span>
+          <Button size="sm" variant="ghost" onClick={() => setPreviewHistoryRetry(value => value + 1)}>{t("common.retry")}</Button>
+        </div>
+      )}
+      {previewSendError && (
+        <div className="border-b px-4 py-2 text-xs text-destructive" role="alert">{previewSendError}</div>
+      )}
+      {lastPreview && (
+        <div className="space-y-2 border-b px-4 py-3 text-xs">
+          <p role="status" className={lastPreview.configKey !== previewConfigKey ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"}>
+            {t(lastPreview.configKey === null ? "builds.preview.configUnknown" : lastPreview.configKey !== previewConfigKey ? "builds.preview.configChanged" : "builds.preview.currentConfig")}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {state.taskId !== lastPreview.taskId && (
+              <Button size="sm" variant="outline" disabled={previewSending} onClick={() => openPreviewRecord(lastPreview)}>{t("builds.preview.viewLast")}</Button>
+            )}
+            <Button size="sm" variant="outline"
+              disabled={previewSending || state.isProcessing || state.isHistoryLoading || previewHistoryLoading || loadingAgent || !modelConfig.general || !lastPreview.message}
+              onClick={() => void handlePreviewSendMessage(lastPreview.message, undefined, lastPreview.files, true)
+                .catch(error => {
+                  if (error?.errorCode === "task_busy") toast.error(t("clientErrors.taskBusy"))
+                })}>
+              {t("builds.preview.rerunSample")}
+            </Button>
+          </div>
+        </div>
+      )}
       <div className="flex-1 min-h-0">
         <TaskConversationPanel
           mode="embedded-preview"
@@ -2905,6 +3097,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           showDagPreview={false}
           showTaskFiles={true}
           autoFocusInput={false}
+          deferFileUpload={true}
           onSend={handlePreviewSendMessage}
         />
       </div>
@@ -2938,7 +3131,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               modelConfig, selectedKbs, selectedSkills, selectedToolCategories
             }}
             onUpdateConfig={(updates) => {
-              if (updates.id !== undefined) setLocalAgentId(updates.id.toString());
+              if (updates.id !== undefined) {
+                if (!localAgentId) void bindPreviewTask(updates.id)
+                setLocalAgentId(updates.id.toString())
+              }
               if (updates.name !== undefined) setName(updates.name);
               if (updates.description !== undefined) setDescription(updates.description);
               if (updates.instructions !== undefined) setInstructions(updates.instructions);
@@ -2947,7 +3143,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               if (updates.modelConfig !== undefined) setModelConfig(updates.modelConfig);
               if (updates.selectedKbs !== undefined) setSelectedKbs(updates.selectedKbs);
               if (updates.selectedSkills !== undefined) setSelectedSkills(updates.selectedSkills);
-              if (updates.selectedToolCategories !== undefined) setSelectedToolCategories(updates.selectedToolCategories);
+              const chatCategories = updates.selectedToolCategories
+              // Chat never writes connectors: keep a bare "mcp" grant or saving revokes it.
+              if (chatCategories !== undefined) setSelectedToolCategories(prev => [...chatCategories, ...prev.filter(c => c === "mcp")]);
             }}
             availableOptions={{
               models: (Array.isArray(models) ? models : []).map(m => ({ id: m.id, name: m.model_name || m.model_id })),
@@ -2982,7 +3180,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           <DialogFooter className="gap-2 sm:justify-end">
             <div className="flex w-full sm:w-auto gap-2 justify-end">
               <Button variant="outline" onClick={handleDialogClose}>
-                {t("common.cancel")}
+                {t("builds.editor.success.keepEditing")}
               </Button>
               <Button onClick={handleDialogPublish}>
                 {t("builds.editor.header.publish")}
@@ -3039,7 +3237,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         open={isKbModalOpen}
         onOpenChange={setIsKbModalOpen}
         onSuccess={(createdCollections) => {
-          refreshKbs()
+          void reloadKbs()
           if (createdCollections && createdCollections.length > 0) {
             setSelectedKbs(prev => {
               const newKbs = Array.from(new Set([...prev, ...createdCollections]))
@@ -3089,13 +3287,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           onConnectSelected={(selectedApps) => {
             setSelectedMcpServers(selectedApps)
           }}
-          onSuccess={() => {
-            refreshMcpApps().catch(console.error)
-            apiRequest(`${getApiUrl()}/api/mcp/servers`)
-              .then(res => res.json())
-              .then(data => setMcpServers(data || []))
-              .catch(console.error)
-          }}
+          onSuccess={refreshConnectors}
+        />
+      )}
+      {!readOnly && !loadingAgent && (
+        <OfficialMcpSettingsDialog
+          open={reconnectApp !== null}
+          onOpenChange={(nextOpen) => { if (!nextOpen) setReconnectApp(null) }}
+          app={reconnectApp}
+          onSuccess={refreshConnectors}
         />
       )}
     </div>

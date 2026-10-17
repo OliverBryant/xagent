@@ -1,9 +1,15 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { useLayoutEffect } from "react"
-import { act, renderHook, waitFor } from "@testing-library/react"
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
+  DEAD_AFTER_MS,
+  MessageDeliveryError,
+  type ConnectionPhaseFacts,
   type WebSocketConnection,
+  deriveConnectionPhase,
   useWebSocket,
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
@@ -124,6 +130,10 @@ function writeAuthCache(
   }))
 }
 
+// Hooks left mounted keep their real reconnect timers and would open sockets
+// into a later test's MockWebSocket.instances.
+afterEach(() => cleanup())
+
 describe("useWebSocket message delivery", () => {
   beforeEach(() => {
     MockWebSocket.instances = []
@@ -161,6 +171,7 @@ describe("useWebSocket message delivery", () => {
     await expect(result.current.sendChatMessage("keep this draft")).rejects.toMatchObject({
       message: "Message not sent: the connection is not ready.",
       disposition: "not_sent",
+      errorCode: "connection_not_ready",
     })
   })
 
@@ -229,6 +240,43 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("serializes the interaction request id with the caller's delivery id", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection(),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+
+    let delivery!: Promise<{ client_message_id: string; turn_id: string }>
+    act(() => {
+      delivery = result.current.sendChatMessage(
+        "City: Sydney",
+        undefined,
+        true,
+        "answer-q1",
+        "inputreq_0011223344556677889900aabbccddee",
+      )
+    })
+
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toMatchObject({
+      type: "chat",
+      message: "City: Sydney",
+      client_message_id: "answer-q1",
+      request_id: "inputreq_0011223344556677889900aabbccddee",
+    })
+    act(() => socket.receive({
+      type: "message_accepted",
+      client_message_id: "answer-q1",
+      turn_id: "answer-q1",
+    }))
+    await expect(delivery).resolves.toEqual({
+      client_message_id: "answer-q1",
+      turn_id: "answer-q1",
+    })
+  })
+
   it("assigns idempotency keys to pause and resume commands", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -255,6 +303,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -300,6 +349,328 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("marks a coded backend rejection as localizable and user facing", async () => {
+    // The clarification form only shows a rejection reason that is marked
+    // user facing; if this flag regresses, the visitor drops back to the
+    // generic "Failed to send response" toast.
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-with-reason",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-with-reason",
+        error_code: "guidance_in_progress",
+        message: "A previous guidance message is still being applied. Please wait for it to finish.",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "A previous guidance message is still being applied. Please wait for it to finish.",
+      disposition: "rejected",
+      userFacing: true,
+      errorCode: "guidance_in_progress",
+    })
+  })
+
+  it("preserves absent-code rejection prose for a trusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "trusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "trusted-legacy-rejection",
+        message: "Legacy actionable authenticated rejection",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Legacy actionable authenticated rejection",
+      disposition: "rejected",
+      userFacing: true,
+      errorCode: null,
+    })
+  })
+
+  it("hides absent-code rejection prose for an untrusted legacy transport", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "untrusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "untrusted-legacy-rejection",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "untrusted-legacy-rejection",
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it("keeps a rejection without a backend reason marked as not user facing", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-no-reason",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-no-reason",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it("does not trust a rejection carrying an unknown error code", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-unknown-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-unknown-code",
+        error_code: "provider_secret",
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
+    ["object", {}],
+    ["number", 7],
+    ["array", ["provider_secret"]],
+    ["boolean", false],
+    ["null", null],
+  ])("does not trust a rejection carrying a malformed %s error code", async (_label, malformedCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-malformed-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-malformed-code",
+        error_code: malformedCode,
+        message: "provider token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it("gives a trusted rejection with blank prose and no code the not-accepted code", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-blank-prose",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-blank-prose",
+        message: "   ",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
+    "upload_failed",
+    "connection_not_ready",
+  ])("gives a definitive rejection naming the client-only code %s the not-accepted code", async (clientOnlyCode) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      legacyErrorProse: "trusted",
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-client-only-code",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-client-only-code",
+        error_code: clientOnlyCode,
+        message: "token=secret",
+        rejection_outcome: "not_accepted",
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "rejected",
+      userFacing: false,
+      errorCode: "message_not_accepted",
+    })
+  })
+
+  it.each([
+    ["an unrecognised code with an explicit outcome_unknown outcome", { error_code: "provider_secret", rejection_outcome: "outcome_unknown" }],
+    ["an unrecognised code with no outcome field", { error_code: "provider_secret" }],
+    ["a client-only code with an outcome_unknown outcome", { error_code: "connection_not_ready", rejection_outcome: "outcome_unknown" }],
+  ])("shows the outcome-unknown code for %s", async (_label, frame) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage(
+      "answer",
+      undefined,
+      false,
+      "rejected-outcome-unknown",
+    )
+    act(() => {
+      socket.receive({
+        type: "message_rejected",
+        client_message_id: "rejected-outcome-unknown",
+        message: "token=secret",
+        ...frame,
+      })
+    })
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "Message was rejected.",
+      disposition: "outcome_unknown",
+      userFacing: false,
+      errorCode: "message_outcome_unknown",
+    })
+  })
+
   it("rejects concurrent reuse of a pending client message id without replacing its owner", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -339,6 +710,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -366,6 +738,26 @@ describe("useWebSocket message delivery", () => {
       retryWithNewId: true,
       disposition: "rejected",
     })
+  })
+
+  it("forwards a personal unknown notice after inbox acceptance without resending", async () => {
+    const onMessage = vi.fn()
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, onMessage }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    const delivery = result.current.sendChatMessage("uncertain", undefined, false, "original-id")
+    act(() => socket.receive({ type: "message_accepted", client_message_id: "original-id" }))
+    await delivery
+    act(() => {
+      socket.receive({ type: "message_rejected", client_message_id: "original-id", rejection_outcome: "outcome_unknown", error_code: "message_outcome_unknown" })
+      socket.receive({ type: "error", task_id: 1, client_message_id: "original-id", turn_id: "original-id", error_code: "message_outcome_unknown" })
+    })
+    expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "error", task_id: 1,
+      data: expect.objectContaining({ client_message_id: "original-id", error_code: "message_outcome_unknown" }),
+    }))
+    expect(socket.send).toHaveBeenCalledTimes(1)
   })
 
   it("allows the same text to be sent again after the first ack", async () => {
@@ -417,10 +809,14 @@ describe("useWebSocket message delivery", () => {
     await expect(delivery).rejects.toMatchObject({
       message: "Connection closed before the message was accepted.",
       disposition: "outcome_unknown",
+      errorCode: "message_outcome_unknown",
     })
   })
 
-  it("rejects an unacknowledged delivery after 30 seconds", async () => {
+  it.each([
+    ["retires the connection when nothing at all arrives", false],
+    ["keeps the connection when any frame but no acknowledgement arrives", true],
+  ] as const)("%s for 30 seconds after a send", async (_name, frameAfterSend) => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
@@ -434,13 +830,19 @@ describe("useWebSocket message delivery", () => {
     try {
       const delivery = result.current.sendChatMessage("timeout draft")
       const rejection = expect(delivery).rejects.toMatchObject({
-        message: "Message delivery was not acknowledged. Your draft was kept.",
+        message: frameAfterSend
+          ? "Message delivery was not acknowledged. Your draft was kept."
+          : "Connection lost before the message was accepted.",
         disposition: "outcome_unknown",
+        errorCode: "message_outcome_unknown",
       })
+      if (frameAfterSend) act(() => socket.receive({ type: "heartbeat" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
       await rejection
+      expect(socket.close.mock.calls).toEqual(frameAfterSend ? [] : [[1000, "Connection liveness timeout"]])
+      expect(result.current.connectionPhase).toBe(frameAfterSend ? "connected" : "reconnecting")
     } finally {
       vi.useRealTimers()
     }
@@ -454,6 +856,7 @@ describe("useWebSocket message delivery", () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
+      legacyErrorProse: "trusted",
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const socket = MockWebSocket.instances[0]
@@ -471,6 +874,28 @@ describe("useWebSocket message delivery", () => {
       message: "ambiguous delivery",
       disposition,
     })
+  })
+})
+
+describe("MessageDeliveryError display code", () => {
+  it.each([
+    ["an unknown outcome with no code", "outcome_unknown", false, undefined, "message_outcome_unknown"],
+    ["an unknown outcome with an explicit null code", "outcome_unknown", false, null, "message_outcome_unknown"],
+    ["a user-facing unknown outcome with no code", "outcome_unknown", true, undefined, null],
+    ["an unknown outcome with an explicit code", "outcome_unknown", false, "task_busy", "task_busy"],
+    ["a not-sent failure with no code", "not_sent", false, undefined, null],
+    ["a rejection with no code", "rejected", false, undefined, null],
+  ] as const)("derives the code for %s", (_label, disposition, userFacing, errorCode, expected) => {
+    const error = new MessageDeliveryError("diagnostic text", disposition, {
+      userFacing,
+      ...(errorCode === undefined ? {} : { errorCode }),
+    })
+
+    expect(error.errorCode).toBe(expected)
+    // Only the code is derived; every other field keeps its input.
+    expect(error.retryWithNewId).toBe(false)
+    expect(error.userFacing).toBe(userFacing)
+    expect(error.message).toBe("diagnostic text")
   })
 })
 
@@ -509,7 +934,7 @@ describe("useWebSocket normalized connections", () => {
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token")
+    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token&liveness=heartbeat")
     expect(MockWebSocket.instances[0].protocols).toBeUndefined()
   })
 
@@ -528,12 +953,421 @@ describe("useWebSocket normalized connections", () => {
       message: "legacy",
       task_id: 7,
       client_message_id: "legacy-turn",
+      context: { timezone: expect.any(String) },
     })
     act(() => socket.receive({
       type: "message_accepted",
       client_message_id: "legacy-turn",
     }))
     await delivery
+  })
+
+  it("reports the browser timezone so the agent clock can render local time", async () => {
+    // Pinned, not read back from Intl: asserting against the same source the
+    // code reads makes the test tautological on a UTC host.
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions)
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("what is tomorrow", undefined, false, "tz-turn")
+      const sent = JSON.parse(socket.send.mock.calls[0][0])
+      expect(sent.context).toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "tz-turn",
+      }))
+      await delivery
+    } finally {
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("prefers the embedder-declared timezone from the iframe URL over the browser zone", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions)
+    window.history.replaceState({}, "", "/widget/chat/session?timezone=Australia%2FPerth")
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("hi", undefined, false, "declared-turn")
+      const sent = JSON.parse(socket.send.mock.calls[0][0])
+      expect(sent.context).toEqual({ timezone: "Australia/Perth" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "declared-turn",
+      }))
+      await delivery
+    } finally {
+      resolvedOptions.mockRestore()
+      window.history.replaceState({}, "", "/")
+    }
+  })
+
+  it("falls back to the browser zone when the declared timezone is blank", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions)
+    window.history.replaceState({}, "", "/widget/chat/session?timezone=%20%20")
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("hi", undefined, false, "blank-declared")
+      const sent = JSON.parse(socket.send.mock.calls[0][0])
+      expect(sent.context).toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "blank-declared",
+      }))
+      await delivery
+    } finally {
+      resolvedOptions.mockRestore()
+      window.history.replaceState({}, "", "/")
+    }
+  })
+
+  it("omits the context entirely when the browser cannot resolve a timezone", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "" } as Intl.ResolvedDateTimeFormatOptions)
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("hi", undefined, false, "no-tz-turn")
+      const sent = JSON.parse(socket.send.mock.calls[0][0])
+      expect("context" in sent).toBe(false)
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "no-tz-turn",
+      }))
+      await delivery
+    } finally {
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("keeps a same-id retry bound to the zone of its first attempt", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions)
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const first = result.current.sendChatMessage("same", undefined, false, "retry-id")
+      expect(JSON.parse(socket.send.mock.calls[0][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      // Unknown outcome: the command may already be executing server-side, so
+      // the client retries under the same id.
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "retry-id",
+        message: "connection lost",
+      }))
+      await expect(first).rejects.toThrow()
+
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+
+      const retry = result.current.sendChatMessage("same", undefined, true, "retry-id")
+      expect(JSON.parse(socket.send.mock.calls[1][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "retry-id",
+      }))
+      await retry
+
+      // A genuinely new id picks up the current zone.
+      const fresh = result.current.sendChatMessage("next", undefined, false, "fresh-id")
+      expect(JSON.parse(socket.send.mock.calls[2][0]).context)
+        .toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "fresh-id",
+      }))
+      await fresh
+    } finally {
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("frees the attempt zone after a not-sent failure so a same-id retry re-resolves", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions)
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      socket.send.mockImplementationOnce(() => {
+        throw new Error("socket closed during write")
+      })
+      const failed = result.current.sendChatMessage("same", undefined, false, "reuse-id")
+      await expect(failed).rejects.toThrow()
+
+      // Nothing reached the server, so the same id is free to adopt the new zone.
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+      const retry = result.current.sendChatMessage("same", undefined, false, "reuse-id")
+      // calls[0] is the throwing send (still records its args); the retry is calls[1].
+      expect(JSON.parse(socket.send.mock.calls[1][0]).context)
+        .toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "reuse-id",
+      }))
+      await retry
+    } finally {
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("keeps a same-id retry context-free when the first attempt had no zone", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "" } as Intl.ResolvedDateTimeFormatOptions)
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const first = result.current.sendChatMessage("same", undefined, false, "omit-id")
+      expect("context" in JSON.parse(socket.send.mock.calls[0][0])).toBe(false)
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "omit-id",
+        message: "connection lost",
+      }))
+      await expect(first).rejects.toThrow()
+
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+
+      const retry = result.current.sendChatMessage("same", undefined, true, "omit-id")
+      expect("context" in JSON.parse(socket.send.mock.calls[1][0])).toBe(false)
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "omit-id",
+      }))
+      await retry
+    } finally {
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("frees the attempt zone when a late accepted ack follows a timeout", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions)
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 7,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    vi.useFakeTimers()
+    try {
+      const first = result.current.sendChatMessage("same", undefined, false, "late-id")
+      first.catch(() => {})
+      expect(JSON.parse(socket.send.mock.calls[0][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
+      await act(async () => {
+        vi.advanceTimersByTime(30000)
+      })
+      await expect(first).rejects.toMatchObject({ disposition: "outcome_unknown" })
+
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+      // Late terminal ack for the same id after the timeout removed the pending
+      // entry: the binding must be released.
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "late-id",
+      }))
+
+      const retry = result.current.sendChatMessage("same", undefined, true, "late-id")
+      expect(JSON.parse(socket.send.mock.calls[1][0]).context)
+        .toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "late-id",
+      }))
+      await retry
+    } finally {
+      vi.useRealTimers()
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("frees the attempt zone when a late not_accepted reject follows a timeout", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions)
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 7,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    vi.useFakeTimers()
+    try {
+      const first = result.current.sendChatMessage("same", undefined, false, "late-rej")
+      first.catch(() => {})
+      expect(JSON.parse(socket.send.mock.calls[0][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
+      await act(async () => {
+        vi.advanceTimersByTime(30000)
+      })
+      await expect(first).rejects.toMatchObject({ disposition: "outcome_unknown" })
+
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "late-rej",
+        message: "rejected outright",
+        rejection_outcome: "not_accepted",
+      }))
+
+      const retry = result.current.sendChatMessage("same", undefined, true, "late-rej")
+      expect(JSON.parse(socket.send.mock.calls[1][0]).context)
+        .toEqual({ timezone: "America/New_York" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "late-rej",
+      }))
+      await retry
+    } finally {
+      vi.useRealTimers()
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("keeps the attempt zone after a timeout until a terminal ack arrives", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockReturnValue({ timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions)
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 7,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    vi.useFakeTimers()
+    try {
+      const first = result.current.sendChatMessage("same", undefined, false, "keep-id")
+      first.catch(() => {})
+      expect(JSON.parse(socket.send.mock.calls[0][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
+      await act(async () => {
+        vi.advanceTimersByTime(30000)
+      })
+      await expect(first).rejects.toMatchObject({ disposition: "outcome_unknown" })
+
+      resolvedOptions.mockReturnValue(
+        { timeZone: "America/New_York" } as Intl.ResolvedDateTimeFormatOptions,
+      )
+      // A late outcome_unknown reject must NOT release the binding: a same-id
+      // retry is still permitted and must reuse the first attempt's zone.
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "keep-id",
+        message: "still ambiguous",
+      }))
+
+      const retry = result.current.sendChatMessage("same", undefined, true, "keep-id")
+      expect(JSON.parse(socket.send.mock.calls[1][0]).context)
+        .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "keep-id",
+      }))
+      await retry
+    } finally {
+      vi.useRealTimers()
+      resolvedOptions.mockRestore()
+    }
+  })
+
+  it("sends without a context when Intl itself throws", async () => {
+    const resolvedOptions = vi
+      .spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions")
+      .mockImplementation(() => {
+        throw new RangeError("ICU unavailable")
+      })
+    try {
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("hi", undefined, false, "throw-turn")
+      const sent = JSON.parse(socket.send.mock.calls[0][0])
+      expect("context" in sent).toBe(false)
+      expect(sent.message).toBe("hi")
+      act(() => socket.receive({
+        type: "message_accepted",
+        client_message_id: "throw-turn",
+      }))
+      await delivery
+    } finally {
+      resolvedOptions.mockRestore()
+    }
   })
 
   it("treats an explicit null connection as disabled even when legacy inputs exist", async () => {
@@ -706,6 +1540,7 @@ describe("useWebSocket normalized connections", () => {
     expect(sent).toEqual({
       type: "chat",
       message: "create lazily",
+      context: { timezone: expect.any(String) },
       client_message_id: "session-turn-1",
     })
 
@@ -718,6 +1553,52 @@ describe("useWebSocket normalized connections", () => {
       client_message_id: "session-turn-1",
       turn_id: "server-turn-1",
     })
+  })
+
+  it("offers an explicit unbound Session binding on the initial physical connection", async () => {
+    renderHook(() => useWebSocket({
+      connection: sessionConnection({
+        taskBindingMode: "session-subprotocol",
+      }),
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.unbound",
+    ])
+  })
+
+  it("offers the current bound task when establishing a replacement physical connection", async () => {
+    const connection = sessionConnection({
+      taskBindingMode: "session-subprotocol",
+    })
+    const hook = renderHook(
+      ({ taskId }: { taskId: number | undefined }) => useWebSocket({
+        connection,
+        taskId,
+      }),
+      { initialProps: { taskId: undefined as number | undefined } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    expect(MockWebSocket.instances[0].protocols).toContain(
+      "xagent-session-task.unbound",
+    )
+
+    hook.rerender({ taskId: 42 })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    act(() => hook.result.current.disconnect())
+    act(() => hook.result.current.connect())
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1].protocols).toEqual([
+      "xagent-session-v1",
+      "xagent-session-token.st_secret",
+      "xagent-session-binding-v1",
+      "xagent-session-task.42",
+    ])
   })
 
   it.each([4001, 4003, 1011])(
@@ -889,6 +1770,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("keeps legacy auth refresh, retry, pause, resume, and status behavior", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     authState.refreshAccessToken.mockResolvedValue(false)
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -1004,12 +1886,12 @@ describe("useWebSocket normalized connections", () => {
       url: "ws://localhost",
       taskId: 1,
       token: "token",
-    }, "ws://localhost/ws/chat/1?token=token"],
+    }, "ws://localhost/ws/chat/1?token=token&liveness=heartbeat"],
     ["an explicit empty legacy token", {
       url: "ws://localhost",
       taskId: 1,
       token: "",
-    }, "ws://localhost/ws/chat/1"],
+    }, "ws://localhost/ws/chat/1?liveness=heartbeat"],
     ["an explicit Session descriptor", {
       connection: sessionConnection(),
     }, "wss://embed.example/v1/external/chat/sessions/ws"],
@@ -1055,7 +1937,7 @@ describe("useWebSocket normalized connections", () => {
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const oldSocket = MockWebSocket.instances[0]
-    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token")
+    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token&liveness=heartbeat")
     act(() => oldSocket.open())
     vi.useFakeTimers()
 
@@ -1067,7 +1949,7 @@ describe("useWebSocket normalized connections", () => {
     hook.rerender()
     expect(MockWebSocket.instances).toHaveLength(2)
     const refreshedSocket = MockWebSocket.instances[1]
-    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token")
+    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token&liveness=heartbeat")
     act(() => refreshedSocket.open())
 
     await act(async () => {
@@ -1927,6 +2809,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("resets the transport reconnect delay after explicit disconnect without resetting auth refresh", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     vi.useFakeTimers()
@@ -1947,6 +2830,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("does not suppress a retry for an arbitrary close reason", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     vi.useFakeTimers()
@@ -2359,10 +3243,138 @@ describe("useWebSocket normalized connections", () => {
     act(() => socket.open())
 
     const file = new File(["secret"], "secret.txt", { type: "text/plain" })
-    await expect(result.current.sendChatMessage("with file", [file])).rejects.toThrow(
-      "not supported",
-    )
+    await expect(
+      result.current.sendChatMessage("with file", [file])
+    ).rejects.toMatchObject({
+      message: "File delivery is not supported for this connection.",
+      disposition: "not_sent",
+    })
     expect(uploadFiles).not.toHaveBeenCalled()
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: false,
+        error_code: "upload_too_large",
+        detail: "private proxy detail",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_too_large",
+      message: "File is too large. Please reduce the upload size and try again.",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it("rejects a malformed oversized upload result before sending chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        success: true,
+        files: [
+          { file_id: 123, filename: "bad.txt" },
+          { file_id: "file-2", filename: "second.txt" },
+          { file_id: "file-3", filename: "extra.txt" },
+        ],
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    )
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const outcome = result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["one"], "first.txt"),
+        new File(["two"], "second.txt"),
+      ],
+    ).then(
+      () => null,
+      error => error,
+    )
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+    await expect(outcome).resolves.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    fetchMock.mockRestore()
+  })
+
+  it("rejects an incomplete custom upload result before sending chat", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue([]),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with file",
+      [new File(["data"], "data.txt")],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "blank",
+      uploadResult: [{ file_id: "   " }, { file_id: "file-2" }],
+    },
+    {
+      name: "duplicate",
+      uploadResult: [{ file_id: "file-1" }, { file_id: " file-1 " }],
+    },
+  ])("rejects $name custom upload identifiers before sending chat", async ({ uploadResult }) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles: vi.fn().mockResolvedValue(uploadResult),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    await expect(result.current.sendChatMessage(
+      "with files",
+      [
+        new File(["first"], "first.txt"),
+        new File(["second"], "second.txt"),
+      ],
+    )).rejects.toMatchObject({
+      errorCode: "upload_failed",
+      userFacing: true,
+    })
     expect(socket.send).not.toHaveBeenCalled()
   })
 
@@ -2629,5 +3641,357 @@ describe("useWebSocket normalized connections", () => {
 
     expect(oldSocket.send).not.toHaveBeenCalled()
     await rejection
+  })
+
+  describe("dead-connection detection and reconnect", () => {
+    const ACK = { type: "connection_capabilities", capabilities: ["heartbeat"] }
+    const HEARTBEAT = { type: "heartbeat" }
+
+    // Synchronous on purpose: React's async act helper draws from Math.random,
+    // which would consume the values the jitter tests pin.
+    const advance = (ms: number) => act(() => {
+      vi.advanceTimersByTime(ms)
+    })
+    const socketAt = (index: number) => MockWebSocket.instances[index]
+    const expectReconnectAfter = (delay: number, margin = 1) => {
+      const count = MockWebSocket.instances.length
+      advance(delay - margin)
+      expect(MockWebSocket.instances).toHaveLength(count)
+      advance(margin)
+      expect(MockWebSocket.instances).toHaveLength(count + 1)
+    }
+    const mountChat = (extra: Record<string, unknown> = {}) => renderHook(
+      (props: Record<string, unknown>) => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+        ...extra,
+        ...props,
+      }),
+      { initialProps: {} as Record<string, unknown> },
+    )
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    it("keeps the widget.js stable window at twice the dead threshold", () => {
+      const widgetScript = readFileSync(resolve(process.cwd(), "public/widget.js"), "utf8")
+      const stableWindow = Number(/var SESSION_STABLE_CONNECTION_MS = (\d+);/.exec(widgetScript)?.[1])
+      expect(stableWindow).toBe(2 * DEAD_AFTER_MS)
+    })
+
+    describe("dead rule", () => {
+      it.each([
+        ["a heartbeat frame", (socket: MockWebSocket) => socket.receive(HEARTBEAT)],
+        ["a frame that failed to parse", (socket: MockWebSocket) => socket.onmessage?.({ data: "{not json" } as MessageEvent)],
+      ] as const)("keeps the connection 29,999 ms after %s", (_name, sendFrame) => {
+        vi.spyOn(console, "error").mockImplementation(() => {})
+        const hook = mountChat()
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => socket.receive(ACK))
+        advance(15_000)
+        act(() => sendFrame(socket))
+
+        advance(29_999)
+
+        expect(socket.close).not.toHaveBeenCalled()
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+
+      it("retires at 30,000 ms, reports the stream as unavailable, and hides liveness frames", () => {
+        const onMessage = vi.fn()
+        const hook = mountChat({ onMessage })
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => {
+          socket.receive(ACK)
+          socket.receive({ type: "trace_event", task_id: 7, stream_run_id: "run-1", data: {} })
+          socket.receive(HEARTBEAT)
+        })
+
+        advance(30_000)
+
+        expect(socket.close).toHaveBeenCalledWith(1000, "Connection liveness timeout")
+        expect(hook.result.current.isConnected).toBe(false)
+        const types = onMessage.mock.calls.map(([message]) => message.type)
+        expect(types).not.toContain("connection_capabilities")
+        expect(types).not.toContain("heartbeat")
+        expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "stream_unavailable", task_id: 7 }))
+      })
+
+      it.each([
+        ["no capability array", "heartbeat"],
+        ["other capabilities", ["other"]],
+      ])("does not enable the rule when the acknowledgement lists %s", (_name, capabilities) => {
+        const hook = mountChat()
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => socket.receive({ type: "connection_capabilities", capabilities }))
+
+        advance(120_000)
+
+        expect(socket.close).not.toHaveBeenCalled()
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+    })
+
+    it("reconnect chain backs off and gives up", () => {
+      const random = vi.spyOn(Math, "random")
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0.9999)
+        .mockReturnValue(0.5)
+      const hook = mountChat()
+      const phase = () => hook.result.current.connectionPhase
+      const first = socketAt(0)
+      act(() => first.open())
+      act(() => first.receive(ACK))
+      expect(phase()).toBe("connected")
+
+      act(() => first.triggerClose(1006))
+      // Only the retry timer remains: the dead-connection timer is gone.
+      expect(vi.getTimerCount()).toBe(1)
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(800)
+      expect(phase()).toBe("reconnecting")
+
+      // Reconnects fail by error, handshake timeout, 1006, error, timeout.
+      act(() => socketAt(1).triggerError())
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(2_400, 2)
+
+      advance(9_998)
+      expect(phase()).toBe("reconnecting")
+      advance(2)
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(4_000, 2)
+
+      act(() => socketAt(3).triggerClose(1006))
+      expectReconnectAfter(8_000)
+
+      act(() => socketAt(4).triggerError())
+      expectReconnectAfter(15_000)
+      expect(phase()).toBe("reconnecting")
+
+      advance(10_000)
+      expect(phase()).toBe("lost")
+      advance(60_000)
+      expect(MockWebSocket.instances).toHaveLength(6)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(random).toHaveBeenCalledTimes(5)
+    })
+
+    describe("first connection failures end in lost", () => {
+      it.each([
+        ["a transport error", (socket: MockWebSocket) => socket.triggerError()],
+        ["a handshake timeout", () => vi.advanceTimersByTime(10_000)],
+      ] as const)("does not retry a first connection that fails with %s", (_name, fail) => {
+        const hook = mountChat()
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+
+        act(() => {
+          fail(socketAt(0))
+        })
+        advance(60_000)
+
+        expect(MockWebSocket.instances).toHaveLength(1)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("does not carry the previous task's opened key to a newly selected task", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerClose(1006))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        hook.rerender({ taskId: 8 })
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerError())
+        advance(60_000)
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("reconnects an opened connection that only reports a transport error", () => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+        mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerError())
+        expectReconnectAfter(1_000)
+      })
+    })
+
+    it.each([
+      ["a heartbeat connection with frames spanning 29,999 ms", true, 29_999, 2_000],
+      ["a heartbeat connection with frames spanning 30,000 ms", true, 30_000, 1_000],
+      ["a connection without heartbeat open for 29,999 ms", false, 29_999, 2_000],
+      ["a connection without heartbeat open for 30,000 ms", false, 30_000, 1_000],
+    ] as const)("budget reset rules: resets the count for %s", (_name, heartbeat, span, expectedDelay) => {
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      mountChat()
+      // Spend one budget slot on an opened key.
+      act(() => socketAt(0).open())
+      act(() => socketAt(0).triggerClose(1006))
+      advance(1_000)
+      const socket = socketAt(1)
+      act(() => socket.open())
+      if (heartbeat) {
+        // The span counts from the first frame, 5 s after open.
+        advance(5_000)
+        act(() => socket.receive(ACK))
+        advance(15_000)
+        act(() => socket.receive(HEARTBEAT))
+        advance(span - 15_000)
+        act(() => socket.receive(HEARTBEAT))
+      } else {
+        advance(span)
+      }
+
+      act(() => socket.triggerClose(1006))
+      expectReconnectAfter(expectedDelay)
+    })
+
+    it("session transport hands dead connections to its owner", () => {
+      const onSessionConnectionFailure = vi.fn()
+      const hook = mountChat({
+        url: undefined,
+        taskId: undefined,
+        connection: sessionConnection(),
+        onSessionConnectionFailure,
+      })
+      const socket = socketAt(0)
+      socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      act(() => socket.receive(ACK))
+
+      advance(150_000)
+
+      expect(onSessionConnectionFailure.mock.calls).toEqual([
+        [expect.objectContaining({ recoverable: true }), "widget-session:1"],
+      ])
+      expect(MockWebSocket.instances).toHaveLength(1)
+      expect(hook.result.current.connectionPhase).toBe("lost")
+    })
+
+    describe("connection phase", () => {
+      const base: ConnectionPhaseFacts = {
+        hasDescriptor: true,
+        autoConnect: true,
+        stoppedByCaller: false,
+        ownerOpen: false,
+        ownerInFlight: false,
+        retryPending: false,
+        lifecycleEnded: false,
+      }
+
+      it.each([
+        ["no descriptor", { hasDescriptor: false, ownerOpen: true }, "idle"],
+        ["stopped by the caller, even with a timer", { stoppedByCaller: true, retryPending: true }, "idle"],
+        ["auto connect off and no connection object", { autoConnect: false, retryPending: true }, "idle"],
+        ["auto connect off with a connection object", { autoConnect: false, ownerInFlight: true }, "connecting"],
+        ["an open connection, even with a timer", { ownerOpen: true, retryPending: true }, "connected"],
+        ["a timer waiting", { retryPending: true }, "reconnecting"],
+        ["an unopened connection after a failed cycle", { ownerInFlight: true, lifecycleEnded: true }, "reconnecting"],
+        ["an unopened connection in a fresh cycle", { ownerInFlight: true }, "connecting"],
+        ["nothing yet in a fresh cycle", {}, "connecting"],
+        ["nothing left after a failed cycle", { lifecycleEnded: true }, "lost"],
+      ] as const)("derives the phase for %s", (_name, facts, expected) => {
+        expect(deriveConnectionPhase({ ...base, ...facts })).toBe(expected)
+      })
+
+      it("recomputes when a stale retry timer fires", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerClose(1006))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        // A manual connect makes the waiting retry timer stale.
+        act(() => hook.result.current.connect())
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerClose(1000))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        advance(1_200)
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("reads connecting, not reconnecting, when the caller connects again after a failure", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerError())
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        // No disconnect() in between: the caller starts a new cycle directly.
+        act(() => hook.result.current.connect())
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+
+        act(() => socketAt(1).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+    })
+
+    describe("descriptor changes keep the connection key", () => {
+      beforeEach(() => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+      })
+
+      it.each([
+        ["on a healthy connection is a reconnect that spends budget", false, 2_000],
+        ["while a retry timer waits still spends one slot", true, 4_000],
+      ] as const)("a routine descriptor change %s", (_name, dead, expectedDelay) => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        if (dead) {
+          act(() => socketAt(0).receive(ACK))
+          advance(30_000)
+          expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        }
+
+        authState.session = { ...authState.session }
+        hook.rerender({})
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+        act(() => socketAt(1).triggerError())
+        expectReconnectAfter(expectedDelay)
+      })
+
+      it("starts a fresh key when another account takes over the same task", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        // Spend one reconnect slot under the old principal first.
+        act(() => socketAt(0).triggerClose(1006))
+
+        authState.user = { id: "user-2" }
+        authState.token = "token-2"
+        authState.session = { ...authState.session, accessToken: "token-2", userId: "user-2" }
+        hook.rerender({})
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerError())
+        advance(60_000)
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        act(() => hook.result.current.connect())
+        act(() => socketAt(2).open())
+        act(() => socketAt(2).triggerClose(1006))
+        expectReconnectAfter(1_000)
+      })
+
+      it("shows connecting, not reconnecting, after a caller disconnect and connect", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+
+        act(() => hook.result.current.disconnect())
+        expect(hook.result.current.connectionPhase).toBe("idle")
+        act(() => hook.result.current.connect())
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+      })
+    })
   })
 })

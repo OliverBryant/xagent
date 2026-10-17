@@ -24,6 +24,20 @@ def _load_migration_module():
     return module
 
 
+def _load_remote_mcp_migration_module():
+    migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261002_migrate_hubspot_to_remote_mcp.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "migrate_hubspot_to_remote_mcp", migration_file
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
@@ -298,6 +312,39 @@ def test_upgrade_does_not_log_when_no_grants_exist(tmp_path, caplog):
     assert caplog.records == []
 
 
+def test_upgrade_does_not_log_when_table_exists_with_no_hubspot_rows(tmp_path, caplog):
+    """The no-table case above only exercises _columns_present's table-missing
+    branch. A table that exists but has zero matching rows takes a different
+    path (result.rowcount == 0 after the UPDATE), so needs its own case."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE user_oauth (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    provider VARCHAR(50) NOT NULL,
+                    refresh_token VARCHAR,
+                    access_token VARCHAR NOT NULL
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO user_oauth (user_id, provider, access_token) "
+                "VALUES (1, 'salesforce', 'old-salesforce-token')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with caplog.at_level("WARNING", logger=migration.logger.name):
+                migration.upgrade()
+    assert caplog.records == []
+
+
 def test_upgrade_clears_access_token_without_refresh_token_column(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -321,7 +368,10 @@ def test_upgrade_without_user_oauth_table_is_a_noop(tmp_path):
 
 def test_downgrade_does_not_touch_user_oauth(tmp_path):
     """Cleared access tokens are gone for good; downgrade only reverts
-    public_mcp_apps, mirroring the Facebook scope migration's approach."""
+    public_mcp_apps, mirroring the Facebook scope migration's approach. A
+    provider row that was never touched (salesforce here) must also come
+    through both upgrade and downgrade completely untouched, matching the
+    equivalent assertion already made on the upgrade side."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -332,14 +382,27 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
             migration.downgrade()
         tokens = _access_tokens(connection)
         assert tokens["hubspot"] == ""
+        assert tokens["salesforce"] == "old-salesforce-token"
+        refresh_tokens = _refresh_tokens(connection)
+        assert refresh_tokens["salesforce"] == "old-salesforce-refresh"
 
 
-def test_migration_fields_match_registry():
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+def test_migration_fields_chain_to_remote_mcp_migration():
+    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
+    snapshots, not the app's final values. Later migrations add the deals
+    write scope, revise the description, and finally replace the legacy OAuth
+    connector with HubSpot's hosted MCP server.
 
+    An earlier revision of this file bumped both constants forward to match
+    the live registry exactly, to keep this exact-match assertion passing -
+    but that broke downgrade(): 20260914's downgrade() reverts description to
+    its own PREVIOUS_DESCRIPTION (this migration's true CURRENT_DESCRIPTION)
+    before this migration's downgrade() runs, so a bumped-forward
+    CURRENT_DESCRIPTION here no longer matched what was actually in the row
+    at that point, silently no-opping the "only revert if unchanged" guard
+    and leaving a downgraded database advertising Marketing Hub/forms and
+    analytics support with none of the granting scopes.
+    """
     migration = _load_migration_module()
-    registry_row = next(
-        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "hubspot"
-    )
-    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+    remote_migration = _load_remote_mcp_migration_module()
+    assert set(migration.CURRENT_SCOPES) <= set(remote_migration.LEGACY_SCOPES)

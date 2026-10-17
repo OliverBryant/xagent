@@ -1,5 +1,5 @@
 import asyncio
-import time
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -18,11 +18,6 @@ from xagent.core.execution_scope import (
     ExecutionScopeContext,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.api.chat import (
-    AgentServiceManager,
-    _build_tool_selection_spec_for_task,
-    create_default_tools,
-)
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import AgentStatus
@@ -31,7 +26,15 @@ from xagent.web.models.task import TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services import workforce_runs as workforce_runs_module
-from xagent.web.services.task_lease_service import acquire_task_lease
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _build_tool_selection_spec_for_task,
+    create_default_tools,
+)
+from xagent.web.services.task_lease_service import (
+    acquire_task_lease,
+    bind_task_lease_context,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_runs import (
     create_preview_workforce_run,
@@ -222,10 +225,113 @@ def _workforce_runtime_with_worker_tools(*tool_names: str) -> WorkforceTaskRunti
 
 
 @pytest.mark.asyncio
-async def test_create_workforce_run_creates_task_run_and_starts_turn(
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opening turn starts inside task creation, so the zone has to ride
+    the create request; there is no chat frame to carry it."""
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
+
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_sends_no_context_without_a_timezone(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "no-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_treats_a_blank_timezone_as_absent(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "blank-tz-owner")
+    manager = _create_agent(db_session, user, "Manager")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, _create_agent(db_session, user, "Analyst"))
+    db_session.commit()
+
+    result = await create_workforce_run(
+        db_session,
+        user,
+        workforce,
+        message="hello",
+        timezone="   ",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_workforce_run_creates_task_run_and_starts_turn(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     scheduled = _patch_schedule_bg(monkeypatch)
 
     user = _create_user(db_session, "owner")
@@ -250,7 +356,17 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         message="Coordinate a launch brief",
         selected_file_ids=["file-1"],
     )
-    await result.background_task
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
     assert not hasattr(result.task, "_sa_instance_state")
     assert not hasattr(result.workforce_run, "_sa_instance_state")
 
@@ -262,31 +378,123 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     )
     db_session.refresh(uploaded_file)
 
-    assert task.status == TaskStatus.RUNNING
+    assert task.status == (TaskStatus.PENDING if shared else TaskStatus.RUNNING)
     assert task.agent_id == manager.id
     assert result.task.agent_id == manager.id
-    assert result.task.run_id == task.run_id
+    assert result.task.run_id == (command.target_run_id if shared else task.run_id)
     assert result.task.state_version == task.state_version
     assert result.task.control_state == task.control_state
     assert task.execution_mode == "think"
-    assert task.input == "Coordinate a launch brief"
+    assert task.input == (None if shared else "Coordinate a launch brief")
     assert task.agent_config["workforce_id"] == workforce.id
     assert task.agent_config["workforce_run_id"] == workforce_run.id
     assert task.agent_config["selected_file_ids"] == ["file-1"]
     assert task.agent_config["workforce_snapshot"]["manager"]["agent_id"] == manager.id
     assert task.connector_runtime_selected_refs == []
     assert workforce_run.task_id == task.id
-    assert workforce_run.status == "running"
+    assert workforce_run.status == ("pending" if shared else "running")
     assert workforce_run.is_preview is False
     assert uploaded_file.task_id == task.id
-    assert scheduled["task_id"] == task.id
-    assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
+    if shared:
+        assert task.run_id is None
+        assert result.task.run_id is not None
+        assert task.runner_id is None
+        assert command.payload["message"] == "Coordinate a launch brief"
+        assert command.payload["file_ids"] == ["file-1"]
+    else:
+        assert scheduled["task_id"] == task.id
+        assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
     assert (
         db_session.query(TaskChatMessage)
         .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [False, True])
+async def test_create_preview_workforce_run_forwards_the_caller_timezone(
+    db_session: Session,
+    shared: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="how many shifts do we have on tomorrow?",
+        timezone="Australia/Melbourne",
+    )
+    if shared:
+        assert result.background_task is None
+        command = (
+            db_session.query(TaskExecutionCommand)
+            .filter_by(task_id=result.task.id)
+            .one()
+        )
+        assert command.status == "pending"
+        assert not scheduled
+    else:
+        await result.background_task
+
+    if shared:
+        assert command.payload["timezone"] == "Australia/Melbourne"
+    else:
+        assert scheduled["context"] == {"timezone": "Australia/Melbourne"}
+
+
+@pytest.mark.asyncio
+async def test_create_preview_workforce_run_sends_no_context_without_a_timezone(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled = _patch_schedule_bg(monkeypatch)
+
+    user = _create_user(db_session, "preview-no-tz-owner")
+    manager = _create_agent(db_session, user, "Draft Manager")
+    worker_agent = _create_agent(db_session, user, "Draft Analyst")
+    db_session.commit()
+
+    result = await create_preview_workforce_run(
+        db_session,
+        user_id=user.id,
+        name="Launch Team",
+        description=None,
+        manager_agent_id=manager.id,
+        workers=[
+            {
+                "agent_id": worker_agent.id,
+                "alias": "Analyst",
+                "assignment_instructions": "Do the work.",
+            }
+        ],
+        message="hello",
+    )
+    await result.background_task
+
+    assert scheduled["context"] is None
 
 
 @pytest.mark.asyncio
@@ -743,11 +951,16 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
     db.commit()
 
     checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
     original = workforce_runs_module._create_claimed_workforce_run_isolated
 
     def observed(*args: Any, **kwargs: Any):
         checked_out.append(engine.pool.checkedout())
-        time.sleep(0.05)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -756,32 +969,26 @@ async def test_create_workforce_run_releases_connection_before_worker_transactio
         observed,
     )
 
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        result = await create_workforce_run(
+    startup = asyncio.create_task(
+        create_workforce_run(
             db,
             user,
             workforce,
             message="Coordinate a launch brief",
         )
-        await result.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
 
     assert result.task.status == TaskStatus.RUNNING
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
-    assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -798,11 +1005,16 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
     db.commit()
 
     checked_out: list[int] = []
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
     original = workforce_runs_module._create_claimed_preview_run_isolated
 
     def observed(*args: Any, **kwargs: Any):
         checked_out.append(engine.pool.checkedout())
-        time.sleep(0.05)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "workforce transaction was never released"
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
@@ -811,18 +1023,8 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
         observed,
     )
 
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.005)
-
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        result = await create_preview_workforce_run(
+    startup = asyncio.create_task(
+        create_preview_workforce_run(
             db,
             user_id=user.id,
             name="Launch Team",
@@ -837,15 +1039,19 @@ async def test_create_preview_workforce_run_releases_connection_before_worker_tr
             ],
             message="Draft a launch brief",
         )
-        await result.background_task
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not startup.done()
+        assert checked_out == [0]
     finally:
-        ticker_stop.set()
-        await ticker_task
+        release.set()
+        result = await asyncio.wait_for(startup, timeout=30)
+    await result.background_task
 
     assert result.task.status == TaskStatus.RUNNING
     assert result.workforce_run.status == "running"
     assert checked_out == [0]
-    assert ticks >= 3, "preview workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio
@@ -959,7 +1165,7 @@ async def test_create_workforce_run_claim_timeout_rolls_back_created_records(
 
     monkeypatch.setattr(
         task_orchestrator_module,
-        "_persist_claimed_turn_no_commit",
+        "_persist_accepted_turn_no_commit",
         MagicMock(side_effect=synthetic_timeout),
     )
     monkeypatch.setattr(
@@ -1390,14 +1596,15 @@ def test_release_current_runner_task_lease_with_workforce_sync_pauses_run(
     lease = acquire_task_lease(db_session, int(task.id))
     assert lease is not None
 
-    assert (
-        release_current_runner_task_lease_with_workforce_sync(
-            db_session,
-            int(task.id),
-            status=TaskStatus.WAITING_FOR_USER,
+    with bind_task_lease_context(lease):
+        assert (
+            release_current_runner_task_lease_with_workforce_sync(
+                db_session,
+                int(task.id),
+                status=TaskStatus.WAITING_FOR_USER,
+            )
+            is True
         )
-        is True
-    )
     db_session.refresh(task)
     db_session.refresh(run)
 
@@ -1542,7 +1749,10 @@ async def test_verified_workforce_run_scope_loads_manager_config(
 
     default_llm = MagicMock()
     default_llm.model_name = "default-model"
-    with patch("xagent.web.api.chat.create_default_llm", return_value=default_llm):
+    with patch(
+        "xagent.web.services.agent_service_manager.create_default_llm",
+        return_value=default_llm,
+    ):
         runtime_config = AgentServiceManager()._resolve_task_runtime_config(
             task_id=int(result.task.id),
             task=task,

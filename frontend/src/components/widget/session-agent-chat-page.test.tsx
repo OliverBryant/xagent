@@ -1,7 +1,8 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { MessageDeliveryError } from "@/hooks/use-websocket"
 import type { WidgetSession } from "./use-widget-session"
 
 const bridge = vi.hoisted(() => ({
@@ -16,6 +17,8 @@ const bridge = vi.hoisted(() => ({
     handleConnectionFailure: vi.fn(),
   },
 }))
+
+const i18n = vi.hoisted(() => ({ locale: "en" }))
 
 const app = vi.hoisted(() => ({
   provider: null as null | {
@@ -112,7 +115,9 @@ vi.mock("@/components/task/task-conversation-panel", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({
+    t: (key: string) => (i18n.locale === "en" ? key : `${i18n.locale}:${key}`),
+  }),
 }))
 
 import { SessionAgentChatPage } from "./session-agent-chat-page"
@@ -177,6 +182,7 @@ describe("SessionAgentChatPage", () => {
   })
 
   afterEach(() => {
+    i18n.locale = "en"
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
@@ -186,7 +192,14 @@ describe("SessionAgentChatPage", () => {
     render(<SessionAgentChatPage />)
 
     expect(screen.getByText("widgetChat.status.initializing")).toBeInTheDocument()
+    // This "waiting" branch renders no header at all -- widget.js's mobile
+    // full-screen FAB-hiding guard depends on WidgetChromeControls (and thus
+    // this close button) never rendering here; a regression that added it
+    // without the panel actually being able to close would go uncaught
+    // without this.
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(app.provider?.token).toBeUndefined()
+    expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.session).toEqual({
       connection: null,
       onConnectionClose: bridge.value.handleConnectionClose,
@@ -203,11 +216,17 @@ describe("SessionAgentChatPage", () => {
     // the conversation in place by opening a new tab.
     expect(app.provider?.transport?.capabilities).toEqual({
       linksOpenInNewTab: "enabled",
+      taskStop: "enabled",
     })
   })
 
   it("constructs the exact active Session transport and does not leak credentials", () => {
-    const storageSet = vi.spyOn(Storage.prototype, "setItem")
+    // Same fix as widget-chrome.test.ts: this suite's localStorage is a
+    // LocalStorageMock with its own prototype (vitest.setup.ts), unrelated
+    // to native Storage.prototype -- spying there never intercepted this
+    // component's actual localStorage.setItem calls, so this credential-leak
+    // assertion was vacuous.
+    const storageSet = vi.spyOn(localStorage, "setItem")
     setBridge("active", activeSession())
     app.isConnected = true
 
@@ -222,9 +241,11 @@ describe("SessionAgentChatPage", () => {
       protocols: [
         "xagent-session-v1",
         `xagent-session-token.${SESSION_TOKEN}`,
+        "xagent-session-liveness-v1",
       ],
       expectedProtocol: "xagent-session-v1",
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     })
     expect(app.provider?.transport?.session?.onConnectionFailure).toBe(
@@ -247,7 +268,8 @@ describe("SessionAgentChatPage", () => {
     render(<SessionAgentChatPage />)
 
     expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
-    expect(screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     })).toBeDisabled()
     expect(app.startProps).toBeNull()
@@ -263,7 +285,8 @@ describe("SessionAgentChatPage", () => {
     app.state.taskId = 92
     app.startNewConversation.mockRejectedValueOnce(new Error("timeout"))
     const { rerender } = render(<SessionAgentChatPage />)
-    fireEvent.click(screen.getByRole("button", { name: "widgetSession.startNewConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
     await screen.findByText("widgetSession.resetFailed")
 
     app.sessionConversationState = "reload_required"
@@ -303,9 +326,10 @@ describe("SessionAgentChatPage", () => {
       { mode: "balanced" },
       [],
     )
-    expect(screen.queryByRole("button", {
-      name: "widgetSession.startNewConversation",
-    })).not.toBeInTheDocument()
+    // No conversation yet — nothing to reset, but the "..." trigger still
+    // renders since expand/collapse is always offered regardless.
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
 
   it("renders the conversation with files disabled and gates reset on pending work", () => {
@@ -324,17 +348,44 @@ describe("SessionAgentChatPage", () => {
       showTaskFiles: false,
       showTaskActions: false,
     }))
-    const reset = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const reset = screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     })
     expect(reset).toBeDisabled()
 
     app.isMessageDeliveryPending = false
     rerender(<SessionAgentChatPage />)
-    fireEvent.click(screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     }))
     expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the reset visibly pending on the trigger after the menu auto-closes on click", () => {
+    // The menuitem click that starts the reset also closes the menu (normal
+    // menu UX), so the "Resetting..." label is only reachable here if the
+    // trigger itself carries the pending state too.
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    app.isConnected = true
+
+    const { rerender } = render(<SessionAgentChatPage />)
+    const trigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
+    expect(screen.queryByRole("menu")).toBeNull()
+    expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+
+    app.isConversationResetPending = true
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.queryByRole("menu")).toBeNull()
+    // The spinner is status feedback, not a lockout -- sizing has no
+    // dependency on the conversation reset, so the trigger itself must stay
+    // reachable even while pending.
+    expect(trigger).not.toBeDisabled()
+    expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
   it("shows connecting and the non-blocking absolute-expiry warning", () => {
@@ -357,6 +408,164 @@ describe("SessionAgentChatPage", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
     })
+  })
+
+  async function failStartMessage(error: unknown): Promise<unknown> {
+    app.sendMessage.mockRejectedValueOnce(error)
+    const onSend = app.startProps?.onSend as (
+      message: string,
+      files: File[],
+      config?: Record<string, unknown>,
+    ) => Promise<void>
+    let thrown: unknown
+    await act(async () => {
+      thrown = await onSend("hi", [], {}).then(() => null, (caught: unknown) => caught)
+    })
+    return thrown
+  }
+
+  it.each([
+    [
+      "a coded delivery error",
+      new MessageDeliveryError("diagnostic", "not_sent", { errorCode: "connection_not_ready" }),
+      "clientErrors.connectionNotReady",
+    ],
+    [
+      "an error carrying an unrecognised code",
+      Object.assign(new Error("x"), { errorCode: "not_a_code" }),
+      "widgetSession.startMessageFailed",
+    ],
+  ])("shows the start-message failure for %s", async (_label, error, expectedText) => {
+    setBridge("active", activeSession())
+    render(<SessionAgentChatPage />)
+
+    const thrown = await failStartMessage(error)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(expectedText)
+    expect(thrown).toBe(error)
+    expect((thrown as { notificationHandled?: unknown }).notificationHandled).toBeUndefined()
+  })
+
+  it("re-renders the start-message failure in the new locale", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "not_sent", { errorCode: "connection_not_ready" }),
+    )
+    expect(screen.getByRole("alert")).toHaveTextContent("clientErrors.connectionNotReady")
+    expect(screen.getByRole("alert")).not.toHaveTextContent("zh:")
+
+    i18n.locale = "zh"
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent("zh:clientErrors.connectionNotReady")
+  })
+
+  it("does not show a start-message failure that arrives after the conversation is established", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    await failStartMessage(new Error("late rejection"))
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("does not bring an old start-message failure back when the conversation returns to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("early rejection"))
+    expect(screen.getByRole("alert")).toBeInTheDocument()
+
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("does not show a start-message failure stored while established after a reset to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("never inserts a stale start-message failure while returning to the start page", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+    await failStartMessage(
+      new MessageDeliveryError("diagnostic", "outcome_unknown"),
+    )
+
+    // rerender flushes effects before it returns, so the final DOM cannot show
+    // a line that was committed and then cleared; the observer records every
+    // node inserted on the way.
+    const inserted: Element[] = []
+    const collect = (records: MutationRecord[]) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (node instanceof Element) inserted.push(node)
+        })
+      }
+    }
+    const observer = new MutationObserver(collect)
+    observer.observe(document.body, { childList: true, subtree: true })
+    app.state.taskId = null
+    rerender(<SessionAgentChatPage />)
+    collect(observer.takeRecords())
+    observer.disconnect()
+
+    expect(inserted.some((node) => node.textContent?.includes("start:Support Agent"))).toBe(true)
+    expect(inserted.filter((node) => (
+      node.matches('[role="alert"]') || node.querySelector('[role="alert"]') !== null
+    ))).toEqual([])
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("clears the previous start-message failure while a resend is pending", async () => {
+    setBridge("active", activeSession())
+    render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("first failure"))
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
+
+    app.sendMessage.mockReturnValueOnce(new Promise<void>(() => undefined))
+    const onSend = app.startProps?.onSend as (
+      message: string,
+      files: File[],
+      config?: Record<string, unknown>,
+    ) => Promise<void>
+    act(() => {
+      void onSend("hi again", [], {})
+    })
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("lets the reload-required notice take priority over the start-message failure", async () => {
+    setBridge("active", activeSession())
+    const { rerender } = render(<SessionAgentChatPage />)
+    await failStartMessage(new Error("early rejection"))
+
+    app.isSessionInteractionLocked = true
+    rerender(<SessionAgentChatPage />)
+
+    expect(screen.getAllByRole("alert")).toHaveLength(1)
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
   })
 
   it("preserves validated Agent metadata and the conversation while refreshing", () => {
@@ -391,6 +600,7 @@ describe("SessionAgentChatPage", () => {
     expect(screen.getByText("widgetSession.unavailable.description")).toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.initializing")).not.toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.connecting")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
   })
 
   it("removes all conversation controls after degradation with an existing Agent", () => {
@@ -408,8 +618,52 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("button", {
       name: "widgetSession.startNewConversation",
     })).not.toBeInTheDocument()
+    // This branch renders no header at all -- including WidgetChromeControls
+    // itself, not just its menu. A regression that only dropped the menu
+    // item's own render path (leaving the close button behind) would slip
+    // past the two assertions above alone.
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(screen.queryByTestId("session-conversation-panel")).not.toBeInTheDocument()
     expect(app.provider?.transport?.session?.connection).toBeNull()
+  })
+
+  it("keeps an accepted expansion across a degraded/active remount instead of resetting to Expand", () => {
+    // WidgetChromeControls is torn down and rebuilt across this transition
+    // (the degraded branch renders a completely different subtree with no
+    // header at all), so its own isExpanded state can't survive it -- this
+    // is why SessionAgentChatPage lifts and passes it down as a controlled
+    // prop instead of leaving it as the component's internal useState.
+    const postMessageSpy = vi.fn()
+    vi.stubGlobal("parent", { postMessage: postMessageSpy })
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    app.isConnected = true
+
+    const { rerender } = render(<SessionAgentChatPage />)
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+
+    setBridge("degraded", null)
+    rerender(<SessionAgentChatPage />)
+    expect(screen.getByRole("heading", {
+      name: "widgetSession.unavailable.title",
+    })).toBeInTheDocument()
+
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_collapse" },
+      "*",
+    )
   })
 
   it.each([

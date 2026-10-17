@@ -39,6 +39,9 @@ import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
+import { needsReconnect, type McpConnectionStatus } from "@/lib/mcp-connection-status"
+import { sanitizeConnectorStatusEntry } from "@/lib/team-sharing-sanitizers"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
 import {
@@ -93,6 +96,7 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  connection_status?: McpConnectionStatus | null
   user_env?: Record<string, string>
   can_edit_global?: boolean
   runtime_input_schema?: Record<string, any> | null
@@ -137,9 +141,11 @@ function ToolsPageContent() {
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
   const [connectorStatus, setConnectorStatus] = useState<Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }>>({})
+  const [isConnectorStatusLoaded, setIsConnectorStatusLoaded] = useState(false)
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [isDeletingServer, setIsDeletingServer] = useState(false)
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
   const [isOfficialAppDialogOpen, setIsOfficialAppDialogOpen] = useState(false)
   const [editingOfficialApp, setEditingOfficialApp] = useState<AppIntegration | null>(null)
@@ -181,11 +187,11 @@ function ToolsPageContent() {
 
   const { t, tDynamic } = useI18n()
   const { user, inTeam } = useAuth()
-  const { getAppIcon } = useMcpApps()
+  const { getAppIcon, apps: catalogApps } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
-  // F8: strip all three mcp_oauth redirect params in both effects below, not
-  // just the one each effect owns. The two backend redirects are mutually
+  // F8: strip every mcp_oauth redirect param in both effects below, not just
+  // the one each effect owns. The two backend redirects are mutually
   // exclusive today (never both present at once), but if that ever changed,
   // one effect's router.replace could otherwise undo the other's cleanup and
   // cause a duplicate-toast loop.
@@ -193,6 +199,7 @@ function ToolsPageContent() {
     const next = new URLSearchParams(params.toString())
     next.delete("mcp_oauth_error")
     next.delete("mcp_oauth_error_message")
+    next.delete("mcp_oauth_provider_error")
     next.delete(MCP_OAUTH_SUCCESS_PARAM)
     const nextQuery = next.toString()
     router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
@@ -292,8 +299,10 @@ function ToolsPageContent() {
     // /api/connectors/status route, so skip the call entirely when not in a team.
     if (!inTeam) {
       setConnectorStatus({})
+      setIsConnectorStatusLoaded(true)
       return
     }
+    setIsConnectorStatusLoaded(false)
     try {
       const refs = servers.map((s) => ({
         type: s.transport === "custom_api" ? "custom_api" : "mcp",
@@ -301,6 +310,7 @@ function ToolsPageContent() {
       }))
       if (refs.length === 0) {
         setConnectorStatus({})
+        setIsConnectorStatusLoaded(true)
         return
       }
       const response = await apiRequest(`${getApiUrl()}/api/connectors/status`, {
@@ -310,6 +320,7 @@ function ToolsPageContent() {
       })
       if (response.ok) {
         setConnectorStatus(await response.json())
+        setIsConnectorStatusLoaded(true)
       }
     } catch (error) {
       console.error("Failed to load connector status:", error)
@@ -579,12 +590,28 @@ function ToolsPageContent() {
 
       // Use app_id from backend if available, fallback to basic logic
       const appId = server.app_id || server.name.toLowerCase().replace(/\s+/g, '-')
+      const accountInput = catalogApps.find((app) => app.id === appId)?.oauth_account_input
 
       // We need to fetch the icon or use a generic one
       let icon = getAppIcon(server.name) || "";
 
-      // Create an AppIntegration-like object for the dialog
+      // Same key derivation the card uses to read connectorStatus, so the
+      // settings dialog shows the same ownership label as the card it was
+      // opened from. Sanitized so the dialog's badge gate (which requires
+      // app.shared to be a real boolean) only ever sees a well-formed answer.
+      // This branch only runs for isOfficial servers, which are always
+      // transport === 'oauth' (see the isOfficial check above), so the key
+      // prefix here is always 'mcp'.
+      const connType = 'mcp'
+      const sharingStatus = sanitizeConnectorStatusEntry(connectorStatus[`${connType}:${server.id}`])
+
+      // Create an AppIntegration-like object for the dialog. The sanitized
+      // sharing status is spread FIRST: today it carries exactly the three
+      // sharing keys, but spreading it last would let any extra key a future
+      // sanitizer change lets through silently override the identity fields
+      // set below (server_id, is_connected, auth_type).
       setEditingOfficialApp({
+        ...(sharingStatus ?? {}),
         id: appId, // Store the app ID for OAuth flow
         server_id: server.id, // Store the actual server ID for disconnect
         name: server.name,
@@ -593,11 +620,16 @@ function ToolsPageContent() {
         is_connected: true,
         provider: provider,
         connected_account: server.connected_account,
+        // The settings dialog names its login action Reconnect from this.
+        connection_status: server.connection_status,
         is_custom: false,
         // This reconstruction path is only reached for oauth servers (gated
         // above); set auth_type explicitly so the settings dialog's isKeyBased
         // check stays correct if this path is ever reused for other transports.
-        auth_type: "builtin_oauth"
+        auth_type: "builtin_oauth",
+        // Server rows don't carry the account input; the catalog entry does,
+        // and Configure re-runs the login that needs it.
+        oauth_account_input: accountInput,
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
@@ -685,6 +717,55 @@ function ToolsPageContent() {
       toast.error(t('tools.mcp.alerts.saveFailed'))
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  // Delete is offered to owners and admins only (can_edit_global). The
+  // DELETE routes also accept non-owner rows that carry can_delete, such as
+  // catalog connections, but the list does not expose that flag, so those
+  // keep their existing disconnect paths. In a team, an admin's list also
+  // holds team connectors without a personal row; DELETE answers 404 for
+  // those, so the button waits for the ownership status and hides it for
+  // team tools the viewer does not own. Other refusals (team admin rules,
+  // live OAuth connections) come back as the toast below.
+  const canDeleteServer = (server: MCPServer) => {
+    if (server.can_edit_global !== true) return false
+    if (!inTeam) return true
+    if (!isConnectorStatusLoaded) return false
+    const connType = server.transport === 'custom_api' ? 'custom_api' : 'mcp'
+    const status = connectorStatus[`${connType}:${server.id}`]
+    return !(status?.shared && status.is_owner !== true)
+  }
+
+  const handleDeleteMcpServer = async () => {
+    const server = editingServer
+    if (!server || isDeletingServer) return
+    if (!confirm(t('tools.mcp.dialog.deleteConfirm', { name: server.name }))) return
+
+    setIsDeletingServer(true)
+    try {
+      const url = server.transport === 'custom_api'
+        ? `${getApiUrl()}/api/custom-apis/${server.id}`
+        : `${getApiUrl()}/api/mcp/servers/${server.id}`
+      const response = await apiRequest(url, { method: 'DELETE' })
+      if (!response.ok) {
+        const err = await response.json().catch(() => null)
+        toast.error(
+          typeof err?.detail === 'string' && err.detail
+            ? err.detail
+            : t('tools.mcp.dialog.deleteFailed', { name: server.name })
+        )
+        return
+      }
+
+      setIsMcpDialogOpen(false)
+      await loadMCPServers()
+      toast.success(t('tools.mcp.dialog.deleteSuccess', { name: server.name }))
+    } catch (error) {
+      console.error("Failed to delete connector:", error)
+      toast.error(t('tools.mcp.dialog.deleteFailed', { name: server.name }))
+    } finally {
+      setIsDeletingServer(false)
     }
   }
 
@@ -981,6 +1062,7 @@ function ToolsPageContent() {
                 {t('tools.mcp.sharing.needsConfig')}
               </span>
             )}
+            {needsReconnect(server) && <NeedsReconnectBadge />}
           </div>
         </div>
         <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">
@@ -1074,6 +1156,9 @@ function ToolsPageContent() {
       <Dialog
         open={isMcpDialogOpen}
         onOpenChange={(nextOpen) => {
+          // Keep the dialog open until a pending delete settles, so its
+          // completion cannot close an editor opened for another connector.
+          if (!nextOpen && isDeletingServer) return
           setIsMcpDialogOpen(nextOpen)
           if (!nextOpen) {
             connectorEditRequestRef.current += 1
@@ -1114,13 +1199,25 @@ function ToolsPageContent() {
             )}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)}>
+            {editingServer && canDeleteServer(editingServer) && (
+              <Button
+                variant="destructive"
+                className="sm:mr-auto"
+                onClick={handleDeleteMcpServer}
+                disabled={isDeletingServer || isLoading}
+              >
+                {isDeletingServer ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+                {t('tools.mcp.buttons.delete')}
+              </Button>
+            )}
+            <Button variant="outline" onClick={() => setIsMcpDialogOpen(false)} disabled={isDeletingServer}>
               {t('tools.mcp.buttons.cancel')}
             </Button>
             <Button
               onClick={handleSaveMcpServer}
               disabled={
                 isLoading ||
+                isDeletingServer ||
                 !mcpFormData.name.trim() ||
                 (mcpFormData.transport === 'custom_api' && customApiEnv.length > 0 && customApiEnv.some(env => !env.key.trim() || !env.value.trim()))
               }

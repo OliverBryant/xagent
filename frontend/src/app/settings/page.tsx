@@ -14,15 +14,18 @@ import {
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Locale } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
 import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
+import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
+import { useSetupStatus } from "@/hooks/use-setup-status"
 
 export default function SettingsPage() {
   const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
+  const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -31,6 +34,8 @@ export default function SettingsPage() {
   const [confirmPassword, setConfirmPassword] = useState("")
   const [isChangingPassword, setIsChangingPassword] = useState(false)
   const [passwordMessage, setPasswordMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+  const { passwordMinLength } = useSetupStatus()
+  const hasPassword = user?.has_password !== false
 
   useEffect(() => {
     let isMounted = true
@@ -102,7 +107,7 @@ export default function SettingsPage() {
               <Label htmlFor="language-select">{t("settings.language.title")}</Label>
               <Select
                 value={locale}
-                onValueChange={(val) => setLocale(val as any)}
+                onValueChange={(val) => setLocale(val as Locale)}
                 options={[
                   { value: "zh", label: "简体中文" },
                   { value: "en", label: "English" },
@@ -152,9 +157,23 @@ export default function SettingsPage() {
               />
             </div>
 
+            {hasPassword && (
+              <div className="space-y-2">
+                <Label htmlFor="email-current-password">{t("settings.password.current")}</Label>
+                <Input
+                  id="email-current-password"
+                  type="password"
+                  value={emailCurrentPassword}
+                  onChange={(e) => setEmailCurrentPassword(e.target.value)}
+                  placeholder={t("settings.password.current_placeholder")}
+                  disabled={isProfileLoading || isSavingEmail}
+                />
+              </div>
+            )}
+
             <Button
               onClick={handleEmailUpdate}
-              disabled={isProfileLoading || isSavingEmail || !email.trim()}
+              disabled={isProfileLoading || isSavingEmail || !email.trim() || (hasPassword && !emailCurrentPassword)}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
@@ -197,6 +216,7 @@ export default function SettingsPage() {
               <Input
                 id="new-password"
                 type="password"
+                minLength={passwordMinLength}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
                 placeholder={t("settings.password.new_placeholder")}
@@ -208,6 +228,7 @@ export default function SettingsPage() {
               <Input
                 id="confirm-password"
                 type="password"
+                minLength={passwordMinLength}
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 placeholder={t("settings.password.confirm_placeholder")}
@@ -223,6 +244,7 @@ export default function SettingsPage() {
             </Button>
           </CardContent>
         </Card>
+        <ExecutionBudgetSettings key={session.sessionId} isAdmin={user?.is_admin} />
       </div>
     </div>
   )
@@ -238,8 +260,13 @@ export default function SettingsPage() {
       return
     }
 
-    if (newPassword.length < 6) {
-      setPasswordMessage({ type: 'error', text: t("settings.password.errors.too_short") })
+    if (newPassword.length < passwordMinLength) {
+      setPasswordMessage({
+        type: 'error',
+        text: t("settings.password.errors.too_short", {
+          min: passwordMinLength,
+        }),
+      })
       return
     }
 
@@ -293,6 +320,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({
           email,
+          ...(hasPassword ? { current_password: emailCurrentPassword } : {}),
         })
       })
 
@@ -303,6 +331,7 @@ export default function SettingsPage() {
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
+          setEmailCurrentPassword('')
           setEmailMessage({ type: 'success', text: t("settings.email.success") })
         } else if (updated.status === "advanced") {
           applyCanonicalEmail()
@@ -324,7 +353,7 @@ export default function SettingsPage() {
 
   async function syncCachedUser(
     capturedSession: typeof session,
-    nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean },
+    nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean; has_password?: boolean },
   ) {
     return updateAuthSessionUser(capturedSession, nextUser)
   }

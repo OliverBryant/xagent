@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -16,17 +17,21 @@ from xagent.core.execution_scope import (
     ExecutionScope,
     set_execution_scope_snapshot_loader,
 )
-from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.websocket import _make_command_reply
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_command_execution as command_execution_service
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_setup_snapshot as snapshot_module
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
     TaskControlState,
 )
+from xagent.web.services.task_lease_service import TaskLease
 
 
 @pytest.fixture()
@@ -73,11 +78,18 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
         assert resolved_task_id == task_id
         return None
 
-    def finalize_pause(resolved_task_id: int, *, expected_run_id: str | None) -> bool:
+    def finalize_pause(
+        resolved_task_id: int,
+        *,
+        expected_run_id: str | None,
+        owner_leases: tuple[object, ...],
+    ) -> command_execution_service.PauseWriteOutcome:
         worker_threads["finalize"] = threading.get_ident()
         assert resolved_task_id == task_id
         assert expected_run_id == "run-1"
-        return True
+        # No heartbeat or coordinator holds this mocked run.
+        assert owner_leases == ()
+        return command_execution_service.PauseWriteOutcome.APPLIED
 
     def forbidden_event_loop_db() -> object:
         raise AssertionError("pause handler opened a request Session on the event loop")
@@ -94,26 +106,30 @@ async def test_pause_handler_keeps_database_work_off_the_event_loop(
     # Pause is a control operation on an already-running task, so it resolves
     # off-turn: it must stay available while the scope is in dispute.
     monkeypatch.setattr(
-        websocket_api, "resolve_execution_scope_off_turn", resolve_scope_off_turn
+        command_execution_service,
+        "resolve_execution_scope_off_turn",
+        resolve_scope_off_turn,
     )
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_apply_pause_requested_isolated",
         finalize_pause,
         raising=False,
     )
     monkeypatch.setattr(database_module, "get_db", forbidden_event_loop_db)
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(),
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()),
             task_id,
             {"user": actor},
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     assert set(worker_threads) == {"snapshot", "scope", "finalize"}
     assert all(thread_id != event_loop_thread for thread_id in worker_threads.values())
@@ -172,20 +188,22 @@ async def test_pause_survives_a_scope_authority_mismatch(
         snapshot_module, "load_task_setup_snapshot_sync", lambda *a, **k: snapshot
     )
     monkeypatch.setattr(
-        websocket_api,
+        command_execution_service,
         "_apply_pause_requested_isolated",
-        lambda *a, **k: True,
+        lambda *a, **k: command_execution_service.PauseWriteOutcome.APPLIED,
         raising=False,
     )
-    monkeypatch.setattr(chat_api, "get_agent_manager", lambda: agent_manager)
+    monkeypatch.setattr(
+        agent_runtime_service, "get_agent_manager", lambda: agent_manager
+    )
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
     try:
-        await websocket_api._handle_pause_task_unserialized(
-            MagicMock(), task_id, {"user": actor}
+        await command_execution_service.pause_task(
+            _make_command_reply(MagicMock()), task_id, {"user": actor}
         )
     finally:
-        websocket_api._clear_task_pause_accepted(task_id)
+        task_execution_service._clear_task_pause_accepted(task_id)
 
     # The pause went through on the resolver's answer instead of raising.
     agent_service.pause_execution.assert_awaited_once_with()
@@ -194,6 +212,18 @@ async def test_pause_survives_a_scope_authority_mismatch(
             "resolved_execution_scope"
         ].sandbox_key_suffix
         == "from-resolver"
+    )
+
+
+_OWNER_LEASE_ATTEMPT = "attempt-1"
+
+
+def _owner_lease(task: Task) -> TaskLease:
+    return TaskLease(
+        task_id=int(task.id),
+        runner_id=str(task.runner_id),
+        run_id=str(task.run_id),
+        attempt_id=_OWNER_LEASE_ATTEMPT,
     )
 
 
@@ -211,6 +241,9 @@ def _running_task(db_session: Session, *, run_id: str = "run-1") -> Task:
         run_id=run_id,
         state_version=3,
         control_state=TaskControlState.RUNNING.value,
+        runner_id="owner-runner",
+        lease_attempt_id=_OWNER_LEASE_ATTEMPT,
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
     db_session.add(task)
     db_session.commit()
@@ -223,14 +256,15 @@ def test_pause_transition_updates_only_the_expected_running_run(
 ) -> None:
     task = _running_task(db_session)
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
+        owner_leases=(_owner_lease(task),),
     )
 
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
-    assert applied is True
+    assert applied is command_execution_service.PauseWriteOutcome.APPLIED
     assert stored.status == TaskStatus.RUNNING
     assert stored.run_id == "run-1"
     assert stored.control_state == TaskControlState.PAUSE_REQUESTED.value
@@ -241,9 +275,10 @@ def test_pause_transition_rejects_a_replacement_run(db_session: Session) -> None
     task = _running_task(db_session, run_id="replacement-run")
 
     with pytest.raises(StaleTaskRunError, match="run changed"):
-        websocket_api._apply_pause_requested_isolated(
+        command_execution_service._apply_pause_requested_isolated(
             int(task.id),
             expected_run_id="original-run",
+            owner_leases=(_owner_lease(task),),
         )
 
     db_session.expire_all()
@@ -261,14 +296,37 @@ def test_pause_transition_leaves_a_terminal_task_unchanged(
     setattr(task, "control_state", TaskControlState.COMPLETED.value)
     db_session.commit()
 
-    applied = websocket_api._apply_pause_requested_isolated(
+    applied = command_execution_service._apply_pause_requested_isolated(
         int(task.id),
         expected_run_id="run-1",
+        owner_leases=(_owner_lease(task),),
     )
 
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
-    assert applied is False
+    assert applied is command_execution_service.PauseWriteOutcome.NOT_APPLIED
     assert stored.status == TaskStatus.COMPLETED
     assert stored.control_state == TaskControlState.COMPLETED.value
+    assert stored.state_version == 3
+
+
+def test_pause_transition_reports_a_run_that_already_paused(
+    db_session: Session,
+) -> None:
+    task = _running_task(db_session)
+    setattr(task, "status", TaskStatus.PAUSED)
+    setattr(task, "control_state", TaskControlState.PAUSED.value)
+    db_session.commit()
+
+    outcome = command_execution_service._apply_pause_requested_isolated(
+        int(task.id),
+        expected_run_id="run-1",
+        owner_leases=(_owner_lease(task),),
+    )
+
+    db_session.expire_all()
+    stored = db_session.query(Task).filter(Task.id == int(task.id)).one()
+    assert outcome is command_execution_service.PauseWriteOutcome.RUN_ALREADY_PAUSED
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.control_state == TaskControlState.PAUSED.value
     assert stored.state_version == 3

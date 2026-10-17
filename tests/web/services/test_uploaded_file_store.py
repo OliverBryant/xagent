@@ -234,6 +234,8 @@ def test_upsert_already_durable_allows_explicit_same_owner_task_rebind():
     db = _session()
     user = _user(db)
     user_id = int(user.id)
+    db.add(Task(id=24, user_id=user_id, title="rebind target"))
+    db.commit()
     record = UploadedFile(
         file_id="file-task-rebind",
         user_id=user_id,
@@ -385,6 +387,8 @@ def test_two_sessions_cannot_apply_the_same_stale_uploaded_file_snapshot(tmp_pat
     with SessionLocal() as seed_db:
         user = _user(seed_db)
         user_id = int(user.id)
+        seed_db.add(Task(id=11, user_id=user_id, title="stale task"))
+        seed_db.flush()
         old_key = _generation_key(
             user_id=user_id,
             task_id=11,
@@ -1277,6 +1281,7 @@ def test_compensation_preserves_metadata_when_durable_cleanup_fails(
                 storage_path="/tmp/cleanup-success.txt",
                 storage_key="users/1/uploads/cleanup-success/success.txt",
                 storage_status="available",
+                checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
                 file_size=7,
             ),
             UploadedFile(
@@ -1286,6 +1291,7 @@ def test_compensation_preserves_metadata_when_durable_cleanup_fails(
                 storage_path="/tmp/cleanup-failure.txt",
                 storage_key="users/1/uploads/cleanup-failure/failure.txt",
                 storage_status="available",
+                checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
                 file_size=7,
             ),
         ]
@@ -1364,7 +1370,7 @@ def test_compensation_reconciles_delete_ack_loss_as_cleaned(
             storage_backend="file",
             storage_key=storage_key,
             storage_status="available",
-            checksum="checksum",
+            checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             file_size=source.stat().st_size,
         )
     )
@@ -1432,7 +1438,7 @@ def test_compensation_keeps_unknown_delete_outcome_unavailable(
             storage_backend="file",
             storage_key=storage_key,
             storage_status="available",
-            checksum="checksum",
+            checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             file_size=7,
         )
     )
@@ -1499,7 +1505,7 @@ def test_delayed_upload_compensation_does_not_delete_a_file_that_was_bound(
             storage_path="/tmp/request-file.txt",
             storage_key=storage_key,
             storage_status="available",
-            checksum="checksum",
+            checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             file_size=7,
         )
     )
@@ -1568,7 +1574,7 @@ def test_compensation_claim_blocks_a_concurrent_file_binding(monkeypatch):
             storage_path="/tmp/request-file.txt",
             storage_key=storage_key,
             storage_status="available",
-            checksum="checksum",
+            checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             file_size=7,
         )
     )

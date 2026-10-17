@@ -13,6 +13,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.pool_contention_shared import CONTENTION_POOL_TIMEOUT
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
@@ -71,9 +72,9 @@ def _create_compensating_file(
             user_id=user_id,
             filename=f"{suffix}.txt",
             storage_path=f"/tmp/{suffix}.txt",
-            storage_backend="s3",
+            storage_backend="file",
             storage_key=storage_key,
-            checksum="checksum",
+            checksum="239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
             storage_status="compensating",
             file_size=7,
             updated_at=updated_at,
@@ -249,7 +250,7 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
     def original_delete(*, user_id: int, storage_key: str) -> str:
         del user_id, storage_key
         original_delete_started.set()
-        assert allow_original_delete_to_return.wait(timeout=5)
+        assert allow_original_delete_to_return.wait(timeout=DB_PROGRESS_TIMEOUT)
         return "absent"
 
     monkeypatch.setattr(
@@ -269,44 +270,44 @@ def test_recovery_never_restores_while_original_delete_is_in_flight(
 
     original_thread = Thread(target=run_original)
     original_thread.start()
-    assert original_delete_started.wait(timeout=5)
+    assert original_delete_started.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     try:
-        first_recovery = recover_stale_uploaded_file_compensations_batch_isolated(
-            cutoff=now + timedelta(minutes=10),
-            batch_size=10,
-            session_factory=SessionLocal,
-            compensation_delete=lambda **_kwargs: "exists",
-        )
-        assert first_recovery.deleted == 0
-        assert first_recovery.deferred_exists == 1
-        with SessionLocal() as db:
-            claimed_record = (
-                db.query(UploadedFile).filter(UploadedFile.id == row_id).one()
-            )
-            assert claimed_record.storage_status == "compensating"
+        from filelock import FileLock, Timeout
 
-        allow_original_delete_to_return.set()
-        original_thread.join(timeout=5)
-        assert not original_thread.is_alive()
-        assert original_errors == []
-        with SessionLocal() as db:
-            claimed_record = (
-                db.query(UploadedFile).filter(UploadedFile.id == row_id).one()
-            )
-            assert claimed_record.storage_status == "compensating"
+        blocked = Event()
+        original_acquire = FileLock.acquire
 
-        final_recovery = recover_stale_uploaded_file_compensations_batch_isolated(
-            cutoff=now + timedelta(minutes=10),
-            batch_size=10,
-            session_factory=SessionLocal,
-            compensation_delete=lambda **_kwargs: "absent",
-        )
-        assert final_recovery.deleted == 1
-        with SessionLocal() as db:
-            assert (
-                db.query(UploadedFile).filter(UploadedFile.id == row_id).first() is None
+        def acquire(lock, *args, **kwargs):
+            try:
+                return original_acquire(lock, *args, **{**kwargs, "timeout": 0})
+            except Timeout:
+                blocked.set()
+                return original_acquire(lock, *args, **kwargs)
+
+        monkeypatch.setattr(FileLock, "acquire", acquire)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            recovery = pool.submit(
+                recover_stale_uploaded_file_compensations_batch_isolated,
+                cutoff=now + timedelta(minutes=10),
+                batch_size=10,
+                session_factory=SessionLocal,
+                compensation_delete=lambda **_kwargs: "exists",
             )
+            assert blocked.wait(DB_PROGRESS_TIMEOUT)
+            with SessionLocal() as db:
+                assert (
+                    db.query(UploadedFile).filter_by(id=row_id).one().storage_status
+                    == "compensating"
+                )
+            allow_original_delete_to_return.set()
+            original_thread.join(timeout=DB_PROGRESS_TIMEOUT)
+            assert original_errors == []
+            result = recovery.result(timeout=DB_PROGRESS_TIMEOUT)
+            assert result.deleted == 0
+            assert result.deferred_exists == 0
+        with SessionLocal() as db:
+            assert db.query(UploadedFile).filter_by(id=row_id).first() is None
     finally:
         allow_original_delete_to_return.set()
         original_thread.join(timeout=5)
@@ -346,7 +347,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
     def original_delete(*, user_id: int, storage_key: str) -> str:
         del user_id, storage_key
         original_delete_started.set()
-        assert allow_original_delete_to_return.wait(timeout=5)
+        assert allow_original_delete_to_return.wait(timeout=DB_PROGRESS_TIMEOUT)
         return "absent"
 
     def unexpected_sync(self, *, storage_key=None, mime_type=None):
@@ -376,7 +377,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
 
     original_thread = Thread(target=run_original)
     original_thread.start()
-    assert original_delete_started.wait(timeout=5)
+    assert original_delete_started.wait(timeout=DB_PROGRESS_TIMEOUT)
 
     try:
         with SessionLocal() as db:
@@ -395,7 +396,7 @@ def test_storage_path_upsert_cannot_revive_an_inflight_compensation(
         assert sync_calls == []
 
         allow_original_delete_to_return.set()
-        original_thread.join(timeout=5)
+        original_thread.join(timeout=DB_PROGRESS_TIMEOUT)
         assert not original_thread.is_alive()
         assert original_errors == []
         with SessionLocal() as db:

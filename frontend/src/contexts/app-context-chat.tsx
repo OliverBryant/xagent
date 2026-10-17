@@ -9,6 +9,7 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
+import { ConnectorRuntimeDialog } from "@/components/chat/connector-runtime-dialog"
 import {
   AgentCardPresentationCapability,
   LinksOpenInNewTabCapability,
@@ -18,6 +19,8 @@ import {
   FileAccessProvider,
   type FileAccessPolicy,
 } from "@/contexts/file-access-context"
+import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
+import { FIRST_GATE_CLEARED_MESSAGE_KEY, isConnectorRuntimeDialogTriggerCode, shouldHoldFirstMessage } from "@/lib/connector-runtime-api"
 
 interface WebSocketMessage {
   type: string
@@ -27,7 +30,11 @@ interface WebSocketMessage {
   step_id?: string
   event_type?: string
   event_id?: string
+  message_id?: string
+  execution_sequence?: number
   run_id?: string | null
+  stream_run_id?: string | null
+  stream_attempt_id?: string | null
   state_version?: number
   control_state?: TaskControlState
   status?: unknown
@@ -44,6 +51,14 @@ type TaskControlState =
   | "completed"
   | "failed"
 
+// The structured half of a terminal task_error frame: the stable error code
+// the client renders and localizes. The frame carries nothing else
+// connector-specific -- its audience includes anonymous widget and
+// share-link visitors.
+type TaskErrorProjection = {
+  code: string
+}
+
 type TaskControlEnvelope = {
   isStateEvent: boolean
   taskId?: number
@@ -53,7 +68,8 @@ type TaskControlEnvelope = {
   status?: TaskStatus
 }
 
-const VERSIONED_TASK_EVENT_TYPES = new Set([
+export const VERSIONED_TASK_EVENT_TYPES = new Set([
+  "task_stream_snapshot",
   "agent_error",
   "error",
   "task_completed",
@@ -87,11 +103,14 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "ADD_STEP",
   "UPDATE_STEP",
   "UPDATE_TASK_STATUS",
+  "APPLY_AUTO_RESUME_NOTICE",
   "SET_CURRENT_TASK",
   "SET_PROCESSING",
   "SET_HISTORY_LOADING",
   "ADD_MESSAGE",
   "UPSERT_STREAMING_FINAL_ANSWER",
+  "SET_STREAM_RECOVERY",
+  "RECONCILE_STREAM_OUTPUT",
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
   "SET_PLAN_MEMORY_INFO",
@@ -104,6 +123,7 @@ const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 const MAX_RETIRED_SESSION_TASK_IDS = 500
 const SESSION_RESET_ACK_TIMEOUT_MS = 30_000
 const SESSION_TASK_ADOPTION_TIMEOUT_MS = 30_000
+const SESSION_STOP_TIMEOUT_MS = 30_000
 const MAX_SESSION_PRE_ADOPTION_FRAMES = 64
 const MAX_SESSION_PRE_ADOPTION_BYTES = 256 * 1024
 
@@ -115,6 +135,25 @@ type SessionConversationState =
   | { phase: "replacement_sending"; connectionIdentity: string; taskId: null }
   | { phase: "replacement_awaiting_task"; connectionIdentity: string; taskId: null }
   | { phase: "reload_required"; connectionIdentity: string | null; taskId: null }
+
+// The stop control's own state. The server sends no acknowledgement frame for
+// a stop, so "stopping" ends in one of six ways: this task's terminal frame,
+// the local timeout above, an agent_error for this task that carries no code
+// or carries external_stop_not_applied, a reconnect (the button's own state is
+// per-connection and cannot outlive the connection it was set on), the
+// control ceasing to be available while the run pauses without ending or
+// while the socket is down (see the effect keyed on canStopTask), or a later
+// stop attempt that the socket refuses, which moves the state straight to
+// "not_sent" (see stopTask). The last one is defensive: the stop button ignores
+// presses while a stop is pending, so only a caller other than the button can
+// reach it. That agent_error only returns the control to pressable and does
+// not end the stop intent: it is broadcast to every connection on the task
+// without naming which stop press it answers. "not_sent" itself is usually
+// short-lived: a socket that refuses a frame is normally closing or already
+// replaced, and once the drop or the new connection is observed the control
+// returns to "idle" (the effect keyed on canStopTask, or the one keyed on the
+// connection identity).
+export type SessionStopState = "idle" | "stopping" | "timed_out" | "not_sent"
 
 type SessionConversationAction =
   | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
@@ -324,7 +363,7 @@ const acceptTaskControlVersion = (
 }
 
 export interface Interaction {
-  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards";
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps";
   field: string;
   label: string;
   options?: Array<{ label: string; value: string; description?: string; action_type?: string }>;
@@ -336,18 +375,25 @@ export interface Interaction {
   default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
+  /** For "connect_apps": connector app display names (matched against
+   * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
+   * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
+  apps?: string[];
 }
 import {
   useWebSocket,
+  MessageDeliveryError,
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
-import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
-import { useI18n } from "@/contexts/i18n-context"
+import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
+import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
-import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { normalizeCompletionOutcome, normalizeTaskCompletedMessage, type TaskCompletionOutcome } from "@/lib/task-completion"
 import { emitTaskError } from "@/lib/task-error-events"
 import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
@@ -360,6 +406,10 @@ import {
   shouldBufferMessageForHistoricalReplay,
 } from "@/lib/streaming-final-answer"
 import { extractSharedChatResponse } from "@/lib/chat-response"
+import {
+  isStableAssistantMessageId,
+  stableAssistantMessageId,
+} from "@/lib/assistant-message-identity"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -426,7 +476,6 @@ const dispatchAutoOpenPreview = (
   })
 }
 
-const OPTIMISTIC_USER_MESSAGE_PREFIX = "msg-user-optimistic"
 const USER_TURN_MESSAGE_PREFIX = "msg-user-turn"
 const USER_EVENT_MESSAGE_PREFIX = "msg-user-event"
 const USER_MESSAGE_REPLACE_WINDOW_MS = 30000
@@ -473,11 +522,29 @@ const normalizeMessageContent = (content: string | React.ReactNode): string => {
   return ''
 }
 
+// A user message id minted from a stable per-turn identity: the wire's
+// `turn_id` / `event_id` (stableUserMessageId) or the sender's own
+// client_message_id (userTurnMessageId), which the backend echoes back as
+// that turn's id.
+const hasStableUserTurnIdentity = (id: string): boolean =>
+  id.startsWith(`${USER_TURN_MESSAGE_PREFIX}-`) ||
+  id.startsWith(`${USER_EVENT_MESSAGE_PREFIX}-`)
+
 const findOptimisticUserMessageIndex = (
   messages: Message[],
   incomingMessage: Message,
 ): number => {
   if (incomingMessage.role !== "user") {
+    return -1
+  }
+
+  // Identity beats text: a message carrying one is reconciled by
+  // ADD_MESSAGE's id branch alone. Merging by text instead can drop a turn
+  // from the transcript with no error, and repeated text is routine here -
+  // a clarification form with no free-text field serializes to a fixed
+  // string. Only identity-less legacy events still need text. See the commit
+  // for which same-turn pairs this gives up on, and why they are unreachable.
+  if (hasStableUserTurnIdentity(incomingMessage.id)) {
     return -1
   }
 
@@ -490,14 +557,7 @@ const findOptimisticUserMessageIndex = (
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const existingMessage = messages[index]
-    if (
-      existingMessage.role !== "user" ||
-      typeof existingMessage.id !== "string" ||
-      (
-        !existingMessage.isOptimistic &&
-        !existingMessage.id.startsWith(OPTIMISTIC_USER_MESSAGE_PREFIX)
-      )
-    ) {
+    if (existingMessage.role !== "user" || !existingMessage.isOptimistic) {
       continue
     }
 
@@ -526,7 +586,7 @@ if (typeof window !== 'undefined') {
     duplicateMessageCacheClearers.forEach(clear => clear())
   }
 }
-const normalizeInteractions = (value: unknown): Interaction[] => {
+export const normalizeInteractions = (value: unknown): Interaction[] => {
   if (!Array.isArray(value)) {
     return []
   }
@@ -555,7 +615,7 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
       const field = seenFields.has(baseField) ? `${baseField}_${index}` : baseField
       seenFields.add(field)
       if (
-        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards"].includes(type) ||
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps"].includes(type) ||
         typeof field !== "string" ||
         !field.trim()
       ) {
@@ -592,8 +652,14 @@ const normalizeInteractions = (value: unknown): Interaction[] => {
       if (typeof item.min === "number") normalized.min = item.min
       if (typeof item.max === "number") normalized.max = item.max
       if (typeof item.default !== "undefined") normalized.default = item.default
+      if (item.default_value === null || typeof item.default_value === "string" || typeof item.default_value === "boolean" || (typeof item.default_value === "number" && Number.isFinite(item.default_value))) {
+        normalized.default_value = item.default_value
+      }
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
+      if (Array.isArray(item.apps)) {
+        normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
+      }
 
       return normalized
     })
@@ -621,12 +687,14 @@ interface Message {
   content: string | React.ReactNode
   rawContent?: string
   timestamp: string
-  status?: "pending" | "running" | "completed" | "failed"
+  status?: "pending" | "running" | "completed" | "failed" | "interrupted"
   isResult?: boolean
   isFileOutput?: boolean
   streamMessageId?: string
+  executionSequence?: number
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
+  interactionRequestId?: string
   isSystemNotice?: boolean
   isOptimistic?: boolean
 }
@@ -642,10 +710,89 @@ const normalizeTaskRuntimeExtensions = (value: unknown): TaskRuntimeExtensions =
   )
 }
 
+// Why a PAUSED task's run stopped: the server's ``auto_recovery`` view
+// (history task_info) or a ``task_paused`` event's ``interruption_reason``.
+// ``reason`` is an InterruptionReason value (``user_pause`` when the user
+// paused it). Kept only while the task is paused.
+export interface TaskAutoRecovery {
+  reason: string
+}
+
+const normalizeAutoRecovery = (value: unknown): TaskAutoRecovery | undefined =>
+  isJsonRecord(value) && typeof value.reason === "string" && value.reason
+    ? { reason: value.reason }
+    : undefined
+
+// Automatic resume of a paused task, from the latest ``task_recovery_update``
+// event: scheduled, under way, or stopped (``stopReason`` says why). It is
+// tied to the fence it was announced at and kept only while the task rests
+// there.
+export interface TaskAutoResume {
+  status: "scheduled" | "resuming" | "stopped"
+  stopReason?: string
+  nextAttemptAt?: string
+  runId: string
+  stateVersion: number
+}
+
+const AUTO_RESUME_STATUSES = new Set(["scheduled", "resuming", "stopped"])
+
+// ``task_recovery_update`` -> the task it is for and its notice, or nothing
+// for a malformed event.
+export const parseAutoResumeNotice = (
+  message: unknown,
+): { taskId: number; reason?: string; notice: TaskAutoResume } | undefined => {
+  const root = asMessageRecord(message)
+  // useWebSocket moves an unrecognised event's body into ``data`` and keeps
+  // the control envelope (task_id, run_id, state_version) at the root.
+  const view = asMessageRecord(root.auto_resume ?? asMessageRecord(root.data).auto_resume)
+  const taskId = parseInteger(root.task_id)
+  const stateVersion = parseInteger(root.state_version)
+  const status = view.status
+  if (
+    taskId === undefined
+    || stateVersion === undefined
+    || typeof root.run_id !== "string"
+    || typeof status !== "string"
+    || !AUTO_RESUME_STATUSES.has(status)
+  ) return undefined
+  return {
+    taskId,
+    reason: typeof view.reason === "string" && view.reason ? view.reason : undefined,
+    notice: {
+      status: status as TaskAutoResume["status"],
+      stopReason: typeof view.stop_reason === "string" ? view.stop_reason : undefined,
+      nextAttemptAt: typeof view.next_attempt_at === "string" ? view.next_attempt_at : undefined,
+      runId: root.run_id,
+      stateVersion,
+    },
+  }
+}
+
+// An automatic-resume notice only describes the fence it was announced at.
+const autoResumeAtFence = (task: Task): TaskAutoResume | undefined =>
+  task.status === "paused"
+  && task.autoResume?.stateVersion === task.stateVersion
+  && task.autoResume?.runId === task.runId
+    ? task.autoResume
+    : undefined
+
+// A task's interruption only describes it while it rests paused.
+const clearStaleAutoRecovery = (task: Task | null): Task | null => {
+  if (!task) return task
+  const autoRecovery = task.status === "paused" ? task.autoRecovery : undefined
+  const autoResume = autoResumeAtFence(task)
+  return autoRecovery === task.autoRecovery && autoResume === task.autoResume
+    ? task
+    : { ...task, autoRecovery, autoResume }
+}
+
 export interface Task {
   id: string
   title: string
   status: TaskStatus
+  completionOutcome?: TaskCompletionOutcome
+  conversationStorageVersion?: number
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -666,9 +813,12 @@ export interface Task {
   runtimeExtensionBindings?: string[]
   waitingQuestion?: string
   waitingInteractions?: Interaction[]
+  waitingRequestId?: string
   runId?: string | null
   stateVersion?: number
   controlState?: TaskControlState
+  autoRecovery?: TaskAutoRecovery
+  autoResume?: TaskAutoResume
   // Frontend-only, distinct from updatedAt: stamped once by UPDATE_TASK_STATUS
   // when this run actually terminates (completed/failed), cleared when it
   // starts running again, and deliberately preserved across SET_CURRENT_TASK
@@ -853,6 +1003,10 @@ const taskFromTaskInfoData = (
   title: taskData.title as string,
   description: taskData.description as string,
   status: normalizeTaskStatus(taskData.status) || "pending",
+  completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
+  ...(taskData.conversation_storage_version !== undefined
+    ? { conversationStorageVersion: taskData.conversation_storage_version as number }
+    : {}),
   createdAt: taskData.created_at as string | number,
   updatedAt: taskData.updated_at as string | number,
   modelId: taskData.model_id as string | undefined,
@@ -874,12 +1028,56 @@ const taskFromTaskInfoData = (
   runId: taskData.run_id as string | null | undefined,
   stateVersion: parseInteger(taskData.state_version),
   controlState: taskData.control_state as TaskControlState | undefined,
+  // Only a frame that reports the view (history replay's) may replace or
+  // clear one already held; live task_info frames do not carry it.
+  ...(hasOwn(taskData, "auto_recovery")
+    ? { autoRecovery: normalizeAutoRecovery(taskData.auto_recovery) }
+    : {}),
 })
 
-const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+const getWebSocketErrorCodeField = (message: WebSocketMessage): {
+  present: boolean
+  value: unknown
+} => {
   const root = message as unknown as Record<string, unknown>
   const data = isJsonRecord(message.data) ? message.data : null
+  if (data && Object.prototype.hasOwnProperty.call(data, "error_code")) {
+    return { present: true, value: data.error_code }
+  }
+  if (Object.prototype.hasOwnProperty.call(root, "error_code")) {
+    return { present: true, value: root.error_code }
+  }
+  return { present: false, value: undefined }
+}
+
+const getWebSocketErrorMessage = (
+  message: WebSocketMessage,
+  trustLegacyErrorProse: boolean,
+): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  if (getWebSocketErrorCodeField(message).present) return "Unknown error"
+  if (!trustLegacyErrorProse) return "Unknown error"
   return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketErrorCode = (message: WebSocketMessage) => {
+  const errorCode = getWebSocketErrorCodeField(message)
+  return errorCode.present ? readClientErrorCode(errorCode.value) : null
+}
+
+// The frame deliberately carries nothing connector-specific beyond the code:
+// its audience includes anonymous widget and share-link visitors. Which
+// connector, which key, and each key's declared type all come from the
+// per-task requirements endpoint, which selects on
+// `Task.id == task_id AND Task.user_id == current_user.id`.
+const getTaskErrorProjection = (
+  message: WebSocketMessage,
+): TaskErrorProjection | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const code = getString(data?.code) || getString(root.code)
+  return code ? { code } : null
 }
 
 const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
@@ -892,6 +1090,126 @@ const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | nul
 
 const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
   isStoppedTaskStatus(status)
+
+export type ErrorFrameDisplay = {
+  /** Terminal (`task_error`) or a rejection on the mixed root `error` channel. */
+  isTerminal: boolean
+  /** Status carried by the frame, or null when it carries none. */
+  taskStatus: Task["status"] | null
+  stopsProcessing: boolean
+  /** First argument to the dedup check: the server sentence, or the constant
+   *  that stands in for it on a transport that marks legacy prose untrusted. */
+  dedupText: string
+  /** Third argument to the dedup check. Undefined means "no identity, key on
+   *  the text alone". */
+  occurrenceIdentity: string | undefined
+  bubbleContent: string
+  isResult: boolean
+  /** The frame's own code, once it has cleared the client error table --
+   *  null on a non-terminal frame, a terminal frame with no code, or a code
+   *  the table does not list (e.g. auto_model_unavailable). Reuses the same
+   *  `projectedCode` this function already derives for the bubble; a caller
+   *  must not call getTaskErrorProjection a second time to get it. */
+  terminalErrorCode: ClientErrorCode | null
+}
+
+// One place where a frame on the error/task_error handler becomes the six
+// values the handler needs: the bubble's wording, the dedup text, the dedup
+// identity, the result flag, the task status to dispatch, and the code that
+// opens the connector-runtime dialog. Each of those needs a different subset
+// of "is this terminal / is legacy prose trusted / did a code survive / is
+// there a state version", and deriving each subset at its own use site is
+// what let five separate defects land in this handler.
+// Pure on purpose: no dispatch, no refs, nothing
+// outside its arguments, so every cell of that matrix is unit-testable
+// without rendering the provider -- the same shape extractTaskControlEnvelope
+// above already uses.
+export const projectErrorFrameForDisplay = (
+  message: WebSocketMessage,
+  options: {
+    trustLegacyErrorProse: boolean
+    translate: Translate
+    controlEnvelope: TaskControlEnvelope
+  },
+): ErrorFrameDisplay => {
+  const { trustLegacyErrorProse, translate, controlEnvelope } = options
+  const websocketErrorCode = getWebSocketErrorCode(message)
+  const dedupText = websocketErrorCode
+    ? translate(clientErrorTranslationKey(websocketErrorCode))
+    : getWebSocketErrorMessage(message, trustLegacyErrorProse)
+  const taskStatus = getWebSocketTaskStatus(message)
+  // Only task_error is terminal. Every frame of that type is emitted after
+  // the row has been committed FAILED -- task_orchestrator.py's settled
+  // branch, and websocket.py's legacy helper, which settles under
+  // only_if_running=True and does not broadcast when that update matches
+  // no row -- and task_error is also the only frame that carries the
+  // structured code. The root "error" type is a mixed
+  // channel: rejected chat messages, rejected pause and rejected resume
+  // all arrive on it while the viewed task is still RUNNING or
+  // WAITING_FOR_USER, and a rejection is not this turn's answer.
+  const isTerminal = message.type === "task_error"
+  const projection = isTerminal ? getTaskErrorProjection(message) : null
+  // The frame's own code decides the wording, and one code has one sentence
+  // for every audience. This is the same table the root error channel already
+  // uses for its error_code field, extended with the connector-runtime codes
+  // and the external-cancel interruption code that reach this frame -- not a
+  // second vocabulary beside it. It also fixes
+  // what the relayed sentence could not: on a transport that marks legacy
+  // prose untrusted, getWebSocketErrorMessage returns a constant by design
+  // (#1938: never render server free text there), so before this the curated
+  // sentence existed for three codes and every other code read "Unknown
+  // error". Nothing here relays server prose; the wording is the client's own,
+  // selected by code. A code the table does not list keeps the generic
+  // prefixed wording.
+  const projectedCode = projection ? readClientErrorCode(projection.code) : null
+  const codedBubble = projectedCode
+    ? translate(clientErrorTranslationKey(projectedCode))
+    : null
+  // The dedup identity has to name WHICH occurrence this frame reports, not
+  // which class of failure it belongs to. broadcast_to_task stamps every frame
+  // of this type with the row's (run_id, state_version) pair before it goes
+  // out -- task_error is in websocket.py's _VERSIONED_TASK_EVENT_TYPES -- and
+  // state_version is bumped by every control transition that actually changes
+  // (status, control_state). So one settlement broadcast twice carries one
+  // version and still collapses, while two failed turns are at least two
+  // versions apart (the retry takes the lease FAILED -> RUNNING, then settles
+  // RUNNING -> FAILED) and both are shown. Keying on the failure's class
+  // instead -- the code, the reason, or the rendered sentence -- cannot tell
+  // those two apart, and on this handler the collapsed frame is the turn's
+  // result. The identity is withheld when the frame carries no version (the
+  // row was already gone when it was broadcast, so no state tuple was
+  // attached), which falls back to keying on the text alone:
+  // canAcceptTaskControlVersion drops such a frame once any versioned event
+  // has been seen for the task, and when none has, two of them key on the
+  // same text and the second still collapses -- the behaviour that predates
+  // this change. Withholding the identity is the honest answer there;
+  // attaching a state tuple needs the row, and a settled FAILED task has one.
+  const occurrenceIdentity =
+    isTerminal && controlEnvelope.stateVersion !== undefined
+      ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
+      : undefined
+  return {
+    isTerminal,
+    taskStatus,
+    stopsProcessing: shouldStopProcessingForTaskStatus(taskStatus),
+    dedupText,
+    occurrenceIdentity,
+    bubbleContent:
+      codedBubble
+      ?? `${translate('agent.logs.event.messages.errorPrefix')} ${dedupText}`,
+    // A terminal failure IS this turn's result: without the flag the
+    // conversation panel (which renders only user / isResult / system-notice
+    // messages) filters the bubble out and falls back to a virtual "unknown
+    // error" placeholder until reload. A non-terminal rejection is not, and
+    // flagging it would close the live progress indicator and the
+    // waiting-answer form of a turn that is still running, and drain this
+    // turn's accumulated trace events into the rejection bubble (see the
+    // ADD_MESSAGE reducer case's isResult branch, which merges
+    // state.traceEvents into the message and clears it).
+    isResult: isTerminal,
+    terminalErrorCode: projectedCode,
+  }
+}
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -994,7 +1312,13 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
 }
 
 export interface AppState {
+  streamRecoveryTaskId?: number | null
   messages: Message[]
+  // Ids of the user messages that opened a turn the visitor stopped. Kept
+  // here rather than on a bubble because a terminal frame that names a
+  // message_id adds no bubble. The conversation panel reads it to draw that
+  // turn's process as stopped. Live only: a reload does not rebuild it.
+  stoppedTurnAnchorIds: string[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
   dagExecution: DAGExecution | null
@@ -1041,15 +1365,19 @@ export interface AppState {
 }
 
 type AppAction =
+  | { type: "SET_STREAM_RECOVERY"; payload: number | null }
+  | { type: "RECONCILE_STREAM_OUTPUT"; payload: { runId: string; output: string; timestamp: string; interrupted: boolean } }
   | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
   | { type: "RESET_SESSION_CONVERSATION" }
+  | { type: "MARK_TURN_STOPPED"; payload: { anchorMessageId: string } }
   | { type: "ADD_MESSAGE"; payload: Message }
-  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
+  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; executionSequence?: number; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; autoRecovery?: TaskAutoRecovery; updatedAt?: string } }
+  | { type: "APPLY_AUTO_RESUME_NOTICE"; payload: { taskId: number; reason?: string; notice: TaskAutoResume; knownVersion?: number } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1091,6 +1419,7 @@ type AppAction =
 
 const createInitialState = (): AppState => ({
   messages: [],
+  stoppedTurnAnchorIds: [],
   currentTask: null,
   taskRuntimeExtensions: {},
   dagExecution: null,
@@ -1157,6 +1486,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // Clear messages if task ID changes
       const taskChanged = state.taskId !== action.payload
       const messages = taskChanged ? [] : state.messages
+      const stoppedTurnAnchorIds = taskChanged ? [] : state.stoppedTurnAnchorIds
       const contextUsage = taskChanged ? null : state.contextUsage
       const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
       // Also clear the previous task's DAG plan/phase here - otherwise
@@ -1169,6 +1499,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         ...state,
         taskId: action.payload,
         messages,
+        stoppedTurnAnchorIds,
         contextUsage,
         taskRuntimeExtensions,
         dagExecution,
@@ -1186,9 +1517,25 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         taskId: action.payload.taskId,
-        currentTask: withDagTerminatedAt(action.payload.task),
+        currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
         taskRuntimeExtensions: {},
+        // The server re-sends task_info for the same task at the start of
+        // every turn, so adopting the task already bound must keep the record
+        // of the turns the visitor stopped; only a different task drops it.
+        stoppedTurnAnchorIds:
+          state.taskId === action.payload.taskId ? state.stoppedTurnAnchorIds : [],
       }
+
+    case "MARK_TURN_STOPPED":
+      return state.stoppedTurnAnchorIds.includes(action.payload.anchorMessageId)
+        ? state
+        : {
+            ...state,
+            stoppedTurnAnchorIds: [
+              ...state.stoppedTurnAnchorIds,
+              action.payload.anchorMessageId,
+            ],
+          }
 
     case "RESET_SESSION_CONVERSATION":
       return {
@@ -1212,6 +1559,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
       if (newMessage.role === "assistant" && newMessage.isResult) {
         const replaceMessageAt = (targetIndex: number) => {
+          const existingSequence = state.messages[targetIndex].executionSequence
+          if (existingSequence !== undefined && newMessage.executionSequence !== undefined
+            && newMessage.executionSequence <= existingSequence) return state
           const updatedMessages = state.messages.map((message, index) =>
             index === targetIndex
               ? {
@@ -1225,15 +1575,49 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           )
           return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
-        if (newMessage.streamMessageId) {
-          const streamingIndex = state.messages.findIndex(
+        if (newMessage.streamMessageId || newMessage.executionSequence !== undefined) {
+          const targetId = newMessage.streamMessageId ?? newMessage.id
+          const deliveredIndex = state.messages.findIndex(
             message =>
-              message.id === newMessage.streamMessageId &&
-              isStreamingFinalAnswerMessage(message)
+              message.role === "assistant" && message.id === targetId &&
+              (!newMessage.streamMessageId || isStreamingFinalAnswerMessage(message))
           )
-          if (streamingIndex >= 0) {
-            return replaceMessageAt(streamingIndex)
+          if (deliveredIndex >= 0) {
+            return replaceMessageAt(deliveredIndex)
           }
+        }
+      }
+
+      // One assistant question can be delivered twice -- live, then replayed
+      // from the transcript after a reconnect -- under one event identity but
+      // with different text, because the replayed copy carries the rendered
+      // interaction list. Identity decides, never text: #2250 is the record
+      // of what text matching costs. The mounted bubble is kept rather than
+      // replaced so an open clarification form is not remounted under the
+      // visitor; the re-delivery only fills in what the bubble lacks. Content
+      // is deliberately not among those fields: one event id is one question,
+      // and the replayed copy differs only by the rendered interaction list
+      // the form already draws.
+      if (messageToAdd.role === "assistant" && isStableAssistantMessageId(messageToAdd.id)) {
+        const deliveredIndex = state.messages.findIndex(
+          message => message.role === "assistant" && message.id === messageToAdd.id,
+        )
+        if (deliveredIndex >= 0) {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === deliveredIndex
+              ? {
+                ...message,
+                interactions: message.interactions ?? messageToAdd.interactions,
+                interactionRequestId:
+                  message.interactionRequestId ?? messageToAdd.interactionRequestId,
+                traceEvents: mergeTraceEventsById(
+                  message.traceEvents,
+                  messageToAdd.traceEvents,
+                ),
+              }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
         }
       }
 
@@ -1292,11 +1676,61 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
     }
 
+    case "SET_STREAM_RECOVERY":
+      return { ...state, streamRecoveryTaskId: action.payload }
+
+    case "RECONCILE_STREAM_OUTPUT": {
+      const { runId, output, timestamp, interrupted } = action.payload
+      let resultIndex = -1
+      for (let index = state.messages.length - 1; index >= 0; index--) {
+        const message = state.messages[index]
+        if (message.role === "user") break
+        if (message.role === "assistant" && message.isResult) {
+          resultIndex = index
+          break
+        }
+      }
+      const existing = state.messages[resultIndex]
+      // Preserve richer live formatting/files when a complete result already
+      // arrived. A partial stream, or a missed result, needs the durable text.
+      if (existing?.status === "completed" && !interrupted) return state
+      const restored: Message = {
+        ...existing,
+        id: existing?.id ?? `final_answer_recovered_${runId}`,
+        role: "assistant",
+        content: output,
+        rawContent: output,
+        timestamp: existing?.timestamp ?? timestamp,
+        status: "completed",
+        isResult: true,
+      }
+      const messages = [...state.messages]
+      if (resultIndex >= 0) messages[resultIndex] = restored
+      else messages.push(restored)
+      return { ...state, messages, streamRecoveryTaskId: null }
+    }
+
     case "UPSERT_STREAMING_FINAL_ANSWER": {
-      const { messageId, delta, content, status, timestamp } = action.payload
+      const { messageId, delta, content, status, timestamp, executionSequence } = action.payload
       const existing = state.messages.find(message => message.id === messageId)
+      if (existing?.executionSequence !== undefined) {
+        if (executionSequence !== undefined && executionSequence <= existing.executionSequence) {
+          // Ownership can end without adding another stream fact. Refresh
+          // that start's status, but never downgrade newer or terminal text.
+          if (executionSequence === existing.executionSequence
+            && status === "interrupted" && existing.status === "running") {
+            return { ...state, messages: state.messages.map(message =>
+              message.id === messageId ? { ...message, status: "interrupted" } : message
+            ) }
+          }
+          return state
+        }
+        // Deltas are ephemeral; a durable terminal frame owns the full text.
+        if (executionSequence === undefined && existing.status !== "running") return state
+      }
       if (!existing) {
         const message: Message = {
+          executionSequence,
           id: messageId,
           role: "assistant",
           content: content || delta || "",
@@ -1319,6 +1753,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           ...message,
           content: nextContent,
           rawContent: nextContent,
+          executionSequence: executionSequence ?? message.executionSequence,
           status: status || message.status || "running",
         }
       })
@@ -1347,7 +1782,10 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
       // backfills the former and clears the latter so a prior run's
       // dagTerminatedAt can't linger into this one.
-      const currentTask = withDagTerminatedAt(mergedTask)
+      const currentTask = clearStaleAutoRecovery(withDagTerminatedAt(mergedTask && {
+        ...mergedTask,
+        completionOutcome: mergedTask.status === "completed" ? mergedTask.completionOutcome : undefined,
+      }))
 
       return {
         ...state,
@@ -1408,6 +1846,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt = new Date().toISOString()
         }
       }
+      const replacesWaitingOccurrence = isWaitingForUser
+        && action.payload.waitingRequestId !== undefined
+        && action.payload.waitingRequestId !== state.currentTask.waitingRequestId
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -1416,6 +1857,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
+          completionOutcome: nextStatus === "completed"
+            ? ("completionOutcome" in action.payload ? action.payload.completionOutcome : state.currentTask.completionOutcome)
+            : undefined,
           // Prefer the originating event's own timestamp over the client's
           // current wall-clock time - during historical replay, every event
           // gets processed at "now", so stamping updatedAt with the reducer's
@@ -1426,16 +1870,80 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           dagTerminatedAt,
           dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
-            ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
+            ? action.payload.waitingQuestion ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingQuestion
+            )
             : undefined,
           waitingInteractions: isWaitingForUser
-            ? action.payload.waitingInteractions ?? state.currentTask.waitingInteractions
+            ? action.payload.waitingInteractions ?? (
+              replacesWaitingOccurrence ? undefined : state.currentTask.waitingInteractions
+            )
+            : undefined,
+          waitingRequestId: isWaitingForUser
+            ? action.payload.waitingRequestId ?? (
+              action.payload.waitingQuestion === undefined
+              && action.payload.waitingInteractions === undefined
+                ? state.currentTask.waitingRequestId
+                : undefined
+            )
             : undefined,
           runId: action.payload.runId ?? state.currentTask.runId,
           stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
           controlState: action.payload.controlState ?? state.currentTask.controlState,
+          // A pause event without a reason (history's reasserted pause, a
+          // live-lease restore, an unknown-input pause) keeps the one already
+          // known; leaving paused clears it.
+          autoRecovery: nextStatus === "paused"
+            ? action.payload.autoRecovery ?? state.currentTask.autoRecovery
+            : undefined,
+          // Kept only while the task rests at the fence it was announced at.
+          autoResume: autoResumeAtFence({
+            ...state.currentTask,
+            status: nextStatus,
+            runId: action.payload.runId ?? state.currentTask.runId,
+            stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
+          }),
         },
       }
+    }
+
+    case "APPLY_AUTO_RESUME_NOTICE": {
+      const { taskId, reason, notice, knownVersion } = action.payload
+      const task = state.currentTask
+      if (!task || task.id !== String(taskId)) return state
+      // The task's own version, else the last one a versioned event set.
+      const known = task.stateVersion ?? knownVersion
+      if (known === undefined) {
+        // Nothing to order it against: only annotate a pause already shown,
+        // never move a running or finished task.
+        if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
+          return state
+        }
+        return { ...state, currentTask: { ...task, autoResume: notice } }
+      }
+      if (notice.stateVersion < known) return state
+      if (notice.stateVersion === known) {
+        // Same fence: annotate the pause the client already shows.
+        if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
+          return state
+        }
+        return { ...state, currentTask: { ...task, autoResume: notice } }
+      }
+      // A newer fence: the server rests the task paused there (a lease-expiry
+      // pause announces nothing else), so apply that pause first.
+      const paused = projectAppState(state, {
+        type: "UPDATE_TASK_STATUS",
+        payload: {
+          status: "paused",
+          runId: notice.runId,
+          stateVersion: notice.stateVersion,
+          controlState: "paused",
+          autoRecovery: reason ? { reason } : undefined,
+        },
+      })
+      return paused.currentTask
+        ? { ...paused, isProcessing: false, currentTask: { ...paused.currentTask, autoResume: notice } }
+        : paused
     }
 
     case "SET_DAG_EXECUTION":
@@ -1547,9 +2055,9 @@ function projectAppState(state: AppState, action: AppAction): AppState {
             isStreamingFinalAnswerMessage(message)
           )
         })
-        return { ...state, messages: messagesToKeep }
+        return { ...state, messages: messagesToKeep, stoppedTurnAnchorIds: [] }
       }
-      return { ...state, messages: [] }
+      return { ...state, messages: [], stoppedTurnAnchorIds: [] }
 
     case "RESET_STATE":
       return {
@@ -1741,6 +2249,8 @@ interface PendingMessage {
   targetTaskId?: number
   force?: boolean
   clientMessageId?: string
+  requestId?: string
+  start?: () => boolean
   resolve?: () => void
   reject?: (error: Error) => void
 }
@@ -1759,8 +2269,14 @@ interface AppContextType {
   selectStep: (stepId: string | null) => void
   clearMessages: () => void
   isConnected: boolean
+  // Counts onConnect's same-task branch: the socket reopened for the task it
+  // was last connected to. The first connect for a task does not count.
+  sameTaskReconnects: number
   connectionError: Error | null
   startNewConversation: () => Promise<void>
+  canStopTask: boolean
+  stopTask: () => void
+  stopState: SessionStopState
   isConversationResetPending: boolean
   isMessageDeliveryPending: boolean
   isSessionInteractionLocked: boolean
@@ -1793,9 +2309,19 @@ export interface AppProviderTransportCapabilities {
   // (including "page"): only the embedded Chat Widget opts in, since that is
   // the only surface where an in-tab navigation abandons the visitor's iframe.
   linksOpenInNewTab?: TransportCapabilityState
+  // Same default-closed rule as linksOpenInNewTab above: only a transport that
+  // explicitly asks for it gets a stop control, because only the delegated
+  // session endpoint reads a stop frame at all.
+  taskStop?: TransportCapabilityState
 }
 
 export interface AppProviderTransportConfig {
+  /**
+   * Whether no-code error frames may render server prose during a temporary
+   * old-backend/new-frontend deployment skew. Public and external-credential
+   * transports must opt out; the authenticated page keeps its legacy default.
+   */
+  legacyErrorProse?: "trusted" | "untrusted"
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
   /**
    * Owns every file URL and request made below this provider. Public
@@ -1879,23 +2405,45 @@ export function AppProvider({
     createInitialState,
   )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
+  const firstGateTaskIdRef = useRef<number | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
+  // Read through a ref, not a useCallback dependency, so the dialog
+  // provider's state changes never change handleMessage's or sendMessage's
+  // identity -- the same shape sessionMessageHandlerRef uses. Uses the
+  // "if mounted" form, not useConnectorRuntimeDialogActions(): this context
+  // is mounted on the widget/share pages with no ConnectorRuntimeDialogProvider
+  // above it, and every call site below that reads connectorRuntimeDialogRef
+  // legitimately expects that shape rather than a wiring mistake.
+  const connectorRuntimeDialogActions = useConnectorRuntimeDialogActionsIfMounted()
+  const connectorRuntimeDialogRef = useRef(connectorRuntimeDialogActions)
+  useLayoutEffect(() => {
+    connectorRuntimeDialogRef.current = connectorRuntimeDialogActions
+  }, [connectorRuntimeDialogActions])
   const isHistoricalDataLoadingRef = useRef(false)
   const historicalDataRequestMapRef = useRef(new Map<number, boolean>())
-  const recentMessagesRef = useRef(new Set<string>())
+  const recentMessagesRef = useRef(new Map<string, ReturnType<typeof setTimeout>>())
   const isDuplicateMessage = useCallback((
     content: string | React.ReactNode,
     type = "general",
     force = false,
     shouldCache = true,
+    occurrenceIdentity?: string,
   ) => {
     const contentStr = normalizeMessageContent(content)
-    const key = `${type}:${contentStr}`
+    const key = JSON.stringify([type, contentStr])
+    const occurrenceKey = occurrenceIdentity
+      ? JSON.stringify([type, contentStr, occurrenceIdentity])
+      : undefined
     const cache = recentMessagesRef.current
-    if (!force && cache.has(key)) return true
+    if (!force && cache.has(occurrenceKey || key)) return true
     if (shouldCache) {
-      cache.add(key)
-      setTimeout(() => cache.delete(key), 30_000)
+      for (const cacheKey of occurrenceKey ? [key, occurrenceKey] : [key]) {
+        clearTimeout(cache.get(cacheKey))
+        const expiry = setTimeout(() => {
+          if (cache.get(cacheKey) === expiry) cache.delete(cacheKey)
+        }, 30_000)
+        cache.set(cacheKey, expiry)
+      }
     }
     return false
   }, [])
@@ -1903,6 +2451,10 @@ export function AppProvider({
   // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)
   const dispatch = useCallback((action: AppAction) => {
+    // Whatever cleared the transcript (reconnect, task switch, workforce run
+    // swap) will have it replayed back; a surviving 30s entry would swallow
+    // the replayed bubbles as duplicates.
+    if (action.type === "CLEAR_MESSAGES") recentMessagesRef.current.clear()
     const next = projectAppState(stateRef.current, action)
     stateRef.current = next
     privateCommit({ state: next })
@@ -1934,6 +2486,7 @@ export function AppProvider({
     }
   }, [])
   const sessionTransport = transport?.session
+  const trustLegacyErrorProse = transport?.legacyErrorProse !== "untrusted"
   const filesDisabled = !resolveTransportCapability(
     sessionTransport,
     sessionTransport?.files,
@@ -1956,6 +2509,9 @@ export function AppProvider({
   // wrong default here — this must stay off everywhere except the transports
   // that explicitly request it.
   const linksOpenInNewTab = transport?.capabilities?.linksOpenInNewTab === "enabled"
+  // Default-closed for the same reason as the line above: only the session
+  // endpoint reads a stop frame.
+  const taskStopEnabled = transport?.capabilities?.taskStop === "enabled"
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.voice,
@@ -1986,9 +2542,45 @@ export function AppProvider({
     (message: WebSocketMessage, owner: SessionMessageOwner) => void
   >(() => {})
   const mountedRef = useRef(false)
+  const [stopState, setStopState] = useState<SessionStopState>("idle")
+  const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Per task, not per connection: "the visitor asked to stop task N" stays
+  // true across a token-refresh reconnect and across an isProcessing dip. It
+  // is cleared by that task's own terminal frame -- failure or completion --
+  // and by this connection binding a different task. Nothing else clears it:
+  // an agent_error, coded external_stop_not_applied or codeless, is broadcast
+  // to every connection on the task without naming which stop press it
+  // answers, so it releases the control and leaves the intent standing.
+  const stopIntentTaskIdRef = useRef<number | null>(null)
+  const previousBoundSessionTaskIdRef = useRef<number | null>(null)
+
+  const clearStopTimeout = useCallback(() => {
+    if (stopTimeoutRef.current !== null) {
+      clearTimeout(stopTimeoutRef.current)
+      stopTimeoutRef.current = null
+    }
+  }, [])
+  // Returns the button to pressable and disarms its window. It deliberately
+  // leaves stopIntentTaskIdRef alone: the intent is per task and outlives the
+  // button (a reconnect, a waiting turn), so each caller decides it itself.
+  const releaseStopControl = useCallback(() => {
+    clearStopTimeout()
+    setStopState("idle")
+  }, [clearStopTimeout])
   const { t } = useI18n()
   const router = useRouter()
   const lastConnectedTaskId = useRef<number | null>(null)
+  const [sameTaskReconnects, setSameTaskReconnects] = useState(0)
+  const sharedStreamRef = useRef<{
+    taskId?: number
+    runId?: string | null
+    attemptId?: string | null
+    interrupted: boolean
+    prefixSeen: boolean
+    complete: boolean
+    messageId?: string
+    executionSequence?: number
+  }>({ interrupted: false, prefixSeen: false, complete: false })
   const taskStateVersionsRef = useRef(
     new Map<number, TaskStateVersionEntry>()
   )
@@ -2165,10 +2757,39 @@ export function AppProvider({
     state.taskId,
   ])
 
+  const boundSessionTaskId =
+    state.sessionConversation.phase === "bound"
+      ? state.sessionConversation.taskId
+      : null
+  useEffect(() => {
+    if (boundSessionTaskId === null) return
+    const previousBoundTaskId = previousBoundSessionTaskIdRef.current
+    previousBoundSessionTaskIdRef.current = boundSessionTaskId
+    if (
+      previousBoundTaskId === null
+      || previousBoundTaskId === boundSessionTaskId
+    ) return
+    // The task this connection is bound to changed. It had to pass through an
+    // unbound or replacement phase to get here — SESSION_TASK_INFO leaves the
+    // bound id alone when a task_info names a different task — so whatever the
+    // visitor asked to stop, this connection no longer follows it. Only the
+    // intent is cleared here: the control was already released on the way
+    // through that phase, because canStopTask is false there.
+    stopIntentTaskIdRef.current = null
+  }, [boundSessionTaskId])
+
+  useEffect(() => clearStopTimeout, [clearStopTimeout])
+
   useEffect(() => {
     const previousIdentity = previousSessionConnectionIdentityRef.current
     previousSessionConnectionIdentityRef.current = sessionConnectionIdentity
     if (previousIdentity === sessionConnectionIdentity) return
+
+    // Per-connection button state only. The stop intent is per task and
+    // deliberately survives this: the session token is re-issued 60s before
+    // expiry, which changes the connection identity mid-cancel, and the turn's
+    // terminal frame must still render as a stopped turn afterwards.
+    releaseStopControl()
 
     if (sessionConversationRef.current.phase === "bound") {
       if (sessionConnectionIdentity) {
@@ -2184,7 +2805,7 @@ export function AppProvider({
         new Error("Conversation outcome is unknown after a connection refresh; reload required.")
       )
     }
-  }, [dispatchSessionConversation, requireSessionReload, sessionConnectionIdentity])
+  }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
   const onConnect = useCallback(() => {
     if (sessionTransport?.history === "none") {
@@ -2206,6 +2827,7 @@ export function AppProvider({
     // This prevents stale data issues and fixes race conditions
     if (lastConnectedTaskId.current === stateRef.current.taskId) {
       // Reconnection to SAME task -> Clear messages
+      setSameTaskReconnects(count => count + 1)
       dispatch({
         type: "CLEAR_MESSAGES",
         payload: {
@@ -2290,6 +2912,7 @@ export function AppProvider({
       sessionTransport === undefined
         ? undefined
         : deliveryGeneration,
+    legacyErrorProse: trustLegacyErrorProse ? "trusted" : "untrusted",
     onSessionConnectionClose: sessionTransport?.onConnectionClose,
     onSessionConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
@@ -2310,6 +2933,29 @@ export function AppProvider({
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
   })
+
+  const canStopTask =
+    taskStopEnabled
+    // A press while the socket is down can only end in "not_sent".
+    && isConnected
+    && state.isProcessing
+    && state.sessionConversation.phase === "bound"
+
+  // The control's own state lasts only as long as the control is available,
+  // and availability is wider than "this run is over": a task that pauses to
+  // ask the visitor a question also stops counting as processing, and a
+  // dropped socket makes the control unavailable too, so a stop still
+  // outstanding at that moment loses its "stopping" state and its
+  // unconfirmed-timeout window, and the control returns pressable with no
+  // record of the earlier press. Accepted as it stands: the per-task stop
+  // intent lives in a ref this effect does not touch, so the turn still
+  // renders as a stopped turn when its own terminal frame says it was
+  // interrupted — what is lost is the button's memory of the press, not the
+  // outcome of the stop.
+  useEffect(() => {
+    if (canStopTask) return
+    releaseStopControl()
+  }, [canStopTask, releaseStopControl])
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
@@ -2332,6 +2978,7 @@ export function AppProvider({
       // Ensure we are sending to the correct task
       // If targetTaskId is set, it must match the current connected task
       if (pendingMessage.targetTaskId) {
+        if (stateRef.current.taskId !== pendingMessage.targetTaskId) return
         // We use lastConnectedTaskId.current because state.taskId might be updated before the socket is connected
         // But sendChatMessage sends to the currently connected socket.
         // We need to make sure the CURRENT socket corresponds to the targetTaskId.
@@ -2345,6 +2992,12 @@ export function AppProvider({
         }
       }
 
+      // The queue owns only the connection wait. Once claimed, the transport
+      // owns upload cancellation and acknowledgement timeouts/dispositions.
+      if (pendingMessageRef.current !== pendingMessage || pendingMessage.start?.() === false) return
+      pendingMessageRef.current = null
+      setPendingMessage(current => current === pendingMessage ? null : current)
+
       console.log('📤 Sending pending message:', {
         message: pendingMessage.message,
         hasFiles: pendingMessage.files && pendingMessage.files.length > 0,
@@ -2356,6 +3009,7 @@ export function AppProvider({
           pendingMessage.files,
           pendingMessage.force,
           pendingMessage.clientMessageId,
+          pendingMessage.requestId,
         )
       ).then(() => {
         pendingMessage.resolve?.()
@@ -2376,26 +3030,36 @@ export function AppProvider({
     if (!pendingMessage?.targetTaskId) return
     if (state.taskId === pendingMessage.targetTaskId) return
     pendingMessage.reject?.(
-      new Error('Message not sent: the conversation was reset before it could be delivered.')
+      new MessageDeliveryError('Message not sent: the conversation was reset before it could be delivered.', 'not_sent')
     )
     setPendingMessage(current => (current === pendingMessage ? null : current))
   }, [pendingMessage, state.taskId])
 
-  const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'resolve' | 'reject'>) => {
+  const queuePendingMessage = useCallback((message: Omit<PendingMessage, 'start' | 'resolve' | 'reject'>) => {
     return new Promise<void>((resolve, reject) => {
+      let waiting = true
       const timeout = window.setTimeout(() => {
+        waiting = false
         setPendingMessage(current => (
           current?.clientMessageId === message.clientMessageId ? null : current
         ))
-        reject(new Error('Message not sent: timed out waiting for the task connection.'))
+        reject(new MessageDeliveryError('Message not sent: timed out waiting for the task connection.', 'not_sent'))
       }, 30000)
       setPendingMessage({
         ...message,
+        start: () => {
+          if (!waiting) return false
+          waiting = false
+          window.clearTimeout(timeout)
+          return true
+        },
         resolve: () => {
+          waiting = false
           window.clearTimeout(timeout)
           resolve()
         },
         reject: (error) => {
+          waiting = false
           window.clearTimeout(timeout)
           reject(error)
         },
@@ -2415,7 +3079,41 @@ export function AppProvider({
         if (pendingTaskToExecuteRef.current) {
           const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
           if (!hasUserMessages) {
-            sendChatMessage(pendingTaskToExecuteRef.current.description, [])
+            const description = pendingTaskToExecuteRef.current.description
+            const taskId = stateRef.current.taskId
+            const clientMessageId = generateClientMessageId()
+            // This auto-send bypasses sendMessage entirely (it predates the
+            // connector-runtime dialog and must keep this old path's own
+            // behavior unchanged, not gain sendMessage's optimistic bubble
+            // or send guards), so it never staged a resend candidate for
+            // itself. Stage/redeem/discard it here the same way sendMessage's
+            // own call sites do, or a terminal task_error this send provokes
+            // finds no candidate to offer.
+            if (typeof taskId === "number") {
+              connectorRuntimeDialogRef.current.stagePendingDelivery({
+                taskId, clientMessageId, text: description, files: [],
+              })
+            }
+            sendChatMessage(description, [], false, clientMessageId)
+              .then(() => {
+                if (typeof taskId === "number") {
+                  connectorRuntimeDialogRef.current.recordDelivery({
+                    taskId, clientMessageId, text: description, files: [],
+                  })
+                }
+              })
+              .catch(() => {
+                // Logged, not rethrown. This is a detached promise inside a
+                // setTimeout callback: there is no caller above it to receive
+                // a rethrow, so one would surface as an unhandled rejection
+                // instead of reaching anything that could act on it. The
+                // sibling stage/discard sites in sendMessage do rethrow
+                // because each of them sits inside a call its own caller
+                // awaits. Without this line the send failing here is silent
+                // on every surface -- no bubble, no toast, no log.
+                console.warn("[connector-runtime] pending-task auto-send failed")
+                connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+              })
             pendingTaskToExecuteRef.current = null
           }
         }
@@ -2442,6 +3140,33 @@ export function AppProvider({
       timestamp: new Date().toISOString()
     })
   }, [isConnected, state.taskId, connectionError])
+
+  // The single place that answers "this frame ends the turn -- now what?".
+  // Each of the three settlement call sites below (task_completed,
+  // agent_error, terminal task_error) keeps its own predicate for WHETHER a
+  // frame is terminal, because the three frame families prove terminality
+  // differently (see each call site's own comment). What they must NOT keep
+  // is their own idea of what to do once settled: that lives here, so a
+  // fourth frame family added later cannot settle a turn while quietly
+  // skipping the stash and pending-candidate cleanup that settlement
+  // requires (see the stash lifecycle docs on ConnectorRuntimePendingDelivery).
+  //
+  // Recreated on every render and captured by handleMessage's useCallback
+  // without appearing in its dependency array. That is safe for as long as
+  // the body below reads nothing but connectorRuntimeDialogRef.current,
+  // which a ref always resolves to the latest value regardless of which
+  // render's closure is calling. Anything read here that is not a ref --
+  // a prop, a state value, another callback -- makes a stale capture
+  // possible, and at that point this has to move behind a ref of its own
+  // rather than be added to that array.
+  const settleConnectorRuntimeTurn = (taskId: number, opensDialog: boolean): void => {
+    // openForTask hands this tab's candidate (staged or already-confirmed)
+    // to the request and clears it in the same update: that frame both
+    // opens the dialog and settles the turn. Never call forgetDelivery
+    // before this for the same frame -- see its own misuse warning.
+    if (opensDialog) connectorRuntimeDialogRef.current.openForTask(taskId)
+    else connectorRuntimeDialogRef.current.forgetDelivery(taskId)
+  }
 
   const handleMessage = useCallback((
     message: WebSocketMessage,
@@ -2492,6 +3217,146 @@ export function AppProvider({
       }
       rawDispatch(action)
     }
+    if (!isMessageForOtherTask && typeof messageTaskId === "number") {
+      let stream = sharedStreamRef.current
+      if (stream.taskId !== messageTaskId) {
+        stream = { taskId: messageTaskId, interrupted: false, prefixSeen: false, complete: false }
+        sharedStreamRef.current = stream
+      }
+      if (message.type === "stream_unavailable" || message.type === "stream_resync_required") {
+        stream.interrupted = true
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+        return
+      }
+      if (message.type === "task_stream_snapshot") {
+        if (isHistoricalDataLoadingRef.current) return
+        const envelope = extractTaskControlEnvelope(message)
+        if (!acceptTaskControlVersion(message, envelope, taskStateVersionsRef.current)) return
+        const data = asMessageRecord(message.data)
+        // A new run starting can't have inherited an interruption from
+        // whatever run preceded it - carrying a stale `true` forward would
+        // flag the very first snapshot of a brand-new, healthy run. But
+        // going from "no run known yet" to "this run" is NOT a run change:
+        // stream.runId starts undefined, and the backend reports `null` for
+        // a task that hasn't started running yet (both mean "nothing to
+        // compare against" the same way) - an explicit stream_unavailable/
+        // stream_resync_required for the CURRENT run can set interrupted
+        // before its first snapshot with a real run id ever arrives. Only a
+        // known-to-different-known transition is a genuine new run.
+        const isNewRun =
+          stream.runId != null && envelope.runId != null && stream.runId !== envelope.runId
+        if (stream.runId !== envelope.runId) {
+          stream.runId = envelope.runId
+          stream.prefixSeen = false
+          stream.complete = false
+          if (isNewRun) stream.interrupted = false
+        }
+        stream.attemptId = typeof data.lease_attempt_id === "string" ? data.lease_attempt_id : null
+        // "running with no prefix seen yet" is the ordinary state of every task
+        // between the run starting and its final-answer text beginning to
+        // stream (planning, tool calls, etc.) - it is NOT evidence anything
+        // was missed. This periodic snapshot fires every 5s for every
+        // connected task regardless of stream health, so treating that as an
+        // interruption flagged the recovery banner on almost every run.
+        // Genuine misses are already caught elsewhere: an explicit
+        // stream_unavailable/stream_resync_required message above, or a
+        // final_answer_delta arriving before its prefix below - both leave
+        // positive evidence content was produced without us. Leave
+        // stream.interrupted as carried over from those instead of deriving
+        // a new value from status alone.
+        const active = envelope.status === "running"
+        if (envelope.status) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: {
+            status: envelope.status, runId: envelope.runId,
+            completionOutcome: normalizeCompletionOutcome(data.completion_outcome),
+            stateVersion: envelope.stateVersion, controlState: envelope.controlState,
+            ...(envelope.status === "waiting_for_user" ? {
+              waitingQuestion: typeof data.question === "string" ? data.question : undefined,
+              waitingInteractions: normalizeInteractions(data.interactions),
+            } : {}),
+          } })
+          dispatch({ type: "SET_PROCESSING", payload: active })
+        }
+        if (typeof data.output === "string" && typeof envelope.runId === "string") {
+          dispatch({ type: "RECONCILE_STREAM_OUTPUT", payload: {
+            runId: envelope.runId, output: data.output,
+            timestamp: message.timestamp, interrupted: stream.interrupted,
+          } })
+          stream.interrupted = false
+          stream.complete = true
+        } else if (envelope.status && envelope.status !== "running") {
+          stream.interrupted = false
+        }
+        dispatch({ type: "SET_STREAM_RECOVERY", payload: stream.interrupted ? messageTaskId : null })
+        return
+      }
+      if (message.stream_run_id !== undefined) {
+        const known = taskStateVersionsRef.current.get(messageTaskId)
+        if (known?.runId !== undefined && known.runId !== message.stream_run_id) {
+          const envelope = extractTaskControlEnvelope(message)
+          if (!envelope.isStateEvent || envelope.runId !== message.stream_run_id
+            || envelope.stateVersion === undefined || envelope.stateVersion <= known.version) return
+        }
+        if (stream.runId !== message.stream_run_id) {
+          stream.runId = message.stream_run_id
+          stream.attemptId = message.stream_attempt_id
+          stream.prefixSeen = false
+          stream.interrupted = false
+          stream.complete = false
+          dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+        }
+        if (stream.attemptId && message.stream_attempt_id !== stream.attemptId) return
+      }
+      const streamType = getWebSocketEventType(message)
+      if (isFinalAnswerStreamEventType(streamType)) {
+        const sharedFrame = message.stream_run_id !== undefined
+        const data = asMessageRecord(message.data)
+        const eventData = message.type === "trace_event"
+          ? asMessageRecord(data.data ?? data)
+          : { ...data, ...message }
+        const executionSequence = message.execution_sequence
+        // Historical frames still update their own bubbles below. Only a
+        // newer boundary can change which occurrence owns transport flags.
+        const updatesCurrentStream = executionSequence === undefined
+          || stream.executionSequence === undefined
+          || executionSequence > stream.executionSequence
+        if (updatesCurrentStream) {
+          if (executionSequence !== undefined) {
+            if (eventData.message_id !== stream.messageId) {
+              stream.complete = false
+              stream.prefixSeen = false
+              stream.interrupted = false
+            }
+            stream.messageId = eventData.message_id as string
+            stream.executionSequence = executionSequence
+          }
+          if (stream.complete && executionSequence === undefined
+            && (stream.executionSequence === undefined || eventData.message_id === stream.messageId)) return
+          if (streamType === "final_answer_start") {
+            stream.prefixSeen = true
+            stream.interrupted = false
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+          }
+          const replacesContent = (sharedFrame || executionSequence !== undefined) && (
+            (streamType === "final_answer_end" && typeof eventData.content === "string")
+            || (streamType === "final_answer_error" && typeof eventData.error === "string")
+          )
+          if (sharedFrame && streamType === "final_answer_delta"
+            && (!stream.prefixSeen || (stream.executionSequence !== undefined && eventData.message_id !== stream.messageId))) {
+            stream.interrupted = true
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: messageTaskId })
+            return
+          }
+          if (replacesContent) {
+            stream.prefixSeen = true
+            stream.interrupted = false
+            dispatch({ type: "SET_STREAM_RECOVERY", payload: null })
+          }
+          if (stream.interrupted) return
+          if (replacesContent) stream.complete = true
+        }
+      }
+    }
     // The 30s dedup cache below is keyed on message content/type only, not
     // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
     // iteration") are templated purely on generic fields like iteration
@@ -2504,7 +3369,8 @@ export function AppProvider({
     const isDuplicateMessageForViewedTask = (
       content: string | React.ReactNode,
       type = "general",
-    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
+      occurrenceIdentity?: string,
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask, occurrenceIdentity)
     // Shared by both dag_execution shapes this handler processes below (the
     // modern trace_event-wrapped one, and the legacy bare "dag_execution"
     // message type) - duplicating this logic per call site is exactly how a
@@ -2695,6 +3561,7 @@ export function AppProvider({
         eventType: message.type,
         eventData: message,
         eventId: message.event_id,
+        executionSequence: message.execution_sequence,
         timestamp: message.timestamp,
         fallbackMessageId: generateMessageId("msg-final-answer"),
       })
@@ -2705,23 +3572,6 @@ export function AppProvider({
     }
 
     switch (message.type) {
-      case "chat":
-        const chatData = message as any
-        const messageContent = chatData.message || ""
-
-        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
-          dispatch({
-            type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-user"),
-              role: "user",
-              content: messageContent,
-              timestamp: message.timestamp?.toString() || Date.now().toString(),
-            }
-          })
-        }
-        break
-
       case "trace_event":
         const traceEventData = (message.data ?? {}) as any
 
@@ -2751,6 +3601,19 @@ export function AppProvider({
             })
           }
 
+          // V2 completion/AI facts are timeline entries. The owning durable
+          // assistant message supplies the bubble, with an explicit stream alias.
+          if (eventData.display === "timeline" && (eventType === "task_completion" || eventType === "ai_message")) {
+            dispatch({ type: "ADD_TRACE_EVENT", payload: {
+              event_id: message.event_id || traceEventData.event_id,
+              event_type: eventType,
+              step_id: message.step_id || eventData.step_id,
+              timestamp: message.timestamp,
+              data: eventData,
+            } })
+            return
+          }
+
           // Handle structured trace events
           if (eventType === "task_info") {
             const taskData = eventData as Record<string, unknown>
@@ -2768,8 +3631,9 @@ export function AppProvider({
             // gated by the dispatch wrapper's task scoping, so a stray
             // background task's own pending task_info must not overwrite
             // what's about to be auto-sent for the task actually being
-            // viewed/connected.
-            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask) {
+            // viewed/connected. A task whose first message went to the first
+            // gate is never armed: its description is that message (sendMessage).
+            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask && taskId !== firstGateTaskIdRef.current) {
               pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
@@ -2932,6 +3796,7 @@ export function AppProvider({
               eventType,
               eventData,
               eventId: message.event_id,
+              executionSequence: message.execution_sequence,
               timestamp: message.timestamp,
               fallbackMessageId: generateMessageId("msg-final-answer"),
             })
@@ -2994,6 +3859,9 @@ export function AppProvider({
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
+            const interactionRequestId = typeof eventData.request_id === "string"
+              ? eventData.request_id
+              : undefined
             const isAgentMessage = eventType === "agent_message"
             const isAiMessage = eventType === "ai_message"
             const expectsUserResponse =
@@ -3024,27 +3892,45 @@ export function AppProvider({
             const shouldHideAgentMessage =
               isAgentMessage &&
               eventData.visible === false
-            if (expectsUserResponse) {
+            // Replayed questions belong in the transcript, but must not undo
+            // the settled status/outcome already restored by task_info.
+            if (expectsUserResponse && !(
+              isHistoricalDataLoadingRef.current &&
+              isTerminalTaskStatus(currentState.currentTask?.status)
+            )) {
               dispatch({
                 type: "UPDATE_TASK_STATUS",
                 payload: {
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
+                  waitingRequestId: interactionRequestId,
                 }
               })
             }
-            const streamMessageId =
-              isAiMessage
+            const canonicalMessageId = typeof eventData.message_id === "string"
+              && (eventData.message_id.startsWith("execution_message_") || eventData.message_id.startsWith("final_answer_"))
+              ? eventData.message_id : undefined
+            const streamMessageId = canonicalMessageId?.startsWith("final_answer_")
+              ? canonicalMessageId : isAiMessage
                 ? getFinalAnswerStreamMessageId(eventData)
                 : undefined
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
+            if (!canonicalMessageId && !streamMessageId && isDuplicateMessageForViewedTask(
+              messageContent,
+              'agent-message',
+              isAgentMessage ? interactionRequestId : undefined,
+            )) {
               return
             }
-            const msgId = generateMessageId("msg-agent")
+            const msgId = canonicalMessageId ??
+              (isAgentMessage
+                ? stableAssistantMessageId(
+                  message.event_id || traceEventData.event_id || eventData.event_id,
+                )
+                : null) ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -3053,10 +3939,16 @@ export function AppProvider({
                 content: messageContent,
                 rawContent: messageContent,
                 timestamp: message.timestamp,
-                status: eventData.status === "completed" ? "completed" : "running",
+                // Legacy chat_history replay rows carry no canonical id, so
+                // the failure provenance must win over the id-based status.
+                status: eventData.message_type === "task_failure" ? "failed"
+                  : canonicalMessageId ? "completed"
+                  : eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
                 streamMessageId,
+                executionSequence: message.execution_sequence,
                 interactions: interactions.length > 0 ? interactions : undefined,
+                interactionRequestId,
               }
             })
             if (eventData.status === "completed") {
@@ -3431,13 +4323,19 @@ export function AppProvider({
             dispatch({ type: "ADD_STEP", payload: step })
 
             // Also add to traceEvents for displaying execution logs
+            // Preserve the failed outcome in the display event vocabulary;
+            // dag_step_end is emitted by the backend for both outcomes.
+            const displayEventType = step.status === "failed" ? "dag_step_failed" : eventType
             const traceEvent: TraceEvent = {
               event_id: generateMessageId(`trace-step-end`),
-              event_type: eventType,
+              event_type: displayEventType,
               step_id: message.step_id || eventData.step_id || stepName,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.dag_step_end'),
+                action: t(displayEventType === "dag_step_failed"
+                  ? 'agent.logs.event.actions.dag_step_failed'
+                  : 'agent.logs.event.actions.dag_step_end'),
+                error: eventData.error,
                 step_name: stepName,
                 description: eventData.description,
                 tool_names: eventData.tool_name ? [eventData.tool_name] : eventData.tool_names || [],
@@ -5179,26 +6077,13 @@ export function AppProvider({
         }
         break
 
-      case "chat_message":
-        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (chat_message)')
-        const messageData = message.data as any
-        dispatch({
-          type: "ADD_MESSAGE",
-          payload: {
-            id: `msg-${messageData.id}`,
-            role: messageData.role,
-            content: messageData.content,
-            timestamp: messageData.timestamp,
-          },
-        })
-        break
-
       case "task_completed":
         const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: taskData.status,
+            completionOutcome: taskData.completionOutcome,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState,
@@ -5206,6 +6091,31 @@ export function AppProvider({
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
+
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(taskData.status)) {
+          // A settled turn can no longer be resent, whether it succeeded or
+          // failed for a reason other than a missing connector input; see
+          // the stash lifecycle in connector-runtime-api.ts's docs.
+          // taskData.status is always "completed" or "failed" here
+          // (NormalizedTaskCompletion narrows it), so this reads the same
+          // terminal-status predicate the agent_error branch below reads,
+          // rather than assuming this frame type alone proves settlement.
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
+        }
+
+        // A stop intent lives until this task's next terminal frame, and a
+        // normal completion is the other terminal frame. Without this, an
+        // intent recorded for a turn that finished on its own would still be
+        // standing when a later turn of the same task is interrupted by a stop
+        // this visitor did not ask for, and that turn would render as this
+        // visitor's stopped turn. Rendering below is untouched.
+        if (
+          stopIntentTaskIdRef.current !== null
+          && controlEnvelope.taskId === stopIntentTaskIdRef.current
+        ) {
+          stopIntentTaskIdRef.current = null
+        }
 
         if (!taskData.success) {
           // error_details carries the structured reason ({code, ..., message});
@@ -5215,9 +6125,11 @@ export function AppProvider({
           const failureReason =
             getString(taskData.output) ||
             getString(taskData.errorDetails?.message)
-          // Coded failures (e.g. a quota-gate refusal) also notify the app
-          // layer so it can surface them richly (see task-error-events). Stock
-          // xagent has a no-op controller and only an app layer ever sets a code.
+          // Coded failures (for example a quota-gate refusal, or "model_error"
+          // for a model-provider failure) also notify the app layer so it can
+          // surface them richly (see task-error-events). Stock xagent mounts a
+          // no-op controller, so in stock xagent the bubble below is what the
+          // user sees.
           // Not gated on failureReason: the coded dialog carries its own copy
           // and must still fire when the reason is empty. Tag it with the
           // event's own task id (not the currently-viewed one) so a dialog
@@ -5238,11 +6150,11 @@ export function AppProvider({
           const lastMessage = currentState.messages[currentState.messages.length - 1]
           const lastContent =
             typeof lastMessage?.content === "string" ? lastMessage.content : ""
-          if (failureReason && lastContent !== failureReason) {
+          if (failureReason && (message.message_id || lastContent !== failureReason)) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
-                id: generateMessageId("msg-task-failed"),
+                id: typeof message.message_id === "string" ? message.message_id : generateMessageId("msg-task-failed"),
                 role: "assistant",
                 // The reason verbatim, no prefix: a reload replays the
                 // persisted transcript row (this same text), so any live-only
@@ -5433,8 +6345,10 @@ export function AppProvider({
         break
 
 
-      case "task_paused":
+      case "task_paused": {
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_paused)')
+        const pausedReason = asMessageRecord(message.data).interruption_reason
+          ?? asMessageRecord(message).interruption_reason
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
@@ -5442,10 +6356,33 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "paused",
+            autoRecovery: normalizeAutoRecovery({ reason: pausedReason }),
           },
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
         break
+      }
+
+      case "task_recovery_update": {
+        const parsed = parseAutoResumeNotice(message)
+        if (!parsed) break
+        // Read before the check below records this notice's version.
+        const knownVersion = taskStateVersionsRef.current.get(parsed.taskId)?.version
+        // Not a versioned control event, but it names the fence it was
+        // announced at: an older one is stale.
+        if (!acceptTaskControlVersion(
+          message,
+          {
+            isStateEvent: true,
+            taskId: parsed.taskId,
+            runId: parsed.notice.runId,
+            stateVersion: parsed.notice.stateVersion,
+          },
+          taskStateVersionsRef.current,
+        )) break
+        dispatch({ type: "APPLY_AUTO_RESUME_NOTICE", payload: { ...parsed, knownVersion } })
+        break
+      }
 
       case "task_pause_requested":
         if (controlEnvelope.status) {
@@ -5463,15 +6400,26 @@ export function AppProvider({
 
       case "task_waiting_for_user":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_waiting_for_user)')
-        const waitingData = message.data as any
-        const waitingMessage = waitingData?.question || waitingData?.message || ""
-        const interactions = normalizeInteractions(waitingData?.interactions)
+        const waitingRoot = asMessageRecord(message)
+        const waitingData = asMessageRecord(message.data)
+        const waitingMessage = getString(waitingRoot.question)
+          || getString(waitingData.question)
+          || getString(waitingRoot.message)
+          || getString(waitingData.message)
+        const interactions = normalizeInteractions(
+          waitingRoot.interactions ?? waitingData.interactions
+        )
+        const waitingRequestIdValue = waitingRoot.request_id ?? waitingData.request_id
+        const waitingRequestId = typeof waitingRequestIdValue === "string"
+          ? waitingRequestIdValue
+          : undefined
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: {
             status: controlEnvelope.status || "waiting_for_user",
             waitingQuestion: waitingMessage && waitingMessage !== "Task waiting for user response" ? waitingMessage : undefined,
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
+            waitingRequestId,
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
@@ -5479,9 +6427,14 @@ export function AppProvider({
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
         if (
+          waitingRoot.display !== "timeline" && waitingData.display !== "timeline" &&
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(
+            waitingMessage,
+            'agent-message',
+            waitingRequestId,
+          )
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -5494,6 +6447,7 @@ export function AppProvider({
               status: "running",
               isResult: true,
               interactions: interactions.length > 0 ? interactions : undefined,
+              interactionRequestId: waitingRequestId,
             }
           })
         }
@@ -5514,7 +6468,10 @@ export function AppProvider({
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorCode = getWebSocketErrorCode(message)
+        const agentErrorMessage = agentErrorCode
+          ? t(clientErrorTranslationKey(agentErrorCode))
+          : getWebSocketErrorMessage(message, trustLegacyErrorProse)
         const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
         if (agentErrorTaskStatus) {
@@ -5543,6 +6500,19 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
+        if (!isMessageForOtherTask && currentState.taskId && isTerminalTaskStatus(agentErrorTaskStatus)) {
+          // Unlike task_completed and the terminal task_error frame, this
+          // frame type is not on its own proof that the turn is over: its
+          // status is a live DB read from a command-execution rejection path
+          // (see the stash lifecycle docs) and can just as easily be
+          // "running" as "failed". Read the same terminal-status check the
+          // task_completed branch above satisfies unconditionally, so a
+          // frame that only pauses processing (paused, waiting_for_user)
+          // leaves a still-resendable message's stash alone.
+          // This frame type never opens the dialog itself.
+          settleConnectorRuntimeTurn(currentState.taskId, false)
+        }
+
         dispatch({
           type: "ADD_MESSAGE",
           payload: {
@@ -5553,35 +6523,164 @@ export function AppProvider({
             status: "failed",
           },
         })
+        // A stop the server could not confirm is answered on this channel,
+        // not on the terminal one, as an agent_error carrying
+        // external_stop_not_applied. A stop that found the turn already
+        // over, a server that predates that code, and any other
+        // external-scope command that fails on this task are answered with
+        // the same frame and no code at all. Either way the frame is broadcast
+        // to every connection on the task and does not name which stop press
+        // it answers, so it cannot end the stop intent: a second press on
+        // this page, or a press on another page bound to the same task, may
+        // still take effect, and the intent is left standing to be retired
+        // only by this task's own terminal frame or by this connection
+        // binding a different task. What the frame does answer is the
+        // button: the visitor has just been shown a sentence about a failure
+        // on this task, and a control still stuck on "Stopping..." would
+        // contradict it, so the control leaves "stopping" here rather than
+        // waiting out the local 30-second window. Any other code names a
+        // different failure and leaves the control alone.
+        if (
+          (
+            !getWebSocketErrorCodeField(message).present
+            || agentErrorCode === "external_stop_not_applied"
+          )
+          && stopIntentTaskIdRef.current !== null
+          && controlEnvelope.taskId === stopIntentTaskIdRef.current
+        ) {
+          releaseStopControl()
+        }
         break
 
       case "error":
-      case "task_error":
+      case "task_error": {
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
-        const websocketErrorMessage = getWebSocketErrorMessage(message)
-        const websocketTaskStatus = getWebSocketTaskStatus(message)
+        const errorFrame = projectErrorFrameForDisplay(message, {
+          trustLegacyErrorProse,
+          translate: t,
+          controlEnvelope,
+        })
 
-        if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+        if (errorFrame.taskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: errorFrame.taskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
-        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+        if (errorFrame.stopsProcessing) {
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
+        // errorFrame.isTerminal (message.type === "task_error") is this
+        // family's terminal-status predicate: a task_error frame is only
+        // ever emitted after its lease owner commits a terminal status, so
+        // the frame type itself already reads as terminal here -- unlike
+        // agent_error above, which shares this branch's underlying
+        // task_status field with a live, possibly non-terminal DB read.
+        // The sibling `error` type carries the same task_status field for
+        // an unrelated meaning (a rejection while the turn is still
+        // running), which is why this checks the frame type and not the
+        // status value directly.
+        //
+        // Kept outside the bubble-dedup guard below, matching the
+        // task_completed and agent_error settle-task call sites above: a
+        // terminal frame whose dedup text collapses into an existing bubble
+        // (most often a version-less frame, since a version makes the dedup
+        // key occurrence-specific) must still resolve this turn's dialog and
+        // stash even when the bubble it would have added does not render.
+        if (errorFrame.isTerminal && !isMessageForOtherTask && currentState.taskId) {
+          // A trigger code both opens the dialog and settles the turn in
+          // the same call; any other terminal code just settles it. See
+          // settleConnectorRuntimeTurn's own docs for what "settles" means.
+          settleConnectorRuntimeTurn(
+            currentState.taskId,
+            errorFrame.terminalErrorCode !== null
+              && isConnectorRuntimeDialogTriggerCode(errorFrame.terminalErrorCode),
+          )
+        }
+
+        const stopIntentTaskId = stopIntentTaskIdRef.current
+        // A stop intent ends with this task's TERMINAL frame only.
+        // errorFrame.isTerminal is the discriminator: the root "error" type is
+        // a mixed channel that also carries rejected chat messages and
+        // rejected pause/resume while the task is still RUNNING, and a
+        // rejection is neither this turn's result nor the answer to a stop.
+        // Reading a rejection as the stopped turn would both render a live
+        // turn as finished and retire the intent before the real terminal
+        // frame arrives, leaving that frame to render as a plain failure.
+        const endsStopIntent =
+          errorFrame.isTerminal
+          && stopIntentTaskId !== null
+          && controlEnvelope.taskId === stopIntentTaskId
+        // Only a turn the server itself says was interrupted renders as the
+        // stopped turn. Any other terminal failure -- a connector-runtime code
+        // that raced the stop, or a codeless failure after the stop was lost
+        // or timed out -- is a real failure and keeps the red bubble and its
+        // own wording, though it still ends the intent.
+        const isVisitorStoppedTurn =
+          endsStopIntent
+          && errorFrame.terminalErrorCode === "external_turn_interrupted"
+        // The stopped mark is recorded before, and independent of, the bubble
+        // check below: a frame that names a message_id adds no bubble, yet its
+        // turn is still the stopped one. The turn is identified by the user
+        // message that opened it; with no user message there is nothing to
+        // anchor to and the turn keeps the failed rendering.
+        if (isVisitorStoppedTurn) {
+          const anchorMessage = [...currentState.messages]
+            .reverse()
+            .find((candidate) => candidate.role === "user")
+          if (anchorMessage) {
+            dispatch({
+              type: "MARK_TURN_STOPPED",
+              payload: { anchorMessageId: anchorMessage.id },
+            })
+          }
+        }
+        // A frame that names a message_id adds no bubble below: that message
+        // is drawn from its own display event. It still ends the intent.
+        if (
+          !message.message_id && !isDuplicateMessageForViewedTask(
+            errorFrame.dedupText,
+            "agent-error",
+            errorFrame.occurrenceIdentity,
+          )
+        ) {
           dispatch({
             type: "ADD_MESSAGE",
-            payload: {
-              id: generateMessageId("msg-error"),
-              role: "assistant",
-              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
-              timestamp: message.timestamp,
-              status: "failed",
-            },
+            payload: isVisitorStoppedTurn
+              ? {
+                  id: generateMessageId("msg-stopped"),
+                  role: "assistant",
+                  // The client's own sentence for the interruption code, read
+                  // from the same table as every other coded bubble and with no
+                  // error prefix. A reload replays the persisted English row,
+                  // so the two views differ only in language.
+                  content: errorFrame.bubbleContent,
+                  timestamp: message.timestamp,
+                  // The turn ended because the visitor asked it to, so this is
+                  // the turn's result. status is not "failed", which keeps the
+                  // bubble out of ChatMessage's red branch; isResult lets it
+                  // through the conversation panel's filter, which renders
+                  // only user / isResult / system-notice messages.
+                  status: "completed",
+                  isResult: true,
+                }
+              : {
+                  id: generateMessageId("msg-error"),
+                  role: "assistant",
+                  content: errorFrame.bubbleContent,
+                  timestamp: message.timestamp,
+                  status: "failed",
+                  isResult: errorFrame.isResult,
+                  // Delivery uncertainty is informational, not the task's result.
+                  isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
+                },
           })
         }
+        if (endsStopIntent) {
+          stopIntentTaskIdRef.current = null
+          releaseStopControl()
+        }
         break
+      }
 
       case "message_received":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (message_received)')
@@ -5604,7 +6703,7 @@ export function AppProvider({
         }
         break
     }
-  }, [])
+  }, [releaseStopControl, trustLegacyErrorProse])
 
   const handleSessionMessage = (
     message: WebSocketMessage,
@@ -5614,6 +6713,28 @@ export function AppProvider({
     if (
       owner.connectionIdentity !== sessionConnectionIdentityRef.current
     ) {
+      return
+    }
+
+    if (message.type === "conversation_reload_required") {
+      const binding = extractSessionTaskBinding(message)
+      const lifecycle = sessionConversationRef.current
+      if (
+        !binding.present
+        || !binding.valid
+        || (
+          lifecycle.phase !== "bound"
+          && lifecycle.phase !== "reset_requested"
+        )
+        || lifecycle.connectionIdentity !== owner.connectionIdentity
+        || lifecycle.taskId !== binding.taskId
+        || sessionTaskIdRef.current !== binding.taskId
+      ) {
+        return
+      }
+      requireSessionReload(
+        new Error("The current conversation cannot be restored; reload required.")
+      )
       return
     }
 
@@ -5868,9 +6989,17 @@ export function AppProvider({
       )
     }
 
-    const clientMessageId = typeof config?.clientMessageId === 'string'
-      ? config.clientMessageId
-      : generateClientMessageId()
+    // Mirrors stableUserMessageId's trim guard. `config` is untyped, so a
+    // blank id would reach userTurnMessageId and mint a bare
+    // `msg-user-turn-` that every other blank-id turn collides on.
+    const requestedClientMessageId =
+      typeof config?.clientMessageId === 'string'
+        ? config.clientMessageId.trim()
+        : ''
+    const clientMessageId = requestedClientMessageId || generateClientMessageId()
+    const requestId = typeof config?.metadata?.request_id === 'string'
+      ? config.metadata.request_id
+      : undefined
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
         ? {
@@ -5886,6 +7015,10 @@ export function AppProvider({
     // invisible until a reload replays the persisted transcript row. The
     // reducer reconciles by turn id / content, keeping the persisted event
     // when it already arrived and replacing this copy when it arrives later.
+    // Also the one place that stashes this turn as the connector-runtime
+    // dialog's resend candidate: this guard is exactly "delivered, and the
+    // user is still looking at this task", which is the stash's own
+    // definition (see connector-runtime-api.ts's docs).
     const addOptimisticUserMessage = (intendedTaskId: number | null) => {
       // Delivery acknowledgement can arrive after the user has navigated to a
       // different task. Never append this turn to whichever task happens to be
@@ -5906,6 +7039,14 @@ export function AppProvider({
         || stateRef.current.taskId !== intendedTaskId
       ) {
         return
+      }
+      if (typeof intendedTaskId === "number") {
+        connectorRuntimeDialogRef.current.recordDelivery({
+          taskId: intendedTaskId,
+          clientMessageId,
+          text: message,
+          files: files ?? [],
+        })
       }
       let content: React.ReactNode = message
       if (files && files.length > 0) {
@@ -5945,8 +7086,10 @@ export function AppProvider({
 
     if (sessionTransport?.allowTasklessChat) {
       if (!sessionDeliveryOwner) {
-        throw new Error(
-          "Message not sent: the Session connection is not ready."
+        throw new MessageDeliveryError(
+          "Message not sent: the Session connection is not ready.",
+          "not_sent",
+          { errorCode: "connection_not_ready" },
         )
       }
 
@@ -5981,13 +7124,25 @@ export function AppProvider({
         }
         beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
       }
+      // Staged before the delivery acknowledgement is awaited, keyed by this
+      // turn's own clientMessageId, so a terminal frame that arrives first
+      // (the transport gives no ordering guarantee between the two) can
+      // still claim it in openForTask. Only staged when there is a task to
+      // attribute it to -- addOptimisticUserMessage below only records the
+      // delivery under the same condition.
+      if (typeof state.taskId === "number") {
+        connectorRuntimeDialogRef.current.stagePendingDelivery({
+          taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+        })
+      }
       beginSessionMessageDelivery()
       try {
         await sendChatMessage(
           message,
-          undefined,
+          files,
           config?.force,
           clientMessageId,
+          requestId,
         )
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
@@ -6036,18 +7191,40 @@ export function AppProvider({
         throw error
       } finally {
         endSessionMessageDelivery()
+        // A no-op if addOptimisticUserMessage already redeemed the ticket
+        // above (recordDelivery removes the pending entry on success): this
+        // only has anything to withdraw when the try block threw or
+        // returned early before reaching that call.
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
       }
       return
     }
 
     if (targetTaskId !== null && state.taskId !== targetTaskId) {
-      await queuePendingMessage({
-        message,
-        files,
-        targetTaskId,
-        force: config?.force,
-        clientMessageId,
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: targetTaskId, clientMessageId, text: message, files: files ?? [],
       })
+      try {
+        await queuePendingMessage({
+          message,
+          files,
+          targetTaskId,
+          force: config?.force,
+          clientMessageId,
+        })
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
+      // The discard above cannot become a `finally` the way the session
+      // path's one below is, because the call on the next line -- which is
+      // what promotes the staged candidate into the resend stash, through
+      // recordDelivery -- sits outside the try. A `finally` would run
+      // before it and withdraw the candidate, and recordDelivery ignores a
+      // delivery it has no staged entry for, so every message queued for
+      // another task would stop leaving a resend candidate behind at all.
+      // Making the two paths one shape means moving this promotion inside
+      // the try first; that regrouping is tracked in xorbitsai/xagent#2488.
       addOptimisticUserMessage(targetTaskId)
       return
     }
@@ -6092,28 +7269,37 @@ export function AppProvider({
 
               const parsed = await parseApiResponse(uploadResponse)
 
-              if (uploadResponse.ok && isJsonRecord(parsed.data)) {
-                const uploadData = parsed.data
-                if (uploadData.success && Array.isArray(uploadData.files)) {
-                  uploadData.files
-                    .filter((f): f is { file_id: string } => isJsonRecord(f) && typeof f.file_id === 'string')
-                    .forEach(f => uploadedFileIds.push(f.file_id))
-                }
-              } else {
-                throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-                  generic: t("files.uploadFailed") || "Upload failed",
-                  ...UPLOAD_ERROR_MESSAGES,
-                }))
+              if (
+                !uploadResponse.ok
+                || !isJsonRecord(parsed.data)
+                || parsed.data.success !== true
+                || !Array.isArray(parsed.data.files)
+              ) {
+                const uploadError = classifyUploadError(uploadResponse, parsed)
+                throw new Error(t(clientErrorTranslationKey(uploadError.errorCode)))
               }
+              const newFileIds = normalizeUploadFileIds(
+                parsed.data.files.map(f => isJsonRecord(f) ? f.file_id : null),
+                filesToUpload.length,
+              )
+              if (!newFileIds) {
+                throw new Error(t("clientErrors.uploadFailed"))
+              }
+              uploadedFileIds.push(...newFileIds)
             } catch (e) {
               console.error('Error uploading files before task creation:', e)
               throw e
             }
           }
 
-          if (uploadedFileIds.length > 0) {
-            requestBody.files = uploadedFileIds
+          const normalizedFileIds = normalizeUploadFileIds(
+            uploadedFileIds,
+            files.length,
+          )
+          if (!normalizedFileIds) {
+            throw new Error(t("clientErrors.uploadFailed"))
           }
+          requestBody.files = normalizedFileIds
         }
 
         // Agent chats should use the published agent's own model configuration.
@@ -6190,6 +7376,7 @@ export function AppProvider({
             agentId: taskData.agent_id,
             agentName: taskData.agent_name,
             agentLogoUrl: taskData.agent_logo_url,
+            conversationStorageVersion: taskData.conversation_storage_version,
             waitingQuestion: taskData.waiting_question,
             waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
             runId: taskData.run_id,
@@ -6201,6 +7388,31 @@ export function AppProvider({
 
           // User message will be handled by backend via trace event
 
+          // A create report with a context value the user can fill here holds
+          // the message before it is staged or queued, so nothing of it reaches
+          // the transport or the dialog's resend candidates until the dialog
+          // ends the hold (FirstGateDecision); the per-turn check still decides
+          // whether the turn runs. Opened here, after the create response, not
+          // from a mount effect: a gate opened in the provider's mount commit is
+          // cleared by its identity effect. The pending-task auto-send never
+          // sends this task's description, which is the held text: its ref is
+          // cleared here, and this task's pending task_info never arms it.
+          if (shouldHoldFirstMessage(taskData.connector_runtime_requirements)) {
+            // null: no provider mounted, or an id it rejects; nothing is held.
+            const held = connectorRuntimeDialogRef.current.openFirstGate(newTaskId)
+            firstGateTaskIdRef.current = newTaskId
+            pendingTaskToExecuteRef.current = null
+            const decision = held === null ? null : await held
+            if (decision === "discarded") return
+            if (decision === "cleared") {
+              // Fixed, translated text naming nothing the user typed. The new
+              // conversation page rethrows it to ChatInput, which shows a userFacing
+              // message instead of "please try again"; the agent page's handler
+              // toasts any error's message itself.
+              throw Object.assign(new Error(t(FIRST_GATE_CLEARED_MESSAGE_KEY)), { userFacing: true })
+            }
+          }
+
           // For new tasks, always send chat message to support file uploads
           console.log('💬 Queuing chat message for new task:', {
             taskId: newTaskId,
@@ -6210,13 +7422,22 @@ export function AppProvider({
 
           // Do not clear the composer until the newly connected task socket
           // confirms that the message was durably accepted.
-          await queuePendingMessage({
-            message,
-            files,
-            targetTaskId: newTaskId,
-            force: config?.force,
-            clientMessageId,
+          connectorRuntimeDialogRef.current.stagePendingDelivery({
+            taskId: newTaskId, clientMessageId, text: message, files: files ?? [],
           })
+          try {
+            await queuePendingMessage({
+              message,
+              files,
+              targetTaskId: newTaskId,
+              force: config?.force,
+              clientMessageId,
+              requestId,
+            })
+          } catch (error) {
+            connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+            throw error
+          }
           addOptimisticUserMessage(newTaskId)
         } else {
           const parsed = await parseApiResponse(response)
@@ -6261,7 +7482,15 @@ export function AppProvider({
       // deliberately runs only after this succeeds - clearing dagExecution/
       // steps first and then throwing would remove the Progress panel and its
       // header toggle for a run that never actually changed.
-      await sendChatMessage(message, files, config?.force, clientMessageId)
+      connectorRuntimeDialogRef.current.stagePendingDelivery({
+        taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
+      })
+      try {
+        await sendChatMessage(message, files, config?.force, clientMessageId, requestId)
+      } catch (error) {
+        connectorRuntimeDialogRef.current.discardPendingDelivery(clientMessageId)
+        throw error
+      }
 
       // A prior turn's DAG plan/steps must not linger into this turn - otherwise
       // the Progress panel would auto-open (or stay open) showing stale steps
@@ -6462,6 +7691,44 @@ export function AppProvider({
     sessionTransport?.supportsConversationReset,
   ])
 
+  const stopTask = useCallback(() => {
+    // Same belt as the phase guard below, on the other half of the rule: a
+    // caller that does not come from the button must not send a stop frame on
+    // a transport that never declared the capability.
+    if (!taskStopEnabled) return
+    const lifecycle = sessionConversationRef.current
+    // Guard duplicated on purpose with the caller-side visibility rule: a
+    // caller that does not come from the button (a future keyboard shortcut, a
+    // console call) must not be able to send a stop frame when this connection
+    // has no bound task to attribute it to.
+    if (lifecycle.phase !== "bound") return
+    const boundTaskId = lifecycle.taskId
+    // No try/catch here, unlike startNewConversation above: sendMessage in
+    // use-websocket already wraps socket.send and returns "not_sent" instead of
+    // throwing, and a stop owns no promise and no session state to roll back.
+    // startNewConversation wraps its send because its catch escalates to
+    // requireSessionReload; a failed stop must not lock the visitor out.
+    if (sendRawMessage({ type: "stop" }) !== "sent") {
+      // The frame never left the socket, so nobody received the request, so
+      // the hint says so rather than reusing the unconfirmed-timeout wording.
+      setStopState("not_sent")
+      return
+    }
+    stopIntentTaskIdRef.current = boundTaskId
+    setStopState("stopping")
+    // Cleared here, next to the arm, rather than on the way in: a call that
+    // sends no frame must leave an earlier attempt's window running, so the
+    // request that did leave the socket can still reach its unconfirmed
+    // timeout instead of ending in a state nothing ever advances. Defensive:
+    // the stop button ignores presses while a stop is pending, so only a
+    // caller other than the button can call this with a window still armed.
+    clearStopTimeout()
+    stopTimeoutRef.current = setTimeout(() => {
+      stopTimeoutRef.current = null
+      setStopState("timed_out")
+    }, SESSION_STOP_TIMEOUT_MS)
+  }, [clearStopTimeout, sendRawMessage, taskStopEnabled])
+
   // Initialize the replay scheduler function
   const initializeReplayScheduler = useCallback(() => {
     // Get cached events
@@ -6562,6 +7829,9 @@ export function AppProvider({
     if (taskId) {
       isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
+    } else {
+      // The task socket is keyed on taskId, so no terminal WS event will clear this.
+      dispatch({ type: "SET_PROCESSING", payload: false })
     }
   }, [dispatch, router])
 
@@ -6655,8 +7925,12 @@ export function AppProvider({
           selectStep,
           clearMessages,
           isConnected,
+          sameTaskReconnects,
           connectionError,
           startNewConversation,
+          canStopTask,
+          stopTask,
+          stopState,
           isConversationResetPending:
             state.sessionConversation.phase === "reset_requested",
           isMessageDeliveryPending: messageDeliveryCount > 0,
@@ -6679,6 +7953,20 @@ export function AppProvider({
           }}
         >
           {children}
+          {/*
+            A second seam alongside the existing TASK_ERROR_EVENT /
+            TaskErrorController mechanism, not a replacement for it. Three
+            reasons it is not reused here: (1) that event only fires from the
+            task_completed branch above (see emitTaskError), while this
+            dialog is driven by the terminal task_error branch -- a
+            different frame entirely; (2) TaskErrorController is mounted as
+            a sibling of AppProvider (see application-shell.tsx), so it
+            cannot reach useApp() the way this component does; (3) that
+            controller's own file already documents itself as a seam an
+            app-layer overlay may replace, which is not this dialog's role.
+            Do not "consolidate" the two without re-checking all three.
+          */}
+          <ConnectorRuntimeDialog />
           </AppContext.Provider>
         </FileAccessProvider>
       </LinksOpenInNewTabCapability.Provider>

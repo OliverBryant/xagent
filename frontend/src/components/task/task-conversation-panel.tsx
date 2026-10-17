@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FolderOpen, Loader2 } from "lucide-react"
+import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
@@ -15,9 +15,9 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp } from "@/contexts/app-context-chat"
+import { useApp, type TaskAutoResume } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
@@ -56,10 +56,55 @@ type CombinedItem = {
   isStreamingFinalAnswer?: boolean
   traceEvents?: any[]
   interactions?: any[]
+  interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
+  showInterruptedStatus?: boolean
   timelineOrder?: number
   isSystemNotice?: boolean
+}
+
+// Notice text for a task a system interruption paused, by its reason.
+const INTERRUPTION_NOTICE_KEYS = {
+  lease_expired: "taskInterruption.leaseExpired",
+  persistence_failure: "taskInterruption.persistenceFailure",
+  llm_unavailable: "taskInterruption.llmUnavailable",
+} as const
+
+const interruptionNoticeKey = (reason: string) =>
+  INTERRUPTION_NOTICE_KEYS[reason as keyof typeof INTERRUPTION_NOTICE_KEYS]
+  ?? "taskInterruption.paused"
+
+// Notice text once automatic resume stopped, by its ``stop_reason``. The
+// superseded copy deliberately does not offer "click resume": a later tick
+// of the same scheduled trigger already ran, and resuming this one would
+// duplicate its work.
+const AUTO_RESUME_STOPPED_KEYS = {
+  limit_reached: "taskInterruption.autoResumeStoppedLimit",
+  expired: "taskInterruption.autoResumeStoppedExpired",
+  superseded: "taskInterruption.autoResumeStoppedSuperseded",
+  failed: "taskInterruption.autoResumeStoppedFailed",
+  disabled: "taskInterruption.autoResumeStoppedDisabled",
+} as const
+
+const autoResumeNotice = (
+  autoResume: TaskAutoResume,
+  t: Translate,
+  locale?: string,
+): string => {
+  if (autoResume.status === "resuming") return t("taskInterruption.autoResumeResuming")
+  if (autoResume.status === "stopped") {
+    return t(
+      AUTO_RESUME_STOPPED_KEYS[autoResume.stopReason as keyof typeof AUTO_RESUME_STOPPED_KEYS]
+      ?? "taskInterruption.autoResumeStopped",
+    )
+  }
+  const at = autoResume.nextAttemptAt ? new Date(autoResume.nextAttemptAt) : undefined
+  return at && !Number.isNaN(at.getTime())
+    ? t("taskInterruption.autoResumeScheduledAt", {
+      time: at.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }),
+    })
+    : t("taskInterruption.autoResumeScheduled")
 }
 
 const toTimestampMs = (timestamp: unknown): number => {
@@ -154,6 +199,11 @@ const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
     return undefined
   }
+  if (currentTask.waitingRequestId) {
+    return currentTask.waitingInteractions?.length
+      ? currentTask.waitingInteractions
+      : undefined
+  }
   if (currentTask.waitingInteractions?.length) {
     return currentTask.waitingInteractions
   }
@@ -203,6 +253,9 @@ export function TaskConversationPanel({
     taskControlsEnabled,
     pauseTask,
     resumeTask,
+    canStopTask,
+    stopTask,
+    stopState,
     openFilePreview,
     closeFilePreview,
     requestStatus,
@@ -213,7 +266,7 @@ export function TaskConversationPanel({
     isSessionInteractionLocked,
   } = useApp()
   const fileAccess = useFileAccess()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
@@ -297,6 +350,7 @@ export function TaskConversationPanel({
             (event: unknown) => !shouldHideWorkforceInternalTrace(event),
           ),
           interactions: message.interactions,
+          interactionRequestId: message.interactionRequestId,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -410,7 +464,22 @@ export function TaskConversationPanel({
       const isCurrentTurnGroup =
         groupIndex >= userTurnCount && groupIndex === latestGroupIndex
       const inferredProcessStatus = resolveTraceProcessStatus({ traceEvents: events })
-      const processStatus = isCurrentTurnGroup
+      // A turn the visitor stopped is recorded by the id of the user message
+      // that opened it (the group's anchor). That record outranks both the
+      // task status and the inferred status, for the current turn and for
+      // earlier ones, so the group carries no "failed" status either and
+      // never takes the turn's task-id failure reference. It is kept while
+      // the same task stays bound and is cleared when the bound task changes
+      // or the conversation or its messages are reset. When a bubble follows
+      // the group, that bubble already says the turn was interrupted, so the
+      // process does not repeat it; when nothing follows (the group still
+      // shows the empty status), the process keeps its "Interrupted" line,
+      // since nothing else on screen says so.
+      const isVisitorStoppedGroup =
+        !!anchor && state.stoppedTurnAnchorIds.includes(anchor.id)
+      const processStatus = isVisitorStoppedGroup
+        ? "interrupted"
+        : isCurrentTurnGroup
         ? resolveTraceProcessStatus({
             processStatus: state.currentTask?.status,
             traceEvents: events,
@@ -425,10 +494,15 @@ export function TaskConversationPanel({
         role: "assistant",
         content: null,
         timestamp: groupTimestamp,
-        status: shouldShowEmptyStatus ? state.currentTask?.status : undefined,
+        status:
+          shouldShowEmptyStatus && !isVisitorStoppedGroup
+            ? state.currentTask?.status
+            : undefined,
         traceEvents: events,
         showEmptyStatus: shouldShowEmptyStatus,
         processStatus,
+        showInterruptedStatus:
+          isVisitorStoppedGroup && !shouldShowEmptyStatus ? false : undefined,
         timelineOrder: groupIndex * 2,
       })
     })
@@ -444,8 +518,42 @@ export function TaskConversationPanel({
     hasFinalAssistantMessage,
     messageItems,
     state.currentTask?.status,
+    state.stoppedTurnAnchorIds,
     managerTraceEvents,
   ])
+
+  // One task-id reference per failed turn. With the trace hidden, a failed
+  // turn can render both its failed process group and its failed result row,
+  // so the result row takes the reference and the process group only gets it
+  // when it is the turn's sole failure mark.
+  const { failureReferenceItemIds, lastTurnHasFailureReference } = useMemo(() => {
+    const ids = new Set<string>()
+    let turn: CombinedItem[] = []
+    let lastTurnHasReference = false
+    const closeTurn = () => {
+      const failed = turn.filter(
+        (item) =>
+          item.role === "assistant" &&
+          (item.status === "failed" || item.processStatus === "failed")
+      )
+      const resultRows = failed.filter((item) => !Array.isArray(item.traceEvents))
+      const chosen = resultRows.at(-1) ?? failed.at(-1)
+      if (chosen) {
+        ids.add(chosen.id)
+      }
+      lastTurnHasReference = Boolean(chosen)
+      turn = []
+    }
+    timelineItems.forEach((item) => {
+      if (item.role === "user") {
+        closeTurn()
+        return
+      }
+      turn.push(item)
+    })
+    closeTurn()
+    return { failureReferenceItemIds: ids, lastTurnHasFailureReference: lastTurnHasReference }
+  }, [timelineItems])
 
   const currentTurnTraceEvents = useMemo(() => {
     if (managerTraceEvents.length === 0) {
@@ -714,6 +822,31 @@ export function TaskConversationPanel({
   const shouldShowHistoryLoading =
     timelineItems.length === 0 &&
     state.isHistoryLoading
+  // A user's own pause needs no explanation; a system interruption does.
+  // Only for the viewed task: right after a switch currentTask can still be
+  // the previous one.
+  const interruptionReason = state.currentTask?.id === String(state.taskId)
+    && state.currentTask.status === "paused"
+    && state.currentTask.autoRecovery?.reason
+    && state.currentTask.autoRecovery.reason !== "user_pause"
+    ? state.currentTask.autoRecovery.reason
+    : undefined
+  // Automatic resume replaces the "click resume" advice while it applies to
+  // the pause shown (the reducer drops it once the task leaves that fence).
+  const autoResume = state.currentTask?.id === String(state.taskId)
+    && state.currentTask.status === "paused"
+    ? state.currentTask.autoResume
+    : undefined
+  // The virtual message belongs to the latest turn, so it follows that turn's
+  // stopped record the same way the process groups above do, including taking
+  // no task-id failure reference. It only appears while the turn has no answer
+  // and no trace group of its own, so its "Interrupted" line is then the
+  // turn's only sign of the interruption and stays on.
+  const latestUserMessage = [...state.messages]
+    .reverse()
+    .find((message) => message.role === "user")
+  const isLatestTurnVisitorStopped =
+    !!latestUserMessage && state.stoppedTurnAnchorIds.includes(latestUserMessage.id)
   const shouldShowVirtualMessage =
     (state.isProcessing ||
       state.currentTask?.status === "paused" ||
@@ -736,6 +869,18 @@ export function TaskConversationPanel({
         style={{ width: anyPreviewOpen ? `${leftWidth}%` : "100%" }}
         className={cn(anyPreviewOpen ? "" : "flex-1", "min-w-0 flex flex-col min-h-0 transition-[width] duration-0 relative")}
       >
+        {state.streamRecoveryTaskId === state.taskId && state.taskId !== null && (
+          <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {t("sharedStream.interrupted")}
+          </div>
+        )}
+        {(autoResume || interruptionReason) && (
+          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {autoResume
+              ? autoResumeNotice(autoResume, t, locale)
+              : t(interruptionNoticeKey(interruptionReason as string))}
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto">
           <main className={cn("mx-auto px-4 relative z-0 transition-all", mode === "page" ? "container max-w-4xl py-8" : "max-w-3xl py-4")}>
             <div className={cn(mode === "page" ? "space-y-6 pb-4" : "space-y-4 pb-4")}>
@@ -771,7 +916,8 @@ export function TaskConversationPanel({
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={showProcessView}
-                        processStatus={item.processStatus}
+                        showInterruptedStatus={item.showInterruptedStatus}
+                        processStatus={item.status === "interrupted" ? "interrupted" : item.processStatus}
                         taskStatus={
                           isFailedResultMessage
                             ? "failed"
@@ -781,6 +927,7 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
+                        interactionRequestId={item.interactionRequestId}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -793,6 +940,9 @@ export function TaskConversationPanel({
                         } : undefined}
                         onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                         onAgentExecutionClick={onAgentExecutionClick}
+                        failureTaskId={
+                          failureReferenceItemIds.has(item.id) ? state.taskId : undefined
+                        }
                       />
                     )
                   })}
@@ -804,15 +954,33 @@ export function TaskConversationPanel({
                       traceEvents={currentTurnTraceEvents as any || []}
                       showProcessView={showProcessView}
                       isVirtual
-                      processStatus={state.currentTask?.status}
+                      processStatus={isLatestTurnVisitorStopped ? "interrupted" : state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
+                      failureTaskId={
+                        !isLatestTurnVisitorStopped &&
+                        !lastTurnHasFailureReference &&
+                        state.currentTask?.id === String(state.taskId) &&
+                        state.currentTask.status === "failed"
+                          ? state.taskId
+                          : undefined
+                      }
                     />
                   )}
                 </>
+              )}
+              {state.currentTask?.id === String(state.taskId)
+                && state.currentTask.status === "completed"
+                && !state.isProcessing
+                && state.currentTask.completionOutcome && (
+                <div role="status" className={cn("flex items-center gap-2 text-sm", state.currentTask.completionOutcome === "completed" ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400")}>
+                  {state.currentTask.completionOutcome === "completed" ? <CheckCircle2 className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                  {t(`taskCompletion.${state.currentTask.completionOutcome}`)}
+                </div>
               )}
               <div ref={messagesEndRef} />
             </div>
@@ -852,6 +1020,12 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
+              currentInteractionRequestId={
+                state.currentTask?.status === "waiting_for_user" &&
+                state.currentTask.id === String(state.taskId)
+                  ? state.currentTask.waitingRequestId
+                  : undefined
+              }
               isLoading={
                 state.isProcessing
                 || isConversationResetPending
@@ -865,6 +1039,8 @@ export function TaskConversationPanel({
               taskStatus={state.currentTask?.status}
               onPause={taskControlsEnabled ? pauseTask : undefined}
               onResume={taskControlsEnabled ? resumeTask : undefined}
+              onStop={canStopTask ? stopTask : undefined}
+              stopState={stopState}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,

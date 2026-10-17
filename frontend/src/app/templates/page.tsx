@@ -12,35 +12,15 @@ import { PageHeader } from "@/components/ui/page-header";
 import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 import type { Template } from "@/types/template";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
-import type { TranslationKey } from "@/i18n/translations";
-import { normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
+import { categoryLabel as sharedCategoryLabel, normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
 import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
+import type { TranslationKey } from "@/i18n/translations";
 
 interface CategorySection {
   id: string;
   title: string;
   templates: Template[];
 }
-
-const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
-  general: "templates.categoryTitles.general",
-  sales: "templates.categoryTitles.sales",
-  marketing: "templates.categoryTitles.marketing",
-  support: "templates.categoryTitles.support",
-  research: "templates.sections.knowledge",
-  productivity: "templates.categoryTitles.general_productivity",
-  healthcare_fitness: "templates.categoryTitles.healthcare_fitness",
-  general_productivity: "templates.categoryTitles.general_productivity",
-  customer_service: "templates.categoryTitles.customer_service",
-  finance_lms_ops: "templates.categoryTitles.finance_lms_ops",
-  security: "templates.categoryTitles.security",
-  operations: "templates.categoryTitles.operations",
-};
-
-const formatFallbackLabel = (category: string) =>
-  category
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (char) => char.toUpperCase());
 
 // The workforce-creation error paths return a structured
 // `detail: {code, message, params}` (see the WORKFORCE_*_CODE constants in
@@ -72,9 +52,8 @@ function TemplatesPageContent() {
   const { t, tDynamic, locale } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
-  // Honors the category the "All templates" escape hatch on the /task
-  // quick-access panel links back to (?category=<id>), so following it
-  // lands on the same category instead of always resetting to "All".
+  // Honors a deep-linked category (?category=<id>), so landing here from
+  // an external link opens on that category instead of always "All".
   const [selectedCategory, setSelectedCategory] = useState(
     () => searchParams.get("category") || "All"
   );
@@ -120,11 +99,7 @@ function TemplatesPageContent() {
     fetchTemplates();
   }, [locale]);
 
-  const categoryLabel = (category?: string) => {
-    const c = category || "Others";
-    const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(c)];
-    return key ? t(key) : formatFallbackLabel(c);
-  };
+  const categoryLabel = (category?: string) => sharedCategoryLabel(t, category);
 
   const formatAgentsCount = (count: number) =>
     count === 1

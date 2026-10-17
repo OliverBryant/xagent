@@ -4,7 +4,7 @@ import {
   type TaskStatus,
 } from "./task-status"
 
-export type TraceProcessStatus = TaskStatus
+export type TraceProcessStatus = TaskStatus | "interrupted"
 
 type TraceProcessEvent = {
   event_type?: string
@@ -46,10 +46,10 @@ const isFailureTraceError = (eventData: Record<string, unknown> | null): boolean
 
 export const normalizeTraceProcessStatus = (
   status: unknown
-): TraceProcessStatus | undefined => normalizeTaskStatus(status)
+): TraceProcessStatus | undefined => status === "interrupted" ? status : normalizeTaskStatus(status)
 
 export const isStoppedTraceProcessStatus = (status: unknown): boolean =>
-  isStoppedTaskStatus(status)
+  status === "interrupted" || isStoppedTaskStatus(status)
 
 export const getTraceProcessStatusFromEvents = (
   events?: TraceProcessEvent[]
@@ -101,7 +101,14 @@ export const resolveTraceProcessStatus = ({
   if (explicit && isStoppedTraceProcessStatus(explicit)) {
     return explicit
   }
-  if (inferred && isStoppedTraceProcessStatus(inferred)) {
+  // An "interrupted" end event belongs to a run that a later resume may have
+  // replaced; it must not override a caller that says the task is running or
+  // pending.
+  if (
+    inferred &&
+    isStoppedTraceProcessStatus(inferred) &&
+    !(inferred === "interrupted" && (explicit === "running" || explicit === "pending"))
+  ) {
     return inferred
   }
   return explicit || inferred

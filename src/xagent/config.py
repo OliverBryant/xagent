@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import math
@@ -40,20 +41,69 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
+WORKER_COUNT = "XAGENT_WORKER_COUNT"
+CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
+TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
+ENCRYPTION_KEY = "ENCRYPTION_KEY"
+# Public development fallback; runtime credential storage must reject it.
+DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
+TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
 TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
+TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
+TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
+TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
+TASK_AUTO_RESUME_WINDOW_SECONDS = "XAGENT_TASK_AUTO_RESUME_WINDOW_SECONDS"
+TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS"
+)
+TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN = "XAGENT_TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN"
+TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS = "XAGENT_TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS"
+TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS"
+)
+TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS = (
+    "XAGENT_TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS"
+)
+TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
+    "XAGENT_TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS"
+)
+# Shared task command dispatcher.
+DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+CONVERSATION_RETENTION_DAYS = "XAGENT_CONVERSATION_RETENTION_DAYS"
+TRACE_RETENTION_DAYS = "XAGENT_TRACE_RETENTION_DAYS"
+RETENTION_ENABLED = "XAGENT_RETENTION_ENABLED"
+RETENTION_DRY_RUN = "XAGENT_RETENTION_DRY_RUN"
+RETENTION_BATCH_SIZE = "XAGENT_RETENTION_BATCH_SIZE"
+RETENTION_SWEEP_INTERVAL_SECONDS = "XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS"
+RETENTION_BATCH_PAUSE_SECONDS = "XAGENT_RETENTION_BATCH_PAUSE_SECONDS"
+TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
+    "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+)
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
 NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
 BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
 BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
+BROWSER_ALLOW_UNSANDBOXED = "XAGENT_BROWSER_ALLOW_UNSANDBOXED"
 BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
 BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
 BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
@@ -97,7 +147,22 @@ DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
 DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
+RUNTIME_TELEMETRY_ENABLED = "XAGENT_RUNTIME_TELEMETRY_ENABLED"
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+OTEL_EXPORT_INTERVAL_MILLISECONDS = "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS"
+OTEL_SERVICE_NAME = "XAGENT_OTEL_SERVICE_NAME"
+_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
+_STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
+_STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
+LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
+LLM_STREAM_EMPTY_DELTA_LIMIT = "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT"
+LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
+LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
+LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
+LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
@@ -114,6 +179,8 @@ SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
     "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
 )
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
+SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
+TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -125,6 +192,9 @@ TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS = (
 )
 CHECKPOINT_ENCODING_V2 = "XAGENT_CHECKPOINT_ENCODING_V2"
 CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
+CHECKPOINT_GATE_STALL_WARNING_SECONDS = "XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS"
+ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
+TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -140,12 +210,19 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
+TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
+TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
 TRIGGER_DISPATCHER_ENABLED = "XAGENT_TRIGGER_DISPATCHER_ENABLED"
 TRIGGER_DISPATCHER_INTERVAL_SECONDS = "XAGENT_TRIGGER_DISPATCHER_INTERVAL_SECONDS"
 TRIGGER_DISPATCHER_BATCH_SIZE = "XAGENT_TRIGGER_DISPATCHER_BATCH_SIZE"
+TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS = (
+    "XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS"
+)
 TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
 TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
@@ -181,6 +258,8 @@ GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
 PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
 S2S_API_BASE_URL = "XAGENT_S2S_API_BASE_URL"
 TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+GOOGLE_RESTRICTED_SCOPES_ENABLED = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+ZOOM_MEETING_WRITE_ENABLED = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
@@ -202,18 +281,28 @@ GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
 GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
 GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
 FRONTEND_URL = "XAGENT_FRONTEND_URL"
+CORS_ORIGINS = "XAGENT_CORS_ORIGINS"
+XAGENT_ENVIRONMENT = "XAGENT_ENVIRONMENT"
+ENVIRONMENT = "ENVIRONMENT"
+REQUIRE_SECURE_SECRETS = "XAGENT_REQUIRE_SECURE_SECRETS"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
+HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
+TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
+INLINE_FILE_DELIVERY_MAX_BYTES = "XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
 
@@ -322,6 +411,21 @@ def get_default_task_execution_mode(
     return "auto"
 
 
+def get_task_reply_wait_timeout_seconds() -> int:
+    """Get the shared reply preparation wait timeout (env override, default 30s)."""
+    value = os.getenv(TASK_REPLY_WAIT_TIMEOUT_SECONDS, "30")
+    try:
+        seconds = int(value)
+        if seconds > 0:
+            return seconds
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r; falling back to 30", TASK_REPLY_WAIT_TIMEOUT_SECONDS, value
+    )
+    return 30
+
+
 def get_task_lease_ttl_seconds() -> int:
     """Get task execution lease TTL in seconds.
 
@@ -397,6 +501,143 @@ def get_task_lease_recovery_batch_size() -> int:
     return _get_positive_int_env(TASK_LEASE_RECOVERY_BATCH_SIZE, 100)
 
 
+def _get_strict_bool_env(env_var: str, default: bool) -> bool:
+    """Parse a boolean env var, warning and falling back on unrecognised values.
+
+    Unlike :func:`_get_bool_env`, an unrecognised value keeps the default
+    instead of reading as ``False``, so a typo cannot silently turn off a
+    default-on switch. Blank counts as unset, as in
+    :func:`_get_retention_bool_env`: a compose file interpolating an unset
+    shell variable passes an empty string, which states nothing and must not
+    warn on every read.
+    """
+
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+    return default
+
+
+def get_task_infra_failure_pause_enabled() -> bool:
+    """Whether eligible tasks pause (instead of failing) on infrastructure failures.
+
+    Unset (or blank or invalid), it follows
+    :func:`get_task_auto_resume_enabled`: a paused run that nothing resumes
+    is worse than a terminal failure for unattended (e.g. scheduled) tasks,
+    so pausing is the default only while automatic resume is on. Channel
+    tasks under shared execution hold their channel reply while an automatic
+    resume is pending, and reply "interrupted" once it stops without
+    resuming (see ``_read_channel_result``); channel tasks of a combined
+    (inline) host are not eligible and are never resumed automatically. Set it
+    explicitly to pause for a manual resume with automatic resume off, or to
+    fail as before with it on. Lease-expiry recovery pauses regardless, as it
+    always has.
+
+    Priority:
+        1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
+        2. get_task_auto_resume_enabled()
+    """
+
+    return _get_strict_bool_env(
+        TASK_INFRA_FAILURE_PAUSE_ENABLED, get_task_auto_resume_enabled()
+    )
+
+
+def get_task_auto_resume_enabled() -> bool:
+    """Whether tasks paused by an interruption are resumed automatically.
+
+    Priority:
+        1. XAGENT_TASK_AUTO_RESUME_ENABLED environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_task_auto_resume_poll_seconds() -> int:
+    """Get the auto-resume sweeper polling interval in seconds (default 5)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_POLL_SECONDS, 5)
+
+
+def get_task_auto_resume_max_per_tick() -> int:
+    """Get the maximum auto-resumes dispatched per sweeper tick (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_PER_TICK, 20)
+
+
+def get_task_auto_resume_max_inflight() -> int:
+    """Get the global cap on auto-resumed runs in flight (default 50)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_INFLIGHT, 50)
+
+
+def get_task_auto_resume_window_seconds() -> int:
+    """Get how long after an interruption auto-resume stays allowed (default 24h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_WINDOW_SECONDS, 86400)
+
+
+def get_task_auto_resume_channel_window_seconds() -> int:
+    """Get the auto-resume staleness window for channel tasks (default 30 min)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS, 1800)
+
+
+def get_task_auto_resume_max_total_per_run() -> int:
+    """Get the absolute cap on auto-resumes for a single run (default 20)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN, 20)
+
+
+def get_task_auto_resume_short_initial_backoff_seconds() -> int:
+    """Get the first backoff for lease_expired/persistence_failure (default 10s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS, 10)
+
+
+def get_task_auto_resume_short_max_no_progress() -> int:
+    """Get the no-progress resume limit for short-backoff reasons (default 3)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS, 3)
+
+
+def get_task_auto_resume_llm_initial_backoff_seconds() -> int:
+    """Get the first backoff for llm_unavailable interruptions (default 60s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS, 60)
+
+
+def get_task_auto_resume_llm_max_backoff_seconds() -> int:
+    """Get the backoff ceiling for llm_unavailable interruptions (default 900s)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS, 900)
+
+
+def get_task_auto_resume_llm_max_elapsed_seconds() -> int:
+    """Get the total retry duration for llm_unavailable interruptions (default 2h)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS, 7200)
+
+
+def get_task_auto_resume_model_output_max_no_progress() -> int:
+    """Get the run-level retry limit for model_output_invalid (default 2)."""
+
+    return _get_positive_int_env(TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS, 2)
+
+
+def get_dispatcher_max_inflight_per_process() -> int:
+    """Get the per-process cap on executions the dispatcher admits (default 80)."""
+
+    return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
+
+
 def get_uploaded_file_recovery_interval_seconds() -> int:
     """Get the interval between stale file-compensation recovery scans."""
 
@@ -413,6 +654,32 @@ def get_uploaded_file_recovery_batch_size() -> int:
     """Get the maximum file-compensation claims examined per polling tick."""
 
     return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
+
+
+def get_temp_file_cleanup_shutdown_timeout_seconds() -> int:
+    """Get how long shutdown waits for the orphaned temp-file sweep to unwind.
+
+    At shutdown the sweep's cooperative stop flag is set and the handler waits
+    up to this long for the walk to reach its next directory boundary and exit.
+    This bounds only the wait, not the walk: the executor thread is not
+    cancellable, so a long overrun is ultimately joined by asyncio.run()'s
+    teardown. Operators on very large uploads trees may want a larger value.
+
+    Unlike XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS and similar getters in this
+    module, "0" is not treated as "disable the timeout" here: it already has
+    a distinct, meaningful value for a wait bound -- "don't wait at all" --
+    which is the opposite of disabling it (waiting forever). So "0" falls
+    back to the default like any other invalid value instead.
+
+    Priority:
+        1. XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS environment variable
+        2. Default of 10 seconds
+
+    Returns:
+        Shutdown grace period in seconds
+    """
+
+    return _get_positive_int_env(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, 10)
 
 
 def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
@@ -435,6 +702,57 @@ def _get_bool_env(env_var: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_otel_metrics_endpoint() -> str | None:
+    """Return the full OTLP/HTTP metrics endpoint.
+
+    XAgent's explicit setting wins. Standard OpenTelemetry variables remain a
+    fallback so an existing Collector deployment can configure this service
+    consistently with the rest of its fleet. ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    is a base endpoint, so the HTTP metrics path is appended to it.
+    """
+
+    endpoint = _normalized_http_env_url(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)
+    if endpoint is not None:
+        return endpoint
+    base_endpoint = _normalized_http_env_url(_STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT)
+    if base_endpoint is None:
+        return None
+    return f"{base_endpoint}/v1/metrics"
+
+
+def get_runtime_telemetry_enabled() -> bool:
+    """Whether runtime metrics should export through OpenTelemetry.
+
+    An explicit XAgent flag is authoritative. Otherwise, configuring any
+    supported OTLP endpoint enables export automatically.
+    """
+
+    if os.getenv(RUNTIME_TELEMETRY_ENABLED) is not None:
+        return _get_bool_env(RUNTIME_TELEMETRY_ENABLED, False)
+    return get_otel_metrics_endpoint() is not None
+
+
+def get_otel_export_interval_milliseconds() -> int:
+    """Return the periodic OTLP metrics export interval."""
+
+    if os.getenv(OTEL_EXPORT_INTERVAL_MILLISECONDS) is not None:
+        return _get_positive_int_env(OTEL_EXPORT_INTERVAL_MILLISECONDS, 10_000)
+    return _get_positive_int_env(_STANDARD_OTEL_METRIC_EXPORT_INTERVAL, 10_000)
+
+
+def get_otel_service_name() -> str:
+    """Return the OpenTelemetry service.name resource attribute."""
+
+    for env_var in (OTEL_SERVICE_NAME, _STANDARD_OTEL_SERVICE_NAME):
+        value = (os.getenv(env_var) or "").strip()
+        if value:
+            return value
+    return "xagent"
 
 
 def _normalized_env_url(env_var: str) -> str | None:
@@ -576,6 +894,29 @@ def get_openrouter_official_providers_only() -> bool:
     return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
 
 
+def get_xrouter_excluded_models() -> tuple[str, ...]:
+    """Return model slugs excluded from xrouter candidate sets.
+
+    The environment value is a comma-separated list. Empty entries are ignored,
+    and duplicates are removed while preserving the configured order.
+    """
+    value = os.getenv(XROUTER_EXCLUDED_MODELS, "")
+    return tuple(
+        dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
+    )
+
+
+def get_form_answer_continuation_enabled() -> bool:
+    """Return whether the form-answer continuation text may be applied.
+
+    One switch for every model, on by default. Unset means on; any set value
+    other than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read on every
+    call (not cached).
+    """
+    return _get_bool_env(FORM_ANSWER_CONTINUATION_ENABLED, True)
+
+
 def get_mcp_oauth_allow_private_hosts() -> bool:
     """Return whether MCP OAuth URL policy may target local/private hosts.
 
@@ -583,6 +924,24 @@ def get_mcp_oauth_allow_private_hosts() -> bool:
     servers. Production deployments should leave it disabled.
     """
     return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
+
+
+def get_hubspot_mcp_client_id() -> str | None:
+    """Return the client ID for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_ID) or "").strip()
+    return value or None
+
+
+def get_hubspot_mcp_client_secret() -> str | None:
+    """Return the client secret for Xagent's HubSpot MCP Connector."""
+    value = (os.getenv(HUBSPOT_MCP_CLIENT_SECRET) or "").strip()
+    return value or None
+
+
+def get_toby_personal_stdio_enabled() -> bool:
+    """Return whether trusted Toby actor executions may use personal stdio."""
+
+    return _get_bool_env(TOBY_PERSONAL_STDIO_ENABLED, False)
 
 
 def get_trusted_egress_proxy_enabled() -> bool:
@@ -632,6 +991,109 @@ def get_redis_url() -> str | None:
     return value or None
 
 
+def get_shared_task_execution_enabled() -> bool:
+    """Enable durable handoff for an explicitly shared deployment topology.
+
+    Explicit configuration always wins.  Without it, preserve the established
+    shared behavior for managed worker pools and split web/worker hosts, while
+    keeping an unconfigured combined wheel or container self-contained.
+    """
+    configured = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    if configured is not None and configured.strip():
+        return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def get_task_execution_role() -> Literal["combined", "web", "worker"]:
+    """Get the process duties; combined hosts both ingress and execution."""
+    role = os.getenv(TASK_EXECUTION_ROLE, "combined").strip().lower()
+    if role == "combined":
+        return "combined"
+    if role == "web":
+        return "web"
+    if role == "worker":
+        return "worker"
+    raise ValueError(f"{TASK_EXECUTION_ROLE} must be combined, web or worker")
+
+
+def get_worker_count() -> int | None:
+    """Get the opt-in number of worker processes managed by the combined CLI."""
+    value = os.getenv(WORKER_COUNT)
+    if not value:
+        return None
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer") from None
+    if count <= 0:
+        raise ValueError(f"{WORKER_COUNT} must be a positive integer")
+    return count
+
+
+def get_channel_ingress_enabled() -> bool:
+    """Open bot connections only on the designated shared ingress host."""
+    if get_shared_task_execution_enabled() and get_task_execution_role() == "worker":
+        return False
+    shared_setting = os.getenv(SHARED_TASK_EXECUTION_ENABLED)
+    explicitly_local = bool(shared_setting and shared_setting.strip()) and not (
+        _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
+    )
+    return _get_bool_env(CHANNEL_INGRESS_ENABLED, explicitly_local)
+
+
+def validate_task_execution_host_config() -> None:
+    """Reject invalid execution configuration before accepting tasks."""
+    role = get_task_execution_role()
+    if not get_shared_task_execution_enabled():
+        if role != "combined":
+            raise ValueError(
+                f"{TASK_EXECUTION_ROLE}={role} requires {SHARED_TASK_EXECUTION_ENABLED}"
+            )
+        get_task_runtime_secrets_ttl_seconds()
+        return
+    if not get_redis_url():
+        raise ValueError(f"{SHARED_TASK_EXECUTION_ENABLED} requires {REDIS_URL}")
+    get_task_runtime_secrets_ttl_seconds()
+    key = get_task_runtime_secrets_encryption_key()
+    if key is None:
+        raise ValueError(
+            "Shared task execution requires an explicit private common ENCRYPTION_KEY"
+        )
+    from cryptography.fernet import Fernet
+
+    Fernet(key.encode())
+    get_task_event_channel_prefix()
+
+
+def get_task_runtime_secrets_ttl_seconds() -> int:
+    """Maximum lifetime of accepted connector values; default one day."""
+    value = int(os.getenv(TASK_RUNTIME_SECRETS_TTL_SECONDS, "86400"))
+    if value <= 0:
+        raise ValueError(f"{TASK_RUNTIME_SECRETS_TTL_SECONDS} must be positive")
+    return value
+
+
+def get_task_runtime_secrets_encryption_key() -> str | None:
+    """Return the explicitly configured ENCRYPTION_KEY.
+
+    Invalid Fernet keys are rejected by the store before any write.
+    """
+    key = os.getenv(ENCRYPTION_KEY)
+    if not key:
+        return None
+    return key
+
+
+def get_task_event_channel_prefix() -> str:
+    """Redis Pub/Sub is not isolated by Redis DB number; namespace each deployment."""
+    prefix = os.getenv(TASK_EVENT_CHANNEL_PREFIX, "xagent:task-events:v1").strip()
+    if not prefix or not re.fullmatch(r"[A-Za-z0-9:._-]+", prefix):
+        raise ValueError(
+            f"{TASK_EVENT_CHANNEL_PREFIX} must be a nonempty channel prefix"
+        )
+    return prefix
+
+
 def get_hot_path_cache_enabled() -> bool:
     """Return whether optional hot-path caching is enabled.
 
@@ -656,6 +1118,42 @@ def get_hot_path_task_cache_ttl_seconds() -> int:
 def get_celery_enabled() -> bool:
     """Return whether durable background jobs should be enqueued to Celery."""
     return _get_bool_env(CELERY_ENABLED, False)
+
+
+EXECUTION_BUDGET_DEFAULT_TOKENS = "XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS"
+EXECUTION_BUDGET_MAX_TOKENS = "XAGENT_EXECUTION_BUDGET_MAX_TOKENS"
+EXECUTION_BUDGET_SOFT_PERCENT = "XAGENT_EXECUTION_BUDGET_SOFT_PERCENT"
+
+
+def get_execution_budget_defaults() -> dict[str, int | None]:
+    """Read execution-budget defaults; absent limits preserve unlimited runs.
+
+    Invalid limits are configuration errors, never silently unlimited budgets.
+    """
+    values: dict[str, int | None] = {}
+    for key, env_name in (
+        ("default_tokens", EXECUTION_BUDGET_DEFAULT_TOKENS),
+        ("max_tokens", EXECUTION_BUDGET_MAX_TOKENS),
+        ("soft_limit_percent", EXECUTION_BUDGET_SOFT_PERCENT),
+    ):
+        raw = os.getenv(env_name)
+        value = int(raw) if raw else (80 if key == "soft_limit_percent" else None)
+        if value is not None and (
+            value <= 0 or (key == "soft_limit_percent" and value >= 100)
+        ):
+            raise ValueError(f"Invalid {env_name}")
+        values[key] = value
+    default_tokens, max_tokens = values["default_tokens"], values["max_tokens"]
+    if (
+        default_tokens is not None
+        and max_tokens is not None
+        and default_tokens > max_tokens
+    ):
+        raise ValueError(
+            f"{EXECUTION_BUDGET_DEFAULT_TOKENS} must not exceed "
+            f"{EXECUTION_BUDGET_MAX_TOKENS}"
+        )
+    return values
 
 
 def get_tool_parallel_enabled() -> bool:
@@ -718,6 +1216,12 @@ def get_native_browser_app_name() -> str:
             f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
         )
     return canonical
+
+
+def get_browser_allow_unsandboxed() -> bool:
+    """Whether Playwright may launch Chromium without its sandbox."""
+
+    return _get_bool_env(BROWSER_ALLOW_UNSANDBOXED, False)
 
 
 _BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
@@ -859,6 +1363,27 @@ def get_checkpoint_history_limit() -> int:
     return _get_positive_int_env(CHECKPOINT_HISTORY_LIMIT, 8, minimum=0)
 
 
+def get_checkpoint_gate_stall_warning_seconds() -> float:
+    """Seconds an exclusive checkpoint section may run before it is reported.
+
+    The section is never timed out: abandoning a write that may still land
+    would create the uncertain outcome it exists to rule out. Crossing this
+    threshold only logs a warning and counts a stall, repeating each interval
+    while the section is still held.
+
+    Priority:
+        1. XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS environment variable
+        2. Default ``30``
+
+    Invalid or non-positive values fall back to the default.
+
+    Returns:
+        The stall warning interval in seconds.
+    """
+    value = _get_positive_float_env(CHECKPOINT_GATE_STALL_WARNING_SECONDS, 30.0)
+    return 30.0 if value is None else value
+
+
 def get_compact_threshold_ratio() -> float:
     """Fraction of a model's context window at which to trigger compaction.
 
@@ -947,7 +1472,13 @@ def get_background_job_max_retries() -> int:
 
 
 def get_background_job_stale_seconds() -> int:
-    """Return the age after which non-terminal jobs should be requeued."""
+    """Return the longest gap without a durable row update before requeueing.
+
+    Measured against ``updated_at`` -- progress or status persistence -- not
+    against how long the job has been running, so a job that keeps reporting is
+    never requeued for being long. Liveness rides on whatever the work loop
+    persists; there is no timer heartbeat.
+    """
     return _get_positive_int_env(BACKGROUND_JOB_STALE_SECONDS, 7200, minimum=60)
 
 
@@ -958,6 +1489,20 @@ def get_background_job_sweep_interval_seconds() -> int:
         300,
         minimum=30,
     )
+
+
+def get_kb_milvus_cleanup_interval_seconds() -> int:
+    """Return how often the leftover Milvus rows of a Milvus deployment are purged."""
+    return _get_positive_int_env(
+        KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
+        3600,
+        minimum=300,
+    )
+
+
+def get_kb_milvus_cleanup_enabled() -> bool:
+    """Return whether the scheduled leftover Milvus row purge runs at all."""
+    return _get_bool_env(KB_MILVUS_CLEANUP_ENABLED, True)
 
 
 def get_taskless_upload_ttl_seconds() -> int:
@@ -991,6 +1536,39 @@ def get_orphan_upload_sweep_interval_seconds() -> int:
         60 * 60,
         minimum=60,
     )
+
+
+def get_task_cleanup_retry_interval_seconds() -> int:
+    """How often the task-cleanup retry driver looks for due obligations (#2587).
+
+    A task deletion that could not release a workspace directory or a
+    runtime-extension's state records the obligation and this driver retries
+    it. The interval only sets how often an idle driver re-checks; per-row
+    backoff decides when a given obligation is due.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS environment variable
+        2. Default 300 (5 minutes)
+    """
+    return _get_positive_int_env(
+        TASK_CLEANUP_RETRY_INTERVAL_SECONDS,
+        5 * 60,
+        minimum=30,
+    )
+
+
+def get_task_cleanup_max_attempts() -> int:
+    """Attempts before a cleanup obligation stops retrying (#2587).
+
+    After this many failed attempts the obligation moves to the terminal
+    ``exhausted`` state, where it stays for an operator to reconcile rather
+    than being retried forever against a resource that will never come back.
+
+    Priority:
+        1. XAGENT_TASK_CLEANUP_MAX_ATTEMPTS environment variable
+        2. Default 8
+    """
+    return _get_positive_int_env(TASK_CLEANUP_MAX_ATTEMPTS, 8)
 
 
 def get_workforce_preview_run_stale_seconds() -> int:
@@ -1034,6 +1612,32 @@ def get_trigger_dispatcher_batch_size() -> int:
         TRIGGER_DISPATCHER_BATCH_SIZE,
         20,
         minimum=1,
+    )
+
+
+def get_trigger_dispatcher_startup_jitter_seconds() -> int:
+    """Return the max random delay before the dispatcher's first tick.
+
+    Priority:
+        1. XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS environment
+           variable
+        2. Default 30
+
+    A container restart brings every trigger that fell due while it was
+    down (Gmail watch renewals, scheduled triggers) up for processing all
+    at once, and the dispatcher's first tick runs immediately on startup --
+    before egress networking may be fully warmed up. This delay pushes that
+    first tick past the likely warm-up window; it does not shrink how much
+    that tick processes (still gated by the dispatcher's own batch-size and
+    scan-limit settings), only when it starts. On a multi-replica rolling
+    restart it also desyncs every replica's first tick from firing at the
+    same instant, spreading their combined load across the window instead
+    of concentrating it in a single moment. 0 disables the delay.
+    """
+    return _get_positive_int_env(
+        TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
+        30,
+        minimum=0,
     )
 
 
@@ -1476,6 +2080,22 @@ def get_gmail_callback_base_url() -> str | None:
     )
 
 
+def get_google_restricted_scopes() -> bool:
+    """Enable Gmail and full Drive authorization only in the review environment."""
+    return _get_bool_env(GOOGLE_RESTRICTED_SCOPES_ENABLED, False)
+
+
+def get_zoom_meeting_write_enabled() -> bool:
+    """Whether the Zoom connector may request meeting:write:meeting.
+
+    Off by default: every scope in the Zoom catalog row is requested at
+    authorization time, and a Zoom app that has not been granted this scope
+    can reject the whole request, read-only connections included. When on,
+    the scope is requested and zoom_create_meeting is offered to the model.
+    """
+    return _get_bool_env(ZOOM_MEETING_WRITE_ENABLED, False)
+
+
 def get_gmail_watch_enabled() -> bool:
     """Return whether the Gmail watch feature is enabled.
 
@@ -1543,6 +2163,37 @@ def get_frontend_url() -> str:
     return "http://localhost:3000"
 
 
+def get_cors_origins() -> list[str]:
+    """Return the explicit browser origins allowed to call the API."""
+    configured = os.getenv(CORS_ORIGINS)
+    if configured and configured.strip():
+        origins = [
+            origin.strip().rstrip("/")
+            for origin in configured.split(",")
+            if origin.strip()
+        ]
+        if "*" in origins:
+            raise ValueError(
+                "XAGENT_CORS_ORIGINS cannot contain '*' when credentials are enabled"
+            )
+        return origins
+    return [get_frontend_url()]
+
+
+def get_environment() -> str:
+    """Return the normalized deployment environment name."""
+    for setting in (XAGENT_ENVIRONMENT, ENVIRONMENT):
+        value = os.getenv(setting)
+        if value and value.strip():
+            return value.strip().lower()
+    return "development"
+
+
+def get_require_secure_secrets() -> bool:
+    """Whether development should also enforce production secret checks."""
+    return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
+
+
 def get_oidc_login_ttl_seconds() -> int:
     """Return the short-lived OIDC login transaction TTL."""
     return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)
@@ -1558,7 +2209,7 @@ def get_session_secret() -> str:
     value = os.getenv(SESSION_SECRET)
     if value and value.strip():
         return value.strip()
-    return os.getenv("XAGENT_JWT_SECRET", "your-secret-key-change-in-production")
+    return os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 
 
 def get_web_dir() -> Path:
@@ -1593,10 +2244,30 @@ class UploadsDirConfigurationError(Exception):
     """
 
 
+class ExternalUploadsDirConfigurationError(Exception):
+    """A configured external upload directory has two physical meanings."""
+
+
 # First absolutized reading of each cwd-dependent uploads root, kept so the
 # root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
 # the configured spelling, so changing the configuration still takes effect.
 _pinned_relative_uploads_roots: dict[str, Path] = {}
+
+# External upload dirs feed both the chat allowlist and sandbox mount building
+# through separate calls. Pin cwd-dependent spellings on first use so a later
+# process-wide chdir cannot make those consumers name different directories.
+_pinned_relative_external_upload_dirs: dict[str, Path] = {}
+
+
+def _reset_path_config_caches_for_tests() -> None:
+    """Clear cwd-dependent path pins between tests.
+
+    Production code deliberately keeps these values for the process lifetime;
+    tests need an explicit reset boundary so their result cannot depend on
+    which working directory an earlier test pinned for the same spelling.
+    """
+    _pinned_relative_uploads_roots.clear()
+    _pinned_relative_external_upload_dirs.clear()
 
 
 def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
@@ -1605,20 +2276,20 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     Paths under the uploads root reach consumers that normalize differently,
     and both normalizations are load-bearing:
 
-    - lexical (``canonical_sandbox_path``) is what sandbox mount identity and
-      desired-vs-observed spec comparison must use, because a path that keeps
-      ``..`` can never byte-match what a container backend reports;
+    - lexical (``canonical_sandbox_path``) is still used by generic sandbox
+      configuration identities and must not preserve ``..`` segments that a
+      backend will report differently;
     - physical (``realpath``) is what ``TaskWorkspace``, the upload writers
       and ``files.py``'s containment checks use, because files have to be
       found.
 
     They agree on every spelling but one: a symlink followed by ``..``, where
     the lexical form discards the symlink the physical form follows. That
-    configuration makes one logical directory two real ones, so an uploaded
-    file can land where the sandbox never mounted and agent tools cannot see
-    it. Rejecting the input is what lets each consumer keep its own
-    normalization: none has to defend against this, and a new consumer cannot
-    reintroduce it by picking the "wrong" one.
+    configuration gives one logical directory two readings. Workspace mount
+    producers retain both readings -- the lexical one for Docker-host path
+    translation and the physical one for file identity -- so rejecting this
+    ambiguous spelling at the shared configuration boundary prevents those
+    two load-bearing views from naming different directories.
 
     An ordinary symlink is untouched -- following one is not a disagreement,
     both spellings still name a single directory.
@@ -1714,6 +2385,29 @@ def get_frontend_dist_dir() -> Path:
     return get_web_dir() / "frontend_dist"
 
 
+ARTIFACT_VALIDATION_MAX_BYTES = "XAGENT_ARTIFACT_VALIDATION_MAX_BYTES"
+ARTIFACT_VALIDATION_TIMEOUT_SECONDS = "XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS"
+
+
+def get_artifact_validation_max_bytes() -> int:
+    """Maximum snapshot bytes to format-check (larger files remain unchecked)."""
+    return _parse_size_bytes(
+        os.getenv(ARTIFACT_VALIDATION_MAX_BYTES) or "32M", ARTIFACT_VALIDATION_MAX_BYTES
+    )
+
+
+def get_artifact_validation_timeout_seconds() -> float:
+    """Hard timeout for each isolated artifact parser process."""
+    import math
+
+    value = float(os.getenv(ARTIFACT_VALIDATION_TIMEOUT_SECONDS) or "8")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{ARTIFACT_VALIDATION_TIMEOUT_SECONDS} must be positive and finite"
+        )
+    return value
+
+
 def get_max_upload_size_bytes() -> int:
     """Get the maximum allowed upload size in bytes.
 
@@ -1736,9 +2430,14 @@ def get_max_upload_size_bytes() -> int:
     if not env_value:
         return 100 * 1024 * 1024
 
-    normalized = env_value.strip().upper()
-    if not normalized:
+    if not env_value.strip():
         return 100 * 1024 * 1024
+    return _parse_size_bytes(env_value, MAX_UPLOAD_SIZE)
+
+
+def _parse_size_bytes(env_value: str, setting: str) -> int:
+    """Shared positive byte-size parser for upload and validation budgets."""
+    normalized = env_value.strip().upper()
 
     suffix_multipliers = [
         ("GB", 1024 * 1024 * 1024),
@@ -1756,27 +2455,23 @@ def get_max_upload_size_bytes() -> int:
             number_part = normalized[: -len(suffix)].strip()
             if not number_part:
                 raise ValueError(
-                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Missing numeric value."
+                    f"Invalid {setting} value: {env_value!r}. Missing numeric value."
                 )
             try:
                 result = int(float(number_part) * multiplier)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
-                ) from exc
+            except (ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
             break
 
     if result is None:
         try:
             result = int(float(normalized))
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}."
-            ) from exc
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid {setting} value: {env_value!r}.") from exc
 
     if result <= 0:
         raise ValueError(
-            f"Invalid {MAX_UPLOAD_SIZE} value: {env_value!r}. Value must be positive."
+            f"Invalid {setting} value: {env_value!r}. Value must be positive."
         )
 
     return result
@@ -1992,7 +2687,11 @@ def get_external_upload_dirs() -> list[Path]:
     """Get external upload directories from environment variable.
 
     The XAGENT_EXTERNAL_UPLOAD_DIRS environment variable should contain
-    a comma-separated list of directory paths.
+    a comma-separated list of directory paths. Environment variables and
+    ``~`` are expanded and relative paths are pinned to their first observed
+    working directory. The returned path deliberately preserves its symlink
+    spelling: Docker sibling-mode translation needs that backend-relative
+    spelling, while file-access consumers resolve it in their own domain.
 
     Example: /path/to/uploads1,/path/to/uploads2
 
@@ -2009,13 +2708,33 @@ def get_external_upload_dirs() -> list[Path]:
     for dir_path in env_dirs.split(","):
         dir_path = dir_path.strip()
         if dir_path:
-            path = Path(dir_path)
-            if path.is_dir():
-                result.append(path)
+            expanded = Path(os.path.expandvars(dir_path)).expanduser()
+            if expanded.is_absolute():
+                absolute = expanded
+            else:
+                absolute = _pinned_relative_external_upload_dirs.setdefault(
+                    dir_path, Path.cwd() / expanded
+                )
+            from .sandbox.base import canonical_sandbox_path
+
+            canonical = Path(canonical_sandbox_path(str(absolute)))
+            physical_configured = os.path.realpath(absolute)
+            physical_canonical = os.path.realpath(canonical)
+            if physical_configured != physical_canonical:
+                raise ExternalUploadsDirConfigurationError(
+                    f"External upload directory {dir_path!r} names two different "
+                    "directories depending on normalization: lexically it is "
+                    f"{str(canonical)!r}, resolving to {physical_canonical!r}, "
+                    "while resolving the configured spelling directly gives "
+                    f"{physical_configured!r}. A '..' segment after a symlink "
+                    "does that; configure the directory you actually mean."
+                )
+            if canonical.is_dir():
+                result.append(canonical)
             else:
                 logger.warning(
                     "External upload directory does not exist or is not a directory: %r",
-                    path,
+                    canonical,
                 )
 
     return result
@@ -2397,6 +3116,26 @@ def get_db_pool_size() -> int:
     return _get_positive_int_env(DB_POOL_SIZE, 10)
 
 
+def get_async_trace_db_enabled() -> bool:
+    """Async PostgreSQL/file-SQLite trace writes; restart to change backend.
+
+    Private memory databases and custom session-only hosts retain bounded sync
+    writes so a second engine cannot change database identity.
+    """
+    return _get_bool_env(ASYNC_TRACE_DB_ENABLED, True)
+
+
+def get_trace_db_max_inflight() -> int:
+    """Bound trace writes before thread/connection acquisition, per event loop.
+
+    Defaults to a conservative four, not the throughput benchmark's optimum.
+    The PostgreSQL async trace pool has this cap and no overflow; SQLite uses
+    one trace writer per loop in either mode. Sync PostgreSQL writes also
+    clamp to leave one shared pooled connection where pool size permits.
+    """
+    return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
+
+
 def get_db_max_overflow() -> int:
     """Get the SQLAlchemy connection pool max overflow for the shared web engine.
 
@@ -2460,6 +3199,148 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_llm_retry_deadline_seconds() -> float:
+    """Get the wall-clock ceiling for one LLM call's whole retry loop.
+
+    Attempt counting cannot bound how long one call holds an execution slot,
+    because every attempt may consume a full request timeout. This is the
+    bound that does. It gates whether a *new* attempt may start, so one call
+    can still overrun it by a single attempt's duration.
+
+    Priority:
+        1. XAGENT_LLM_RETRY_DEADLINE_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Seconds allowed for one call's retry loop; invalid or non-positive
+        values fall back to the default, because an unbounded loop is the
+        defect this exists to prevent.
+    """
+    deadline = _get_positive_float_env(LLM_RETRY_DEADLINE_SECONDS, 300.0)
+    return 300.0 if deadline is None else deadline
+
+
+def get_llm_capacity_max_attempts() -> int:
+    """Get the attempt budget for a provider capacity refusal.
+
+    Deliberately far below the per-model ``max_retries``: a provider that
+    reports being over capacity has asked us not to grow its load, so
+    replaying the identical request is the wrong response. Only ever lowers
+    a call's ceiling -- it cannot raise it above ``max_retries``.
+
+    Priority:
+        1. XAGENT_LLM_CAPACITY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for a capacity refusal; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
+
+
+def get_llm_stream_empty_delta_limit() -> int:
+    """Get the consecutive-empty-delta budget before an LLM stream is abandoned.
+
+    Counts streaming deltas in a row that carry no content, no tool-call
+    bytes, no reasoning text and no finish_reason -- a stream stuck emitting
+    nothing is making no progress even though the connection is still open.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT environment variable
+        2. 200
+
+    Returns:
+        The count of consecutive empty deltas at which the stream is
+        abandoned (the Nth empty delta in a row triggers it); 0 disables the
+        check. Invalid or negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_EMPTY_DELTA_LIMIT, 200, minimum=0)
+
+
+def get_llm_stream_degenerate_window() -> int:
+    """Get the trailing-character window inspected for a degenerate stream tail.
+
+    Used two ways: to size the trailing slice of reasoning text checked for a
+    whitespace-only or periodic (repeated) tail, and as the trailing-whitespace
+    budget allowed after a complete tool-call JSON object has already been
+    emitted.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_WINDOW environment variable
+        2. 256
+
+    Returns:
+        Trailing characters inspected; 0 disables the whitespace and
+        periodicity checks (non-whitespace after a complete tool-call object
+        is still rejected: it can never parse). Invalid or
+        negative values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_WINDOW, 256, minimum=0)
+
+
+def get_llm_stream_degenerate_max_period() -> int:
+    """Get the longest repeat period the periodicity check searches for.
+
+    Bounds how far the degenerate-tail check looks inside the trailing
+    window (``get_llm_stream_degenerate_window``) for a repeating substring,
+    e.g. a model looping on the same few characters instead of finishing.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD environment variable
+        2. 64
+
+    Returns:
+        Longest repeat period, in characters, considered. Invalid or
+        non-positive values fall back to the default.
+    """
+    return _get_positive_int_env(LLM_STREAM_DEGENERATE_MAX_PERIOD, 64)
+
+
+def get_llm_stream_no_payload_abort_models() -> frozenset[str]:
+    """Get the model allowlist for the opt-in no-payload wall-clock abort.
+
+    The wall-clock abort in ``get_llm_stream_no_payload_timeout_seconds`` only
+    applies to models named here, because it is a blunter, time-based signal
+    than the delta- and degenerate-tail checks above and is meant for models
+    known to stall without ever emitting the finish signals those checks rely
+    on. Matching is exact and case-sensitive against the model string sent on
+    the wire (e.g. ``moonshotai.kimi-k2.5``) -- no normalization or prefix
+    matching is applied.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS environment variable
+        2. empty (no models opted in)
+
+    Returns:
+        Frozenset of wire model names for which the no-payload abort is
+        enabled; empty when unset or blank.
+    """
+    raw = os.getenv(LLM_STREAM_NO_PAYLOAD_ABORT_MODELS, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
+
+def get_llm_stream_no_payload_timeout_seconds() -> float:
+    """Get the no-payload wall-clock timeout for allow-listed models.
+
+    Seconds after the first streamed chunk before an allow-listed model's
+    stream (see ``get_llm_stream_no_payload_abort_models``) is abandoned if it
+    has produced no content and no tool-call chunk in that time. Only applies
+    to models on that allowlist; other models are governed solely by the
+    delta- and degenerate-tail checks above.
+
+    Priority:
+        1. XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS environment variable
+        2. 30
+
+    Returns:
+        Seconds allowed with no payload before the stream is abandoned;
+        invalid or non-positive values fall back to the default.
+    """
+    timeout = _get_positive_float_env(LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS, 30.0)
+    return 30.0 if timeout is None else timeout
 
 
 def get_sandbox_cpus() -> int | None:
@@ -2688,16 +3569,49 @@ def get_sandbox_namespace() -> str | None:
     return raw
 
 
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home directory path.
+def get_sandbox_worker_id() -> str | None:
+    """Stable replica identity for shared sandbox ownership, never a process UUID.
 
-    Returns:
-        Path from BOXLITE_HOME_DIR env var, or None
+    Configure a distinct identity for each concurrently running execution host
+    and reuse it on restart. Legacy local execution keeps its existing scope.
+    """
+    if not get_shared_task_execution_enabled():
+        return None
+    worker_id = os.getenv(SANDBOX_WORKER_ID, "").strip()
+    if not worker_id:
+        raise ValueError(f"Shared sandbox execution requires {SANDBOX_WORKER_ID}")
+    validate_sandbox_namespace(worker_id)
+    return worker_id
+
+
+def get_sandbox_worker_namespace() -> str | None:
+    """Scope Docker containers and metadata to one stable execution host."""
+    namespace = get_sandbox_namespace()
+    if namespace is None:
+        return None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is None:
+        return namespace
+    # Hash the pair to avoid ambiguous concatenations of deployment/replica ids.
+    import hashlib
+
+    suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
+    return f"{namespace}-{suffix}"
+
+
+def get_boxlite_home_dir() -> Path | None:
+    """Get the BoxLite home, isolated by stable worker ID in shared mode.
+
+    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
+    Shared execution uses a worker subdirectory under the configured home or
+    the unified storage root's boxlite directory.
     """
     env_str = os.getenv(BOXLITE_HOME_DIR)
-    if env_str:
-        return Path(env_str)
-    return None
+    home_dir = Path(env_str) if env_str else None
+    worker_id = get_sandbox_worker_id()
+    if worker_id is not None:
+        return (home_dir or get_storage_root() / "boxlite") / worker_id
+    return home_dir
 
 
 def get_tool_max_output_length() -> int:
@@ -2708,14 +3622,15 @@ def get_tool_max_output_length() -> int:
     by the combination of per-string limit, max field count, and max recursion depth.
 
     Returns:
-        Maximum per-string length from TOOL_MAX_OUTPUT_LENGTH env var, or 50k by default
+        Maximum per-string length from TOOL_MAX_OUTPUT_LENGTH env var, or 50k
+        by default.
     """
     env_str = os.getenv(TOOL_MAX_OUTPUT_LENGTH)
     if env_str:
         try:
             return int(env_str)
         except ValueError:
-            logger.warning("Invalid TOOL_MAX_OUTPUT_LENGTH value: {env_str}")
+            logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
     return 50 * 1024
 
 
@@ -2799,13 +3714,28 @@ def get_tool_max_field_count() -> int:
     return 1000
 
 
+def get_inline_file_delivery_max_bytes() -> int:
+    """Decoded budget per run; zero rejects attachments, not Base64 passthrough."""
+    try:
+        value = int(os.getenv(INLINE_FILE_DELIVERY_MAX_BYTES, str(8 * 1024 * 1024)))
+        if value < 0:
+            raise ValueError("Inline file delivery budget must be non-negative")
+    except ValueError:
+        logger.warning(
+            "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES; rejecting inline attachments"
+        )
+        return 0
+    return value
+
+
 def get_max_trace_payload_bytes() -> int:
     """Max byte size for individual trace payload fields (e.g. data.messages,
     data.response) before truncation.
 
-    Applies to the LLM I/O audit trace added in fix/llm-trace-coverage. A
-    long DAG task hitting all 9 audit sites can otherwise write multi-MB
-    rows into trace_events.
+    Applies to the LLM I/O audit trace: a long DAG task hitting all 9 audit
+    sites can otherwise write multi-MB rows into trace_events. Also bounds
+    the rendered size of every trace category's console log line, not only
+    LLM audit events.
 
     Priority:
         1. XAGENT_MAX_TRACE_PAYLOAD_BYTES env var
@@ -2828,3 +3758,281 @@ def get_max_trace_payload_bytes() -> int:
         except ValueError:
             logger.warning(f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value: {env_str!r}")
     return 50_000
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2557).
+#
+# Nothing in this repository reads these yet; the job that expires data is a
+# follow-up change. They are settings, and the docstrings below describe what
+# each one means rather than what a consumer will do with it.
+#
+# All of them are read once per process. These getters call ``os.getenv`` at
+# call time, but ``.env`` is loaded at start-up and no code assigns these names
+# afterwards, so within one process each returns the same value forever:
+# changing any of them takes a restart. ``RETENTION_ENV_VARS`` names the set,
+# and ``test_no_module_assigns_a_retention_environment_variable`` pins it.
+#
+# Two rules run through the whole section:
+#   * a value that cannot be read disables the leg it configures, rather than
+#     falling back to a working default -- a default here is a number of days,
+#     and a number of days deletes conversations;
+#   * a switch that cannot be read resolves to whichever side deletes nothing.
+# ---------------------------------------------------------------------------
+
+#: Every environment variable this section reads. One list, consumed by the
+#: getters' tests and by the guard that checks none of them is assigned at run
+#: time, so a new setting cannot be added to only some of those places.
+RETENTION_ENV_VARS: tuple[str, ...] = (
+    CONVERSATION_RETENTION_DAYS,
+    TRACE_RETENTION_DAYS,
+    RETENTION_ENABLED,
+    RETENTION_DRY_RUN,
+    RETENTION_BATCH_SIZE,
+    RETENTION_SWEEP_INTERVAL_SECONDS,
+    RETENTION_BATCH_PAUSE_SECONDS,
+)
+
+#: The largest period the date arithmetic downstream can express. Above it,
+#: ``retention_cutoff``'s ``now - timedelta(days=days)`` raises OverflowError
+#: instead of returning a cutoff, so an operator pasting a date (``20260923``)
+#: would otherwise configure a period that fails on every use.
+#:
+#: The true limit is the distance back to ``datetime.min``, about 739,900 days
+#: today and growing daily; this sits far below so it needs no clock. A period
+#: of 1,900 years already means "keep everything", which is spelled by leaving
+#: the variable unset. It does not catch every mistyped date -- ``260923`` is
+#: 714 years and passes -- but such a value is inert rather than broken.
+#:
+#: ``retention_cli.py`` deliberately asks the arithmetic instead of bounding:
+#: it reports which of an operator's candidate periods are unrepresentable and
+#: needs the exact boundary. This decides only whether to accept a value, which
+#: a ceiling answers without knowing where the boundary is.
+MAX_RETENTION_DAYS = 700_000
+
+
+class _RetentionDays(enum.Enum):
+    """How a period variable was configured.
+
+    Four cases rather than a nullable int, because the two getters read them
+    differently: ``ZERO`` disables the conversation period and inherits it for
+    the trace period. Classifying once is what keeps those two readings from
+    disagreeing about which spellings are zero.
+    """
+
+    UNSET = "unset"
+    ZERO = "zero"
+    DAYS = "days"
+    INVALID = "invalid"
+
+
+def _classify_retention_days(env_var: str) -> tuple[_RetentionDays, int | None]:
+    """Read one period variable into (case, days).
+
+    ``days`` is set only for :attr:`_RetentionDays.DAYS`; no other case names a
+    period. ``0`` is a documented spelling and is classified silently, while a
+    negative, unparsable or too-large value warns.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return _RetentionDays.UNSET, None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    if parsed == 0:
+        return _RetentionDays.ZERO, None
+    if parsed < 0 or parsed > MAX_RETENTION_DAYS:
+        logger.warning(
+            "Invalid %s=%r; expiry for this period is disabled", env_var, value
+        )
+        return _RetentionDays.INVALID, None
+    return _RetentionDays.DAYS, parsed
+
+
+def _get_retention_bool_env(env_var: str, *, permissive: bool) -> bool:
+    """Parse a retention switch, resolving what it cannot read to "delete nothing".
+
+    ``permissive`` is the value that lets expiry proceed, and is also the
+    default: both switches ship in their permissive position, since neither is
+    meant to restrain a deployment that has configured no period. An
+    unrecognised value therefore resolves to ``not permissive``.
+
+    Deliberately not :func:`_get_bool_env`, which reads anything unrecognised
+    as ``False`` -- fine for a feature flag, wrong here, where that turns
+    ``XAGENT_RETENTION_DRY_RUN=enabled`` into a real purge and
+    ``XAGENT_RETENTION_ENABLED=y`` into a silent stop.
+
+    Blank counts as unset, matching :func:`_classify_retention_days`: a compose
+    file interpolating an unset shell variable passes an empty string, which
+    states nothing and must not warn on every read.
+    """
+    value = os.getenv(env_var)
+    if value is None or not value.strip():
+        return permissive
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n"}:
+        return False
+    logger.warning(
+        "Unrecognised %s=%r; reading it as %r so that nothing is deleted",
+        env_var,
+        value,
+        not permissive,
+    )
+    return not permissive
+
+
+def get_conversation_retention_days() -> int | None:
+    """Days of conversation retention, or ``None`` when conversations never expire.
+
+    Priority:
+        1. XAGENT_CONVERSATION_RETENTION_DAYS environment variable
+        2. Default ``None``
+
+    ``None`` disables conversation expiry only. Traces can still expire under
+    their own period, which is a supported configuration.
+
+    Returns:
+        Retention period in days, or None.
+    """
+    return _classify_retention_days(CONVERSATION_RETENTION_DAYS)[1]
+
+
+def get_trace_retention_days() -> int | None:
+    """Days of execution-trace retention.
+
+    Priority:
+        1. XAGENT_TRACE_RETENTION_DAYS environment variable
+        2. XAGENT_CONVERSATION_RETENTION_DAYS (traces expire with the
+           conversation they belong to)
+        3. Default ``None`` -- no trace ever expires
+
+    Unset and ``0`` both mean "same as the conversation period", which is
+    deliberately not what ``0`` means for the conversation period itself: a
+    trace period normally shortens the conversation period, so its
+    unconfigured value is the period it shortens.
+
+    A value that is set but unusable is a third case and does *not* inherit:
+    an operator who typos ``XAGENT_TRACE_RETENTION_DAYS=90d`` was asking for
+    90 days and must not silently receive 365. It disables trace expiry,
+    leaving the conversation period to act alone.
+
+    Configuring this alone is supported rather than accidental -- traces are
+    the bulk of the stored bytes and are debugging data, so "keep
+    conversations indefinitely, expire traces after N days" is one of the
+    shapes #2567 has on the table.
+
+    A trace period longer than the conversation period is accepted and will
+    have no effect, because whole-conversation expiry removes the traces with
+    the conversation.
+
+    Returns:
+        Retention period in days, or None when traces never expire.
+    """
+    case, days = _classify_retention_days(TRACE_RETENTION_DAYS)
+    if case is _RetentionDays.DAYS:
+        return days
+    if case is _RetentionDays.INVALID:
+        return None
+    return get_conversation_retention_days()
+
+
+def get_retention_enabled() -> bool:
+    """Kill switch for retention expiry.
+
+    Priority:
+        1. XAGENT_RETENTION_ENABLED environment variable
+        2. Default ``True``
+
+    Defaulting to true enables nothing on its own: with no period configured
+    there is nothing to expire. The switch exists so that stopping expiry does
+    not mean editing the periods, which are the settings an operator would
+    otherwise have to restore correctly afterwards.
+
+    It takes effect on restart, like every setting in this section. Making it
+    changeable under a running process would need a source that process
+    re-reads, such as a database setting; that is not built.
+
+    An unrecognised value resolves to ``False``.
+
+    Returns:
+        False when explicitly disabled, and when the value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_ENABLED, permissive=True)
+
+
+def get_retention_dry_run() -> bool:
+    """Whether expiry should report what it would delete and delete nothing.
+
+    Priority:
+        1. XAGENT_RETENTION_DRY_RUN environment variable
+        2. Default ``False``
+
+    An unrecognised value resolves to ``True``. This is the setting an
+    operator is meant to reach for before a first real run, so a typo in it
+    must not be the difference between a report and a deletion.
+
+    Returns:
+        True when no writes may be performed, including when the configured
+        value cannot be read.
+    """
+    return _get_retention_bool_env(RETENTION_DRY_RUN, permissive=False)
+
+
+def get_retention_batch_size() -> int:
+    """How many tasks one expiry batch may consider.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_SIZE environment variable
+        2. Default ``100``
+
+    Blank counts as unset, matching the rest of this section.
+
+    Returns:
+        Positive batch size.
+    """
+    value = os.getenv(RETENTION_BATCH_SIZE)
+    if value is None or not value.strip():
+        return 100
+    return _get_positive_int_env(RETENTION_BATCH_SIZE, 100)
+
+
+def get_retention_sweep_interval_seconds() -> float:
+    """Seconds between expiry sweeps once the eligible backlog is drained.
+
+    Priority:
+        1. XAGENT_RETENTION_SWEEP_INTERVAL_SECONDS environment variable
+        2. Default ``86400`` (daily)
+
+    Daily by default because #2557 proposes wording the customer-facing
+    commitment as "within 7 days after the retention period ends"; a daily
+    sweep leaves six days of headroom for a backlog.
+
+    Returns:
+        Interval in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_SWEEP_INTERVAL_SECONDS, None)
+    return 86400.0 if value is None else value
+
+
+def get_retention_batch_pause_seconds() -> float:
+    """Seconds to pause between batches while a backlog remains.
+
+    Priority:
+        1. XAGENT_RETENTION_BATCH_PAUSE_SECONDS environment variable
+        2. Default ``5``
+
+    This is the rate limit. Deleting millions of rows pressures autovacuum and
+    replication on PostgreSQL (item H of the side-effect review on #2557), so
+    a drained backlog can wait a full interval while a live one only pauses.
+
+    Returns:
+        Pause in seconds.
+    """
+    value = _get_positive_float_env(RETENTION_BATCH_PAUSE_SECONDS, None)
+    return 5.0 if value is None else value

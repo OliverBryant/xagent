@@ -18,21 +18,27 @@ from ..core.exceptions import (
 from ..core.schemas import (
     CollectionOperationDetail,
     CollectionOperationResult,
+    DenseSearchResponse,
     DocumentProcessingStatus,
     DocumentRecordDetail,
     DocumentRecordListResult,
+    FusionConfig,
+    HybridSearchResponse,
     RegisterDocumentRequest,
     RegisterDocumentResponse,
+    SparseSearchResponse,
 )
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
+from .async_utils import maybe_await
 from .collection_handle import (
+    KBCollectionHandle,
     KBHandleProvider,
     KBMainPointerSnapshot,
     KBVersionCandidateCleanupSnapshot,
     KBVersionCandidateRollbackResult,
-    LanceDBCollectionHandle,
+    deployment_kb_backend,
 )
 from .file_compatibility import KBFileCompatibilityFacade
 from .legacy_step_compatibility import KBLegacyStepCompatibilityFacade
@@ -43,11 +49,13 @@ from .models import (
     KBBackendCapabilities,
     KBCollectionContext,
     KBContextRequest,
+    KBDocumentRowsSnapshot,
     KBStorageBackend,
     KBUserScope,
     KBVectorStorageCleanupResult,
     RollbackFailedIngestionRequest,
     RollbackFailedIngestionResult,
+    RollbackFailedUploadIngestionRequest,
 )
 from .operation_compatibility import (
     KBOperationCompatibilityFacade,
@@ -127,11 +135,13 @@ class KBCoordinator:
         api_compatibility: KBApiCompatibilityFacade | None = None,
     ) -> None:
         self._storage_factory = storage_factory or StorageFactory.get_factory()
-        self._handle_provider = handle_provider or KBHandleProvider()
         self._storage_shim = storage_shim or KBStorageShimCompatibilityFacade(
             storage_factory=self._storage_factory
         )
-        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade()
+        self._handle_provider = handle_provider or KBHandleProvider(self._storage_shim)
+        self._file_compatibility = file_compatibility or KBFileCompatibilityFacade(
+            storage_shim=self._storage_shim
+        )
         self._management = management_facade or KBCoreManagementCompatibilityFacade(
             coordinator=self
         )
@@ -311,6 +321,14 @@ class KBCoordinator:
                 raise ValueError(f"Collection '{collection}' not found") from exc
 
         backend = self._resolve_backend(collection_info)
+        if request.deployment_engine_only:
+            deployment = deployment_kb_backend()
+            if backend is not deployment:
+                raise ValueError(
+                    f"Collection {collection!r} is bound to the {backend.value} "
+                    f"engine, but this deployment runs {deployment.value}; "
+                    "re-import it to search or ingest."
+                )
         capabilities = self._capabilities_for_backend(backend)
 
         return KBCollectionContext(
@@ -332,16 +350,12 @@ class KBCoordinator:
         """Synchronous wrapper for legacy compatibility surfaces."""
         return _run_in_separate_loop(self.get_context(request))
 
-    async def open_collection(
-        self, request: KBContextRequest
-    ) -> LanceDBCollectionHandle:
+    async def open_collection(self, request: KBContextRequest) -> KBCollectionHandle:
         """Open a thin collection handle for the resolved context."""
         context = await self.get_context(request)
         return self._handle_provider.open(context)
 
-    def open_collection_sync(
-        self, request: KBContextRequest
-    ) -> LanceDBCollectionHandle:
+    def open_collection_sync(self, request: KBContextRequest) -> KBCollectionHandle:
         """Synchronous wrapper for opening a collection handle."""
         return _run_in_separate_loop(self.open_collection(request))
 
@@ -476,6 +490,248 @@ class KBCoordinator:
             self.delete_document_record(
                 collection, doc_id, user_id=user_id, is_admin=is_admin
             )
+        )
+
+    # --- Statistics ---
+
+    def aggregate_collection_stats_sync(
+        self, *, user_id: int | None, is_admin: bool
+    ) -> dict[str, dict[str, int]]:
+        """Return per-collection stats for the deployment engine in one batch."""
+        return self._handle_provider.aggregate_collection_stats(
+            user_id=user_id, is_admin=is_admin
+        )
+
+    def count_rows_by_document_sync(
+        self,
+        collection: str,
+        *,
+        user_id: int | None,
+        is_admin: bool,
+        doc_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Open the collection handle and count rows per document.
+
+        The handle follows the collection binding while the list stats follow
+        the deployment engine; with one engine per deployment they are equal.
+        """
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.count_rows_by_document(
+            user_id=user_id, is_admin=is_admin, doc_id=doc_id
+        )
+
+    # --- Search lifecycle (delegated to the collection handle) ---
+
+    def _search_request(
+        self, collection: str, *, user_id: Optional[int], is_admin: bool
+    ) -> KBContextRequest:
+        return KBContextRequest(
+            collection=collection,
+            user_id=user_id,
+            is_admin=is_admin,
+            access_mode=KBAccessMode.READ,
+            hide_missing=True,
+            deployment_engine_only=True,
+        )
+
+    async def search_dense(
+        self,
+        collection: str,
+        model_tag: str,
+        query_vector: List[float],
+        *,
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DenseSearchResponse:
+        """Resolve the collection context, then run dense search on the handle."""
+        handle = await self.open_collection(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return await handle.search_dense_async(
+            model_tag,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def search_dense_sync(
+        self,
+        collection: str,
+        model_tag: str,
+        query_vector: List[float],
+        *,
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> DenseSearchResponse:
+        """Blocking counterpart of :meth:`search_dense`.
+
+        Opens the handle synchronously rather than wrapping the async method:
+        the public ``retrieval.search_dense`` is sync and must stay off the
+        async handle-opening path.
+        """
+        handle = self.open_collection_sync(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return handle.search_dense(
+            model_tag,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def search_sparse(
+        self,
+        collection: str,
+        model_tag: str,
+        query_text: str,
+        *,
+        top_k: int,
+        filters: Optional[Dict[str, Any]] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> SparseSearchResponse:
+        """Resolve the collection context, then run sparse search on the handle."""
+        handle = await self.open_collection(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return await handle.search_sparse_async(
+            model_tag,
+            query_text,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def search_sparse_sync(
+        self,
+        collection: str,
+        model_tag: str,
+        query_text: str,
+        *,
+        top_k: int,
+        filters: Optional[Dict[str, Any]] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> SparseSearchResponse:
+        """Blocking counterpart of :meth:`search_sparse`."""
+        handle = self.open_collection_sync(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return handle.search_sparse(
+            model_tag,
+            query_text,
+            top_k=top_k,
+            filters=filters,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def search_hybrid(
+        self,
+        collection: str,
+        model_tag: str,
+        query_text: str,
+        query_vector: List[float],
+        *,
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        fusion_config: Optional[FusionConfig] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> HybridSearchResponse:
+        """Resolve the collection context, then run hybrid search on the handle."""
+        handle = await self.open_collection(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return await handle.search_hybrid_async(
+            model_tag,
+            query_text,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            fusion_config=fusion_config,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    def search_hybrid_sync(
+        self,
+        collection: str,
+        model_tag: str,
+        query_text: str,
+        query_vector: List[float],
+        *,
+        top_k: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        fusion_config: Optional[FusionConfig] = None,
+        readonly: bool = False,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> HybridSearchResponse:
+        """Blocking counterpart of :meth:`search_hybrid`."""
+        handle = self.open_collection_sync(
+            self._search_request(collection, user_id=user_id, is_admin=is_admin)
+        )
+        return handle.search_hybrid(
+            model_tag,
+            query_text,
+            query_vector,
+            top_k=top_k,
+            filters=filters,
+            fusion_config=fusion_config,
+            readonly=readonly,
+            nprobes=nprobes,
+            refine_factor=refine_factor,
+            user_id=user_id,
+            is_admin=is_admin,
         )
 
     # --- Ingestion-status lifecycle (delegated to the collection handle) ---
@@ -718,6 +974,25 @@ class KBCoordinator:
             )
         )
 
+    def delete_documents_data_sync(
+        self,
+        collection: str,
+        doc_ids: list[str],
+        *,
+        user_id: int | None,
+        is_admin: bool,
+    ) -> dict[str, int]:
+        """Open the collection handle and delete the documents' data."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                hide_missing=True,
+            )
+        )
+        return handle.delete_documents_data(doc_ids, user_id=user_id, is_admin=is_admin)
+
     async def delete_collection(
         self,
         collection: str,
@@ -730,14 +1005,14 @@ class KBCoordinator:
         """Delete a collection by routing through the collection handle.
 
         When ``is_admin`` is ``True`` all rows are deleted via
-        :meth:`LanceDBCollectionHandle.delete_collection_data`.  For a tenant
+        :meth:`KBCollectionHandle.delete_collection_data`.  For a tenant
         caller, only the rows identified by ``doc_ids`` are removed via
-        :meth:`LanceDBCollectionHandle.delete_documents_data`.  When
+        :meth:`KBCollectionHandle.delete_documents_data`.  When
         ``doc_ids`` is ``None`` or empty and ``is_admin`` is ``False`` the
         data plane is left untouched (config-only path).
 
         ``delete_orphaned_metadata=True`` (default) additionally removes the
-        collection config row via :meth:`LanceDBCollectionHandle.delete_collection_config`.
+        collection config row via :meth:`KBCollectionHandle.delete_collection_config`.
 
         Returns:
             :class:`CollectionOperationResult` with status ``success``,
@@ -930,9 +1205,9 @@ class KBCoordinator:
         """Rename a collection's data, status, and metadata in best-effort order.
 
         Calls three handle primitives sequentially:
-        1. :meth:`LanceDBCollectionHandle.rename_collection_data` – vector-side data tables
-        2. :meth:`LanceDBCollectionHandle.rename_collection_status` – ingestion status rows
-        3. :meth:`LanceDBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
+        1. :meth:`KBCollectionHandle.rename_collection_data` – vector-side data tables
+        2. :meth:`KBCollectionHandle.rename_collection_status` – ingestion status rows
+        3. :meth:`KBCollectionHandle.rename_collection_metadata` – control-plane metadata (async)
 
         Each step is best-effort: if one raises, the error is recorded as a
         warning and the remaining steps still execute.
@@ -1581,12 +1856,12 @@ class KBCoordinator:
 
     def _resolve_backend(self, collection_info: object | None) -> KBStorageBackend:
         if collection_info is None:
-            return KBStorageBackend.LANCEDB
+            return deployment_kb_backend()
 
         extra_metadata = getattr(collection_info, "extra_metadata", None) or {}
         binding = extra_metadata.get(KB_STORAGE_METADATA_KEY)
         if binding is None:
-            return KBStorageBackend.LANCEDB
+            return deployment_kb_backend()
 
         if isinstance(binding, str):
             return self._parse_backend(binding)
@@ -1594,7 +1869,7 @@ class KBCoordinator:
         if isinstance(binding, dict):
             raw_backend = binding.get("backend")
             if raw_backend is None or str(raw_backend).strip() == "":
-                return KBStorageBackend.LANCEDB
+                return deployment_kb_backend()
             return self._parse_backend(str(raw_backend))
 
         raise ValueError(
@@ -1616,6 +1891,8 @@ class KBCoordinator:
     def _capabilities_for_backend(backend: KBStorageBackend) -> KBBackendCapabilities:
         if backend is KBStorageBackend.LANCEDB:
             return KBBackendCapabilities.lancedb()
+        if backend is KBStorageBackend.MILVUS:
+            return KBBackendCapabilities.milvus()
         return KBBackendCapabilities.unsupported()
 
     # --- Rollback snapshot/restore primitives (#513 Task 7) ---
@@ -1862,6 +2139,65 @@ class KBCoordinator:
             )
         )
 
+    def capture_document_rows_sync(
+        self,
+        collection: str,
+        doc_ids: Sequence[str],
+        *,
+        user_id: int,
+        is_admin: bool,
+    ) -> KBDocumentRowsSnapshot:
+        """Open the collection handle and capture these documents' rows."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.READ,
+                hide_missing=True,
+            )
+        )
+        return handle.capture_document_rows(doc_ids, user_id=user_id, is_admin=is_admin)
+
+    def restore_document_rows_sync(
+        self,
+        snapshot: KBDocumentRowsSnapshot,
+        *,
+        user_id: int,
+        is_admin: bool,
+    ) -> list[str]:
+        """Restore the snapshot's rows; return the doc_ids marked partially embedded."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=snapshot.collection,
+                user_id=user_id,
+                is_admin=is_admin,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return handle.restore_document_rows(
+            snapshot, user_id=user_id, is_admin=is_admin
+        )
+
+    def discard_uncommitted_embeddings_sync(
+        self,
+        collection: str,
+        doc_id: str,
+        *,
+        user_id: int | None,
+    ) -> int:
+        """Delete the document's invisible vector rows through its collection handle."""
+        handle = self.open_collection_sync(
+            KBContextRequest(
+                collection=collection,
+                user_id=user_id,
+                access_mode=KBAccessMode.WRITE,
+                hide_missing=True,
+            )
+        )
+        return handle.discard_uncommitted_embeddings(doc_id, user_id=user_id)
+
     async def restore_candidate_cleanup_snapshot(
         self,
         snapshot: "KBVersionCandidateCleanupSnapshot",
@@ -1921,11 +2257,38 @@ class KBCoordinator:
             return self._rollback_boundaries_with_operation(request)
         return self._rollback_boundaries_callbacks_only(request)
 
-    async def rollback_failed_ingestion(
-        self, request: RollbackFailedIngestionRequest
+    async def rollback_failed_upload_ingestion(
+        self, request: RollbackFailedUploadIngestionRequest
     ) -> RollbackFailedIngestionResult:
-        """Async twin (coordinator convention; first awaited in #795)."""
-        return await asyncio.to_thread(self.rollback_failed_ingestion_sync, request)
+        """Run direct-upload failed-ingest compensation DOCUMENT->FILE->COLLECTION.
+
+        Stops at the first failing callback and returns its exception in
+        ``result.error``; never raises for a failing callback.
+        """
+        # Not to_thread: callbacks use the caller's Session, which is not
+        # thread-safe (/ingest-cloud also shares it across gather siblings).
+        attempted = False
+        for boundary, callback in (
+            ("DOCUMENT", request.document_compensation),
+            ("FILE", request.file_compensation),
+            ("COLLECTION", request.collection_compensation),
+        ):
+            if callback is None:
+                continue
+            attempted = True
+            try:
+                await maybe_await(callback())
+            except Exception as exc:  # noqa: BLE001 - returned in result.error
+                return self._callbacks_only_result(
+                    attempted=True,
+                    boundary_errors={boundary: (str(exc),)},
+                    first_error=f"{boundary} boundary compensation failed: {exc}",
+                    warnings=(),
+                    error=exc,
+                )
+        return self._callbacks_only_result(
+            attempted=attempted, boundary_errors={}, first_error=None, warnings=()
+        )
 
     def _rollback_boundaries_with_operation(
         self, request: RollbackFailedIngestionRequest
@@ -2213,6 +2576,22 @@ class KBCoordinator:
                 except Exception as exc:  # noqa: BLE001 - fold into the result
                     _fold("SNAPSHOT", exc)
 
+        return self._callbacks_only_result(
+            attempted=attempted,
+            boundary_errors=boundary_errors,
+            first_error=first_error,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _callbacks_only_result(
+        *,
+        attempted: bool,
+        boundary_errors: dict[str, tuple[str, ...]],
+        first_error: Optional[str],
+        warnings: Sequence[str],
+        error: Optional[Exception] = None,
+    ) -> RollbackFailedIngestionResult:
         if boundary_errors:
             status, rollback_status = "incomplete", RollbackStatus.INCOMPLETE
         elif attempted:
@@ -2227,6 +2606,7 @@ class KBCoordinator:
             first_error=first_error,
             boundary_errors=boundary_errors,
             warnings=tuple(warnings),
+            error=error,
         )
 
     # --- Rollback vector cleanup router (#515) ---

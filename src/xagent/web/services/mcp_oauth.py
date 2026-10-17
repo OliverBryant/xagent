@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
 from ...core.utils.security import (
     PrivateNetworkHostError,
+    build_ca_bundle_ssl_context,
     reject_private_network_host,
 )
 
@@ -133,16 +135,68 @@ class MCPOAuthRuntimeAuth:
     refreshed: bool = False
 
 
+def _ca_bundle_error_detail(configured_ca_vars: list[str]) -> str:
+    if configured_ca_vars:
+        return (
+            f"Server TLS trust store is misconfigured ({'/'.join(configured_ca_vars)})."
+        )
+    return "Server TLS trust store could not be initialized."
+
+
 class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that resolves and pins OAuth hosts before connecting."""
 
     def __init__(self) -> None:
         proxy_url = get_mcp_oauth_proxy_url()
+        configured_ca_vars = [
+            name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if os.environ.get(name)
+        ]
+        try:
+            ssl_context = build_ca_bundle_ssl_context()
+        except OSError as exc:
+            # SSL_CERT_FILE/SSL_CERT_DIR were never read on this path before
+            # this transport verified against an explicit context, so a
+            # stale/misconfigured value was previously harmless. Surface it
+            # as a structured OAuth error instead of letting the raw
+            # FileNotFoundError/ssl.SSLError (a subclass of OSError) escape
+            # as an unhandled 500. Only blame the env vars when one is
+            # actually set -- create_ssl_context() can also raise OSError
+            # from the certifi-backed default path when neither is set (a
+            # broken/partial certifi install), which is an environment
+            # problem, not an admin misconfiguration of these two vars.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration", _ca_bundle_error_detail(configured_ca_vars)
+            ) from exc
+        if configured_ca_vars and not ssl_context.get_ca_certs():
+            # ssl.create_default_context(capath=...) silently loads zero
+            # certs -- no OSError -- when SSL_CERT_DIR names a directory
+            # that doesn't exist or contains no certs (unlike SSL_CERT_FILE,
+            # which does raise for a missing/empty file). Left unguarded,
+            # this transport would build successfully with an empty trust
+            # store, and every TLS request through it would fail later with
+            # a generic httpx.ConnectError instead of this structured error.
+            raise MCPOAuthDiscoveryError(
+                "invalid_configuration",
+                _ca_bundle_error_detail(configured_ca_vars)
+                + " No CA certificates were loaded.",
+            )
+        # An https:// proxy also needs the isolated context on its own CONNECT
+        # TLS leg -- passing proxy_url as a bare string leaves that leg's
+        # ssl_context as None, which httpx/httpcore then defaults to the
+        # certifi-only trust store, bypassing a private CA configured via
+        # SSL_CERT_FILE/SSL_CERT_DIR for the proxy hop itself. httpcore
+        # rejects a non-None proxy_ssl_context outright for a plain http://
+        # proxy (there's no TLS leg to configure there), so only attach it
+        # for an https:// proxy.
+        proxy: httpx.Proxy | str | None = proxy_url
+        if proxy_url and urlsplit(proxy_url).scheme == "https":
+            proxy = httpx.Proxy(url=proxy_url, ssl_context=ssl_context)
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
             http2=False,
-            proxy=proxy_url,
+            proxy=proxy,
+            verify=ssl_context,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -580,8 +634,10 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     if normalized_resource:
         normalized_resource = _canonical_resource(normalized_resource)
-    selected_scope = scope if scope is not None else auth_config.get("scope")
     try:
+        selected_scope = (
+            scope if scope is not None else mcp_oauth_required_scope(auth_config)
+        )
         normalized_scope = (
             normalize_mcp_oauth_scope(selected_scope) if selected_scope else None
         )
@@ -819,6 +875,30 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         refresh_db.close()
 
 
+def select_mcp_oauth_owner(
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    actor_owner_key: str,
+    auth_config: dict[str, Any],
+) -> str:
+    """Prefer one usable exact actor grant, otherwise use the workspace owner."""
+
+    actor_grants = select_mcp_oauth_grants(
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        auth_config=auth_config,
+        resource_owner_key=actor_owner_key,
+    )
+    try:
+        _select_runtime_grant(actor_grants, set())
+    except MCPOAuthRuntimeError:
+        return f"xagent:user:{user_id}"
+    return actor_owner_key
+
+
 def select_mcp_oauth_grants(  # noqa: PLR0913
     db: Any,
     *,
@@ -844,8 +924,16 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
     if normalized_issuer:
         normalized_issuer = _canonical_issuer(normalized_issuer)
-    selected_scope = scope if scope is not None else auth_config.get("scope")
-    normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
+    try:
+        selected_scope = (
+            scope if scope is not None else mcp_oauth_required_scope(auth_config)
+        )
+    except MCPOAuthDiscoveryError:
+        # No grant is usable under a configuration that cannot say what it
+        # requires. Connect, runtime and the callback fail with the
+        # configuration error and /oauth/status returns it; this
+        # side-effect-free selector just matches nothing.
+        return []
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
 
     query = (
@@ -868,7 +956,7 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         query = query.filter(MCPOAuthClient.client_id == configured_client_id)
 
     grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
-    required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
+    required_scopes = _scope_set(selected_scope)
     if not required_scopes:
         return list(grants)
     return [
@@ -1255,6 +1343,66 @@ def normalize_mcp_oauth_scope(value: Any) -> str:
     return scope
 
 
+def mcp_oauth_required_scope_is_set(auth_config: dict[str, Any]) -> bool:
+    """Whether ``auth_config`` sets a ``required_scope``.
+
+    A ``required_scope`` that names no scope is unset, as a blank ``scope`` is:
+    a missing or ``None`` value, an empty or whitespace-only string, and a
+    list of only empty or whitespace entries. A value of another type counts
+    as set, so ``mcp_oauth_required_scope`` reports it as invalid.
+    """
+    required_scope = auth_config.get("required_scope")
+    if required_scope is None:
+        return False
+    if isinstance(required_scope, (str, list, tuple, set)):
+        return bool(_scope_set(required_scope))
+    return True
+
+
+def mcp_oauth_required_scope(auth_config: dict[str, Any]) -> Any:
+    """Return the configured scope an MCP OAuth grant must cover to be usable.
+
+    ``scope`` is what an authorization requests. A provider may grant less than
+    that, for example only the scopes of the products an account has. The
+    optional ``required_scope`` names the part of ``scope`` a grant must still
+    include to count as usable: when the connector is listed as connected, at
+    runtime and after a token refresh. Authorization requests and client
+    registration keep using ``scope``. Grant selection and runtime use this
+    unless their caller names a scope, which replaces it as it always has.
+
+    Without ``required_scope`` the whole ``scope`` is required, and this
+    returns ``scope`` exactly as configured, so callers normalize it as they
+    always have. A blank ``required_scope`` is the same as none (see
+    ``mcp_oauth_required_scope_is_set``). Otherwise the scopes it names are
+    returned sorted and space-separated; whitespace and empty entries next to
+    them are dropped, in a list as in a string.
+
+    Raises ``MCPOAuthDiscoveryError`` with code ``invalid_configuration`` when
+    ``required_scope`` is set but is not a scope string or list, is not
+    accompanied by an explicit ``scope``, or names a scope that ``scope`` does
+    not request.
+    """
+    if not mcp_oauth_required_scope_is_set(auth_config):
+        return auth_config.get("scope")
+    required_scope = auth_config.get("required_scope")
+    if not isinstance(required_scope, (str, list, tuple, set)):
+        raise _invalid_required_scope("must be a scope string or a list of scopes")
+    required_scopes = _scope_set(required_scope)
+    requested_scopes = _scope_set(auth_config.get("scope"))
+    if not requested_scopes:
+        raise _invalid_required_scope("needs an explicit scope")
+    if not required_scopes.issubset(requested_scopes):
+        raise _invalid_required_scope("must only name scopes that scope requests")
+    return " ".join(sorted(required_scopes))
+
+
+def _invalid_required_scope(reason: str) -> MCPOAuthDiscoveryError:
+    return MCPOAuthDiscoveryError(
+        "invalid_configuration",
+        f"MCP OAuth required_scope {reason}",
+    )
+
+
 def validate_mcp_oauth_persisted_value(
     value: str,
     *,
@@ -1364,6 +1512,42 @@ def _grant_needs_refresh(expires_at: Any) -> bool:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def redact_oauth_url_for_diagnostics(value: str | None) -> str | None:
+    """Strip query string, fragment, and userinfo from a user-configured OAuth URL.
+
+    Diagnostic payloads (mcp_runtime.mcp_oauth_runtime_diagnostic) surface
+    ``resource``/``issuer`` in an HTTP 400 body to any user with an active
+    association to the MCP server, not just its owner. ``resource`` in
+    particular is free text set by whoever configured the connector, and
+    commonly carries an API key or token in its query string or userinfo.
+
+    Unlike ``_canonical_url_identifier``, diagnostics must not pass through
+    values without an authority. In ``user:password@host/path``, urlsplit
+    treats the username as a scheme and leaves the password in the path.
+    Omit such ambiguous values instead of returning possible credentials.
+    Protocol-relative URLs still have an authority and can be redacted.
+    """
+    if not value:
+        return None
+    parts = urlsplit(value)
+    if not parts.netloc:
+        return None
+    hostname = (parts.hostname or "").rstrip(".").lower()
+    netloc = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port:
+        netloc = f"{netloc}:{port}"
+    path = parts.path.rstrip("/")
+    return urlunsplit((parts.scheme.lower(), netloc, path, "", ""))
 
 
 def _canonical_resource(endpoint_url: str) -> str:

@@ -40,7 +40,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
 from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
-from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
@@ -55,6 +54,7 @@ from xagent.web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
     stage_trace_event_row,
 )
+from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
 
 def _engine(tmp_path: Path):
@@ -514,9 +514,15 @@ def test_shell_passes_the_partition_stamped_data_into_prune(
     task = db.get(Task, task_id)
     task.status = TaskStatus.RUNNING
     task.runner_id = "runner-a"
+    task.lease_attempt_id = "test-attempt"
     task.run_id = "run-a-t6"
     db.commit()
-    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a-t6")
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="runner-a",
+        run_id="run-a-t6",
+        attempt_id="test-attempt",
+    )
 
     captured: list[dict[str, Any]] = []
     original_prune = DatabaseTraceHandler._prune_checkpoint_history
@@ -578,7 +584,7 @@ def test_prune_checkpoint_history_guard_allows_a_clean_session(
     real call site ever hands it -- a clean session, since prune always
     runs immediately after the checkpoint commit."""
     monkeypatch.setattr(
-        "xagent.web.api.trace_handlers.get_checkpoint_history_limit", lambda: 5
+        "xagent.web.services.trace_handlers.get_checkpoint_history_limit", lambda: 5
     )
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)

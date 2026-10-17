@@ -14,6 +14,8 @@ from xagent.core.agent.context.memory_tool import (
     build_store_memory_tool,
 )
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 
 
 class RecordingMemoryStore:
@@ -82,9 +84,9 @@ async def test_store_memory_adds_note_with_metadata() -> None:
     note = store.added[0]
     assert note.content == "User prefers reports in Chinese."
     assert note.category == "react_memory"
-    assert note.metadata["task"] == "Fix the deploy pipeline"
-    assert note.metadata["kind"] == "user_preference"
-    assert note.metadata["source"] == "store_memory"
+    # The user's request text is conversation content and must not outlive a
+    # purged conversation inside the memory store (#2753).
+    assert note.metadata == {"kind": "user_preference", "source": "store_memory"}
     assert tool.stored_count == 1
 
 
@@ -277,18 +279,65 @@ async def test_search_memory_rejects_empty_query_and_emits_trace() -> None:
         "task_start_memory_retrieve",
         "task_end_memory_retrieve",
     ]
+    assert tracer.events[-1]["data"]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_memory_reports_backend_failure() -> None:
+    class BrokenSearchStore(CrudMemoryStore):
+        def search(self, **kwargs: Any) -> list[Any]:
+            raise RuntimeError("backend unavailable")
+
+    tracer = TraceEventRecorder()
+    tool = SearchMemoryTool(
+        memory_store=BrokenSearchStore(), runtime=FakeRuntime(tracer=tracer)
+    )
+
+    result = await tool.execute(query="preferences")
+
+    assert result == {"success": False, "error": "Failed to search memories."}
+    assert tracer.events[-1]["data"]["success"] is False
+    assert tracer.events[-1]["data"]["found"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_memory_reports_terminal_lancedb_failure(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenConnection:
+        def open_table(self, _: str) -> Any:
+            raise RuntimeError("memory table unavailable")
+
+    base_store = LanceDBMemoryStore(
+        db_dir=str(tmp_path),
+        collection_name="terminal_failure",
+    )
+    monkeypatch.setattr(
+        base_store._vector_store,
+        "get_raw_connection",
+        lambda: BrokenConnection(),
+    )
+    tool = SearchMemoryTool(
+        memory_store=UserIsolatedMemoryStore(base_store),
+    )
+
+    result = await tool.execute(query="preferences")
+
+    assert result == {"success": False, "error": "Failed to search memories."}
 
 
 @pytest.mark.asyncio
 async def test_update_memory_replaces_content() -> None:
     store = CrudMemoryStore({"mem-1": _note("mem-1", "Old fact.")})
-    tool = UpdateMemoryTool(memory_store=store, task="current task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
 
     assert result == {"success": True, "memory_id": "mem-1"}
     assert store.updated[0].content == "Corrected fact."
-    assert store.updated[0].metadata["updated_by_task"] == "current task"
+    # No request text is stamped onto the rewritten note (#2753).
+    assert store.updated[0].metadata == {}
 
 
 @pytest.mark.asyncio
@@ -296,18 +345,18 @@ async def test_update_memory_initializes_missing_metadata() -> None:
     note = _note("mem-1", "Old fact.")
     note.metadata = None  # type: ignore[assignment]
     store = CrudMemoryStore({"mem-1": note})
-    tool = UpdateMemoryTool(memory_store=store, task="current task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     result = await tool.execute(memory_id="mem-1", content="Corrected fact.")
 
     assert result == {"success": True, "memory_id": "mem-1"}
-    assert store.updated[0].metadata == {"updated_by_task": "current task"}
+    assert store.updated[0].metadata == {}
 
 
 @pytest.mark.asyncio
 async def test_update_memory_reports_missing_note_and_bad_args() -> None:
     store = CrudMemoryStore()
-    tool = UpdateMemoryTool(memory_store=store, task="task")
+    tool = UpdateMemoryTool(memory_store=store)
 
     missing = await tool.execute(memory_id="nope", content="New text.")
     bad = await tool.execute(memory_id="", content="")
@@ -348,7 +397,7 @@ async def test_update_memory_reports_note_without_content() -> None:
         def get(self, note_id: str) -> MemoryResponse:
             return MemoryResponse(success=True, memory_id=note_id, content=None)
 
-    tool = UpdateMemoryTool(memory_store=NoContentStore(), task="task")
+    tool = UpdateMemoryTool(memory_store=NoContentStore())
 
     result = await tool.execute(memory_id="mem-1", content="New text.")
 

@@ -10,7 +10,12 @@ from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from googleapiclient.http import MediaIoBaseUpload  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from .utils import resolve_id_from_url, setup_proxy_env
+from .utils import (
+    GoogleFileKind,
+    google_file_error_message,
+    resolve_google_file_id,
+    setup_proxy_env,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-docs-mcp")
@@ -20,7 +25,17 @@ setup_proxy_env()
 
 mcp = FastMCP("google-docs-mcp")
 
-_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
+# "(?!e/)" skips a published-to-the-web link (".../d/e/<publish-id>/pub"),
+# whose "e" segment is not the document id.
+_DOCUMENT_URL_ID_PATTERN = re.compile(r"/document/(?:u/\d+/)?d/(?!e/)([a-zA-Z0-9_-]+)")
+_DOCUMENT_KIND = GoogleFileKind(
+    product="Google Docs",
+    noun="document",
+    link_example="https://docs.google.com/document/d/...",
+    create_tool="google_docs_create_document",
+    office_file="a Word file (.docx)",
+    office_reader="read_file",
+)
 
 _HEADING_PREFIXES = {
     "TITLE": "# ",
@@ -64,9 +79,39 @@ def get_drive_service() -> Any:
     return build("drive", "v3", credentials=_get_credentials())
 
 
-def _resolve_document_id(document_id: str) -> str:
-    """Accept either a bare document id or a full Google Docs URL."""
-    return resolve_id_from_url(document_id, _DOCUMENT_URL_ID_PATTERN)
+def _resolve_document_id(document_id: str, *, editing: bool = False) -> str:
+    """Accept either a bare document id or a full Google Docs URL.
+
+    Pass ``editing=True`` from a tool that changes the document."""
+    return resolve_google_file_id(
+        document_id,
+        _DOCUMENT_URL_ID_PATTERN,
+        "document_id",
+        _DOCUMENT_KIND,
+        editing=editing,
+    )
+
+
+def _document_error(
+    exc: Exception, document_id: str, *, editing: bool = False, opened: bool = False
+) -> str:
+    """``document_id`` is the tool's own argument, before it was resolved.
+
+    Pass ``opened=True`` once the tool has read the document: it is then a
+    Google Doc, whatever link named it, so a 400 for a later request is
+    about that request and keeps Google's own error."""
+    return json.dumps(
+        {
+            "status": "error",
+            "message": google_file_error_message(
+                exc,
+                _DOCUMENT_KIND,
+                editing=editing,
+                file_link_or_id=None if opened else document_id,
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 def _paragraph_text(paragraph: dict[str, Any]) -> str:
@@ -109,6 +154,15 @@ def google_docs_get_document(document_id: str) -> str:
     """
     Read a Google Doc by document id or full document URL.
     Returns the title and the document text with headings rendered as Markdown.
+
+    Documents are opened only by link or id; this connector cannot
+    search for or list documents by name. When the user names a document
+    without giving its link, use google_drive_search to find its id if
+    that tool is available (with per-file Drive access it only finds
+    files created through this app or granted to it); otherwise, or if
+    it finds nothing, ask the user to paste the link
+    (https://docs.google.com/document/d/...). Connecting Google Drive is
+    not needed to open a document by its link.
     """
     try:
         doc_id = _resolve_document_id(document_id)
@@ -125,7 +179,7 @@ def google_docs_get_document(document_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error getting document: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, document_id)
 
 
 @mcp.tool()
@@ -180,10 +234,12 @@ def google_docs_append_text(document_id: str, text: str) -> str:
     """
     Append plain text to the end of an existing Google Doc.
     """
+    opened = False
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         service = get_docs_service()
         document = service.documents().get(documentId=doc_id).execute()
+        opened = True
         insert_index = max(_document_end_index(document) - 1, 1)
 
         result = (
@@ -213,7 +269,7 @@ def google_docs_append_text(document_id: str, text: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error appending text: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, document_id, editing=True, opened=opened)
 
 
 @mcp.tool()
@@ -224,7 +280,7 @@ def google_docs_replace_text(
     Replace all occurrences of find_text with replace_text in a Google Doc.
     """
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         service = get_docs_service()
         result = (
             service.documents()
@@ -260,7 +316,7 @@ def google_docs_replace_text(
         )
     except Exception as e:
         logger.error(f"Error replacing text: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, document_id, editing=True)
 
 
 @mcp.tool()
@@ -272,7 +328,7 @@ def google_docs_batch_update(document_id: str, requests_json: str) -> str:
     Use this only when the simpler tools cannot express the required edit.
     """
     try:
-        doc_id = _resolve_document_id(document_id)
+        doc_id = _resolve_document_id(document_id, editing=True)
         requests = json.loads(requests_json)
         if not isinstance(requests, list):
             raise ValueError("requests_json must be a JSON array of request objects")
@@ -293,7 +349,7 @@ def google_docs_batch_update(document_id: str, requests_json: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error applying batch update: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        return _document_error(e, document_id, editing=True)
 
 
 if __name__ == "__main__":

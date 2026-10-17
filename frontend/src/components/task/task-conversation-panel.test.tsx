@@ -2,28 +2,43 @@ import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { SessionStopState } from "@/contexts/app-context-chat"
+
+type PanelTraceEvent = {
+  event_id?: string
+  event_type?: string
+  timestamp?: string | number
+  data?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 const appState = vi.hoisted(() => ({
   messages: [] as Array<Record<string, unknown>>,
-  traceEvents: [],
+  traceEvents: [] as PanelTraceEvent[],
   currentTask: null as null | Record<string, unknown>,
   taskRuntimeExtensions: {} as Record<string, Record<string, unknown>>,
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
+  stoppedTurnAnchorIds: [] as string[],
   filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
 }))
+const realChatMessage = vi.hoisted(() => ({ enabled: false }))
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
+const stopTaskMock = vi.hoisted(() => vi.fn())
 const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
 const fileAccessRequestMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
   filesDisabled: false,
   voiceInputEnabled: true,
   taskControlsEnabled: true,
+  canStopTask: false,
+  stopState: "idle" as SessionStopState,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
@@ -35,9 +50,12 @@ const chatInputProps = vi.hoisted(() => ({
     voiceInputEnabled?: boolean
     hideFileUpload?: boolean
     isLoading?: boolean
+    currentInteractionRequestId?: string
     onFilesChange?: (files: File[]) => void
     onPause?: () => void
     onResume?: () => void
+    onStop?: () => void
+    stopState?: string
     onSend: (message: string, config?: unknown, files?: File[]) => Promise<void> | void
   },
 }))
@@ -51,6 +69,9 @@ vi.mock("@/contexts/app-context-chat", () => ({
     sendMessage: sendMessageMock,
     pauseTask: pauseTaskMock,
     resumeTask: resumeTaskMock,
+    canStopTask: appControls.canStopTask,
+    stopTask: stopTaskMock,
+    stopState: appControls.stopState,
     openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
@@ -63,7 +84,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: (key: string) => key, tDynamic: (key: string) => key }),
 }))
 
 vi.mock("@/contexts/file-access-context", () => ({
@@ -99,8 +120,11 @@ vi.mock("dagre", () => {
   }
 })
 
-vi.mock("@/components/chat/ChatMessage", () => ({
-  ChatMessage: ({
+vi.mock("@/components/chat/ChatMessage", async () => {
+  const actual = await vi.importActual<typeof import("@/components/chat/ChatMessage")>(
+    "@/components/chat/ChatMessage",
+  )
+  const MockChatMessage = ({
     content,
     interactionsActive,
     traceEvents,
@@ -111,6 +135,9 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     onOpenExecutionPlan,
     contextBadges,
     taskRuntimeExtensionMetadata,
+    interactionRequestId,
+    interactions,
+    failureTaskId,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -125,6 +152,9 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       bindings: string[]
       publicMetadata: Record<string, Record<string, unknown>>
     }
+    interactionRequestId?: string
+    interactions?: unknown[]
+    failureTaskId?: number | null
   }) => (
     <div
       data-testid="chat-message"
@@ -136,6 +166,9 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-show-process-view={showProcessView ? "true" : "false"}
       data-context-badges={JSON.stringify(contextBadges || [])}
       data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
+      data-request-id={interactionRequestId || ""}
+      data-interactions={JSON.stringify(interactions || [])}
+      data-failure-task-id={failureTaskId ?? ""}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -154,8 +187,20 @@ vi.mock("@/components/chat/ChatMessage", () => ({
         </button>
       )}
     </div>
-  ),
-}))
+  )
+  // Tests that assert on the real trace rendering opt in through realChatMessage.
+  return {
+    ...actual,
+    ChatMessage: (props: React.ComponentProps<typeof actual.ChatMessage>) =>
+      realChatMessage.enabled ? <actual.ChatMessage {...props} /> : <MockChatMessage {...(props as React.ComponentProps<typeof MockChatMessage>)} />,
+  }
+})
+
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/components/file/docx-preview-renderer", () => ({ DocxPreviewRenderer: () => null }))
+vi.mock("@/components/file/excel-preview-renderer", () => ({ ExcelPreviewRenderer: () => null }))
+vi.mock("@/components/file/pptx-preview-renderer", () => ({ PptxPreviewRenderer: () => null }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
   ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
@@ -237,6 +282,7 @@ describe("TaskConversationPanel", () => {
     sendMessageMock.mockResolvedValue(undefined)
     pauseTaskMock.mockReset()
     resumeTaskMock.mockReset()
+    stopTaskMock.mockReset()
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -246,19 +292,99 @@ describe("TaskConversationPanel", () => {
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
+    appControls.canStopTask = false
+    appControls.stopState = "idle"
   })
 
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    realChatMessage.enabled = false
     appState.messages = []
     appState.traceEvents = []
+    appState.stoppedTurnAnchorIds = []
     appState.currentTask = null
     appState.taskRuntimeExtensions = {}
     appState.taskId = 42
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
+  })
+
+  it.each(["completed", "partial", "blocked"])("shows the current settled outcome %s, including on history load", (completionOutcome) => {
+    appState.currentTask = { id: "42", status: "completed", completionOutcome }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByText(`taskCompletion.${completionOutcome}`)).toBeInTheDocument()
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByText(`taskCompletion.${completionOutcome}`)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["lease_expired", "taskInterruption.leaseExpired"],
+    ["persistence_failure", "taskInterruption.persistenceFailure"],
+    ["llm_unavailable", "taskInterruption.llmUnavailable"],
+    ["shutdown", "taskInterruption.paused"],
+  ])("explains a %s pause and drops the notice once the task leaves paused", (reason, key) => {
+    appState.currentTask = { id: "42", status: "paused", autoRecovery: { reason } }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByTestId("task-interruption-notice")).toHaveTextContent(key)
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    [{ status: "scheduled" }, "taskInterruption.autoResumeScheduled"],
+    [{ status: "scheduled", nextAttemptAt: "2026-10-10T08:00:12+00:00" }, "taskInterruption.autoResumeScheduledAt"],
+    [{ status: "resuming" }, "taskInterruption.autoResumeResuming"],
+    [{ status: "stopped", stopReason: "limit_reached" }, "taskInterruption.autoResumeStoppedLimit"],
+    [{ status: "stopped", stopReason: "disabled" }, "taskInterruption.autoResumeStoppedDisabled"],
+    [{ status: "stopped", stopReason: "expired" }, "taskInterruption.autoResumeStoppedExpired"],
+    [{ status: "stopped", stopReason: "superseded" }, "taskInterruption.autoResumeStoppedSuperseded"],
+    [{ status: "stopped", stopReason: "failed" }, "taskInterruption.autoResumeStoppedFailed"],
+    // A time that does not parse falls back to the plain scheduled copy.
+    [{ status: "scheduled", nextAttemptAt: "not a time" }, "taskInterruption.autoResumeScheduled"],
+    [{ status: "stopped", stopReason: "ineligible" }, "taskInterruption.autoResumeStopped"],
+  ])("says what automatic resume is doing (%o)", (autoResume, key) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoRecovery: { reason: "lease_expired" },
+      autoResume: { runId: "run-1", stateVersion: 4, ...autoResume },
+    }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByTestId("task-interruption-notice")).toHaveTextContent(key)
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("does not show the previous task's automatic-resume notice after a switch", () => {
+    appState.currentTask = {
+      id: "41",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    appState.taskId = 42
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("does not show the previous task's interruption notice after a switch", () => {
+    appState.currentTask = { id: "41", status: "paused", autoRecovery: { reason: "lease_expired" } }
+    appState.taskId = 42
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("shows no interruption notice for the user's own pause or an unexplained one", () => {
+    appState.currentTask = { id: "42", status: "paused", autoRecovery: { reason: "user_pause" } }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+    appState.currentTask = { id: "42", status: "paused" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
   })
 
   it("marks user turns with the task's Local browser context", () => {
@@ -476,6 +602,61 @@ describe("TaskConversationPanel", () => {
     expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
   })
 
+  it("keeps pause and resume closed while task stop is open", () => {
+    appControls.canStopTask = true
+    appControls.taskControlsEnabled = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBeUndefined()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+    expect(chatInputProps.current?.onStop).toBe(stopTaskMock)
+  })
+
+  it("passes the stop callback when task stop is available", () => {
+    appControls.canStopTask = true
+
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onStop).toBe(stopTaskMock)
+
+    appControls.canStopTask = false
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onStop).toBeUndefined()
+  })
+
+  it("forwards the stop state to the composer", () => {
+    appControls.canStopTask = true
+    appControls.stopState = "stopping"
+
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.stopState).toBe("stopping")
+
+    appControls.stopState = "timed_out"
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.stopState).toBe("timed_out")
+  })
+
+  it("does not offer a retained waiting request identity from a different task", () => {
+    appState.taskId = 43
+    appState.currentTask = {
+      id: "42",
+      title: "Previous waiting task",
+      description: "Previous waiting task",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingRequestId: "inputreq_stale",
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
+  })
+
   it("keeps the composer busy during Session reset and durable delivery", () => {
     appControls.isConversationResetPending = true
     const { rerender } = render(
@@ -528,6 +709,131 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("Which dataset should I use?")).toBeInTheDocument()
     expect(screen.getByTestId("chat-message")).toHaveAttribute("data-active", "true")
+  })
+
+  it("keeps each rendered clarification bound to its own request id", () => {
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "inputreq_q1",
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which hotel?",
+        timestamp: "2000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        interactionRequestId: "inputreq_q2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which hotel?",
+      waitingRequestId: "inputreq_q2",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    expect(rendered[0]).toHaveAttribute("data-request-id", "inputreq_q1")
+    expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
+  })
+
+  it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
+    appState.messages = [{
+      id: "user-r2",
+      role: "user",
+      content: "Start the next question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "stale-r1",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose the old city",
+        expect_response: true,
+        metadata: {
+          interactions: [{
+            type: "select_one",
+            field: "city",
+            label: "City",
+            options: [{ label: "Paris", value: "paris" }],
+          }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Type the current answer",
+      waitingRequestId: "inputreq_r2",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const currentWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-request-id") === "inputreq_r2",
+    )
+    expect(currentWait).toHaveAttribute("data-interactions", "[]")
+    expect(chatInputProps.current?.currentInteractionRequestId).toBe("inputreq_r2")
+  })
+
+  it("keeps the historical trace fallback for id-less waiting state", () => {
+    appState.messages = [{
+      id: "user-legacy",
+      role: "user",
+      content: "Start the legacy question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "legacy-wait",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose a city",
+        expect_response: true,
+        metadata: {
+          interactions: [{ type: "text_input", field: "city", label: "City" }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Legacy preview",
+      description: "Legacy preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Choose a city",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const activeWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-active") === "true",
+    )
+    expect(activeWait).toHaveAttribute(
+      "data-interactions",
+      JSON.stringify([{ type: "text_input", field: "city", label: "City" }]),
+    )
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
   })
 
   it("shows history loading before waiting-for-user content while history is loading", () => {
@@ -776,6 +1082,113 @@ describe("TaskConversationPanel", () => {
     render(<TaskConversationPanel mode="page" showProcessView={false} />)
     const hiddenTraceMessages = screen.getAllByTestId("chat-message")
     expect(hiddenTraceMessages[1]).toHaveAttribute("data-task-status", "failed")
+  })
+
+  it("passes the task id only to failed assistant messages", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+      {
+        id: "msg-failed",
+        role: "assistant",
+        content: "Failure reason",
+        timestamp: "2000",
+        status: "failed",
+        isResult: true,
+      },
+      { id: "msg-user-2", role: "user", content: "Try again", timestamp: "3000" },
+      {
+        id: "msg-done",
+        role: "assistant",
+        content: "Answer",
+        timestamp: "4000",
+        status: "completed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "42", title: "Task", status: "completed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(4)
+    expect(renderedMessages.map((message) => message.getAttribute("data-failure-task-id")))
+      .toEqual(["", "42", "", ""])
+  })
+
+  it("passes the task id to a failed trace process group", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = [
+      { event_id: "start", event_type: "task_start", timestamp: 1500, data: {} },
+      { event_id: "fail", event_type: "task_failed", timestamp: 1600, data: { error: "boom" } },
+    ] as any
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages.at(-1)).toHaveAttribute("data-failure-task-id", "42")
+    expect(renderedMessages[0]).toHaveAttribute("data-failure-task-id", "")
+  })
+
+  it("labels a failed embedded turn once when trace group and result row both fail", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+      {
+        id: "msg-failed",
+        role: "assistant",
+        content: "Task execution failed.",
+        timestamp: "1700",
+        status: "failed",
+        isResult: true,
+      },
+    ] as any
+    appState.traceEvents = [
+      { event_id: "start", event_type: "task_start", timestamp: 1500, data: {} },
+      { event_id: "fail", event_type: "task_failed", timestamp: 1600, data: { error: "boom" } },
+    ] as any
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" showProcessView={false} />)
+
+    const labels = screen
+      .getAllByTestId("chat-message")
+      .map((message) => message.getAttribute("data-failure-task-id"))
+    expect(labels.filter((label) => label === "42")).toHaveLength(1)
+    const failedRow = screen
+      .getAllByTestId("chat-message")
+      .find((message) => message.textContent?.includes("Task execution failed."))
+    expect(failedRow).toHaveAttribute("data-failure-task-id", "42")
+  })
+
+  it("passes the task id to the virtual failure placeholder of the current task", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "42", title: "Task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(2)
+    expect(renderedMessages[1]).toHaveAttribute("data-failure-task-id", "42")
+  })
+
+  it("does not label the virtual placeholder with a mismatched task id", () => {
+    appState.messages = [
+      { id: "msg-user", role: "user", content: "Run analysis", timestamp: "1000" },
+    ] as any
+    appState.traceEvents = []
+    appState.currentTask = { id: "7", title: "Previous task", status: "failed" } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const renderedMessages = screen.getAllByTestId("chat-message")
+    expect(renderedMessages).toHaveLength(2)
+    expect(renderedMessages[1]).toHaveAttribute("data-failure-task-id", "")
   })
 
   it("applies current task status only to the latest trace process group", () => {
@@ -1205,5 +1618,215 @@ describe("TaskConversationPanel", () => {
     for (const message of screen.getAllByTestId("chat-message")) {
       expect(message).toHaveAttribute("data-show-process-view", "true")
     }
+  })
+
+  describe("trace process rendering of paused and interrupted runs", () => {
+    const traceEvent = (
+      id: string,
+      type: string,
+      stepId: string,
+      timestamp: number,
+      data: Record<string, unknown> = {},
+    ) => ({ event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data })
+    const task = (status: string) => ({
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })
+    const turnOne = { id: "u1", role: "user", content: "First", timestamp: "1000" }
+
+    beforeEach(() => {
+      realChatMessage.enabled = true
+    })
+
+    it("keeps a resumed run spinning after a pause in the same turn", () => {
+      appState.messages = [turnOne]
+      appState.traceEvents = [
+        traceEvent("a-start", "react_task_start", "react_a", 1100, { pattern: "ReActPattern" }),
+        traceEvent("a-tool", "tool_execution_start", "react_a", 1400, { tool_name: "web_search" }),
+        traceEvent("a-end", "react_task_end", "react_a", 1500, {
+          pattern: "ReActPattern",
+          status: "interrupted",
+        }),
+        traceEvent("b-start", "react_task_start", "react_b", 2000, { pattern: "ReActPattern" }),
+        traceEvent("b-tool", "tool_execution_start", "react_b", 2160, { tool_name: "web_search" }),
+      ]
+      appState.currentTask = task("running")
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector(".animate-spin")).not.toBeNull()
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+      expect(screen.queryByText("agent.layout.status.interrupted")).toBeNull()
+    })
+
+    it("renders a paused-and-abandoned DAG step as stopped in a closed turn", () => {
+      appState.messages = [
+        turnOne,
+        { id: "u2", role: "user", content: "Second", timestamp: "3000" },
+        { id: "r2", role: "assistant", content: "ok", timestamp: "3500", isResult: true },
+      ]
+      appState.traceEvents = [
+        traceEvent("d-start", "dag_execute_start", "root", 1100),
+        traceEvent("d1-s", "dag_step_start", "s1", 1200, { step_name: "Step one" }),
+        traceEvent("d1-e", "dag_step_end", "s1", 1300, { step_name: "Step one", result: "ok" }),
+        traceEvent("d2-s", "dag_step_start", "s2", 1400, { step_name: "Step two" }),
+        traceEvent("d2-tool", "tool_execution_start", "s2", 1450, { tool_name: "web_search" }),
+        traceEvent("d-end", "dag_execute_end", "root", 1500, { status: "interrupted" }),
+        traceEvent("c-start", "react_task_start", "react_c", 3100),
+        traceEvent("c-end", "react_task_end", "react_c", 3400, { status: "completed" }),
+      ]
+      appState.currentTask = task("completed")
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      const stepTwo = screen.getByRole("button", { name: /Step two/ })
+      const icon = stepTwo.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(stepTwo.querySelector(".animate-spin")).toBeNull()
+      expect(container.querySelector(".animate-spin")).toBeNull()
+    })
+  })
+  describe("a turn the visitor stopped", () => {
+    const traceEvent = (id: string, type: string, stepId: string, timestamp: number, data: Record<string, unknown> = {}) => (
+      { event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data }
+    )
+    const failedTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "failed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    }
+    const STOPPED_BUBBLE = "This response was interrupted."
+    const user = (id: string, timestamp: number) => ({ id, role: "user", content: `question ${id}`, timestamp: String(timestamp) })
+    const stoppedBubble = (timestamp: number) => ({
+      id: "msg-stopped-1",
+      role: "assistant",
+      content: STOPPED_BUBBLE,
+      timestamp: String(timestamp),
+      status: "completed",
+      isResult: true,
+    })
+    // A turn cut off while a tool was still running: no terminal trace event.
+    const cutOffTurn = (prefix: string, start: number) => [
+      traceEvent(`${prefix}-start`, "react_task_start", `react_${prefix}`, start, { pattern: "ReActPattern" }),
+      traceEvent(`${prefix}-tool`, "tool_execution_start", `react_${prefix}`, start + 100, { tool_name: "web_search" }),
+    ]
+    const FAILURE_TEXTS = ["traceEventRenderer.unknownError", "common.errors.unknown"]
+
+    beforeEach(() => {
+      realChatMessage.enabled = true
+      appState.currentTask = failedTask
+    })
+
+    it("shows the stopped turn's process as interrupted, not as a red failure", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      const icon = container.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      expect(container.querySelector(".animate-spin")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+    })
+
+    it("still shows a failure for a turn the visitor did not stop", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = []
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+      expect(container.querySelector(".text-red-500")).not.toBeNull()
+    })
+
+    it("marks the turn when no bubble was added for its terminal frame", () => {
+      appState.messages = [user("u1", 1000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+      expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+      // No bubble says the turn was interrupted, so the process says it once.
+      // The step icon's screen-reader label carries the same words.
+      expect(
+        screen
+          .queryAllByText("agent.layout.status.interrupted")
+          .filter((element) => !element.classList.contains("sr-only"))
+      ).toHaveLength(1)
+    })
+
+    it("shows the interruption once, in the turn's own bubble", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      render(<TaskConversationPanel mode="page" />)
+
+      expect(screen.getAllByText(STOPPED_BUBBLE)).toHaveLength(1)
+      // The step icon's screen-reader label carries the same words; only the
+      // visible "Interrupted" line must be absent.
+      expect(
+        screen
+          .queryAllByText("agent.layout.status.interrupted")
+          .filter((element) => !element.classList.contains("sr-only"))
+      ).toHaveLength(0)
+    })
+
+    it("says the turn was interrupted when there is no trace and no bubble to say it", () => {
+      appState.messages = [user("u1", 1000)]
+      appState.traceEvents = []
+      appState.stoppedTurnAnchorIds = ["u1"]
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      for (const text of FAILURE_TEXTS) expect(screen.queryByText(text)).toBeNull()
+      expect(screen.queryByTestId("task-failure-reference")).toBeNull()
+    })
+
+    it("re-renders the process as interrupted when only the record changes", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000)]
+      appState.traceEvents = cutOffTurn("a", 1100)
+      appState.stoppedTurnAnchorIds = []
+
+      const { container, rerender } = render(<TaskConversationPanel mode="page" />)
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+
+      appState.stoppedTurnAnchorIds = ["u1"]
+      rerender(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+    })
+
+    it("leaves a later turn running normally after the stopped one", () => {
+      appState.messages = [user("u1", 1000), stoppedBubble(2000), user("u2", 3000)]
+      appState.traceEvents = [...cutOffTurn("a", 1100), ...cutOffTurn("b", 3100)]
+      appState.stoppedTurnAnchorIds = ["u1"]
+      appState.currentTask = { ...failedTask, status: "running" }
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelectorAll("svg[data-icon='interrupted']")).toHaveLength(1)
+      expect(container.querySelector(".animate-spin")).not.toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+    })
   })
 })

@@ -32,13 +32,19 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+    ensure_documents_table,
+    ensure_ingestion_runs_table,
+)
+from xagent.providers.vector_store.lancedb import get_connection_from_env
 from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
     _build_ingest_backup_path,
-    _compensate_new_web_ingest_files,
     _copy_upload_file_to_path,
+    _create_document_compensation,
     _create_file_compensation_restore,
+    _create_status_compensation,
     _create_web_uploaded_file_record,
     _delete_web_rag_side_effects_for_file_id,
     _get_file_sha256,
@@ -47,7 +53,6 @@ from xagent.web.api.kb import (
     _RagDocumentSnapshot,
     _recreate_missing_existing_file,
     _refresh_existing_file_if_changed,
-    _restore_rag_snapshot_rows,
     _rollback_failed_web_document_ingestion,
     _upsert_uploaded_file_record,
     _WebFileLock,
@@ -61,6 +66,41 @@ from xagent.web.services.uploaded_file_store import (
     UploadedFileVersionConflict,
     snapshot_uploaded_file_version,
 )
+
+
+def run_web_file_rollback(
+    file_info,
+    ingestion_result=None,
+    *,
+    collection: str = "test_collection",
+    url: str = "https://example.com",
+):
+    """Roll back a file_handler result the way ``web_ingestion`` does.
+
+    Enters at ``_run_file_handler_compensation`` so the routing into per-boundary
+    compensation is exercised too. ``page_operation`` is None, which is the
+    degenerate branch, not the typical one: the ingest-web route opens an
+    operation, so `web_page_operation` normally yields a real ``KBOperation``
+    and the coordinator takes its saga path (covered by the coordinator's own
+    tests). None only happens with no operation facade or no active operation.
+    Boundary ordering and error folding belong to the coordinator, so this
+    returns ``first_error`` (None on success) rather than raising.
+    """
+    from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+    from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+        _run_file_handler_compensation,
+    )
+
+    warnings: list[str] = []
+    return _run_file_handler_compensation(
+        pipeline_facade=get_kb_coordinator().pipeline,
+        page_operation=None,
+        file_info=file_info,
+        collection=collection,
+        url=url,
+        warnings=warnings,
+        ingestion_result=ingestion_result,
+    )
 
 
 class TestNormalizeWebTitleForFilename:
@@ -743,7 +783,7 @@ class TestWebIngestionUploadedFilePersistence:
 
         assert result is not None
         assert result["file_id"] == str(existing_record.file_id)
-        assert callable(result["rollback_on_failure"])
+        assert callable(result["document_compensation"])
         assert existing_path.read_text(encoding="utf-8") == "old content"
         assert processed_urls == {}
 
@@ -824,6 +864,7 @@ class TestWebIngestionUploadedFilePersistence:
         temp_file_path = tmp_path / "incoming.md"
         temp_file_path.write_text("new content", encoding="utf-8")
         existing_record = UploadedFile(
+            id=1,
             file_id=str(uuid4()),
             user_id=int(mock_user.id),
             filename="existing.md",
@@ -1376,7 +1417,6 @@ class TestIngestWebHandleWebFile:
         url_hash = hashlib.sha256(f"{collection}:{url}".encode()).hexdigest()[:16]
         filename = f"{url_hash}_{_normalize_web_title_for_filename(title)}.md"
         expected_persistent = uploads_root / f"user_{user.id}" / collection / filename
-        captured: dict[str, str] = {}
 
         def patched_get_upload_path(
             filename_arg: str,
@@ -1385,8 +1425,10 @@ class TestIngestWebHandleWebFile:
             collection: str,
             collection_is_sanitized: bool,
         ) -> Path:
-            assert collection_is_sanitized is True
+            captured["collection_sanitized"] = collection_is_sanitized
             return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        captured: dict[str, object] = {}
 
         async def stub_run_web_ingestion(
             *,
@@ -1402,7 +1444,10 @@ class TestIngestWebHandleWebFile:
             file_info = file_handler(temp_md, title, collection, url)
             captured["file_id"] = str(file_info["file_id"])
 
-            from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+            from xagent.core.tools.core.RAG_tools.core.schemas import (
+                IngestionResult,
+                WebIngestionResult,
+            )
             from xagent.web.services.managed_file_ref import build_upload_storage_key
 
             result = IngestionResult(
@@ -1415,11 +1460,27 @@ class TestIngestWebHandleWebFile:
                 captured["file_id"],
                 filename,
             )
-            assert expected_persistent.exists()
-            assert get_unscoped_file_storage().exists(captured["storage_key"])
+            captured["persistent_exists"] = expected_persistent.exists()
+            captured["storage_exists"] = get_unscoped_file_storage().exists(
+                captured["storage_key"]
+            )
 
-            file_info["rollback_on_failure"](result)
-            return result
+            captured["rollback_error"] = run_web_file_rollback(file_info, result)
+            return WebIngestionResult(
+                status="error",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[url],
+                failed_urls={url: "embedding failed"},
+                message="embedding failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
 
         with (
             patch(
@@ -1439,7 +1500,12 @@ class TestIngestWebHandleWebFile:
                 headers=headers,
             )
 
+        assert captured["rollback_error"] is None
+        assert captured["persistent_exists"] is True
+        assert captured["storage_exists"] is True
         assert response.status_code == 500
+        assert captured["collection_sanitized"] is True
+        assert response.json()["status"] == "error"
         assert captured["file_id"]
         assert not expected_persistent.exists()
         assert not get_unscoped_file_storage().exists(captured["storage_key"])
@@ -1479,8 +1545,10 @@ class TestIngestWebHandleWebFile:
             collection: str,
             collection_is_sanitized: bool,
         ) -> Path:
-            assert filename_arg == filename
+            captured["upload_filename_ok"] = filename_arg == filename
             return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        captured: dict[str, object] = {}
 
         async def stub_run_web_ingestion(
             *,
@@ -1494,7 +1562,6 @@ class TestIngestWebHandleWebFile:
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("# Title\n\nBody", encoding="utf-8")
             file_info = file_handler(temp_md, title, collection, url)
-            assert callable(file_info["rollback_on_failure"])
 
             from xagent.core.tools.core.RAG_tools.core.schemas import (
                 IngestionResult,
@@ -1502,7 +1569,8 @@ class TestIngestWebHandleWebFile:
                 WebIngestionResult,
             )
 
-            file_info["rollback_on_failure"](
+            captured["rollback_error"] = run_web_file_rollback(
+                file_info,
                 IngestionResult(
                     status="partial",
                     doc_id="doc-1",
@@ -1515,7 +1583,7 @@ class TestIngestWebHandleWebFile:
                     ],
                     failed_step="embed_chunks",
                     message="embedding failed",
-                )
+                ),
             )
 
             return WebIngestionResult(
@@ -1554,7 +1622,9 @@ class TestIngestWebHandleWebFile:
                 headers=headers,
             )
 
+        assert captured["rollback_error"] is None
         assert response.status_code == 500
+        assert captured["upload_filename_ok"] is True
         assert not expected_persistent.exists()
         mock_delete_document.assert_called_once_with(
             collection, "doc-1", user.id, False
@@ -1611,8 +1681,10 @@ class TestIngestWebHandleWebFile:
             collection: str,
             collection_is_sanitized: bool,
         ) -> Path:
-            assert filename_arg == filename
+            captured["upload_filename_ok"] = filename_arg == filename
             return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        captured: dict[str, object] = {}
 
         async def stub_run_web_ingestion(
             *,
@@ -1626,13 +1698,14 @@ class TestIngestWebHandleWebFile:
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("new content", encoding="utf-8")
             file_info = file_handler(temp_md, title, collection, url)
-            assert file_info["file_id"] == existing_file_id
-            assert persistent_file.read_text(encoding="utf-8") == "new content"
-            assert callable(file_info["rollback_on_failure"])
+            captured["refresh_file_id_ok"] = file_info["file_id"] == existing_file_id
+            captured["refresh_content_ok"] = (
+                persistent_file.read_text(encoding="utf-8") == "new content"
+            )
 
             from xagent.core.tools.core.RAG_tools.core.schemas import WebIngestionResult
 
-            file_info["rollback_on_failure"]()
+            captured["rollback_error"] = run_web_file_rollback(file_info)
 
             return WebIngestionResult(
                 status="error",
@@ -1685,7 +1758,13 @@ class TestIngestWebHandleWebFile:
                 headers=headers,
             )
 
+        assert captured["rollback_error"] is None
         assert response.status_code == 500
+        # The refresh path never reaches get_upload_path; pin that, so a
+        # future routing change cannot quietly void this instrumentation.
+        assert "upload_filename_ok" not in captured
+        assert captured["refresh_file_id_ok"] is True
+        assert captured["refresh_content_ok"] is True
         assert persistent_file.read_text(encoding="utf-8") == "old content"
         mock_snapshot_runs.assert_called_once_with(existing_file_id)
         mock_snapshot_rag.assert_called_once_with(
@@ -1752,8 +1831,10 @@ class TestIngestWebHandleWebFile:
             collection: str,
             collection_is_sanitized: bool,
         ) -> Path:
-            assert filename_arg == filename
+            captured["upload_filename_ok"] = filename_arg == filename
             return uploads_root / f"user_{user_id}" / collection / filename_arg
+
+        captured: dict[str, object] = {}
 
         async def stub_run_web_ingestion(
             *,
@@ -1767,10 +1848,32 @@ class TestIngestWebHandleWebFile:
             temp_md = tmp_path / "temp.md"
             temp_md.write_text("new content", encoding="utf-8")
             file_info = file_handler(temp_md, title, collection, url)
-            assert file_info["file_id"] == existing_file_id
-            assert persistent_file.read_text(encoding="utf-8") == "new content"
+            captured["refresh_file_id_ok"] = file_info["file_id"] == existing_file_id
+            captured["refresh_content_ok"] = (
+                persistent_file.read_text(encoding="utf-8") == "new content"
+            )
 
-            file_info["rollback_on_failure"]()
+            captured["rollback_error"] = run_web_file_rollback(file_info)
+
+            from xagent.core.tools.core.RAG_tools.core.schemas import (
+                WebIngestionResult,
+            )
+
+            return WebIngestionResult(
+                status="error",
+                collection=collection,
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[url],
+                failed_urls={url: "ingestion failed"},
+                message="ingestion failed",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
 
         with (
             patch(
@@ -1788,7 +1891,7 @@ class TestIngestWebHandleWebFile:
             ),
             patch(
                 "xagent.web.api.kb._snapshot_rag_documents_for_uploaded_file",
-                return_value=object(),
+                return_value=_RagDocumentSnapshot(doc_refs=[], collections=[]),
             ),
             patch(
                 "xagent.web.api.kb._restore_ingestion_runs_snapshot"
@@ -1808,7 +1911,13 @@ class TestIngestWebHandleWebFile:
                 headers=headers,
             )
 
+        assert "rag restore failed" in captured["rollback_error"]
         assert response.status_code == 500
+        # The refresh path never reaches get_upload_path; pin that, so a
+        # future routing change cannot quietly void this instrumentation.
+        assert "upload_filename_ok" not in captured
+        assert captured["refresh_file_id_ok"] is True
+        assert captured["refresh_content_ok"] is True
         assert persistent_file.read_text(encoding="utf-8") == "old content"
         mock_restore_runs.assert_called_once()
 
@@ -1897,7 +2006,7 @@ class TestWebFileRefreshHelpers:
     def test_web_rollback_exception_path_uses_file_id_after_empty_snapshot(
         self,
     ) -> None:
-        snapshot = _RagDocumentSnapshot(doc_refs=[], rows_by_table={})
+        snapshot = _RagDocumentSnapshot(doc_refs=[], collections=[])
         with (
             patch(
                 "xagent.web.api.kb._restore_rag_document_snapshot"
@@ -1926,134 +2035,6 @@ class TestWebFileRefreshHelpers:
             user_id=1,
             is_admin=False,
         )
-
-    def test_restore_rag_snapshot_rows_batches_unknown_table_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="custom_table",
-            snapshot_rows=[{"collection": "c1", "doc_id": "doc-old"}],
-            current_rows=[
-                {"collection": "c1", "doc_id": "doc-1"},
-                {"collection": "c1", "doc_id": "doc-2"},
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "(collection = 'c1' and doc_id = 'doc-1')" in delete_filter
-        assert "(collection = 'c1' and doc_id = 'doc-2')" in delete_filter
-        assert " or " in delete_filter
-        table.add.assert_called_once_with([{"collection": "c1", "doc_id": "doc-old"}])
-
-    def test_restore_rag_snapshot_rows_batches_stale_row_delete(self) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="chunks",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-old",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "parse_hash": "hash",
-                    "chunk_id": "chunk-stale-2",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "parse_hash", "chunk_id"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "chunk_id = 'chunk-old'" not in delete_filter
-        assert "(collection = 'c1'" in delete_filter
-        assert "chunk_id = 'chunk-stale'" in delete_filter
-        assert "chunk_id = 'chunk-stale-2'" in delete_filter
-        assert " or " in delete_filter
-
-    def test_restore_rag_snapshot_rows_keys_embeddings_by_parse_and_model(
-        self,
-    ) -> None:
-        table = MagicMock()
-        table.schema.names = []
-
-        _restore_rag_snapshot_rows(
-            table,
-            table_name="embeddings_text_embedding_v4",
-            snapshot_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                }
-            ],
-            current_rows=[
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-new",
-                    "model": "model-a",
-                },
-                {
-                    "collection": "c1",
-                    "doc_id": "doc-1",
-                    "chunk_id": "chunk-1",
-                    "parse_hash": "parse-old",
-                    "model": "model-b",
-                },
-            ],
-            user_id=1,
-            is_admin=False,
-        )
-
-        table.merge_insert.assert_called_once_with(
-            ["collection", "doc_id", "chunk_id", "parse_hash", "model"]
-        )
-        table.delete.assert_called_once()
-        delete_filter = table.delete.call_args.args[0]
-        assert "parse_hash = 'parse-new'" in delete_filter
-        assert "model = 'model-b'" in delete_filter
-        assert "parse_hash = 'parse-old' and model = 'model-a'" not in delete_filter
-        assert " or " in delete_filter
 
     def test_get_file_sha256_changes_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2122,101 +2103,38 @@ class TestWebFileRefreshHelpers:
 
         assert processed_urls["hash-key"] == "new-file-id"
 
-    def test_compensate_new_web_ingest_files_continues_after_commit_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        compensated_file_ids: list[str] = []
-
-        class _CleanupResult:
-            side_effects_may_remain = False
-            errors: tuple[str, ...] = ()
-
-        def fake_compensate(_db, *, file_id: str, user_id: int):
-            assert user_id == 1
-            compensated_file_ids.append(file_id)
-            return _CleanupResult()
-
-        class _DB:
-            def __init__(self) -> None:
-                self.commits = 0
-                self.rollbacks = 0
-
-            def commit(self) -> None:
-                self.commits += 1
-                if self.commits == 1:
-                    raise RuntimeError("commit unavailable")
-
-            def rollback(self) -> None:
-                self.rollbacks += 1
-
-        monkeypatch.setattr(
-            "xagent.web.api.kb._compensate_new_uploaded_file",
-            fake_compensate,
+    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(self) -> None:
+        conn = get_connection_from_env()
+        ensure_documents_table(conn)
+        conn.open_table("documents").add(
+            [
+                {"collection": "kb", "doc_id": "doc-1", "file_id": "file-123"},
+                {"collection": "kb2", "doc_id": "doc-2", "file_id": "file-123"},
+                {"collection": "kb", "doc_id": "doc-2", "file_id": "other-file"},
+            ]
         )
-        db = _DB()
-
-        cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
-            db,  # type: ignore[arg-type]
-            file_ids={"file-b", "file-a"},
-            user_id=1,
-        )
-
-        assert compensated_file_ids == ["file-a", "file-b"]
-        assert db.commits == 2
-        assert db.rollbacks == 1
-        assert cleanup_incomplete is True
-        assert cleanup_errors == [
-            "Database commit failed for file file-a: commit unavailable"
-        ]
-
-    def test_mark_uploaded_file_for_reindex_clears_ingestion_runs(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        deleted_filters: list[str] = []
-
-        class _FakeTable:
-            def search(self):
-                return self
-
-            def where(self, _expr: str):
-                return self
-
-            def select(self, _fields: list[str]):
-                return self
-
-            def limit(self, _value: int):
-                return self
-
-            def delete(self, expr: str) -> None:
-                deleted_filters.append(expr)
-
-        class _FakeConn:
-            def open_table(self, _name: str):
-                return _FakeTable()
-
-        monkeypatch.setattr(
-            "xagent.providers.vector_store.lancedb.get_connection_from_env",
-            lambda: _FakeConn(),
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_documents_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_ingestion_runs_table",
-            lambda _conn: None,
-        )
-        monkeypatch.setattr(
-            "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.query_to_list",
-            lambda _query: [{"collection": "kb", "doc_id": "doc-1"}],
+        ensure_ingestion_runs_table(conn)
+        conn.open_table("ingestion_runs").add(
+            [
+                {"collection": c, "doc_id": d, "status": "success", "user_id": u}
+                for c, d, u in [
+                    ("kb", "doc-1", 1),
+                    ("kb", "doc-1", None),
+                    ("kb2", "doc-2", 2),
+                    ("kb", "doc-2", 1),
+                    ("kb2", "doc-1", 2),
+                ]
+            ]
         )
 
         marked = _mark_uploaded_file_for_reindex("file-123")
 
         assert marked is True
-        assert len(deleted_filters) == 1
-        assert "collection = 'kb'" in deleted_filters[0]
-        assert "doc_id = 'doc-1'" in deleted_filters[0]
+        left = conn.open_table("ingestion_runs").search().limit(-1).to_list()
+        assert sorted((r["collection"], r["doc_id"]) for r in left) == [
+            ("kb", "doc-2"),
+            ("kb2", "doc-1"),
+        ]
 
     def test_refresh_fails_when_ingestion_run_snapshot_fails(
         self,
@@ -2268,7 +2186,7 @@ class TestWebFileRefreshHelpers:
         mock_snapshot_runs.assert_called_once_with(file_id)
         mock_mark.assert_not_called()
 
-    def test_unchanged_existing_file_result_has_rollback_callback(
+    def test_unchanged_existing_file_result_rolls_back_cleanly(
         self,
         db_session: Session,
         test_user: User,
@@ -2287,7 +2205,7 @@ class TestWebFileRefreshHelpers:
             file_size=existing_path.stat().st_size,
         )
         run_snapshot = object()
-        rag_snapshot = object()
+        rag_snapshot = _RagDocumentSnapshot(doc_refs=[], collections=[])
 
         with (
             patch(
@@ -2318,7 +2236,7 @@ class TestWebFileRefreshHelpers:
                 processed_urls={},
                 context="unit-test",
             )
-            result["rollback_on_failure"](None)
+            assert run_web_file_rollback(result) is None
 
         mock_rollback_rag.assert_called_once_with(
             collection_name="test_collection",
@@ -2328,4 +2246,351 @@ class TestWebFileRefreshHelpers:
             rag_snapshot=rag_snapshot,
             file_id=str(existing_record.file_id),
         )
-        mock_restore_runs.assert_called_once_with(run_snapshot)
+        mock_restore_runs.assert_called_once_with(run_snapshot, keep=[])
+
+
+def test_web_rollback_skips_status_clear_after_deleting_registered_doc() -> None:
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    result = IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        completed_steps=[
+            IngestionStepResult(name="register_document", metadata={"created": True})
+        ],
+        message="embedding failed",
+    )
+    with (
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        mock_delete_document.return_value = MagicMock(status="success")
+
+        _rollback_failed_web_document_ingestion(
+            collection_name="test_collection",
+            result=result,
+            user_id=1,
+            is_admin=False,
+            file_id="file-1",
+        )
+
+    mock_delete_document.assert_called_once_with("test_collection", "doc-1", 1, False)
+    mock_clear_status.assert_not_called()
+
+
+def test_web_document_rollback_keeps_its_failure_label() -> None:
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    result = IngestionResult(
+        status="partial",
+        doc_id="d",
+        completed_steps=[
+            IngestionStepResult(name="register_document", metadata={"created": True})
+        ],
+        message="partial failure",
+    )
+    with patch("xagent.web.api.kb.delete_document") as mock_delete_document:
+        mock_delete_document.return_value = MagicMock(status="error", message="boom")
+
+        with pytest.raises(RuntimeError) as info:
+            _rollback_failed_web_document_ingestion(
+                collection_name="coll",
+                result=result,
+                user_id=7,
+                is_admin=False,
+            )
+
+    assert str(info.value) == "delete document 'd' during web rollback failed: boom"
+
+
+def test_document_and_status_compensation_without_ingestion_result() -> None:
+    from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+        generate_deterministic_doc_id,
+    )
+
+    coordinator = MagicMock()
+    with (
+        patch(
+            "xagent.web.api.kb.get_session_local",
+            side_effect=RuntimeError("no DB session expected"),
+        ) as mock_session_local,
+        patch(
+            "xagent.web.api.kb._list_document_refs_for_uploaded_file",
+            return_value=[],
+        ),
+        patch("xagent.web.api.kb.get_kb_coordinator", return_value=coordinator),
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        _create_document_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+            file_record_id="file-1",
+        )(None)()
+        doc_id = generate_deterministic_doc_id("test_collection", "file-1")
+        coordinator.delete_documents_data_sync.assert_called_once_with(
+            "test_collection", [doc_id], user_id=1, is_admin=False
+        )
+        mock_clear_status.assert_called_once_with(
+            "test_collection", doc_id, user_id=1, is_admin=False
+        )
+
+        _create_status_compensation(
+            collection_name="test_collection",
+            user_id=1,
+            is_admin=False,
+        )(None)()
+
+    mock_clear_status.assert_called_once()
+    mock_session_local.assert_not_called()
+
+
+def _new_web_file_info(tmp_path: Path):
+    from xagent.web.api.kb import _create_new_web_file_handler_result
+
+    incoming = tmp_path / "incoming.md"
+    incoming.write_text("# page", encoding="utf-8")
+    with patch(
+        "xagent.web.api.kb._create_web_uploaded_file_record",
+        return_value=MagicMock(file_id="file-1"),
+    ):
+        return _create_new_web_file_handler_result(
+            temp_file_path=incoming,
+            persistent_file=tmp_path / "page.md",
+            db_session=MagicMock(),
+            user_id=1,
+            is_admin=False,
+            collection_name="coll",
+            filename="page.md",
+            url="https://example.com/page",
+            url_hash="h",
+            processed_urls={},
+        )
+
+
+def _failed_page_result(*, registered: bool):
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        IngestionResult,
+        IngestionStepResult,
+    )
+
+    steps = (
+        [IngestionStepResult(name="register_document", metadata={"created": True})]
+        if registered
+        else []
+    )
+    return IngestionResult(
+        status="partial",
+        doc_id="doc-1",
+        completed_steps=steps,
+        message="embedding failed",
+    )
+
+
+def _roll_back_new_web_page(file_info, result, *, with_operation: bool):
+    from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.kb.models import (
+        RollbackFailedIngestionRequest,
+    )
+    from xagent.core.tools.core.RAG_tools.kb.operation_compatibility import (
+        KBOperation,
+        PersistencePolicy,
+        record_document_registration_side_effect,
+    )
+
+    operation = None
+    if with_operation:
+        operation = KBOperation(
+            operation_type="web_page_ingestion",
+            collection="coll",
+            persistence_policy=PersistencePolicy.PRESERVE_SUCCESSFUL_CHILDREN,
+        )
+        record_document_registration_side_effect(
+            operation,
+            collection="coll",
+            doc_id="doc-1",
+            created=True,
+            source_path="page.md",
+            file_id="file-1",
+            user_id=1,
+        )
+    outcome = KBCoordinator.__new__(KBCoordinator).rollback_failed_ingestion_sync(
+        RollbackFailedIngestionRequest(
+            collection="coll",
+            user_id=None,
+            is_admin=False,
+            operation=operation,
+            ingestion_result=result,
+            doc_id="doc-1",
+            source="https://example.com/page",
+            document_compensation=file_info.get("document_compensation"),
+            status_compensation=file_info.get("status_compensation"),
+        )
+    )
+    return outcome, operation
+
+
+@pytest.mark.parametrize("with_operation", [False, True])
+def test_new_web_page_registered_doc_status_cleared_only_by_delete_document(
+    tmp_path: Path, with_operation: bool
+) -> None:
+    file_info = _new_web_file_info(tmp_path)
+    with (
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        mock_delete_document.return_value = MagicMock(status="success")
+        outcome, _ = _roll_back_new_web_page(
+            file_info,
+            _failed_page_result(registered=True),
+            with_operation=with_operation,
+        )
+
+    mock_delete_document.assert_called_once_with("coll", "doc-1", 1, False)
+    mock_clear_status.assert_not_called()
+    assert outcome.first_error is None
+    assert outcome.side_effects_may_remain is False
+
+
+@pytest.mark.parametrize("with_operation", [False, True])
+def test_new_web_page_unregistered_doc_status_cleared_once(
+    tmp_path: Path, with_operation: bool
+) -> None:
+    file_info = _new_web_file_info(tmp_path)
+    with (
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        outcome, _ = _roll_back_new_web_page(
+            file_info,
+            _failed_page_result(registered=False),
+            with_operation=with_operation,
+        )
+
+    mock_delete_document.assert_not_called()
+    mock_clear_status.assert_called_once_with(
+        "coll", "doc-1", user_id=1, is_admin=False
+    )
+    assert outcome.first_error is None
+    assert outcome.side_effects_may_remain is False
+
+
+@pytest.mark.parametrize("with_operation", [False, True])
+def test_new_web_page_status_still_cleared_when_document_rollback_fails(
+    tmp_path: Path, with_operation: bool
+) -> None:
+    file_info = _new_web_file_info(tmp_path)
+    with (
+        patch("xagent.web.api.kb.delete_document") as mock_delete_document,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        mock_delete_document.return_value = MagicMock(status="error", message="boom")
+        outcome, operation = _roll_back_new_web_page(
+            file_info,
+            _failed_page_result(registered=True),
+            with_operation=with_operation,
+        )
+
+    assert set(outcome.boundary_errors) == {"DOCUMENT"}
+    mock_clear_status.assert_called_once_with(
+        "coll", "doc-1", user_id=1, is_admin=False
+    )
+    if with_operation:
+        pending = {step.idempotency_key for step in operation.uncompensated_steps()}
+        assert pending == {"document:coll:doc-1"}
+
+
+def test_status_still_clears_after_document_restores_a_rag_snapshot() -> None:
+    status_cleared: set[str] = set()
+    result = _failed_page_result(registered=False)
+    with (
+        patch("xagent.web.api.kb._restore_rag_document_snapshot") as mock_restore,
+        patch("xagent.web.api.kb.clear_ingestion_status") as mock_clear_status,
+    ):
+        _create_document_compensation(
+            collection_name="coll",
+            user_id=1,
+            is_admin=False,
+            file_record_id="file-1",
+            rag_document_snapshot=MagicMock(),
+            status_cleared=status_cleared,
+        )(result)()
+        _create_status_compensation(
+            collection_name="coll",
+            user_id=1,
+            is_admin=False,
+            status_cleared=status_cleared,
+        )(result)()
+
+    mock_restore.assert_called_once()
+    mock_clear_status.assert_called_once_with(
+        "coll", "doc-1", user_id=1, is_admin=False
+    )
+
+
+@pytest.mark.parametrize("handler", ["refresh", "recreate"])
+def test_web_file_handler_rejects_record_without_row_id_before_side_effects(
+    tmp_path: Path, handler: str
+) -> None:
+    existing_path = tmp_path / "existing.md"
+    existing_path.write_text("old", encoding="utf-8")
+    incoming = tmp_path / "incoming.md"
+    incoming.write_text("new", encoding="utf-8")
+    record = UploadedFile(
+        file_id="file-1",
+        user_id=1,
+        filename="existing.md",
+        storage_path=str(existing_path),
+        mime_type="text/markdown",
+        file_size=3,
+    )
+    kwargs = dict(
+        existing_record=record,
+        temp_file_path=incoming,
+        db_session=MagicMock(),
+        user_id=1,
+        is_admin=False,
+        collection_name="coll",
+        filename="existing.md",
+        url_hash="h",
+        processed_urls={},
+    )
+    with (
+        patch(
+            "xagent.web.api.kb._snapshot_ingestion_runs_for_uploaded_file"
+        ) as mock_snapshot_runs,
+        pytest.raises(ValueError, match="has no row id"),
+    ):
+        if handler == "refresh":
+            _refresh_existing_file_if_changed(
+                **kwargs, url="https://example.com/page", context="test"
+            )
+        else:
+            _recreate_missing_existing_file(**kwargs)
+
+    mock_snapshot_runs.assert_not_called()
+    assert existing_path.read_text(encoding="utf-8") == "old"
+    assert incoming.exists()
+
+
+@pytest.mark.parametrize("missing", ["previous_version", "expected_current_version"])
+def test_file_restore_compensation_requires_both_receipts(missing: str) -> None:
+    receipts = {
+        "previous_version": MagicMock(),
+        "expected_current_version": MagicMock(),
+    }
+    del receipts[missing]
+    with pytest.raises(TypeError, match=missing):
+        _create_file_compensation_restore(
+            file_record_id="file-1",
+            existing_path=Path("existing.md"),
+            backup_path=None,
+            record_snapshot={},
+            **receipts,
+        )

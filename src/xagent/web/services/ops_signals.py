@@ -27,6 +27,8 @@ GMAIL_WATCH_REGISTRATION_DISABLED = "gmail_watch_registration_disabled"
 CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
 CHECKPOINT_LEGACY_POINTER_AMBIGUOUS = "checkpoint_legacy_pointer_ambiguous"
 CHECKPOINT_LOAD_UNAVAILABLE = "checkpoint_load_unavailable"
+# Cleared once per lease-recovery sweep; any unavailable candidate sets it again.
+CHECKPOINT_RECOVERY_UNAVAILABLE = "checkpoint_recovery_unavailable"
 CHECKPOINT_PK_ANCHOR_DANGLING = "checkpoint_pk_anchor_dangling"
 CHECKPOINT_PRUNE_FAILED = "checkpoint_prune_failed"
 # Set when the interaction rollout gate (or /ready, in native mode) finds
@@ -54,8 +56,15 @@ INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
 )
 # Set by resolve_interaction_anchor (task_interaction_anchor.py) when the
 # trace_events row its pointer names fails the ownership/type/partition/
-# identity checks that make it a valid anchor. Deliberately not paired with
-# a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
+# identity checks that make it a valid anchor -- with one shape excluded: a
+# row that fails only the partition check, and only because the field is
+# absent, is a pre-existing row rather than a corrupt one and increments a
+# counter instead (see that resolver's own judgment table). A second shape
+# narrows the reason without excluding it: a row that fails only the
+# partition check because the field names a different run still registers
+# this same signal, carrying its own detail string distinct from the
+# generic corrupt one (also in that judgment table). Deliberately not
+# paired with a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
 # above: a corrupt anchor is a property of a persisted trace_events row, and
 # no in-process registry can observe that row being fixed. Auto-clearing
 # would assert "the data got fixed" without evidence for it.
@@ -65,6 +74,10 @@ INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
 # process-scoped signal: it reports whether the sweep mechanism is
 # working, not whether a particular task has been repaired.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
+# Set by the auto-resume sweeper loop (task_auto_resume.py) after three
+# consecutive failed ticks; cleared by its next successful tick. While it is
+# set, scheduled automatic resumes are not being dispatched by this process.
+TASK_AUTO_RESUME_UNAVAILABLE = "task_auto_resume_unavailable"
 
 # Set when a legacy-resume interaction close (task_interaction_close.py)
 # matches more than one active row for a single task -- structurally

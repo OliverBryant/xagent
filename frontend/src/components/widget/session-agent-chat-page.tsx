@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
-import { Button } from "@/components/ui/button"
+import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
   AppProvider,
   type AppProviderTransportConfig,
@@ -12,6 +12,11 @@ import {
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
+import { readSendErrorCode } from "@/components/chat/clarification-delivery"
+import {
+  clientErrorTranslationKey,
+  type ClientErrorCode,
+} from "@/lib/client-errors"
 import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
@@ -20,6 +25,10 @@ import {
 } from "./use-widget-session"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
+// Asks the session server to confirm and send heartbeat frames. A server that
+// does not know the marker ignores it, and the connection then runs without
+// dead-connection detection.
+const SESSION_LIVENESS_PROTOCOL = "xagent-session-liveness-v1"
 type SessionTerminalPresentation = "expired" | "unavailable"
 
 const SESSION_TERMINAL_PRESENTATION: Readonly<Record<string, SessionTerminalPresentation>> = {
@@ -42,6 +51,13 @@ interface SessionConversationContentProps {
   agent: WidgetSessionAgent | null
   terminalCode: string | null
   isAbsoluteExpiryWarningVisible: boolean
+  // Lifted to the never-unmounting SessionAgentChatPage below: this
+  // component's own "active" JSX branch unmounts on a degraded/reconnect
+  // transition (see the status check further down), which would otherwise
+  // silently reset an accepted expand back to the collapsed label/icon while
+  // the panel itself is still actually expanded.
+  isExpanded: boolean
+  onExpandedChange: (expanded: boolean) => void
 }
 
 function SessionConversationContent({
@@ -49,6 +65,8 @@ function SessionConversationContent({
   agent,
   terminalCode,
   isAbsoluteExpiryWarningVisible,
+  isExpanded,
+  onExpandedChange,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -64,18 +82,37 @@ function SessionConversationContent({
   } = useApp()
   const { t } = useI18n()
   const [resetError, setResetError] = useState(false)
-  const [startMessageError, setStartMessageError] = useState(false)
+  // The failure is stored as a code, not as text, so the line is translated
+  // at render time and follows a locale switch. It is only a note on the
+  // start page; the toast raised by the composer is the failure signal.
+  const [startMessageFailure, setStartMessageFailure] =
+    useState<{ code: ClientErrorCode | null } | null>(null)
+  const conversationEstablished = state.taskId !== null
+
+  // The failure line belongs to the current start-page visit only: whenever
+  // the conversation becomes established or returns to the start page, the
+  // stored failure is dropped, so a failure that arrived while a conversation
+  // was established never shows on a later start page. The drop happens while
+  // rendering rather than in an effect: React re-runs this component with the
+  // cleared failure before committing, so the stale line under role="alert"
+  // never reaches the DOM, not even for a single commit.
+  const [lastSeenConversationEstablished, setLastSeenConversationEstablished] =
+    useState(conversationEstablished)
+  if (lastSeenConversationEstablished !== conversationEstablished) {
+    setLastSeenConversationEstablished(conversationEstablished)
+    setStartMessageFailure(null)
+  }
 
   const handleStartMessage = useCallback(async (
     message: string,
     files: File[],
     config?: Record<string, unknown>,
   ) => {
-    setStartMessageError(false)
+    setStartMessageFailure(null)
     try {
       await sendMessage(message, config, files)
     } catch (error) {
-      setStartMessageError(true)
+      setStartMessageFailure({ code: readSendErrorCode(error) })
       throw error
     }
   }, [sendMessage])
@@ -123,7 +160,6 @@ function SessionConversationContent({
     )
   }
 
-  const hasEstablishedConversation = state.taskId !== null
   const reloadRequired = isSessionInteractionLocked
   const resetDisabled =
     reloadRequired || isConversationResetPending || isMessageDeliveryPending
@@ -155,20 +191,18 @@ function SessionConversationContent({
                 : t("widgetChat.status.connecting")}
             </p>
           </div>
-          {hasEstablishedConversation ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="ml-auto"
-              disabled={resetDisabled}
-              onClick={() => void handleStartNewConversation()}
-            >
-              {isConversationResetPending
+          <WidgetChromeControls
+            newConversation={conversationEstablished ? {
+              label: isConversationResetPending
                 ? t("widgetSession.resetting")
-                : t("widgetSession.startNewConversation")}
-            </Button>
-          ) : null}
+                : t("widgetSession.startNewConversation"),
+              onClick: () => void handleStartNewConversation(),
+              disabled: resetDisabled,
+              pending: isConversationResetPending,
+            } : undefined}
+            expanded={isExpanded}
+            onExpandedChange={onExpandedChange}
+          />
         </div>
         {isAbsoluteExpiryWarningVisible ? (
           <p
@@ -183,9 +217,11 @@ function SessionConversationContent({
             {t("widgetSession.resetFailed")}
           </p>
         ) : null}
-        {startMessageError && !reloadRequired ? (
+        {startMessageFailure && !reloadRequired && !conversationEstablished ? (
           <p className="mt-2 text-xs text-destructive" role="alert">
-            {t("widgetSession.startMessageFailed")}
+            {startMessageFailure.code
+              ? t(clientErrorTranslationKey(startMessageFailure.code))
+              : t("widgetSession.startMessageFailed")}
           </p>
         ) : null}
         {reloadRequired ? (
@@ -196,7 +232,7 @@ function SessionConversationContent({
       </header>
 
       <div className="min-h-0 flex-1">
-        {hasEstablishedConversation ? (
+        {conversationEstablished ? (
           <TaskConversationPanel
             mode="page"
             showTaskActions={false}
@@ -243,6 +279,7 @@ function SessionConversationContent({
 
 export function SessionAgentChatPage() {
   const bridge = useWidgetSession()
+  const [isExpanded, setIsExpanded] = useState(false)
 
   const connection = useMemo<WebSocketConnection | null>(() => {
     if (bridge.status !== "active" || !bridge.session) return null
@@ -253,18 +290,22 @@ export function SessionAgentChatPage() {
       protocols: [
         SESSION_PROTOCOL,
         `xagent-session-token.${bridge.session.token}`,
+        SESSION_LIVENESS_PROTOCOL,
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     }
   }, [bridge.session, bridge.status])
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       // This page only renders for the embedded widget's session-resume
       // route, so an in-tab navigation always abandons the visitor's iframe.
       linksOpenInNewTab: "enabled",
+      taskStop: "enabled",
     },
     session: {
       connection,
@@ -295,6 +336,8 @@ export function SessionAgentChatPage() {
         isAbsoluteExpiryWarningVisible={
           bridge.isAbsoluteExpiryWarningVisible
         }
+        isExpanded={isExpanded}
+        onExpandedChange={setIsExpanded}
       />
     </AppProvider>
   )

@@ -6,19 +6,18 @@ import asyncio
 import builtins
 import io
 import threading
-import time
 from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import files as files_api
-from xagent.web.api import websocket as websocket_api
 from xagent.web.api.public_chat_access import (
     PublicChatAccessContext,
     ShareChatAccessContext,
@@ -27,7 +26,9 @@ from xagent.web.api.public_chat_access import (
 )
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.managed_file_ref import (
+    DURABLE_FAULT_LOG_PREFIX,
     DurableStorageOperationError,
     ManagedFileRef,
 )
@@ -47,6 +48,10 @@ def isolated_upload_storage(monkeypatch: pytest.MonkeyPatch, tmp_path):
     upload_root = tmp_path / "uploads"
     object_root = tmp_path / "objects"
     upload_root.mkdir()
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(upload_root))
+    monkeypatch.setenv(
+        "XAGENT_FILE_MATERIALIZE_DIR", str(upload_root.parent / "materialized")
+    )
     monkeypatch.setenv(
         "XAGENT_FILE_STORAGE_URI",
         object_root.as_uri(),
@@ -95,14 +100,18 @@ def _stage_path_in(root: Path, user_id: int):
 class _SlowTrackingSource(io.BytesIO):
     """A synchronous source that reveals an accidental event-loop read."""
 
-    def __init__(self, payload: bytes, delay_seconds: float) -> None:
+    def __init__(self, payload: bytes) -> None:
         super().__init__(payload)
-        self.delay_seconds = delay_seconds
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.loop_thread = threading.get_ident()
         self.read_threads: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
         self.read_threads.append(threading.get_ident())
-        time.sleep(self.delay_seconds)
+        self.started.set()
+        assert threading.get_ident() != self.loop_thread
+        assert self.release.wait(timeout=30), "upload read was never released"
         return super().read(size)
 
 
@@ -131,9 +140,11 @@ def _admin_user_id() -> int:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evicted_base", [False, True])
 async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
     monkeypatch: pytest.MonkeyPatch,
     isolated_upload_storage,
+    evicted_base: bool,
 ) -> None:
     """The shared staging boundary must make naming reservation atomic."""
 
@@ -143,22 +154,43 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
 
-    original_reserve = files_api._reserve_and_copy_upload
+    base_path = upload_root / f"user_{user_id}" / "same-name.txt"
+    original_upload = None
+    if evicted_base:
+        original_upload = await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(filename="same-name.txt", file=io.BytesIO(b"original"))
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+        base_path.unlink()
+
+    race_path = base_path.with_name("same-name_1.txt") if evicted_base else base_path
+    original_lookup = files_api.upload_path_is_registered_sync
     workers_started = 0
     workers_ready = threading.Barrier(2)
     workers_lock = threading.Lock()
 
-    def synchronized_reserve(upload, **kwargs):  # type: ignore[no-untyped-def]
+    def synchronized_lookup(path: Path) -> bool:
         nonlocal workers_started
-        with workers_lock:
-            workers_started += 1
-        workers_ready.wait(timeout=2)
-        return original_reserve(upload, **kwargs)
+        registered = original_lookup(path)
+        if path == race_path:
+            assert not registered
+            with workers_lock:
+                workers_started += 1
+            # Both workers finish the pre-check before either can reserve the
+            # candidate. Exclusive creation must resolve the actual race.
+            workers_ready.wait(timeout=DB_PROGRESS_TIMEOUT)
+        return registered
 
     monkeypatch.setattr(
         files_api,
-        "_reserve_and_copy_upload",
-        synchronized_reserve,
+        "upload_path_is_registered_sync",
+        synchronized_lookup,
     )
     first = UploadFile(
         filename="same-name.txt",
@@ -197,6 +229,130 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
         b"first exact contents",
         b"second exact contents",
     }
+    if original_upload is not None:
+        assert not base_path.exists()
+        assert base_path not in staged
+        response = client.get(
+            f"/api/files/download/{original_upload['file_id']}",
+            headers=_admin_headers(),
+        )
+        assert response.status_code == 200
+        assert response.content == b"original"
+        assert {path.read_bytes() for path in staged} == {
+            b"first exact contents",
+            b"second exact contents",
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, FileExistsError])
+async def test_upload_lookup_failure_propagates_without_staging_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+    error_type: type[Exception],
+) -> None:
+    """A lookup failure is not a filename collision and must fail closed."""
+
+    upload_root, object_root = isolated_upload_storage
+    user_id = _admin_user_id()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
+    )
+
+    def failing_lookup(_path: Path) -> bool:
+        raise error_type("lookup unavailable")
+
+    monkeypatch.setattr(files_api, "upload_path_is_registered_sync", failing_lookup)
+    source = io.BytesIO(b"must not be staged")
+    with pytest.raises(error_type, match="lookup unavailable"):
+        await files_api.store_uploaded_files(
+            upload_items=[UploadFile(filename="lookup-failure.txt", file=source)],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+    assert source.tell() == 0
+    assert not list(upload_root.rglob("lookup-failure*"))
+    assert not list(object_root.rglob("lookup-failure*"))
+    with _direct_db_session() as db:
+        assert db.query(UploadedFile).count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path_spelling", ["plain", "symlink", "parent-components"])
+async def test_same_name_upload_preserves_registered_file_after_cache_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_upload_storage,
+    path_spelling: str,
+) -> None:
+    """An absent local cache is not an unclaimed upload path."""
+
+    upload_root, _object_root = isolated_upload_storage
+    staging_root = upload_root
+    if path_spelling == "symlink":
+        staging_root = upload_root.with_name("upload-alias")
+        staging_root.symlink_to(upload_root, target_is_directory=True)
+    elif path_spelling == "parent-components":
+        intermediate = upload_root / "nested"
+        intermediate.mkdir()
+        staging_root = intermediate / ".."
+    if path_spelling != "plain":
+        assert str(staging_root) != str(staging_root.resolve())
+    user_id = _admin_user_id()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_path_in(staging_root, user_id)
+    )
+
+    async def upload(payload: bytes):
+        return await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(filename="same-name.txt", file=io.BytesIO(payload))
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+
+    originals = []
+    for payload in (b"first contents", b"second contents"):
+        result = await upload(payload)
+        with _direct_db_session() as db:
+            record = (
+                db.query(UploadedFile)
+                .filter(UploadedFile.file_id == result["file_id"])
+                .one()
+            )
+            original_path = Path(record.storage_path)
+        # Registration preserves the same spelling used by the reservation check.
+        assert original_path.parent == staging_root / f"user_{user_id}"
+        originals.append((result["file_id"], original_path, payload))
+        original_path.unlink()
+
+    new_upload = await upload(b"new contents")
+    with _direct_db_session() as db:
+        new_record = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.file_id == new_upload["file_id"])
+            .one()
+        )
+        new_path = Path(new_record.storage_path)
+        assert db.query(UploadedFile).count() == 3
+    assert new_path not in [path for _, path, _ in originals]
+    assert new_path.read_bytes() == b"new contents"
+
+    headers = _admin_headers()
+    for file_id, original_path, payload in originals:
+        assert file_id != new_upload["file_id"]
+        assert not original_path.exists()
+        response = client.get(f"/api/files/download/{file_id}", headers=headers)
+        assert response.status_code == 200
+        assert response.content == payload
+        assert original_path.read_bytes() == payload
+    assert new_path.read_bytes() == b"new contents"
 
 
 @pytest.mark.asyncio
@@ -212,14 +368,13 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
     engine = _install_one_slot_queue_pool(monkeypatch)
-    source = _SlowTrackingSource(b"bounded-copy", delay_seconds=0.2)
+    source = _SlowTrackingSource(b"bounded-copy")
     upload = UploadFile(
         filename="off-loop.txt",
         file=source,
         headers={"content-type": "text/plain"},
     )
     loop_thread = threading.get_ident()
-    started_at = asyncio.get_running_loop().time()
     task = asyncio.create_task(
         files_api.store_uploaded_files(
             upload_items=[upload],
@@ -231,15 +386,20 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         )
     )
     try:
-        await asyncio.sleep(0.01)
-        assert asyncio.get_running_loop().time() - started_at < 0.1
+        assert await asyncio.to_thread(source.started.wait, 30)
+        assert not task.done()
         assert engine.pool.checkedout() == 0
-        await task
+        source.release.set()
+        await asyncio.wait_for(task, timeout=30)
         assert source.read_threads
         assert all(thread_id != loop_thread for thread_id in source.read_threads)
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        source.release.set()
+        try:
+            await asyncio.wait_for(task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 def test_reserve_and_copy_enforces_max_size_and_cleans_partial_file(
@@ -811,6 +971,7 @@ async def test_cancel_after_upload_registration_compensates_metadata_and_bytes(
 async def test_failed_compensation_does_not_skip_request_local_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     isolated_upload_storage,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     _upload_root, _object_root = isolated_upload_storage
     _admin_headers()
@@ -827,7 +988,9 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
         raise RuntimeError("registration failed")
 
     def fail_compensation(_claims) -> None:  # type: ignore[no-untyped-def]
-        raise DurableStorageOperationError("storage cleanup unavailable")
+        raise DurableStorageOperationError(
+            "storage cleanup unavailable", storage_key=None
+        )
 
     monkeypatch.setattr(
         files_api,
@@ -858,6 +1021,21 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
 
     assert local_paths
     assert all(not path.exists() for path in local_paths)
+
+    # The double fault -- the upload failed against durable storage and
+    # compensating against it failed too -- is the incident this reporting
+    # exists for, so it must not be recorded as an unlabelled traceback. The
+    # AST sweep pins that the site declares these fields; this pins that the
+    # record actually carries them, with the values from this request.
+    fault_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "xagent.web.api.files"
+        and DURABLE_FAULT_LOG_PREFIX in record.getMessage()
+    ]
+    assert len(fault_lines) == 1, caplog.records
+    assert "upload compensation" in fault_lines[0]
+    assert f"user_id={user_id}" in fault_lines[0]
 
 
 @pytest.mark.asyncio
@@ -975,7 +1153,7 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
         base_dir=str(tmp_path := upload_root / "agent-workspaces"),
         allowed_external_dirs=[str(Path(storage_path).parent)],
     )
-    websocket_api._register_uploaded_files_for_agent(
+    task_execution_service._register_uploaded_files_for_agent(
         type("AgentService", (), {"workspace": workspace})(),
         [file_info],
     )

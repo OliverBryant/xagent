@@ -7,6 +7,18 @@ from typing import Any, AsyncIterator, List
 from ..types import ChunkType, StreamChunk
 
 
+def compatible_tool_choice_for_llm(
+    llm: Any, tool_choice: str | dict[str, Any] | None
+) -> str | dict[str, Any] | None:
+    """Return the strongest tool choice supported by an arbitrary LLM object."""
+
+    if getattr(llm, "supports_forced_tool_choice", True):
+        return tool_choice
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return tool_choice
+    return "auto"
+
+
 class BaseLLM(ABC):
     """
     Abstract base class for Large Language Models (LLMs) with ability-based support.
@@ -33,7 +45,10 @@ class BaseLLM(ABC):
     def abilities(self) -> List[str]:
         """
         Get the list of abilities supported by this LLM implementation.
-        Possible abilities: ["chat", "vision", "video", "thinking_mode", "tool_calling"]
+        Possible abilities: ["chat", "vision", "video", "thinking_mode",
+        "tool_calling", "auto_tool_choice_only"]. The last ability marks opaque
+        model identifiers whose provider accepts automatic but not forced tool
+        choice.
 
         Returns:
             List[str]: List of supported abilities
@@ -83,6 +98,24 @@ class BaseLLM(ABC):
         return True
 
     @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether the model accepts a request that requires a tool call.
+
+        Tool calling and forced tool selection are separate capabilities: a
+        model can accept tool schemas with ``tool_choice=auto`` while rejecting
+        ``required`` or a named tool. Most providers support both, so the
+        default preserves their existing behavior. Wrappers that do not use
+        the generic retry delegator must explicitly forward this property.
+        """
+        return True
+
+    def compatible_tool_choice(
+        self, tool_choice: str | dict[str, Any] | None
+    ) -> str | dict[str, Any] | None:
+        """Return the strongest tool choice this model can accept."""
+        return compatible_tool_choice_for_llm(self, tool_choice)
+
+    @property
     def supports_native_video_input(self) -> bool:
         """Whether this model accepts a video as one multimodal input.
 
@@ -129,6 +162,28 @@ class BaseLLM(ABC):
             bool: True if the ability is supported, False otherwise
         """
         return ability in self.abilities
+
+    def _strip_internal_message_keys(
+        self, messages: List[dict[str, Any]]
+    ) -> List[dict[str, Any]]:
+        """Remove Xagent-only message metadata before sending provider calls.
+
+        Every provider that forwards a message dict's keys through to its SDK
+        call largely unchanged (as opposed to rebuilding a provider-shaped
+        message field-by-field) must call this before the request leaves the
+        process, or an internal marker like ``_xagent_provider_state`` leaks
+        onto the wire.
+        """
+        sanitized: List[dict[str, Any]] = []
+        for message in messages:
+            sanitized.append(
+                {
+                    key: value
+                    for key, value in message.items()
+                    if not key.startswith("_xagent_")
+                }
+            )
+        return sanitized
 
     def _sanitize_unicode_content(self, content: Any) -> Any:
         """
@@ -202,14 +257,25 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model (e.g. top_p, user, stop).
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: other implementations (e.g. the OpenAI family --
+                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
+                   the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], ...} for a
+                       tool call
+                   A "raw" key carrying the provider's full response is
+                   present on some implementations' envelopes and absent on
+                   others, so callers must not require it. Neither list is
+                   exhaustive, and an implementation listed above as
+                   returning a bare string for ordinary replies can still
+                   return a tool-call envelope -- Gemini does exactly that.
+                   Callers that must accept more than one implementation need
+                   to branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model call fails or returns an unexpected format.
@@ -246,14 +312,25 @@ class BaseLLM(ABC):
             **kwargs: Additional parameters specific to the underlying model.
 
         Returns:
-            If the model returns a natural language response:
-                -> string (the assistant reply content)
-
-            If the model triggers a tool call:
-                -> dict with fields:
-                    - "type": "tool_call"
-                    - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+            The return type is a union; the concrete shape depends on the
+            implementation:
+                -> str: some implementations (e.g. Zhipu, Claude, Gemini)
+                   return the assistant reply content as a bare string.
+                -> dict: other implementations (e.g. the OpenAI family --
+                   OpenAI, OpenRouter, DashScope -- and Xinference) wrap
+                   the reply in an envelope instead:
+                     - {"type": "text", "content": <str>, ...} for a
+                       natural language response
+                     - {"type": "tool_call", "tool_calls": [...], ...} for a
+                       tool call
+                   A "raw" key carrying the provider's full response is
+                   present on some implementations' envelopes and absent on
+                   others, so callers must not require it. Neither list is
+                   exhaustive, and an implementation listed above as
+                   returning a bare string for ordinary replies can still
+                   return a tool-call envelope -- Gemini does exactly that.
+                   Callers that must accept more than one implementation need
+                   to branch on the shape rather than assume a bare string.
 
         Raises:
             RuntimeError if the model doesn't support vision or the call fails.

@@ -5,10 +5,13 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
+import random
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -28,8 +31,10 @@ from typing import (
     TypeVar,
     cast,
 )
+from weakref import WeakValueDictionary
 
 import httpx
+from sqlalchemy import text
 
 from ...config import get_uploads_dir
 from ...core.agent.result import (
@@ -38,6 +43,7 @@ from ...core.agent.result import (
     normalize_tool_failure_code,
 )
 from ...core.tools.adapters.vibe.config import (
+    ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -57,14 +63,32 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
+from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ..services.actor_mcp_runtime import (
+    ActorMCPStdioSessionIdentity,
+    resolve_actor_mcp_stdio_configs,
+)
+from ..services.mcp_runtime import (
+    MCPActorExecutionIdentity,
+    MCPBuiltinOAuthActorPolicy,
+)
+from ..services.slack_actor_runtime import (
+    SLACK_ACTOR_RUNTIME_REFRESH_KEY,
+    SLACK_CHANNEL_ACCESS_POLICY_ENV,
+    resolve_slack_actor_runtime_grant,
+    serialize_slack_channel_access_policy,
+)
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
+    has_user_tool_overrides_hook,
     has_user_tool_policy_hooks,
     resolve_tool_credential,
+    unresolved_tool_policy_allowlist,
 )
+from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +99,15 @@ OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+# The user's only grant is a provider-level one this app no longer accepts
+# (APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT); connecting the app itself fixes it.
+UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
+    f"{UNAVAILABLE_MCP_CREDENTIAL_MESSAGE} "
+    "Reconnect this app to grant the permissions it needs."
+)
+_ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
+    tuple[int, int, str, str], asyncio.Lock
+] = WeakValueDictionary()
 # This web-runtime allowlist is intentionally narrower than the adapter-layer
 # public summary allowlist. It accepts only credential/config resolution reasons
 # produced at this boundary; adapter/list-tools phases are sanitized separately
@@ -82,9 +115,11 @@ UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
 MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "authorization_required",
+        ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
         "insufficient_scope",
+        "invalid_configuration",
         "invalid_launch_config",
         "oauth_token_refresh_failed",
         "oauth_token_required",
@@ -115,6 +150,15 @@ class TokenRequest:
     without canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
+    ``auth_type`` is the connector's declared authentication type as classified
+    by ``connector_auth_type()`` (e.g. ``"none"``, ``"bearer"``, ``"api_key"``,
+    ``"oauth2"``, ``"mcp_oauth"``); it is the literal string ``"builtin_oauth"``
+    for catalog apps whose OAuth is implied by ``transport == "oauth"``; and it
+    is ``None`` when the type cannot be determined, which a resolver should
+    treat as "unknown", never as "no credential needed". ``"none"`` means only
+    that the connector declares no ``auth`` JSON; it does not mean the
+    connector carries no credential, because static ``headers`` (e.g.
+    ``Authorization``) are sent regardless and are not inspected there.
     """
 
     provider: str
@@ -122,6 +166,7 @@ class TokenRequest:
     scope: Optional[Any] = None
     resource: str | None = None
     refresh: OAuthRefreshContext | None = None
+    auth_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,17 +178,27 @@ class ResolvedToken:
     comparison. Resolvers SHOULD set ``expires_at`` to enable MCP config
     caching; ``expires_at=None`` means the token is usable for this build only
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
+    ``instance_url`` carries the per-org API host a provider like Salesforce
+    returns alongside its access token; providers without one leave it None.
     """
 
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
     generation: str | None = field(default=None, repr=False)
+    instance_url: str | None = None
 
 
 @dataclass(frozen=True)
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    credential_present: bool = False
+    # No accepted grant, but a provider-level one the app-scoped policy
+    # rejected exists: reconnecting the app fixes it.
+    policy_rejected_grant_present: bool = False
+    # Set only for providers that return a per-org API host instead of
+    # using a fixed domain (Salesforce) -- None for everyone else.
+    instance_url: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -256,6 +311,7 @@ class _ResolvedHookToken:
     access_token: str = field(repr=False)
     expires_at: datetime | None
     generation: str | None = field(repr=False)
+    instance_url: str | None = None
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -280,6 +336,24 @@ class _OAuthLaunchConfigInvalid(Exception):
     def __init__(self, *, field: str) -> None:
         super().__init__(field)
         self.field = field
+
+
+class _OAuthInstanceUrlRequired(Exception):
+    """The launch_config declares an instance_url env mapping, but the
+    resolved token (hook or legacy DB path) didn't supply one.
+
+    Raised instead of silently omitting the env var so the connector comes
+    back as unavailable/reconnect-required, matching how a missing
+    access_token is already surfaced, rather than launching a subprocess
+    that fails opaquely on its first real tool call. Carries the env_mapping
+    key that triggered it, mirroring _OAuthLaunchConfigInvalid.field, so a
+    second provider adding its own instance_url-mapped key someday doesn't
+    leave both call sites' log lines unable to say which one failed.
+    """
+
+    def __init__(self, *, env_key: str) -> None:
+        super().__init__(env_key)
+        self.env_key = env_key
 
 
 @dataclass(frozen=True)
@@ -418,6 +492,21 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     return f"{text[: max_length - 3]}..."
 
 
+def _redacted_bounded_resource(resource: str | None) -> str | None:
+    """Redact and bound an OAuth resource URL for a diagnostic, or ``None``
+    if there is none. Every producer of ``resource`` (``mcp_runtime.py``'s
+    ``effective_mcp_oauth_resource`` and this module's
+    ``_oauth_token_configured_resource``) excludes the empty string, so a
+    truthy guard and an ``is not None`` guard are equivalent in practice;
+    this uses the truthy form so ``""`` -- if a producer's contract ever
+    changes -- is treated the same as ``None`` rather than redacted and
+    bounded into a diagnostic-empty string.
+    """
+    if not resource:
+        return None
+    return _bounded_oauth_metadata(redact_urls_in_text(resource))
+
+
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
     try:
         raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
@@ -458,7 +547,7 @@ def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
     from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
 
     return restrict_to_app_scoped_oauth_grant(
-        app_info.get("id"), (app_info.get("provider"), app_info.get("id"))
+        app_info, (app_info.get("provider"), app_info.get("id"))
     )
 
 
@@ -542,6 +631,24 @@ def _oauth_launch_config_env_mapping(
     return {}
 
 
+def _actor_oauth_refresh_lock(
+    user_id: int,
+    resource_owner_key: str,
+    app_id: str,
+) -> asyncio.Lock:
+    key = (
+        id(asyncio.get_running_loop()),
+        user_id,
+        resource_owner_key,
+        app_id,
+    )
+    lock = _ACTOR_OAUTH_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ACTOR_OAUTH_REFRESH_LOCKS[key] = lock
+    return lock
+
+
 def _oauth_launch_config_mapping(
     launch_config: Any,
 ) -> Mapping[str, Any] | None:
@@ -552,10 +659,247 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
+OAUTH_REFRESH_MAX_ATTEMPTS = 2
+OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
+# Only failures that guarantee the request body was never transmitted are
+# safe to retry blindly. A grant_type=refresh_token POST is not idempotent
+# on providers that rotate refresh tokens: if the server processed the
+# grant and issued a new refresh_token but the response was lost to a
+# ReadTimeout/WriteTimeout (request already sent, outcome unknown), a
+# retry would resend the now-stale refresh_token and get back a genuine
+# invalid_grant for a token that, moments ago, was perfectly valid --
+# indistinguishable from an actually-dead token and forcing an
+# unnecessary reconnect. A connect-phase failure never got that far, so
+# it's unconditionally safe to retry. A 5xx is conventionally treated the
+# same way (the provider's own signal that it didn't process the
+# request) -- not an absolute guarantee, but the standard assumption
+# behind retrying 5xx across virtually every HTTP client's default retry
+# policy, and a much narrower risk window than a timeout that could land
+# on either side of the provider actually persisting the grant.
+_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    # A proxy-handshake failure (e.g. an env-configured egress proxy,
+    # trust_env=True is httpx's default) means the request never reached
+    # the actual token endpoint either -- same "never transmitted"
+    # guarantee as ConnectError, just one hop earlier.
+    httpx.ProxyError,
+    # Timing out waiting for a free connection from the client's own pool
+    # happens before a single byte is written to the wire -- same
+    # guarantee again, and the likeliest of the four to actually fire in
+    # this function's own motivating scenario: a burst of concurrent
+    # refreshes contending for a still-small connection pool right after
+    # a cold start.
+    httpx.PoolTimeout,
+)
+
+
+async def _request_oauth_refresh_with_retries(
+    request: Callable[[], Awaitable[httpx.Response]],
+    *,
+    provider_name: str,
+) -> httpx.Response:
+    """Retry a token-endpoint request across transient failures that are
+    safe to resend -- see _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS. Useful for
+    the cold-start network blip right after a container restart, when a
+    backlog of triggers firing at once produces a burst of concurrent
+    refreshes just as egress is still warming up. A 4xx is the provider's
+    definitive answer about this specific token; retrying cannot change
+    it, so it's returned immediately without spending a retry on it.
+    """
+    for attempt in range(OAUTH_REFRESH_MAX_ATTEMPTS):
+        is_last_attempt = attempt == OAUTH_REFRESH_MAX_ATTEMPTS - 1
+        try:
+            response = await request()
+            if response.status_code < 500 or is_last_attempt:
+                return response
+        except _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS:
+            if is_last_attempt:
+                raise
+
+        # Jittered so a burst of concurrent refreshes (the exact scenario
+        # above) doesn't retry in lockstep and reproduce the same
+        # contention on the next attempt.
+        delay = OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS * (2**attempt)
+        delay += random.uniform(0, OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS)
+        logger.info(
+            "Retrying %s token refresh after a transient failure (attempt %s/%s)",
+            provider_name,
+            attempt + 2,
+            OAUTH_REFRESH_MAX_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+
+    raise AssertionError("unreachable: the last attempt always returns or raises")
+
+
+# No error code is trusted globally across every provider -- not even RFC
+# 6749's invalid_grant. Per RFC 6749 section 5.2, invalid_grant also
+# covers a refresh token "issued to another client": a client-binding
+# mismatch that a shared OAuthProvider row's credential rotation can
+# trigger for every existing UserOAuth account at once (the new
+# client_id/secret get sent alongside a refresh_token issued under the
+# old ones), without any of those grants actually being dead -- the same
+# class of "one admin credential change mass-deletes every user's
+# connection" bug already fixed below for invalid_client/
+# unauthorized_client, just reachable through invalid_grant's more
+# overloaded RFC meaning instead of a missing-credential check.
+#
+# Only a provider's own unambiguous, non-standard dead-token vocabulary
+# is trusted, gated on provider_name (an unrelated provider -- including
+# a future one, or an admin-added custom OAuthProvider row with an
+# arbitrary token endpoint -- that coincidentally uses the same string
+# for a different, non-fatal reason can't be misread as a dead-token
+# signal). Meta's own OAuthException codes (190/102, normalized to the
+# string "invalid_grant" by oauth_provider_quirks.
+# meta_invalid_token_error_code) are Meta-specific and unambiguous, unlike
+# RFC 6749's own invalid_grant string, so they're listed here too rather
+# than trusted for every provider.
+_PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
+    # GitHub's classic OAuth Apps token endpoint reports a dead
+    # refresh_token via a 200 response with this code, not a 4xx.
+    "github": frozenset({"bad_refresh_token"}),
+    # Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    # ...} -- applies to its oauth.v2.access refresh grant too, for
+    # workspaces with token rotation enabled.
+    "slack": frozenset({"invalid_refresh_token"}),
+    # See meta_invalid_token_error_code -- normalizes Meta's own
+    # OAuthException codes to this string.
+    "meta": frozenset({"invalid_grant"}),
+    # Zendesk refresh tokens are single-use and expire (90 days at most);
+    # Zendesk's refresh-token docs attribute a failed refresh with an expired
+    # or invalid token to an invalid grant. Trusting it assumes a wrong client secret answers
+    # invalid_client instead -- otherwise an admin credential change would
+    # tombstone every connection -- which the live-account verification for
+    # #2930 must confirm. A personal-flow request that merely lost a race
+    # against a concurrent rotation is kept from tombstoning the newer grant
+    # in _finish_legacy_oauth_access_token_resolution; the actor flow holds
+    # its row lock across the refresh instead.
+    "zendesk": frozenset({"invalid_grant"}),
+}
+
+
+class _OAuthRefreshPermanentlyInvalid(Exception):
+    """The provider (or our own stored config) confirms this connection's
+    refresh token is dead -- revoked, expired, or the token/config it needs
+    to refresh is simply missing -- as opposed to a transient failure
+    (timeout, network error, provider 5xx) that may well succeed on a later
+    retry. Only this case should invalidate the user's stored credentials.
+    """
+
+
+def _oauth_refresh_error_code(
+    response: httpx.Response, provider_name: str
+) -> str | None:
+    """Best-effort OAuth ``error`` code from a failed refresh response body.
+
+    Most providers use the standard top-level string ``error`` field.
+    Meta's differently-shaped nested error object is normalized via
+    oauth_provider_quirks.meta_invalid_token_error_code -- gated on
+    provider_name so an unrelated provider whose error object happens to
+    carry the same type/code-shaped keys isn't misread as Meta's.
+    """
+    from ..oauth_provider_quirks import meta_invalid_token_error_code
+
+    try:
+        data = response.json()
+    except Exception:
+        # response.json() isn't guaranteed to raise only ValueError/
+        # JSONDecodeError -- a sufficiently pathological body (e.g. deeply
+        # nested enough to blow the parser's recursion limit) can raise
+        # something else entirely. This is a best-effort extraction either
+        # way, so any failure to parse means "no code", not a reason to
+        # let an exotic exception escape uncaught to the caller's generic
+        # handler and lose the status-code-bearing log line above it.
+        return None
+    if not data or not isinstance(data, Mapping):
+        return None
+    error = data.get("error")
+    if isinstance(error, str) and error:
+        return error
+    if provider_name.lower() == "meta":
+        return meta_invalid_token_error_code(error)
+    return None
+
+
+def _is_permanent_oauth_refresh_error(
+    provider_name: str, status_code: int, error_code: str | None
+) -> bool:
+    """Whether the provider's error body unambiguously says the refresh
+    token itself is dead. Any other failure (an unrecognized error code, a
+    malformed/absent body) is left to the caller as a transient failure --
+    see _OAuthRefreshPermanentlyInvalid.
+
+    A 5xx is excluded regardless of what the body claims: it's the
+    provider's own signal that something went wrong on its end, never
+    proof that this specific grant is dead (a proxy/gateway outage, or a
+    misbehaving custom/admin-configured token endpoint, could easily wrap
+    a stale cached or otherwise-unrelated error body in a 500). Every
+    other status is eligible, deliberately including 2xx: GitHub's classic
+    OAuth Apps token endpoint reports a dead refresh token (``{"error":
+    "bad_refresh_token"}``) via a 200 response rather than a 4xx, so
+    requiring 400/401 here would make that case unclassifiable no matter
+    what the caller checks.
+
+    See _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES for why no code
+    (including RFC 6749's own invalid_grant) is trusted for every
+    provider.
+    """
+    if status_code >= 500:
+        return False
+    return error_code in _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES.get(
+        provider_name.lower(), frozenset()
+    )
+
+
+def _log_and_classify_failed_refresh(
+    *, response: httpx.Response, provider_name: str
+) -> None:
+    """Log a failed refresh response and raise _OAuthRefreshPermanentlyInvalid
+    when its body confirms the refresh token itself is dead. Shared by
+    every response shape that means "this refresh did not produce a usable
+    access_token" -- a non-200 status, and a 200 status whose body still
+    lacks access_token (see _is_permanent_oauth_refresh_error).
+    """
+    # Providers occasionally echo something far longer than a short error
+    # code/slug into `error` -- capped to bound the resulting log line,
+    # reusing api/auth.py's own limit for provider-controlled
+    # token-endpoint text rather than a second, independently-tunable copy.
+    from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
+
+    error_code = _oauth_refresh_error_code(response, provider_name)
+    logger.error(
+        "Failed to refresh %s token (status %s, error=%s)",
+        provider_name,
+        response.status_code,
+        (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
+    )
+    if _is_permanent_oauth_refresh_error(
+        provider_name, response.status_code, error_code
+    ):
+        raise _OAuthRefreshPermanentlyInvalid()
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
+    from ..models.user_oauth import is_undecryptable_oauth_token
+
+    # A ciphertext that cannot be opened with the configured key is exposed by
+    # the ORM as an empty reconnect marker.  Handle it before the expiry check
+    # so rows without ``expires_at`` cannot be treated as usable credentials.
+    if is_undecryptable_oauth_token(
+        getattr(oauth_account, "access_token", None)
+    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
+        logger.warning(
+            "Cannot refresh %s OAuth credentials for user %s: "
+            "stored token was encrypted with a rotated key; reconnect required",
+            provider_name,
+            oauth_account.user_id,
+        )
+        return False
+
     if not oauth_account.expires_at:
         return True  # Assume valid if no expiration is set
 
@@ -572,8 +916,12 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ...core.utils.encryption import decrypt_value
+        from ..api.auth import (
+            _resolve_oauth_client_per_field,
+            _resolve_oauth_redirect_uri,
+        )
         from ..models.oauth_provider import OAuthProvider
+        from ..oauth_provider_quirks import requires_json_accept_header
 
         provider_config = (
             db.query(OAuthProvider)
@@ -584,8 +932,14 @@ async def refresh_oauth_token_if_needed(
             logger.warning(f"Unknown provider for refresh: {provider_name}")
             return False
 
-        client_id = decrypt_value(provider_config.client_id)
-        client_secret = decrypt_value(provider_config.client_secret)
+        # Matches the connect path (_resolve_oauth_secret, api/auth.py) --
+        # without the same env-var fallback here, a provider row seeded with
+        # blank credentials (e.g. a migration that ran before the app's env
+        # was fully populated) connects fine via the env fallback but then
+        # fails every refresh, since this used to read only the DB row.
+        client_id, client_secret = _resolve_oauth_client_per_field(
+            provider_name, provider_config
+        )
 
         if not client_id or not client_secret:
             logger.warning(
@@ -600,15 +954,18 @@ async def refresh_oauth_token_if_needed(
 
         if normalized_provider == "meta":
             async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    provider_config.token_url,
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "fb_exchange_token": oauth_account.access_token,
-                    },
-                    timeout=10.0,
+                response = await _request_oauth_refresh_with_retries(
+                    lambda: client.get(
+                        provider_config.token_url,
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "fb_exchange_token": oauth_account.access_token,
+                        },
+                        timeout=10.0,
+                    ),
+                    provider_name=provider_name,
                 )
 
             if response.status_code == 200:
@@ -624,19 +981,24 @@ async def refresh_oauth_token_if_needed(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
                     return True
-            else:
-                logger.error(
-                    "Failed to refresh %s token (status %s)",
-                    provider_name,
-                    response.status_code,
-                )
+            # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+            # classic OAuth Apps token endpoint reporting a dead
+            # refresh_token) a 200 whose body still lacks access_token.
+            _log_and_classify_failed_refresh(
+                response=response, provider_name=provider_name
+            )
             return False
 
         if not oauth_account.refresh_token:
+            # Unlike the provider-config checks above (which can self-heal
+            # once an admin fixes the OAuthProvider row, so are left as a
+            # transient False), a missing refresh_token is a property of
+            # this specific account row -- no retry will ever produce one,
+            # so this is permanent.
             logger.warning(
                 f"Token expired for {provider_name} but no refresh_token available."
             )
-            return False
+            raise _OAuthRefreshPermanentlyInvalid()
 
         data = {
             "grant_type": "refresh_token",
@@ -655,9 +1017,124 @@ async def refresh_oauth_token_if_needed(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        refresh_token_url = provider_config.token_url
+        from ..oauth_account_hosts import (
+            OAuthAccountError,
+            get_oauth_account_host,
+            normalize_oauth_account,
+            resolve_oauth_account_endpoints,
+        )
+
+        account_host = get_oauth_account_host(normalized_provider)
+        if account_host is not None:
+            # Refresh on the account the grant was issued for (stored in
+            # instance_url at connect, see oauth_account_hosts). A missing or
+            # malformed stored label never heals on retry, so it is
+            # permanent; a resolution failure below stays transient.
+            try:
+                stored_account = normalize_oauth_account(oauth_account.instance_url)
+            except OAuthAccountError:
+                logger.warning(
+                    "Cannot refresh %s token for user %s: no valid account "
+                    "stored on this connection.",
+                    provider_name,
+                    oauth_account.user_id,
+                )
+                raise _OAuthRefreshPermanentlyInvalid() from None
+            account_endpoints = await asyncio.to_thread(
+                resolve_oauth_account_endpoints, account_host, stored_account
+            )
+            refresh_token_url = account_endpoints.token_url
+            data.update(account_host.token_params)
+            # A redirect would skip the account host's private-network check.
+            post_kwargs["follow_redirects"] = False
+        if normalized_provider == "deputy":
+            # Deputy's docs (both the code-exchange and refresh legs) list
+            # `redirect_uri` and `scope` as required body params here too,
+            # matching the code-exchange branch in api/auth.py. scope is
+            # read from provider_config.default_scopes -- same source, and
+            # same "no app-level oauth_scopes override" caveat, as that
+            # code-exchange leg (see its comment) -- rather than a
+            # hardcoded literal, so an admin who edits this provider row's
+            # scopes doesn't leave refresh silently still sending the old
+            # value.
+            # Resolved from the CURRENT provider row/env var, not whatever
+            # redirect_uri was actually used for this grant's original
+            # authorization -- UserOAuth has no per-grant redirect_uri
+            # column to read instead (no provider in this codebase needs
+            # one; Deputy is the only one requiring redirect_uri on
+            # refresh at all). If an admin changes the Deputy provider's
+            # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
+            # already connected, Deputy may reject those users' next
+            # refresh with a redirect_uri mismatch until they reconnect --
+            # a known limitation, not something this function can resolve
+            # without a schema change.
+            data["redirect_uri"] = _resolve_oauth_redirect_uri(
+                provider_name, provider_config
+            )
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in provider_config.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
+            # Deputy's generic once.deputy.com host only serves the initial
+            # code exchange -- token renewal must go to the same per-install
+            # host returned as `endpoint` in that exchange (and persisted as
+            # UserOAuth.instance_url), not the static token_url on the
+            # provider row. See deputy.py's _instance_url() for the matching
+            # use-time validation of that same stored value.
+            stored_instance_url = getattr(oauth_account, "instance_url", None)
+            if not stored_instance_url:
+                # A per-account data problem (like the missing refresh_token
+                # check above), not a provider-config one -- retrying will
+                # never produce an instance_url, so this is permanent.
+                logger.warning(
+                    f"Cannot refresh Deputy token for user "
+                    f"{oauth_account.user_id}: no instance_url stored on "
+                    "this connection."
+                )
+                raise _OAuthRefreshPermanentlyInvalid()
+            refresh_token_url = f"{stored_instance_url}/oauth/access_token"
+
         headers = {}
         if normalized_provider == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if requires_json_accept_header(normalized_provider):
+            headers["Accept"] = "application/json"
+
+        from ..api.auth import _is_employment_hero_token_url
+        from ..oauth_provider_quirks import matches_provider_family
+
+        if matches_provider_family(
+            normalized_provider, "employment-hero"
+        ) and _is_employment_hero_token_url(refresh_token_url):
+            # Matches the code-exchange branch in api/auth.py: Employment
+            # Hero's partner guide requires grant_type and refresh_token as
+            # query parameters on the refresh request too, with only the
+            # credential fields in the form body. Gated on
+            # _is_employment_hero_token_url too, not just the family match
+            # -- same reasoning as the code-exchange branch: an admin-
+            # created "employment-hero"-family row's token_url isn't
+            # guaranteed to actually be Employment Hero's, and this
+            # EH-specific wire quirk would break a genuinely different
+            # token endpoint's refresh instead of using the standard RFC
+            # 6749 body-only shape it likely expects. Putting a long-lived
+            # credential (refresh_token) in a query string is a generic
+            # secret-exposure anti-pattern (it can end up in proxy/server
+            # access logs a form body wouldn't) -- accepted here as a
+            # residual risk forced by Employment Hero's documented contract,
+            # not a choice this codebase would otherwise make. No httpx/
+            # httpcore request-logging middleware exists in this codebase
+            # today (those loggers are pinned to WARNING) and the
+            # configured HTTPS proxy only sees a CONNECT tunnel, never this
+            # URL's query string -- reassess this note if either changes.
+            post_kwargs["params"] = {
+                "grant_type": data.pop("grant_type"),
+                "refresh_token": data.pop("refresh_token"),
+            }
 
         # Matches the code-exchange branch in api/auth.py: Atlassian's token
         # endpoint requires a JSON body on refresh too, not form-urlencoded.
@@ -667,12 +1144,15 @@ async def refresh_oauth_token_if_needed(
             body_kwarg = {"json": data}
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                provider_config.token_url,
-                headers=headers,
-                timeout=10.0,
-                **body_kwarg,
-                **post_kwargs,
+            response = await _request_oauth_refresh_with_retries(
+                lambda: client.post(
+                    refresh_token_url,
+                    headers=headers,
+                    timeout=10.0,
+                    **body_kwarg,
+                    **post_kwargs,
+                ),
+                provider_name=provider_name,
             )
 
         if response.status_code == 200:
@@ -681,22 +1161,73 @@ async def refresh_oauth_token_if_needed(
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
+                # An account-hosted grant stays bound to its account.
+                if "instance_url" in data and account_host is None:
+                    # Matches the code-exchange branch in api/auth.py:
+                    # Salesforce can return a different instance_url on
+                    # refresh (e.g. after an org migration), so this is
+                    # re-persisted here too, not just at initial connect.
+                    # Type/non-empty checked (not full host/scheme
+                    # validation -- that stays salesforce.py's own
+                    # use-time job) before overwriting: this row's
+                    # existing instance_url is a previously-valid value,
+                    # and a malformed refresh response replacing it would
+                    # break the connector on its next use with no signal
+                    # at refresh time that anything went wrong.
+                    refreshed_instance_url = data["instance_url"]
+                    if (
+                        isinstance(refreshed_instance_url, str)
+                        and refreshed_instance_url
+                    ):
+                        oauth_account.instance_url = refreshed_instance_url
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "instance_url; keeping the previously stored value"
+                        )
+                if normalized_provider == "deputy" and "endpoint" in data:
+                    # Deputy's equivalent of the block above -- its refresh
+                    # response carries the per-install host under `endpoint`,
+                    # not `instance_url`, and without a scheme (matches the
+                    # code-exchange branch in api/auth.py).
+                    from ..api.auth import _normalize_deputy_endpoint
+
+                    refreshed_endpoint = _normalize_deputy_endpoint(data["endpoint"])
+                    if refreshed_endpoint:
+                        oauth_account.instance_url = refreshed_endpoint
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "endpoint; keeping the previously stored value"
+                        )
                 if "expires_in" in data:
+                    # int(), not a bare pass-through: MYOB's documented token
+                    # response (both the code-exchange and refresh legs)
+                    # returns this as a JSON *string* (e.g. "1200"), which
+                    # timedelta()'s seconds kwarg rejects outright
+                    # (TypeError) -- MYOB is the first provider whose
+                    # refresh reaches this generic branch with no
+                    # provider-specific handling (unlike Meta's own branch
+                    # a few lines above, or the code-exchange leg in
+                    # api/auth.py's generic_oauth_callback, both of which
+                    # already cast this the same way).
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
-                        seconds=data["expires_in"]
+                        seconds=int(data["expires_in"])
                     )
                 db.flush([oauth_account])
                 logger.info(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
                 return True
-        else:
-            logger.error(
-                "Failed to refresh %s token (status %s)",
-                provider_name,
-                response.status_code,
-            )
+        # Not a successful refresh -- a non-200 status, or (e.g. GitHub's
+        # classic OAuth Apps token endpoint reporting a dead refresh_token)
+        # a 200 whose body still lacks access_token.
+        _log_and_classify_failed_refresh(response=response, provider_name=provider_name)
 
+    except _OAuthRefreshPermanentlyInvalid:
+        raise
     except Exception as e:
         logger.error(
             "Exception refreshing token for %s with %s",
@@ -1138,6 +1669,15 @@ def _load_tool_runtime_policy_snapshot(
 
     from ..models.user import User
 
+    # A registering application enforces authorization through the policy
+    # hooks, so "could not resolve the policy" must not be reported as "no
+    # policy configured". Both branches below reach the hooks not at all, so
+    # the application has nothing to intercept; the loader itself has to fail
+    # closed. Recorded per input and collapsed into a deny-all allowlist after
+    # every input has had its own isolated Session, so an unresolvable
+    # overrides read cannot skip the independent allowlist read.
+    unresolved: set[str] = set()
+
     def load_policy_input(
         input_name: str,
         loader: Callable[[Any, Any], Any],
@@ -1147,11 +1687,21 @@ def _load_tool_runtime_policy_snapshot(
             try:
                 user = db.query(User).filter(User.id == user_id).first()
                 if user is None:
+                    unresolved.add(input_name)
+                    logger.warning(
+                        "Tool policy %s unresolved: user %s could not be reloaded",
+                        input_name,
+                        user_id,
+                    )
                     return default
                 return loader(db, user)
             except Exception as exc:
+                # Pool timeouts keep propagating (the caller retries the turn),
+                # and CancelledError is a BaseException that is deliberately
+                # not caught here.
                 if is_database_pool_timeout(exc):
                     raise
+                unresolved.add(input_name)
                 logger.exception("Failed to get user tool %s", input_name)
                 return default
 
@@ -1168,6 +1718,16 @@ def _load_tool_runtime_policy_snapshot(
         lambda db, user: normalize_tool_allowlist(get_user_tool_allowlist(db, user)),
         None,
     )
+    if unresolved:
+        fail_closed = unresolved_tool_policy_allowlist()
+        if fail_closed is not None:
+            logger.error(
+                "Tool policy unresolved for user %s (%s); denying every tool "
+                "for this turn",
+                user_id,
+                ", ".join(sorted(unresolved)),
+            )
+            tool_allowlist = fail_closed
     return _ToolRuntimePolicySnapshot(
         tool_overrides=tool_overrides,
         tool_allowlist=tool_allowlist,
@@ -1194,6 +1754,10 @@ class WebToolConfig(BaseToolConfig):
         vision_model: Optional[Any] = None,
         llm: Optional[Any] = None,
         include_mcp_tools: bool = True,
+        # Set by a caller that must not let this config materialize live MCP
+        # connectors, but still wants the model told why. The selected servers
+        # are reported unavailable with this reason instead of being loaded.
+        mcp_unavailable_reason: Optional[str] = None,
         task_id: Optional[str] = None,
         workspace_base_dir: Optional[str] = None,
         browser_tools_enabled: bool = True,
@@ -1210,6 +1774,7 @@ class WebToolConfig(BaseToolConfig):
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
+        mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
         execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
@@ -1218,6 +1783,13 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
+        # Appended after every pre-existing parameter (not inserted
+        # alongside its closest siblings above) so a caller still using
+        # positional arguments for anything after agent_call_stack keeps
+        # binding the same values it always did.
+        voice: Optional[str] = None,
+        mcp_actor_stdio_connection_adapter: Any = None,
+        mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1245,6 +1817,14 @@ class WebToolConfig(BaseToolConfig):
         # object can be overwritten by the model, and this value must not
         # be confusable with that one at the resolution point.
         self._declared_knowledge_bases = declared_knowledge_bases
+        # Internal storage boundary for actor-scoped stdio. It is deliberately
+        # separate from ordinary MCP env/auth hooks and receives the exact
+        # actor and lifecycle identity on every secret read.
+        self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
+        self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_actor_stdio_session_identities: dict[
+            str, ActorMCPStdioSessionIdentity
+        ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
         self._live_db = db
@@ -1288,6 +1868,7 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_auth_context = (
             mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
         )
+        self._mcp_runtime_authorization_policy = mcp_runtime_authorization_policy
         if connector_runtime_turn_id is None:
             raw_turn_id = workspace_config.get("turn_id")
             connector_runtime_turn_id = (
@@ -1299,6 +1880,7 @@ class WebToolConfig(BaseToolConfig):
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
+        self._mcp_unavailable_reason = mcp_unavailable_reason
         self._task_id = task_id
         self._browser_tools_enabled = browser_tools_enabled
         self._allowed_collections = allowed_collections
@@ -1315,6 +1897,10 @@ class WebToolConfig(BaseToolConfig):
         self._parent_task_id = parent_task_id
         self._parent_tracer = parent_tracer
         self._agent_call_stack = list(agent_call_stack or [])
+        # Already-resolved onboarding output-voice preference (see
+        # get_voice's docstring on BaseToolConfig for why this threads into
+        # delegated AgentTool children).
+        self._voice = voice
         self._excluded_agent_id: Optional[int] = None
 
         # Cache user object for hook queries.
@@ -1325,6 +1911,13 @@ class WebToolConfig(BaseToolConfig):
         # separate flag tracks whether the hook has been consulted yet.
         self._cached_tool_allowlist: Optional[list] = None
         self._tool_allowlist_cached: bool = False
+        # Names the policy inputs whose read could not be resolved (the hook
+        # never ran). ``get_user_tool_allowlist`` turns a non-empty set into a
+        # deny-all allowlist so the execution layer fails closed instead of
+        # building every tool. Each accessor clears its own entry before
+        # re-reading, so a transient failure cannot latch deny-all onto a config
+        # that is reused across turns.
+        self._unresolved_tool_policy_inputs: set[str] = set()
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
         self._sandbox: Optional[Any] = sandbox
@@ -1363,8 +1956,8 @@ class WebToolConfig(BaseToolConfig):
         self._browser_locale_resolved = False
         self._cached_browser_locale: Optional[str] = None
 
-    def _build_mcp_file_allowed_dirs(self) -> str:
-        """Build comma-separated file roots that local MCP tools may read."""
+    def _mcp_file_allowed_dir_paths(self) -> list[str]:
+        """Build unique, resolved file roots for local MCP read tools."""
         dirs: list[str] = []
         base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
         task_id = self._workspace_config.get("task_id")
@@ -1380,7 +1973,28 @@ class WebToolConfig(BaseToolConfig):
             if dir_path not in seen:
                 unique_dirs.append(dir_path)
                 seen.add(dir_path)
-        return ",".join(unique_dirs)
+        return unique_dirs
+
+    def _build_mcp_task_output_dir(self) -> str:
+        """Single write-target root for connectors that create new files in
+        the task workspace (currently Google Drive, OneDrive, and SharePoint
+        download tools).
+
+        Deliberately distinct from _mcp_file_allowed_dir_paths() above:
+        that method builds a read allowlist that may reasonably include
+        allowed_external_dirs (e.g. read-only KB folders) alongside the
+        task dir, and multiple consumers of it pick whichever entry a
+        requested path happens to fall under. A write target has no such
+        "any of these" semantics — writing into an external read-only dir
+        by picking the wrong list entry would be wrong, not just
+        suboptimal — so this only ever returns the task dir itself, never
+        an external dir, and is empty whenever there's no task workspace.
+        """
+        task_id = self._workspace_config.get("task_id")
+        if not task_id:
+            return ""
+        base_dir = Path(str(self._workspace_config.get("base_dir", get_uploads_dir())))
+        return str((base_dir / str(task_id)).expanduser().resolve())
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
         """Extract is_admin flag from the request user, defaulting to False.
@@ -1541,6 +2155,9 @@ class WebToolConfig(BaseToolConfig):
         if not self._include_mcp_tools:
             return []
 
+        if self._mcp_unavailable_reason is not None:
+            return self._refused_mcp_server_configs(self._mcp_unavailable_reason)
+
         if self._cached_mcp_configs is not None:
             if self._mcp_config_cache_is_valid():
                 return self._cached_mcp_configs
@@ -1552,6 +2169,53 @@ class WebToolConfig(BaseToolConfig):
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
         return configs
+
+    def _refused_mcp_server_configs(self, reason: str) -> List[Dict[str, Any]]:
+        """Project the selected MCP servers into unavailable configs.
+
+        Deliberately does not load anything: the point of the refusal is that
+        no connector is materialized, so paying the config scan to name the
+        servers more precisely would defeat it. The selection spec already
+        names them whenever the selection is server-scoped, which is the case
+        this refusal exists for -- a delegated agent whose persisted selection
+        lists ``mcp:<server>``.
+
+        An unrestricted selection (``scoped_mcp_servers()`` is ``None``, i.e.
+        the plain ``mcp`` parent or ALL mode) has no names to report without
+        that scan, so it yields no tools at all. The refusal still holds; only
+        the explanation is best effort.
+        """
+
+        spec = self._tool_selection_spec
+        scoped = spec.scoped_mcp_servers() if spec is not None else None
+        if not scoped:
+            return []
+        return [
+            {
+                "name": server_name,
+                "config": {"unavailable": True, "reason": reason},
+            }
+            for server_name in sorted(scoped)
+        ]
+
+    def get_actor_mcp_stdio_session_identities(
+        self,
+    ) -> Dict[str, ActorMCPStdioSessionIdentity]:
+        """Return host-only identities that must never enter MCP configs."""
+
+        return dict(self._mcp_actor_stdio_session_identities)
+
+    def get_actor_mcp_stdio_session_consumer(self) -> Any:
+        """Return the sandbox-only Chrome consumer for host-side identities."""
+
+        if not self._mcp_actor_stdio_session_identities:
+            return None
+
+        from ..services.chrome_mcp_runtime import (
+            consume_chrome_actor_stdio_session,
+        )
+
+        return consume_chrome_actor_stdio_session
 
     def _serialize_mcp_user_id(self) -> str:
         """Return the explicit identity used to isolate an MCP config."""
@@ -1639,9 +2303,9 @@ class WebToolConfig(BaseToolConfig):
         """Switch the per-turn connector runtime source for reused agents.
 
         ``WebToolConfig`` instances are cached with ``AgentService`` by task.
-        Runtime secrets/auth selectors are intentionally per-turn, so an append
-        turn must not keep using the first turn's resolved connector runtime
-        view or MCP config cache.
+        Resolved connector values/configs are turn-scoped: append and reply
+        turns must reload them. Accepted raw inputs, when retained for the
+        same run, are supplied by the runtime store rather than this cache.
         """
 
         normalized_turn_id = turn_id if isinstance(turn_id, str) else None
@@ -1649,6 +2313,19 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
+    def set_mcp_actor_execution_identity(
+        self, identity: MCPActorExecutionIdentity | None
+    ) -> bool:
+        """Advance the exact actor execution fence on a reused tool config."""
+
+        if self._mcp_actor_execution_identity == identity:
+            return False
+        self._mcp_actor_execution_identity = identity
         self._cached_mcp_configs = None
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
@@ -1990,6 +2667,8 @@ class WebToolConfig(BaseToolConfig):
                     {
                         "server_name": failure.server_name,
                         "reason": failure.reason,
+                        "error_type": failure.cause_type,
+                        "status_code": failure.status_code,
                     }
                     for failure in summary.failures
                 ],
@@ -2037,21 +2716,88 @@ class WebToolConfig(BaseToolConfig):
         """Get active agent delegation call stack for recursion prevention."""
         return self._agent_call_stack
 
+    def get_voice(self) -> Optional[str]:
+        """See BaseToolConfig.get_voice's docstring."""
+        return self._voice
+
+    def get_mcp_unavailable_reason(self) -> Optional[str]:
+        """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
+        return self._mcp_unavailable_reason
+
+    def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
+        """Record that a policy input could not be resolved for this turn.
+
+        The registered hook never ran on these paths, so the application that
+        owns authorization has nothing to intercept and cannot repair the read.
+        ``get_user_tool_allowlist`` converts a recorded input into a deny-all
+        allowlist so the execution layer builds no tools instead of the full
+        default set. Entries live only as long as the cached read that produced
+        them: each accessor drops its own entry before consulting the hook
+        again, so a transient failure denies one turn rather than latching.
+        """
+        if not has_user_tool_policy_hooks():
+            # No application policy to lose: standalone xagent keeps its
+            # unrestricted default rather than denying every tool.
+            return
+        self._unresolved_tool_policy_inputs.add(input_name)
+        # Invalidate any allowlist already cached by an earlier read. The two
+        # inputs are read in either order, so a clean allowlist cached before
+        # this failure would otherwise keep reporting "no filtering" and hand
+        # the turn the full tool set. Re-deriving it applies the denial.
+        if input_name != "allowlist":
+            self._tool_allowlist_cached = False
+            self._cached_tool_allowlist = None
+        logger.error(
+            "Tool policy %s unresolved for user %s (%s); denying every tool "
+            "for this turn",
+            input_name,
+            self._user_id,
+            reason,
+        )
+
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.
 
-        Both display layer and execution layer use this as the single
-        source of truth for per-user tool policies.
+        Both display layer and execution layer read per-user tool policy from
+        here, but this is no longer the whole picture: ``{}`` means either "no
+        overrides configured" or "the policy could not be resolved", and the
+        two are not distinguishable from the return value. The fail-closed
+        signal for an unresolved read is carried by
+        :meth:`get_user_tool_allowlist`, so the execution layer must consult
+        both.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._cached_tool_overrides is not None:
             return self._cached_tool_overrides
+        # This read supersedes whatever the previous one concluded.
+        self._unresolved_tool_policy_inputs.discard("overrides")
         if self._user is None:
+            # No user to hand the hook: the policy is unresolved, not absent.
+            # The overrides mapping stays a dict (the tool-listing API indexes
+            # it); ``get_user_tool_allowlist`` carries the fail-closed signal.
+            #
+            # Gated on the overrides hook specifically, not on either hook:
+            # with no overrides hook registered ``get_user_tool_overrides``
+            # ignores ``user`` and returns ``{}`` regardless, so a missing user
+            # resolves this input. Recording it would deny an allowlist-only
+            # deployment whose allowlist hook answered successfully.
+            if has_user_tool_overrides_hook():
+                self._note_unresolved_tool_policy("overrides", "no runtime user")
             self._cached_tool_overrides = {}
             return {}
         try:
             self._cached_tool_overrides = get_user_tool_overrides(self.db, self._user)
-        except Exception:
+        except Exception as exc:
+            # A pool checkout timeout is not an unresolved policy: the very next
+            # step needs the same pool, so propagate it for the caller to retry
+            # rather than spending the turn with no tools. Matches
+            # ``_load_tool_runtime_policy_snapshot``. Nothing is cached and no
+            # input is recorded, so the retry re-reads from scratch.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool overrides")
+            self._note_unresolved_tool_policy("overrides", "hook read failed")
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
 
@@ -2126,6 +2872,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = snapshot.tool_overrides
         self._cached_tool_allowlist = snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # The worker resolved the policy itself and already folded any
+        # unresolvable input into ``snapshot.tool_allowlist``; stale entries from
+        # an earlier in-request read must not latch deny-all onto this snapshot.
+        self._unresolved_tool_policy_inputs.clear()
 
     async def prepare_factory_runtime(self) -> None:
         """Prefetch synchronous ToolFactory inputs without blocking its loop.
@@ -2270,6 +3020,10 @@ class WebToolConfig(BaseToolConfig):
                 self._cached_tool_overrides = None
                 self._tool_allowlist_cached = False
                 self._cached_tool_allowlist = None
+                # The accessors below each drop their own entry before
+                # re-reading, so nothing from a previous turn survives; clearing
+                # here keeps that explicit for the in-request branch.
+                self._unresolved_tool_policy_inputs.clear()
                 self.refresh_user_tool_overrides()
                 self.refresh_user_tool_allowlist()
                 return
@@ -2288,6 +3042,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = policy_snapshot.tool_overrides
         self._cached_tool_allowlist = policy_snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # This snapshot is authoritative for the turn (the loader already
+        # fail-closed any input it could not resolve), so drop entries left by
+        # an earlier read rather than denying every tool for the rest of the run.
+        self._unresolved_tool_policy_inputs.clear()
         self._pending_runtime_policy = policy_snapshot
 
     def refresh_user_tool_overrides(self) -> dict:
@@ -2303,16 +3061,45 @@ class WebToolConfig(BaseToolConfig):
         list means keep only those tool names (execution layer only). The
         allowlist is resolved from the active execution scope by the hook, so
         it can differ per turn even for the same user.
+
+        When a policy hook is registered but a policy input could not be
+        resolved, this returns the empty list ("no tools allowed") rather than
+        ``None``: the hook never ran, so the application enforcing
+        authorization has nothing to intercept, and reporting "no allowlist"
+        would build the globally available tool set. With no hook registered
+        there is no policy to lose and the unrestricted default is kept.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._tool_allowlist_cached:
             return self._cached_tool_allowlist
+        # This read supersedes whatever the previous one concluded. The
+        # overrides entry is left alone: an unresolved overrides read in this
+        # same turn must still deny below.
+        self._unresolved_tool_policy_inputs.discard("allowlist")
         try:
+            # ``self._user`` may legitimately be ``None`` here: the allowlist is
+            # resolved from the active execution scope, so the hook is consulted
+            # with whatever user the config holds rather than short-circuited.
             self._cached_tool_allowlist = normalize_tool_allowlist(
                 get_user_tool_allowlist(self.db, self._user)
             )
-        except Exception:
+        except Exception as exc:
+            # See get_user_tool_overrides: a pool timeout propagates for retry
+            # instead of being recorded as an unresolved policy. Left uncached
+            # so the retry re-reads, and no deny-all is applied on the way out.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool allowlist")
+            self._note_unresolved_tool_policy("allowlist", "hook read failed")
             self._cached_tool_allowlist = None
+        if self._unresolved_tool_policy_inputs:
+            # An unresolved read on either policy input denies every tool
+            # rather than reporting "no allowlist configured", which would
+            # skip the execution layer's positive filter entirely.
+            fail_closed = unresolved_tool_policy_allowlist()
+            if fail_closed is not None:
+                self._cached_tool_allowlist = fail_closed
         self._tool_allowlist_cached = True
         return self._cached_tool_allowlist
 
@@ -2320,6 +3107,10 @@ class WebToolConfig(BaseToolConfig):
         """Reload the positive tool allowlist from the registered hook."""
         # The active execution scope (hence the CA allowlist) can change while
         # an AgentService instance is reused across turns.
+        #
+        # ``get_user_tool_allowlist`` drops only its own unresolved entry before
+        # re-reading, so a fresh allowlist answer lifts the denial it caused
+        # while an unresolved overrides read from the same turn still denies.
         self._tool_allowlist_cached = False
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
@@ -2701,6 +3492,7 @@ class WebToolConfig(BaseToolConfig):
         providers: list[str],
         resource: str | None,
         resolver: TokenResolver | None = None,
+        auth_type: str | None,
     ) -> _ResolvedHookToken | None:
         if resolver is None:
             resolver, _ = _get_oauth_token_resolver_hook()
@@ -2713,6 +3505,7 @@ class WebToolConfig(BaseToolConfig):
                 user_id=int(self._user_id),
                 scope=self.get_execution_scope(),
                 resource=resource,
+                auth_type=auth_type,
             )
             try:
                 resolved = await _maybe_await_oauth_token_resolver_result(
@@ -2753,6 +3546,7 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         failed_generation: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any] | ClassifiedToolFailure | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
 
@@ -2777,6 +3571,7 @@ class WebToolConfig(BaseToolConfig):
                 challenge_scope=challenge.scope,
                 failed_generation=failed_generation,
             ),
+            auth_type=auth_type,
         )
         try:
             resolved = await _maybe_await_oauth_token_resolver_result(resolver(request))
@@ -2818,6 +3613,7 @@ class WebToolConfig(BaseToolConfig):
             scope=scope,
             resource=resource,
             non_auth_connection=non_auth_connection,
+            auth_type=auth_type,
         )
 
     def _build_resolver_owned_mcp_connection(
@@ -2831,6 +3627,7 @@ class WebToolConfig(BaseToolConfig):
         scope: Any,
         resource: str | None,
         non_auth_connection: dict[str, Any],
+        auth_type: str | None,
     ) -> dict[str, Any]:
         from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
@@ -2848,6 +3645,7 @@ class WebToolConfig(BaseToolConfig):
                 resource=resource,
                 failed_generation=resolved.generation,
                 non_auth_connection=non_auth_connection,
+                auth_type=auth_type,
             )
 
         connection = connection_with_bearer_authorization(
@@ -2895,6 +3693,14 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidGeneration",
                 resource=resource,
             )
+        if resolved.instance_url is not None and (
+            type(resolved.instance_url) is not str or not resolved.instance_url
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidInstanceUrl",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -2909,6 +3715,7 @@ class WebToolConfig(BaseToolConfig):
             access_token=resolved.access_token,
             expires_at=expires_at,
             generation=resolved.generation,
+            instance_url=resolved.instance_url,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
@@ -2938,9 +3745,7 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
-            resource=_bounded_oauth_metadata(error.resource)
-            if error.resource is not None
-            else None,
+            resource=_redacted_bounded_resource(error.resource),
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -2963,9 +3768,12 @@ class WebToolConfig(BaseToolConfig):
         )
         self._mcp_oauth_diagnostics.append(diagnostic)
         logger.warning(
-            "OAuth token resolver failed for MCP server '%s' with %s",
+            "OAuth token resolver failed for MCP server '%s' with %s "
+            "(failure_code=%s, resource=%s)",
             getattr(server, "name", "<unknown>"),
             error.exception_type,
+            error.failure_code,
+            diagnostic["resource"],
         )
         return self._build_unavailable_mcp_config(
             server=server,
@@ -3007,7 +3815,6 @@ class WebToolConfig(BaseToolConfig):
             "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": serialized_user_id,
-            "allow_users": [serialized_user_id],
         }
 
     def _build_oauth_mcp_stdio_transport_config(
@@ -3016,6 +3823,7 @@ class WebToolConfig(BaseToolConfig):
         server: Any,
         app_info: Mapping[str, Any],
         access_token: str,
+        instance_url: str | None = None,
     ) -> Dict[str, Any]:
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
@@ -3031,6 +3839,28 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
+                elif token_type == "instance_url":
+                    if not instance_url:
+                        raise _OAuthInstanceUrlRequired(env_key=env_key)
+                    env[env_key] = instance_url
+                else:
+                    # A typo'd env_mapping value (e.g. "acess_token") would
+                    # otherwise silently emit neither an env var nor an
+                    # error -- the exact opaque failure mode
+                    # _OAuthInstanceUrlRequired exists to prevent for the
+                    # one token_type above it. Not developer-only: an admin
+                    # can reach this through POST /admin/mcp/apps, whose
+                    # launch_config is an unvalidated free-form dict (see
+                    # PublicMCPAppCreate in admin_mcp.py -- its validator
+                    # checks command/required_env/url/auth.type, not
+                    # env_mapping's values), so a hand-typed custom OAuth
+                    # app's env_mapping can carry this too.
+                    logger.warning(
+                        "Unrecognized launch_config.env_mapping token_type "
+                        "'%s' for env var '%s'; no value forwarded",
+                        token_type,
+                        env_key,
+                    )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -3047,10 +3877,31 @@ class WebToolConfig(BaseToolConfig):
                     "http_proxy": os.environ.get("http_proxy", ""),
                 }
             )
-            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-            if allowed_file_dirs:
+            allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
+            if allowed_file_dir_paths:
+                # JSON preserves commas inside directory names. The shared
+                # parser also accepts the legacy comma-delimited form for
+                # manually configured standalone deployments.
+                allowed_file_dirs = json.dumps(allowed_file_dir_paths)
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+                env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = allowed_file_dirs
+            # Distinct from the read allowlists above: Google Drive, OneDrive,
+            # and SharePoint download tools write NEW files into the task workspace, so they
+            # get their own single-value, task-dir-only vars rather than
+            # reusing the read-allowlist shape (see
+            # _build_mcp_task_output_dir's docstring for why that would be
+            # wrong, not just differently-shaped). Upload tools read from the
+            # read allowlists above instead.
+            task_output_dir = self._build_mcp_task_output_dir()
+            if task_output_dir:
+                env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
+                env["XAGENT_ONEDRIVE_OUTPUT_DIR"] = task_output_dir
+                env["XAGENT_SHAREPOINT_OUTPUT_DIR"] = task_output_dir
             transport_config["env"] = env
             return transport_config
 
@@ -3070,25 +3921,298 @@ class WebToolConfig(BaseToolConfig):
             },
         }
 
+    def _legacy_oauth_session_factory(self) -> Callable[[], Any]:
+        """Capture a factory before OAuth maintenance moves to a worker thread."""
+        if self._db_factory is not None:
+            return cast(Callable[[], Any], self._db_factory)
+        if self._live_db is not None:
+            from sqlalchemy.orm import sessionmaker
+
+            return sessionmaker(
+                bind=self._live_db.get_bind().engine,
+                autoflush=False,
+            )
+        return cast(Callable[[], Any], self.get_session_factory())
+
     def _new_legacy_oauth_session(self) -> Any:
         """Open the transaction owner for legacy OAuth token maintenance."""
-        if self._db_factory is not None:
-            return self._db_factory()
-        if self._live_db is not None:
-            from sqlalchemy.orm import Session
+        return self._legacy_oauth_session_factory()()
 
-            return Session(bind=self._live_db.get_bind().engine, autoflush=False)
-        return self.get_session_factory()()
+    async def _finish_legacy_oauth_access_token_resolution(
+        self,
+        *,
+        oauth_db: Any,
+        oauth_account: Any,
+        provider_name: object,
+        user_id: int,
+        resource_owner_key: str | None,
+    ) -> _LegacyOAuthTokenResolution:
+        from ...web.models.user_oauth import UserOAuth
+
+        if not oauth_account:
+            return _LegacyOAuthTokenResolution(access_token=None)
+        if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
+
+        logger.info(
+            "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
+            provider_name,
+            oauth_account.refresh_token is not None,
+            oauth_account.expires_at,
+        )
+        account_id = int(oauth_account.id)
+        attempted_refresh_token = oauth_account.refresh_token
+        ordinary_gmail = is_ordinary_gmail(oauth_account)
+        permanently_invalid = False
+        try:
+            is_valid = await refresh_oauth_token_if_needed(
+                oauth_db,
+                oauth_account,
+                str(provider_name) if provider_name else "",
+            )
+        except _OAuthRefreshPermanentlyInvalid:
+            is_valid = False
+            permanently_invalid = True
+
+        if not is_valid and not permanently_invalid:
+            # A transient failure (network error, timeout, provider outage)
+            # during refresh -- unlike a confirmed dead refresh token, this
+            # may well succeed the next time the connector is used, so the
+            # connection is kept rather than forcing the user to reconnect.
+            logger.warning(
+                "OAUTH CONFIG: Token for '%s' could not be refreshed due to "
+                "a transient error; keeping the connection for a later retry.",
+                provider_name,
+            )
+            oauth_db.rollback()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+                credential_present=True,
+            )
+
+        if permanently_invalid:
+            logger.warning(
+                "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
+                "Clearing stored credentials to prompt user for reconnection.",
+                provider_name,
+            )
+            if resource_owner_key is None:
+                # Ordinary flows preserve the existing recovery path for a
+                # failed flush. Actor flows retain their credential lock so a
+                # concurrent winner cannot be deleted after refresh.
+                oauth_db.rollback()
+                # Unlike the actor flow, nothing serialized the refresh, so
+                # lock the row for the check-then-clear below (the same
+                # per-dialect lock the actor flow takes). Ordinary Gmail's
+                # check below is not atomic with its clear on either dialect:
+                # its tombstone enters the mailbox transition lock, which
+                # commits this session first on PostgreSQL (releasing the
+                # row lock), and on SQLite is an in-process lock that every
+                # other Gmail writer takes before writing, so this session
+                # must not hold the database write lock while waiting for
+                # it. Gmail does not rotate refresh tokens.
+                reread_query = scoped_user_oauth_query(
+                    oauth_db, user_id=user_id, resource_owner_key=None
+                ).filter(UserOAuth.id == account_id)
+                if oauth_db.get_bind().dialect.name != "sqlite":
+                    reread_query = reread_query.with_for_update()
+                elif not ordinary_gmail:
+                    oauth_db.execute(
+                        text("UPDATE user_oauth SET id = id WHERE id = :id"),
+                        {"id": account_id},
+                    )
+                oauth_account = reread_query.populate_existing().first()
+                if (
+                    oauth_account is not None
+                    and oauth_account.refresh_token != attempted_refresh_token
+                ):
+                    # A concurrent refresh or reconnect replaced the grant
+                    # after this refresh was sent. A provider that rotates
+                    # refresh tokens (e.g. Zendesk) rejects the superseded
+                    # one, which says nothing about the stored grant.
+                    logger.warning(
+                        "OAUTH CONFIG: Token for '%s' was replaced while it was "
+                        "being refreshed; keeping the newer credentials.",
+                        provider_name,
+                    )
+                    oauth_db.rollback()
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        refresh_failed=True,
+                        credential_present=True,
+                    )
+            if oauth_account is not None:
+                # Keep the account identity as a reconnect tombstone. Deleting
+                # the row makes a permanently invalid connection
+                # indistinguishable from one that was never authorized, while
+                # retaining either token would keep dead credentials at rest.
+                if (
+                    str(oauth_account.provider) == "gmail"
+                    and oauth_account.resource_owner_key is None
+                ):
+                    # mark_gmail_oauth_reconnect_required clears the tokens
+                    # itself, atomically with quiescing the dependent
+                    # watch/triggers under the account's mailbox transition
+                    # lock. Clearing them here first would let the lock's own
+                    # pre-acquisition commit persist the clear before the
+                    # watch update runs, splitting one transaction into two.
+                    from ..services.gmail_provisioning import (
+                        mark_gmail_oauth_reconnect_required,
+                    )
+
+                    mark_gmail_oauth_reconnect_required(
+                        oauth_db,
+                        oauth_account=oauth_account,
+                    )
+                else:
+                    oauth_account.access_token = ""
+                    oauth_account.refresh_token = None
+                    oauth_account.expires_at = None
+                oauth_db.commit()
+            return _LegacyOAuthTokenResolution(
+                access_token=None,
+                refresh_failed=True,
+                credential_present=True,
+            )
+
+        access_token = str(oauth_account.access_token)
+        instance_url = getattr(oauth_account, "instance_url", None)
+        oauth_db.commit()
+        return _LegacyOAuthTokenResolution(
+            access_token=access_token,
+            instance_url=instance_url,
+            credential_present=True,
+        )
+
+    async def _resolve_actor_oauth_access_token_in_worker(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: str,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve one actor namespace on a worker-thread event loop."""
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = session_factory()
+        try:
+            # Lock the current namespace, not a stale row id. Actor callbacks
+            # replace credentials with delete-and-insert, so the primary key
+            # can change while this resolver waits.
+            actor_query = scoped_user_oauth_query(
+                oauth_db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            ).filter(UserOAuth.provider == app_id)
+            if oauth_db.get_bind().dialect.name == "sqlite":
+                oauth_db.execute(
+                    text(
+                        "UPDATE user_oauth SET id = id "
+                        "WHERE user_id = :user_id "
+                        "AND resource_owner_key = :resource_owner_key "
+                        "AND provider = :provider"
+                    ),
+                    {
+                        "user_id": user_id,
+                        "resource_owner_key": resource_owner_key,
+                        "provider": app_id,
+                    },
+                )
+            else:
+                actor_query = actor_query.with_for_update()
+            # See the ordinary-flow branches in _resolve_legacy_oauth_access_
+            # token for why this is ordered rather than left arbitrary: the
+            # lock above prevents a *new* duplicate from forming during this
+            # resolution, but doesn't retroactively fix a namespace that
+            # already has more than one row from before locking existed (or
+            # from a provider whose identity backfill can't always derive a
+            # non-NULL provider_user_id).
+            oauth_account = actor_query.order_by(UserOAuth.id.desc()).first()
+            logger.info(
+                "OAUTH CONFIG: Checked actor app credential for user %s. Found: %s",
+                user_id,
+                oauth_account is not None,
+            )
+            return await self._finish_legacy_oauth_access_token_resolution(
+                oauth_db=oauth_db,
+                oauth_account=oauth_account,
+                provider_name=provider_name,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            )
+        except Exception:
+            oauth_db.rollback()
+            raise
+        finally:
+            oauth_db.close()
+
+    async def _resolve_actor_oauth_access_token(
+        self,
+        *,
+        provider_name: object,
+        app_id: str,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        from ..services.db_runtime import run_db_io_cancellation_safe
+
+        # Same-process waiters must not open a Session or reserve a pooled
+        # connection. The stable namespace also survives callback replacement
+        # of the credential row.
+        actor_refresh_lock = _actor_oauth_refresh_lock(
+            user_id,
+            resource_owner_key,
+            app_id,
+        )
+        await actor_refresh_lock.acquire()
+        try:
+            session_factory = self._legacy_oauth_session_factory()
+            return await run_db_io_cancellation_safe(
+                lambda: asyncio.run(
+                    self._resolve_actor_oauth_access_token_in_worker(
+                        session_factory=session_factory,
+                        provider_name=provider_name,
+                        app_id=app_id,
+                        resource_owner_key=resource_owner_key,
+                        user_id=user_id,
+                    )
+                )
+            )
+        finally:
+            actor_refresh_lock.release()
 
     async def _resolve_legacy_oauth_access_token(
         self,
         *,
         provider_name: object,
         app_id: object,
+        app_info: Mapping[str, Any] | None = None,
+        resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
-        """Resolve and persist one legacy OAuth account in an isolated transaction."""
-        from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
+        """Resolve and persist one exact OAuth owner in an isolated transaction."""
+        from ...web.mcp_apps import (
+            oauth_grant_keys_rejected_by_app_scope,
+            restrict_to_app_scoped_oauth_grant,
+        )
         from ...web.models.user_oauth import UserOAuth
+
+        if self._user_id is None:
+            return _LegacyOAuthTokenResolution(access_token=None)
+        user_id = int(self._user_id)
+        if resource_owner_key is not None:
+            if not isinstance(app_id, str):
+                return _LegacyOAuthTokenResolution(access_token=None)
+            return await self._resolve_actor_oauth_access_token(
+                provider_name=provider_name,
+                app_id=app_id,
+                resource_owner_key=resource_owner_key,
+                user_id=user_id,
+            )
 
         oauth_db = self._new_legacy_oauth_session()
         try:
@@ -3097,15 +4221,25 @@ class WebToolConfig(BaseToolConfig):
                 # "meta") never requested this app's own oauth_scopes, so it
                 # can't be trusted to carry a permission added after that flow
                 # already existed. See APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT.
+                policy_app = app_info if app_info is not None else app_id
+                provider_candidates = [provider_name, app_id]
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
-                    app_id, [provider_name, app_id]
+                    policy_app, provider_candidates
                 )
                 oauth_account = (
-                    oauth_db.query(UserOAuth)
-                    .filter(
-                        UserOAuth.user_id == self._user_id,
-                        UserOAuth.provider.in_(providers_to_check),
+                    scoped_user_oauth_query(
+                        oauth_db,
+                        user_id=user_id,
+                        resource_owner_key=None,
                     )
+                    .filter(UserOAuth.provider.in_(providers_to_check))
+                    # Deterministic tie-break for the rare case of more than
+                    # one row for this (user, provider) set (e.g. a provider
+                    # whose identity backfill can't always derive a non-NULL
+                    # provider_user_id, like Employment Hero with zero
+                    # accessible organisations) -- most-recently-created wins,
+                    # rather than an arbitrary, backend-dependent row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3114,13 +4248,37 @@ class WebToolConfig(BaseToolConfig):
                     self._user_id,
                     oauth_account is not None,
                 )
+                if oauth_account is None:
+                    rejected_keys = oauth_grant_keys_rejected_by_app_scope(
+                        policy_app, provider_candidates
+                    )
+                    rejected_grant_present = bool(rejected_keys) and (
+                        scoped_user_oauth_query(
+                            oauth_db,
+                            user_id=user_id,
+                            resource_owner_key=None,
+                        )
+                        .filter(UserOAuth.provider.in_(rejected_keys))
+                        .first()
+                        is not None
+                    )
+                    # The finish helper's no-account result, plus whether a
+                    # grant the policy rejected exists.
+                    return _LegacyOAuthTokenResolution(
+                        access_token=None,
+                        policy_rejected_grant_present=rejected_grant_present,
+                    )
             else:
                 oauth_account = (
-                    oauth_db.query(UserOAuth)
-                    .filter(
-                        UserOAuth.user_id == self._user_id,
-                        UserOAuth.provider == provider_name,
+                    scoped_user_oauth_query(
+                        oauth_db,
+                        user_id=user_id,
+                        resource_owner_key=None,
                     )
+                    .filter(UserOAuth.provider == provider_name)
+                    # See the app_id-scoped branch above for why this is
+                    # ordered rather than left to an arbitrary row order.
+                    .order_by(UserOAuth.id.desc())
                     .first()
                 )
                 logger.info(
@@ -3130,42 +4288,13 @@ class WebToolConfig(BaseToolConfig):
                     oauth_account is not None,
                 )
 
-            if not oauth_account or not oauth_account.access_token:
-                return _LegacyOAuthTokenResolution(access_token=None)
-
-            logger.info(
-                "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
-                provider_name,
-                oauth_account.refresh_token is not None,
-                oauth_account.expires_at,
+            return await self._finish_legacy_oauth_access_token_resolution(
+                oauth_db=oauth_db,
+                oauth_account=oauth_account,
+                provider_name=provider_name,
+                user_id=user_id,
+                resource_owner_key=None,
             )
-            account_id = int(oauth_account.id)
-            is_valid = await refresh_oauth_token_if_needed(
-                oauth_db,
-                oauth_account,
-                str(provider_name) if provider_name else "",
-            )
-            if not is_valid:
-                logger.warning(
-                    "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
-                    "Deleting OAuth record to prompt user for reconnection.",
-                    provider_name,
-                )
-                # A failed flush leaves the transaction unusable. Roll it back,
-                # reload the account, then persist the disconnection atomically.
-                oauth_db.rollback()
-                oauth_account = oauth_db.get(UserOAuth, account_id)
-                if oauth_account is not None:
-                    oauth_db.delete(oauth_account)
-                    oauth_db.commit()
-                return _LegacyOAuthTokenResolution(
-                    access_token=None,
-                    refresh_failed=True,
-                )
-
-            access_token = str(oauth_account.access_token)
-            oauth_db.commit()
-            return _LegacyOAuthTokenResolution(access_token=access_token)
         except Exception:
             oauth_db.rollback()
             raise
@@ -3179,23 +4308,75 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
+        actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
-        # Build config dict from server model
-        runtime_bindings = getattr(server, "runtime_bindings", None)
-        allow_delegated_authorization = bool(
-            getattr(server, "allow_delegated_authorization", False)
+        actor_builtin = bool(
+            actor_catalog_app_info is not None
+            and actor_catalog_app_info.get("auth_type") == "builtin_oauth"
         )
-        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
+        if actor_builtin_invalid:
+            policy_diagnostic = {
+                "code": actor_builtin_invalid_reason,
+                "message": "MCP server configuration is unavailable",
+                "server_id": int(server.id),
+                "server_name": server.name,
+            }
+            self._mcp_oauth_diagnostics.append(policy_diagnostic)
+            return self._build_unavailable_mcp_config(
+                server=server,
+                reason=actor_builtin_invalid_reason,
+                diagnostic=policy_diagnostic,
+            )
+
+        if actor_builtin and (self._mcp_auth_context or {}).get(str(server.id)):
+            policy_diagnostic = {
+                "code": "config_load_failed",
+                "message": "Task-supplied MCP authorization is not accepted",
+                "server_id": int(server.id),
+                "server_name": server.name,
+            }
+            self._mcp_oauth_diagnostics.append(policy_diagnostic)
+            return self._build_unavailable_mcp_config(
+                server=server,
+                reason="config_load_failed",
+                diagnostic=policy_diagnostic,
+            )
+
+        # Actor builtins are constructed only from canonical catalog metadata
+        # and the exact actor credential. Task connector runtime values are not
+        # loaded, retained, or exposed in the serialized config.
+        runtime_bindings = (
+            None if actor_builtin else getattr(server, "runtime_bindings", None)
+        )
+        allow_delegated_authorization = (
+            False
+            if actor_builtin
+            else bool(getattr(server, "allow_delegated_authorization", False))
+        )
+        runtime_values = (
+            None
+            if actor_builtin
+            else self._get_connector_runtime_for("mcp", int(server.id))
+        )
         config: Dict[str, Any] = {
             "id": int(server.id),
             "name": server.name,
             "transport": server.transport,
-            "description": server.description,
-            "runtime_input_schema": getattr(server, "runtime_input_schema", None),
-            "runtime_bindings": runtime_bindings,
-            "allow_delegated_authorization": allow_delegated_authorization,
+            "description": (
+                actor_catalog_app_info.get("description")
+                if actor_catalog_app_info is not None
+                else server.description
+            ),
         }
+        if not actor_builtin:
+            config.update(
+                runtime_input_schema=getattr(server, "runtime_input_schema", None),
+                runtime_bindings=runtime_bindings,
+                allow_delegated_authorization=allow_delegated_authorization,
+            )
         if runtime_values:
             context_values = runtime_values.get("context")
             config["connector_runtime"] = {
@@ -3213,7 +4394,11 @@ class WebToolConfig(BaseToolConfig):
             # The provider might be linkedin, google, etc. based on the app config
             from ...web.mcp_apps import get_app_for_mcp_server
 
-            app_info = get_app_for_mcp_server(self.db, server)
+            app_info = (
+                dict(actor_catalog_app_info)
+                if actor_catalog_app_info is not None
+                else get_app_for_mcp_server(self.db, server)
+            )
             if app_info is None:
                 logger.warning(
                     "OAuth MCP server '%s' has no matching catalog app",
@@ -3232,13 +4417,14 @@ class WebToolConfig(BaseToolConfig):
             app_id = app_info.get("id") if app_info else None
 
             hook_token: _ResolvedHookToken | None = None
-            if app_info:
+            if app_info and not actor_builtin:
                 configured_resource = _oauth_token_configured_resource(app_info)
                 providers_to_resolve = _oauth_token_provider_candidates(app_info)
                 try:
                     hook_token = await self._resolve_oauth_token_from_hook(
                         providers=providers_to_resolve,
                         resource=configured_resource,
+                        auth_type="builtin_oauth",
                     )
                 except _OAuthTokenResolverFailed as error:
                     return self._resolver_failure_config(
@@ -3253,6 +4439,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=hook_token.access_token,
+                        instance_url=hook_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3263,6 +4450,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAuth token resolver hook did not supply %s for MCP server '%s'",
+                        error.env_key,
+                        getattr(server, "name", "<unknown>"),
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3274,6 +4473,13 @@ class WebToolConfig(BaseToolConfig):
                 legacy_token = await self._resolve_legacy_oauth_access_token(
                     provider_name=provider_name,
                     app_id=app_id,
+                    app_info=app_info,
+                    resource_owner_key=(
+                        self._mcp_runtime_authorization_policy.resource_owner_key
+                        if actor_builtin
+                        and self._mcp_runtime_authorization_policy is not None
+                        else None
+                    ),
                 )
                 if legacy_token.refresh_failed:
                     return self._build_unavailable_mcp_config(
@@ -3282,14 +4488,55 @@ class WebToolConfig(BaseToolConfig):
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
                     )
-                if legacy_token.access_token is None:
+                access_token = legacy_token.access_token
+                serialized_slack_policy: str | None = None
+                slack_runtime_refresh_args: (
+                    tuple[int, str, MCPActorExecutionIdentity, Any] | None
+                ) = None
+                actor_policy = self._mcp_runtime_authorization_policy
+                if (
+                    actor_builtin
+                    and app_id == "slack"
+                    and access_token is None
+                    and not legacy_token.credential_present
+                    and actor_policy is not None
+                ):
+                    grant = await resolve_slack_actor_runtime_grant(
+                        user_id=self._user_id,
+                        resource_owner_key=actor_policy.resource_owner_key,
+                        execution_identity=self._mcp_actor_execution_identity,
+                        scope=self.get_execution_scope(),
+                    )
+                    if grant is not None:
+                        access_token = grant.access_token
+                        serialized_slack_policy = serialize_slack_channel_access_policy(
+                            grant.channel_access
+                        )
+                        execution_identity = self._mcp_actor_execution_identity
+                        if (
+                            execution_identity is None
+                        ):  # pragma: no cover - resolver gate
+                            raise RuntimeError(
+                                "Slack actor runtime grant requires execution identity"
+                            )
+                        slack_runtime_refresh_args = (
+                            cast(int, self._user_id),
+                            actor_policy.resource_owner_key,
+                            execution_identity,
+                            self.get_execution_scope(),
+                        )
+                if access_token is None:
                     logger.info(
                         f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                     )
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="oauth_token_required",
-                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        message=(
+                            UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE
+                            if legacy_token.policy_rejected_grant_present
+                            else UNAVAILABLE_MCP_CREDENTIAL_MESSAGE
+                        ),
                         failure_code="oauth_token_required",
                     )
                 logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)
@@ -3297,8 +4544,61 @@ class WebToolConfig(BaseToolConfig):
                     transport_config = self._build_oauth_mcp_stdio_transport_config(
                         server=server,
                         app_info=app_info,
-                        access_token=legacy_token.access_token,
+                        access_token=access_token,
+                        instance_url=legacy_token.instance_url,
                     )
+                    if serialized_slack_policy is not None:
+                        transport_config.setdefault("env", {})[
+                            SLACK_CHANNEL_ACCESS_POLICY_ENV
+                        ] = serialized_slack_policy
+                    if slack_runtime_refresh_args is not None:
+                        (
+                            refresh_user_id,
+                            refresh_owner,
+                            refresh_identity,
+                            refresh_scope,
+                        ) = slack_runtime_refresh_args
+                        refresh_template = dict(transport_config)
+                        refresh_env = dict(refresh_template.get("env") or {})
+                        refresh_env.pop("SLACK_ACCESS_TOKEN", None)
+                        refresh_env.pop(SLACK_CHANNEL_ACCESS_POLICY_ENV, None)
+                        refresh_template["env"] = MappingProxyType(refresh_env)
+
+                        async def refresh_slack_actor_runtime_connection(
+                            *,
+                            _user_id: int = refresh_user_id,
+                            _owner: str = refresh_owner,
+                            _identity: MCPActorExecutionIdentity = refresh_identity,
+                            _scope: Any = refresh_scope,
+                            _template: Mapping[str, Any] = MappingProxyType(
+                                refresh_template
+                            ),
+                        ) -> dict[str, Any] | None:
+                            refreshed_grant = await resolve_slack_actor_runtime_grant(
+                                user_id=_user_id,
+                                resource_owner_key=_owner,
+                                execution_identity=_identity,
+                                scope=_scope,
+                            )
+                            if refreshed_grant is None:
+                                return None
+                            refreshed_connection = dict(_template)
+                            refreshed_connection["transport"] = "stdio"
+                            refreshed_env = dict(_template.get("env") or {})
+                            refreshed_env["SLACK_ACCESS_TOKEN"] = (
+                                refreshed_grant.access_token
+                            )
+                            refreshed_env[SLACK_CHANNEL_ACCESS_POLICY_ENV] = (
+                                serialize_slack_channel_access_policy(
+                                    refreshed_grant.channel_access
+                                )
+                            )
+                            refreshed_connection["env"] = refreshed_env
+                            return refreshed_connection
+
+                        transport_config[SLACK_ACTOR_RUNTIME_REFRESH_KEY] = (
+                            refresh_slack_actor_runtime_connection
+                        )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
                         "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
@@ -3308,6 +4608,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAUTH CONFIG: No %s found for '%s'.",
+                        error.env_key,
+                        provider_name,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
 
@@ -3334,22 +4646,88 @@ class WebToolConfig(BaseToolConfig):
 
         elif server.transport in ["sse", "websocket", "streamable_http"]:
             from ...web.mcp_apps import get_app_for_mcp_server
+            from ...web.services.mcp_oauth import select_mcp_oauth_owner
             from ...web.services.mcp_runtime import (
                 build_mcp_runtime_connection,
                 connection_to_transport_config,
+                connector_auth_type,
                 effective_mcp_oauth_resource,
             )
+
+            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            policy = self._mcp_runtime_authorization_policy
+            if policy is not None:
+                app_info = (
+                    dict(actor_catalog_app_info)
+                    if actor_catalog_app_info is not None
+                    else (
+                        get_app_for_mcp_server(self.db, server)
+                        if resolver is not None
+                        else None
+                    )
+                )
+            else:
+                app_info = (
+                    get_app_for_mcp_server(self.db, server)
+                    if resolver is not None
+                    else None
+                )
+            actor_remote_oauth = (
+                policy is not None and actor_catalog_app_info is not None
+            )
+            if actor_remote_oauth:
+                runtime_bindings = None
+                allow_delegated_authorization = False
+                runtime_values = None
+                for key in (
+                    "runtime_input_schema",
+                    "runtime_bindings",
+                    "allow_delegated_authorization",
+                    "connector_runtime",
+                ):
+                    config.pop(key, None)
+            if actor_remote_oauth and (self._mcp_auth_context or {}).get(
+                str(server.id)
+            ):
+                policy_diagnostic = {
+                    "code": "config_load_failed",
+                    "message": "Task-supplied MCP authorization is not accepted",
+                    "server_id": int(server.id),
+                    "server_name": server.name,
+                }
+                self._mcp_oauth_diagnostics.append(policy_diagnostic)
+                return self._build_unavailable_mcp_config(
+                    server=server,
+                    reason="config_load_failed",
+                    diagnostic=policy_diagnostic,
+                )
 
             auth_context = self._mcp_auth_context_for_server(
                 server_id=int(server.id),
                 runtime_values=runtime_values,
             )
-            resolver, registration_generation = _get_oauth_token_resolver_hook()
+            if actor_remote_oauth:
+                policy = cast(
+                    Any,
+                    self._mcp_runtime_authorization_policy,
+                )
+                auth_context = {
+                    str(server.id): {
+                        "resource_owner_key": select_mcp_oauth_owner(
+                            self.db,
+                            server_id=int(server.id),
+                            user_id=int(cast(int, self._user_id)),
+                            actor_owner_key=policy.resource_owner_key,
+                            auth_config=server._decrypt_auth_config(server.auth),
+                        )
+                    }
+                }
+
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
-            if resolver is not None:
-                app_info = get_app_for_mcp_server(self.db, server)
+            remote_auth_type: str | None = None
+            if resolver is not None and not actor_remote_oauth:
                 remote_providers_to_resolve = (
                     _oauth_token_provider_candidates(app_info)
                     if app_info
@@ -3359,12 +4737,14 @@ class WebToolConfig(BaseToolConfig):
                     server,
                     mcp_auth_context=auth_context,
                 )
+                remote_auth_type = connector_auth_type(server)
                 if remote_providers_to_resolve:
                     try:
                         remote_hook_token = await self._resolve_oauth_token_from_hook(
                             providers=remote_providers_to_resolve,
                             resource=remote_configured_resource,
                             resolver=resolver,
+                            auth_type=remote_auth_type,
                         )
                     except _OAuthTokenResolverFailed as error:
                         return self._resolver_failure_config(
@@ -3387,6 +4767,7 @@ class WebToolConfig(BaseToolConfig):
                         runtime_values=runtime_values,
                         runtime_bindings=runtime_bindings,
                     ),
+                    auth_type=remote_auth_type,
                 )
                 transport_config.update(
                     connection_to_transport_config(resolver_connection)
@@ -3450,6 +4831,13 @@ class WebToolConfig(BaseToolConfig):
                             diagnostic=diagnostic,
                             failure_code="oauth_token_required",
                         )
+                    if actor_remote_oauth:
+                        # Actor catalog execution trusts only its selected bearer.
+                        runtime_build.connection["headers"] = {
+                            "Authorization": runtime_build.connection["headers"][
+                                "Authorization"
+                            ]
+                        }
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)
                     )
@@ -3483,9 +4871,7 @@ class WebToolConfig(BaseToolConfig):
         config["config"] = transport_config
 
         # Add user context for MCP tool isolation
-        serialized_user_id = self._serialize_mcp_user_id()
-        config["user_id"] = serialized_user_id
-        config["allow_users"] = [serialized_user_id]  # Only allow current user
+        config["user_id"] = self._serialize_mcp_user_id()
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
@@ -3497,6 +4883,9 @@ class WebToolConfig(BaseToolConfig):
         user_env_by_id: Mapping[int, Any],
         shared_env_by_id: Mapping[int, Any],
         env_source_by_id: Mapping[int, Any],
+        actor_catalog_app_info: Mapping[str, Any] | None = None,
+        actor_builtin_invalid: bool = False,
+        actor_builtin_invalid_reason: str = "config_load_failed",
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -3505,6 +4894,9 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
+                actor_catalog_app_info=actor_catalog_app_info,
+                actor_builtin_invalid=actor_builtin_invalid,
+                actor_builtin_invalid_reason=actor_builtin_invalid_reason,
             )
         except ConnectorRuntimeError:
             raise
@@ -3546,6 +4938,7 @@ class WebToolConfig(BaseToolConfig):
         of leaving the shared layer keyed on the run owner's personal
         shared-env hook answer."""
         self._mcp_oauth_diagnostics = []
+        self._mcp_actor_stdio_session_identities = {}
         self._reset_mcp_config_load_cache_state()
 
         # Resolved before the guarded region below: that region reports
@@ -3553,13 +4946,16 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
-        from ..services.connector_team_scope import resolve_team_connector_ids_or_raise
-
-        team_mcp_ids = frozenset(
-            resolve_team_connector_ids_or_raise(
-                self.db, team_id=self._connector_team_id, log_subject=self._user_id
-            )["mcp"]
+        from ..services.connector_team_scope import (
+            resolve_team_connector_selection_or_raise,
         )
+
+        team_selection = resolve_team_connector_selection_or_raise(
+            self.db,
+            team_id=self._connector_team_id,
+            log_subject=self._user_id,
+        )
+        team_mcp_ids = team_selection.mcp_ids
 
         try:
             from ..services.mcp_runtime import (
@@ -3579,11 +4975,77 @@ class WebToolConfig(BaseToolConfig):
                 self._connector_team_id,
             )
 
+            # Classify the complete personal ∪ governing-team visible set
+            # before constructing any runtime config. Canonical builtins use
+            # actor OAuth; native rows preserve their existing transport path;
+            # reserved/catalog drift is retained as a per-row unavailable
+            # result and can never dispatch through that native path.
+            actor_classifications: dict[int, tuple[Mapping[str, Any] | None, bool]] = {}
+            if self._mcp_runtime_authorization_policy is not None:
+                from ...web.mcp_apps import (
+                    BuiltinOAuthServerDefinitionError,
+                    RemoteOAuthDefinitionOwnership,
+                    RemoteOAuthServerDefinitionError,
+                    classify_actor_builtin_oauth_server,
+                    classify_actor_remote_oauth_server,
+                )
+
+                for visible_server in servers:
+                    try:
+                        catalog_app = classify_actor_builtin_oauth_server(
+                            self.db, visible_server
+                        )
+                        if catalog_app is None:
+                            catalog_app = classify_actor_remote_oauth_server(
+                                self.db,
+                                visible_server,
+                                definition_ownership=(
+                                    RemoteOAuthDefinitionOwnership.TEAM
+                                    if int(visible_server.id)
+                                    in team_selection.owned_mcp_definition_ids
+                                    else RemoteOAuthDefinitionOwnership.UNKNOWN
+                                ),
+                            )
+                        actor_classifications[int(visible_server.id)] = (
+                            catalog_app,
+                            False,
+                        )
+                    except (
+                        BuiltinOAuthServerDefinitionError,
+                        RemoteOAuthServerDefinitionError,
+                    ):
+                        actor_classifications[int(visible_server.id)] = (None, True)
+
+            actor_stdio_resolution = resolve_actor_mcp_stdio_configs(
+                self.db,
+                user_id=(int(self._user_id) if isinstance(self._user_id, int) else 0),
+                policy=self._mcp_runtime_authorization_policy,
+                adapter=self._mcp_actor_stdio_connection_adapter,
+                visible_servers=servers,
+                execution_identity=self._mcp_actor_execution_identity,
+            )
+            for blocked_server_id in actor_stdio_resolution.blocked_server_ids:
+                actor_classifications[blocked_server_id] = (None, True)
+            actor_stdio_block_reasons = dict(
+                actor_stdio_resolution.blocked_server_reasons
+            )
+            self._mcp_actor_stdio_session_identities = dict(
+                actor_stdio_resolution.session_identities
+            )
+
             # Prefetch shared runtime state once before entering the isolated
             # per-server formatter.
-            user_env_by_id = load_user_env_overrides(self.db, self._user_id)
-            shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
-            env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            if servers:
+                user_env_by_id = load_user_env_overrides(self.db, self._user_id)
+                shared_env_by_id = load_shared_env_overrides(self.db, self._user_id)
+                env_source_by_id = load_user_env_sources(self.db, self._user_id)
+            else:
+                # Synthetic actor stdio is intentionally independent from
+                # every ordinary MCP credential source. Avoid even querying
+                # those stores when there are no ordinary server rows.
+                user_env_by_id = {}
+                shared_env_by_id = {}
+                env_source_by_id = {}
 
             # Re-key the shared env layer, for team-owned ids only, onto the
             # governing team's own row -- never the run owner's team, and
@@ -3594,7 +5056,7 @@ class WebToolConfig(BaseToolConfig):
             # the credential-side hook was never installed -- the shared
             # layer stays user-keyed in that state, which is exactly the
             # cross-team influence this block exists to remove.
-            if self._connector_team_id is not None and team_mcp_ids:
+            if servers and self._connector_team_id is not None and team_mcp_ids:
                 if not team_env_hook_installed():
                     warn_team_env_hook_missing_once(
                         team_id=self._connector_team_id,
@@ -3653,9 +5115,19 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id=user_env_by_id,
                 shared_env_by_id=shared_env_by_id,
                 env_source_by_id=env_source_by_id,
+                actor_catalog_app_info=actor_classifications.get(
+                    int(server.id), (None, False)
+                )[0],
+                actor_builtin_invalid=actor_classifications.get(
+                    int(server.id), (None, False)
+                )[1],
+                actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
+                    int(server.id), "config_load_failed"
+                ),
             )
             for server in servers
         ]
+        configs.extend(actor_stdio_resolution.configs)
         logger.info("Loaded %s MCP server configurations", len(configs))
         return configs
 

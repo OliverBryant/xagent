@@ -1063,17 +1063,19 @@ def test_table_is_registered_in_metadata() -> None:
     assert "task_interaction_requests" in models.Base.metadata.tables
 
 
-def test_none_as_null_is_confined_to_this_table() -> None:
-    """Pins the class docstring's claim that JSON(none_as_null=True) is
-    confined to this table, carried by both of its JSON columns.
+def test_none_as_null_is_limited_to_explicit_column_contracts() -> None:
+    """Limit SQL-NULL binding to columns with an explicit absence contract.
+
+    Interaction payloads distinguish absent answers and reject absent requests.
+    Upload cleanup manifests use SQL NULL when no manifest has been persisted,
+    so unclaimed uploads do not block migration downgrade.
 
     Imports xagent.web.models first (same reason as
     test_table_is_registered_in_metadata above) so every model's table is
     actually registered on Base.metadata before this walks it. Only JSON
     type instances carry a none_as_null attribute at all, so the getattr
-    default guards every other column type instead of assuming JSON. This is
-    a guard, not a preference: no OTHER table may quietly adopt the flag
-    without this test catching it.
+    default guards every other column type instead of assuming JSON. New
+    columns may adopt the flag only with an explicit contract in this list.
     """
     import xagent.web.models as models
 
@@ -1086,6 +1088,7 @@ def test_none_as_null_is_confined_to_this_table() -> None:
     assert none_as_null_columns == {
         ("task_interaction_requests", "request_payload"),
         ("task_interaction_requests", "response_payload"),
+        ("uploaded_files", "cleanup_manifest"),
     }
 
 
@@ -1215,6 +1218,9 @@ _SCAN_ROOT = _REPO_ROOT / "src" / "xagent"
 _UNRELATED_SOURCE_LITERALS = {
     ("skills/personal_db.py", "personal"),  # SkillRecord.source
     ("services/tool_credentials.py", "db"),  # local var: credential origin
+    # ExecutionBudgetPolicy.source identifies the policy that sets the cap,
+    # not a task ingress channel or a value written to tasks.source.
+    ("web/services/execution_budget.py", "system_maximum"),
     # ClarificationDraft.source: which waiting mechanism produced the draft
     # (send_message / ask_user_question / tool_waiting), not a Task ingress
     # channel -- these values never reach the tasks.source column or the

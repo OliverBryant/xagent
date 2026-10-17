@@ -156,6 +156,21 @@ describe("ChatMessage Session file capability", () => {
     )
   })
 
+  it("passes the rendered interaction request id to the clarification form", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Clarification required"
+        interactions={[{ type: "text_input", field: "city", label: "City" }]}
+        interactionRequestId="inputreq_q1"
+      />,
+    )
+
+    expect(clarificationFormMock).toHaveBeenCalledWith(
+      expect.objectContaining({ requestId: "inputreq_q1" }),
+    )
+  })
+
   it("renders Computer use context on a user message", () => {
     render(
       <ChatMessage
@@ -450,6 +465,46 @@ describe("ChatMessage Session file capability", () => {
     const copied = clipboardWriteTextMock.mock.calls[0][0]
     expect(copied).not.toContain("raw-file-id")
     expect(copied).not.toContain("/private/raw-secret.csv")
+  })
+
+  it.each([true, false])("labels an unfinished durable stream as interrupted (trace visible: %s)", (showProcessView) => {
+    render(<ChatMessage role="assistant" content="" processStatus="interrupted"
+      showProcessView={showProcessView} showEmptyStatus={false}
+      traceEvents={[{ event_type: "tool_execution_end", data: {} }]} />)
+    expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+    expect(screen.queryByText("common.thinking")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { showProcessView: true, showEmptyStatus: false },
+    { showProcessView: true, showEmptyStatus: true },
+    { showProcessView: false, showEmptyStatus: false },
+    { showProcessView: false, showEmptyStatus: true },
+  ])("draws no interruption line and no empty bubble when the caller says the turn already shows it (%o)", ({ showProcessView, showEmptyStatus }) => {
+    const { container } = render(<ChatMessage role="assistant" content="" processStatus="interrupted"
+      showInterruptedStatus={false} showEmptyStatus={showEmptyStatus} showProcessView={showProcessView}
+      traceEvents={[{ event_type: "tool_execution_end", data: {} }]} />)
+    expect(screen.queryByText("agent.layout.status.interrupted")).not.toBeInTheDocument()
+    // Only the trace is left: the message body (avatar row) is not drawn.
+    expect(container.querySelector(".justify-start")).toBeNull()
+    // With the trace hidden as well, nothing is left to wrap.
+    if (!showProcessView) expect(container.firstChild).toBeNull()
+  })
+
+  it("keeps the message text but drops the interruption line when the caller turns the line off", () => {
+    render(<ChatMessage role="assistant" content="Received answer prefix" processStatus="interrupted"
+      showInterruptedStatus={false} />)
+    expect(screen.getByText("Received answer prefix")).toBeInTheDocument()
+    expect(screen.queryByText("agent.layout.status.interrupted")).not.toBeInTheDocument()
+  })
+
+  it("retains received text when a running stream becomes interrupted", () => {
+    const { rerender } = render(<ChatMessage role="assistant" content="Received answer prefix" processStatus="running" />)
+    expect(screen.getByText("Received answer prefix")).toBeInTheDocument()
+    rerender(<ChatMessage role="assistant" content="Received answer prefix" processStatus="interrupted" />)
+    expect(screen.getByText("Received answer prefix")).toBeInTheDocument()
+    expect(screen.getByText("agent.layout.status.interrupted")).toBeInTheDocument()
+    expect(screen.queryByText("common.thinking")).not.toBeInTheDocument()
   })
 
   it("names the active tool in the status line while it is running", () => {

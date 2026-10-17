@@ -7,19 +7,24 @@ which lists all tools that can be used by agents.
 
 import logging
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from tests.shared.auth_database import auth_db_override
 from xagent.core.tools.adapters.vibe.config import (
     ToolFactoryRuntimeSessionBoundaryError,
 )
 from xagent.web.api.auth import auth_router
 from xagent.web.api.tools import _create_tool_info, tools_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.tool_config import ToolConfig, ToolUsage
+from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.tool_config import ToolConfig
+from xagent.web.models.user import User
 
 
 def override_get_db():
@@ -37,6 +42,7 @@ test_app = FastAPI()
 test_app.include_router(auth_router)
 test_app.include_router(tools_router)
 test_app.dependency_overrides[get_db] = override_get_db
+test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 
 # Create test client
 client = TestClient(test_app)
@@ -176,11 +182,13 @@ class _AvailableToolsRouteHarness:
     def __init__(
         self,
         *,
-        cleanup_error: BaseException,
+        cleanup_error: BaseException | None = None,
         primary_error: BaseException | None = None,
+        usage_counts: dict[str, int] | None = None,
     ) -> None:
         self.cleanup_error = cleanup_error
         self.primary_error = primary_error
+        self.usage_counts = usage_counts or {}
         self.events: list[str] = []
         self.close_calls = 0
 
@@ -226,7 +234,8 @@ class _AvailableToolsRouteHarness:
             def close(self) -> None:
                 harness.events.append("close")
                 harness.close_calls += 1
-                raise harness.cleanup_error
+                if harness.cleanup_error is not None:
+                    raise harness.cleanup_error
 
         class Query:
             def __init__(self, model: object) -> None:
@@ -242,6 +251,14 @@ class _AvailableToolsRouteHarness:
         class Database:
             def query(self, model: object) -> Query:
                 return Query(model)
+
+        def load_tool_usage_counts(_db: object) -> dict[str, int]:
+            harness.events.append("tool_usage")
+            return harness.usage_counts
+
+        monkeypatch.setattr(
+            "xagent.web.api.tools._load_tool_usage_counts", load_tool_usage_counts
+        )
 
         class SandboxManager:
             async def get_or_create_lease_provider(
@@ -334,11 +351,52 @@ async def test_available_tools_cleanup_failure_follows_complete_route_body(
         "sound_effect",
         "music",
         "response_shape",
-        ToolUsage.__name__,
+        "tool_usage",
         ToolConfig.__name__,
         "user_overrides",
         "close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_reports_usage_counts_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+    )
+
+    assert response["tools"][0]["usage_count"] == 4
+    assert "tool_usage" in harness.events
+
+
+@pytest.mark.asyncio
+async def test_available_tools_can_skip_usage_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The agent builder never reads usage_count, so it must not pay for the
+    # aggregation (#3007).
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+        include_usage=False,
+    )
+
+    assert [tool["name"] for tool in response["tools"]] == ["test_tool"]
+    assert "usage_count" not in response["tools"][0]
+    assert "tool_usage" not in harness.events
+    assert ToolConfig.__name__ in harness.events
 
 
 class _RoutePrimaryFailure(BaseException):
@@ -564,6 +622,32 @@ class TestToolsAvailableAPI:
         data = response.json()
         tools = data["tools"]
 
+        counted_tool = tools[0]["name"]
+        with next(get_db()) as db:
+            user = db.query(User).filter(User.username == "admin").one()
+            task = Task(user_id=user.id, title="Tool usage")
+            db.add(task)
+            db.flush()
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id="tool-usage-list-event",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": counted_tool, "success": True},
+                )
+            )
+            db.commit()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert (
+            next(tool for tool in tools if tool["name"] == counted_tool)["usage_count"]
+            == 1
+        )
+
         # Each tool should have usage_count field
         for tool in tools:
             assert "usage_count" in tool
@@ -574,6 +658,23 @@ class TestToolsAvailableAPI:
         sql_tools = [tool for tool in tools if tool["category"] == "database"]
         assert sql_tools
         assert all(tool["requires_configuration"] is True for tool in sql_tools)
+
+    def test_get_available_tools_include_usage_false_omits_usage_count(self):
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available?include_usage=false",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert tools
+        assert all("usage_count" not in tool for tool in tools)
 
     def test_get_available_tools_tool_categories(self):
         """Test that tools have correct category information."""
@@ -610,6 +711,21 @@ class TestToolsAvailableAPI:
 
         assert tool_display_categories.get("fetch_web_content") == "Web Search"
         assert tool_categories.get("fetch_web_content") == "web_search"
+
+    def test_get_available_tools_marks_always_available_tools(self) -> None:
+        from xagent.core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+        from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+
+        response = client.get(
+            "/api/tools/available",
+            headers={"Authorization": f"Bearer {self._login_admin()}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        marked = {t["name"] for t in data["tools"] if t["always_available"]}
+        assert marked == INTRINSIC_TOOL_NAMES
+        assert data["skill_loader_tool"] == LOAD_SKILL_TOOL_NAME
 
     def test_get_available_tools_requires_auth(self):
         """Test that /api/tools/available requires authentication."""
@@ -927,6 +1043,22 @@ class TestToolsGovernanceAPI:
         assert upsert.status_code == 400
         assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]
 
+    def test_sql_connection_put_rejects_platform_database(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres:5432/xagent")
+        response = client.put(
+            "/api/tools/sql-connections/platform-copy",
+            headers=self._admin_headers(),
+            json={
+                "connection_url": (
+                    "postgresql+psycopg://other@public.example/other"
+                    "?host=postgres&dbname=xagent"
+                )
+            },
+        )
+
+        assert response.status_code == 400
+        assert "platform database" in response.json()["detail"]
+
     def test_sql_connections_are_user_scoped(self):
         user1_headers = self._user_headers("user1")
         user2_headers = self._user_headers("user2")
@@ -1173,10 +1305,11 @@ class TestWebToolConfigUserOverride:
             set_user_tool_overrides_hook(None)
 
     @pytest.mark.asyncio
-    async def test_create_all_tools_skips_filter_when_no_user_at_all(self):
-        """When neither explicit user nor request.user is set,
-        get_user_tool_overrides() returns {} and ToolFactory filtering is skipped.
-        This is the safe fallback — no user means no per-user policy can apply."""
+    async def test_create_all_tools_denies_every_tool_when_no_user_at_all(self):
+        """When a policy hook is registered but neither explicit user nor
+        request.user is set, the hook never runs. That is "policy unavailable",
+        not "no policy": the turn must get no tools rather than the full set,
+        which would include the very tool the policy disables."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -1195,7 +1328,7 @@ class TestWebToolConfigUserOverride:
                 db=MagicMock(),
                 request=request_without_user,
                 user_id=42,
-                # No explicit user passed — this is the pre-fix bug path
+                # No explicit user passed — the unresolvable-policy path.
                 workspace_config={"base_dir": "/tmp", "task_id": "test"},
             )
 
@@ -1211,13 +1344,46 @@ class TestWebToolConfigUserOverride:
                 result = await ToolFactory.create_all_tools(cfg)
 
             tool_names = [t.name for t in result]
-            # Without explicit user, overrides are {} and filtering is skipped
-            assert "browser_navigate" in tool_names, (
-                "No filtering when no user (existing behavior)"
+            assert "browser_navigate" not in tool_names, (
+                "an unresolved policy must not hand back a tool the policy disables"
             )
-            assert "calculator" in tool_names
+            # Fail closed all the way: an unresolved policy cannot be narrowed
+            # to just the disabled names, because the hook never told us any.
+            assert tool_names == []
         finally:
             set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_every_tool_when_no_hook_registered(self):
+        """Standalone xagent registers no policy hook, so a config without a
+        runtime user has no policy to lose and keeps its unrestricted default."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.tools.config import WebToolConfig
+
+        request_without_user = MagicMock()
+        del request_without_user.user
+
+        cfg = WebToolConfig(
+            db=MagicMock(),
+            request=request_without_user,
+            user_id=42,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+
+        tool_browser = MagicMock()
+        tool_browser.name = "browser_navigate"
+        tool_calc = MagicMock()
+        tool_calc.name = "calculator"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            AsyncMock(return_value=[tool_browser, tool_calc]),
+        ):
+            result = await ToolFactory.create_all_tools(cfg)
+
+        assert sorted(t.name for t in result) == ["browser_navigate", "calculator"]
 
     @pytest.mark.asyncio
     async def test_create_all_tools_keeps_disabled_when_filter_false(self):

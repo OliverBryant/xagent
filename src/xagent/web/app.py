@@ -1,34 +1,48 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
+import random
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_cors_origins,
+    get_environment,
+    get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
+    get_shared_task_execution_enabled,
+    get_task_auto_resume_poll_seconds,
+    get_task_cleanup_retry_interval_seconds,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
     get_taskless_upload_ttl_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
     get_uploaded_file_recovery_stale_seconds,
@@ -39,10 +53,23 @@ from ..core.execution_scope import (
     ExecutionScopeResolverContractError,
 )
 from ..core.file_storage import StorageKeyScopeError
+from ..core.runtime_performance import (
+    initialize_runtime_performance_telemetry,
+    register_observable_gauge,
+    shutdown_runtime_performance_telemetry,
+    start_event_loop_lag_monitor,
+    stop_event_loop_lag_monitor,
+)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
+from .api.admin_memory_embedding_authority import (
+    OPENAPI_COMPONENT_SCHEMAS as ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+)
+from .api.admin_memory_embedding_authority import (
+    router as admin_memory_embedding_authority_router,
+)
 from .api.admin_users import router as admin_users_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
@@ -54,6 +81,7 @@ from .api.computer import computer_router
 from .api.conversation_logs import router as conversation_logs_router
 from .api.custom_api import custom_api_router
 from .api.deployment_config import router as deployment_config_router
+from .api.execution_budget import router as execution_budget_router
 from .api.files import file_router
 from .api.jobs import jobs_router
 from .api.kb import kb_router
@@ -76,10 +104,16 @@ from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
+from .auth_config import validate_auth_config
+from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.connector_team_scope import (
+    ConnectorHookSessionBoundaryError,
+    connector_hook_session_boundary_error_handler,
+)
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,
@@ -100,11 +134,13 @@ from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
+from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
 setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
@@ -112,6 +148,55 @@ setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 logger = logging.getLogger(__name__)
 
 __all__ = ["app"]
+
+
+class PublicWidgetCORSMiddleware:
+    """Allow credential-free widget calls from customer embedding origins."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope.get("path", "")).startswith(
+            "/api/widget/"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_headers = Headers(scope=scope)
+        origin = request_headers.get("origin")
+        if not origin:
+            await self.app(scope, receive, send)
+            return
+
+        if scope.get("method") == "OPTIONS" and request_headers.get(
+            "access-control-request-method"
+        ):
+            response = Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": request_headers.get(
+                        "access-control-request-headers", ""
+                    ),
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_widget_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["Access-Control-Allow-Origin"] = origin
+                if "access-control-allow-credentials" in response_headers:
+                    del response_headers["access-control-allow-credentials"]
+                response_headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_widget_response)
 
 
 @contextmanager
@@ -148,11 +233,21 @@ def _startup_phase(name: str) -> Iterator[None]:
 # Ensure web, uploads directory exists before configuring static files
 uploads_dir = get_uploads_dir()
 uploads_dir.mkdir(parents=True, exist_ok=True)
+# Validate deployment-owned external roots independently of whether a sandbox
+# backend is enabled or supports runtime-spec readiness. Otherwise an ambiguous
+# path can pass health checks and fail only when the first task reads it.
+get_external_upload_dirs()
 
 
 # FastAPI app creation here
+_is_production_environment = get_environment() != "development"
 app = FastAPI(
-    title="xagent", description="The Agent Operating System", redirect_slashes=False
+    title="xagent",
+    description="The Agent Operating System",
+    redirect_slashes=False,
+    docs_url=None if _is_production_environment else "/docs",
+    redoc_url=None if _is_production_environment else "/redoc",
+    openapi_url=None if _is_production_environment else "/openapi.json",
 )
 
 # Track background migration task for graceful shutdown cleanup.
@@ -264,7 +359,20 @@ async def _run_trigger_dispatcher(
     *,
     poll_interval_seconds: int,
     batch_size: int,
+    startup_jitter_seconds: int = 0,
 ) -> None:
+    if startup_jitter_seconds > 0:
+        # Runs before the loop below's first tick, which otherwise fires
+        # immediately on startup -- see
+        # get_trigger_dispatcher_startup_jitter_seconds for why that's a
+        # problem right after a container restart.
+        delay = random.uniform(0, startup_jitter_seconds)
+        logger.info(
+            "Trigger dispatcher delaying first tick by %.1fs past startup",
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     from .models.database import get_session_local
     from .services.gmail_triggers import scan_due_gmail_watch_renewals
     from .services.triggers import (
@@ -411,18 +519,22 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
+    startup_jitter_seconds = get_trigger_dispatcher_startup_jitter_seconds()
     task = asyncio.create_task(
         _run_trigger_dispatcher(
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
+            startup_jitter_seconds=startup_jitter_seconds,
         )
     )
     _trigger_dispatcher_task = task
     app_instance.state.trigger_dispatcher_task = task
     logger.info(
-        "Started trigger dispatcher task (interval=%ss, batch_size=%s)",
+        "Started trigger dispatcher task (interval=%ss, batch_size=%s, "
+        "startup_jitter=%ss)",
         poll_interval_seconds,
         batch_size,
+        startup_jitter_seconds,
     )
     return task
 
@@ -431,6 +543,11 @@ def start_task_lease_recovery_task(
     app_instance: FastAPI,
 ) -> asyncio.Task[Any] | None:
     """Start automatic expired task-lease recovery for this backend process."""
+
+    from .services.task_execution_host import consumes_task_commands
+
+    if not consumes_task_commands():
+        return None
 
     existing_task = cast(
         asyncio.Task[Any] | None,
@@ -456,6 +573,7 @@ def start_task_lease_recovery_task(
 
     if os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Skipping task lease recovery loop (test environment)")
+        app_instance.state.task_lease_recovery_task = None
         return None
 
     poll_interval_seconds = get_task_lease_recovery_interval_seconds()
@@ -493,6 +611,64 @@ async def stop_task_lease_recovery_task(app_instance: FastAPI) -> None:
                 "Task lease recovery loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_task_auto_resume_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the auto-resume sweeper beside lease recovery in this process."""
+
+    from .services.task_execution_host import consumes_task_commands
+
+    if not consumes_task_commands():
+        return None
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "task_auto_resume_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous auto-resume sweeper loop failed", exc_info=failure)
+        app_instance.state.task_auto_resume_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping auto-resume sweeper loop (test environment)")
+        app_instance.state.task_auto_resume_task = None
+        return None
+
+    poll_interval_seconds = get_task_auto_resume_poll_seconds()
+    task = asyncio.create_task(
+        run_task_auto_resume_loop(poll_interval_seconds=poll_interval_seconds)
+    )
+    app_instance.state.task_auto_resume_task = task
+    logger.info(
+        "Started auto-resume sweeper loop (interval=%ss)", poll_interval_seconds
+    )
+    return task
+
+
+async def stop_task_auto_resume_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's auto-resume sweeper loop."""
+
+    task = getattr(app_instance.state, "task_auto_resume_task", None)
+    app_instance.state.task_auto_resume_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling auto-resume sweeper loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Auto-resume sweeper loop stopped after failure", exc_info=exc)
 
 
 def start_uploaded_file_recovery_task(
@@ -631,6 +807,285 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
                 "Orphan upload GC loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_task_cleanup_retry_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the retry driver for cleanup task deletions still owe (#2587).
+
+    Unlike the retention purge this runs in every deployment: on-demand task
+    and account deletion record obligations on any store, and a directory left
+    by a failed removal is owed whether or not retention is configured. Several
+    replicas running it is safe -- its claim is a compare-and-set.
+
+    Guarded under pytest like the sibling loops; a test that means to exercise
+    the starter opts in through ``task_cleanup_retry_allowed_in_tests``.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_cleanup_obligations import run_cleanup_obligation_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "task_cleanup_retry_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous task cleanup retry loop failed", exc_info=failure)
+        app_instance.state.task_cleanup_retry_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "task_cleanup_retry_allowed_in_tests", False
+    ):
+        logger.info("Skipping task cleanup retry loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_task_cleanup_retry_interval_seconds()
+    task = asyncio.create_task(
+        run_cleanup_obligation_loop(
+            get_session_local(), poll_interval_seconds=poll_interval_seconds
+        )
+    )
+    app_instance.state.task_cleanup_retry_task = task
+    logger.info("Started task cleanup retry loop (interval=%ss)", poll_interval_seconds)
+    return task
+
+
+async def stop_task_cleanup_retry_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's task cleanup retry loop.
+
+    Cancelling is enough here, unlike the purge: an interrupted release keeps
+    its claim until the lease lapses and is then retried, and the release is
+    idempotent.
+    """
+
+    task = getattr(app_instance.state, "task_cleanup_retry_task", None)
+    app_instance.state.task_cleanup_retry_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling task cleanup retry loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Task cleanup retry loop stopped after failure",
+                exc_info=exc,
+            )
+
+
+#: How long shutdown waits for the retention purge loop to stop on its own
+#: before cancelling it. One task's purge has to finish first, and a purge is
+#: a handful of indexed deletes -- not a bound anyone should have to tune, so
+#: it is a constant rather than another environment variable.
+RETENTION_PURGE_STOP_GRACE_SECONDS = 10.0
+
+
+def start_retention_purge_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the conversation/trace retention purge loop, if configured (#2563).
+
+    Returns ``None`` -- having started nothing -- in every deployment that has
+    not opted in, which is all of them until the policy decision in #2567 is
+    made. The loop is also the only thing that reads the configured periods, so
+    a deployment with none configured pays nothing for this call.
+
+    The loop itself refuses to run against anything but PostgreSQL, because the
+    row lock its eligibility check depends on is a no-op elsewhere; it logs the
+    refusal and returns rather than retrying something configuration cannot fix.
+    Guarded under pytest like the five sibling loops. The dialect refusal was
+    argued as making the guard unnecessary -- a test suite runs on SQLite, so
+    the loop would end itself on its first batch -- but ``tests/conftest.py``
+    loads a developer's ``.env`` with ``override=True``, so a machine with
+    both a retention period and a PostgreSQL ``DATABASE_URL`` configured would
+    have run a real, deleting sweep against it. The guard costs one line and
+    removes the need for the argument.
+    """
+
+    from .models.database import get_session_local
+    from .services.task_retention_purge import (
+        retention_purge_configured,
+        run_retention_purge_loop,
+    )
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "retention_purge_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        # Same reporting the neighbouring starters do: a loop that died took
+        # its traceback with it, and this is the last place to say so.
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous retention purge loop failed", exc_info=failure)
+        app_instance.state.retention_purge_task = None
+
+    if not retention_purge_configured():
+        return None
+    if os.getenv("PYTEST_CURRENT_TEST") and not getattr(
+        app_instance.state, "retention_purge_allowed_in_tests", False
+    ):
+        logger.info("Skipping retention purge loop (test environment)")
+        return None
+
+    stop_event = asyncio.Event()
+    app_instance.state.retention_purge_stop = stop_event
+    task = asyncio.create_task(
+        run_retention_purge_loop(get_session_local(), stop_event=stop_event)
+    )
+    app_instance.state.retention_purge_task = task
+    logger.info("Started retention purge loop")
+    return task
+
+
+async def stop_retention_purge_task(app_instance: FastAPI) -> None:
+    """Ask the retention purge loop to stop, give it a moment, then cancel it.
+
+    The signal is not a courtesy. A sweep runs its batch in a worker thread, so
+    cancelling the loop's task would *detach* that thread rather than end it,
+    leaving deletes running while the process tries to exit. The stop event
+    reaches inside the batch, which checks it between tasks and returns.
+
+    The grace window is bounded because between-tasks is not instant: one
+    task's purge has to finish first.
+
+    What cancelling does *not* do is stop that worker. ``task.cancel()`` ends
+    the awaiting coroutine; the thread ``asyncio.to_thread`` handed the batch
+    to keeps running and can still commit the task it is on. That is why the
+    stop event is set at the top of shutdown rather than here -- it is the
+    only thing that reaches inside the batch -- and why the cancel is a
+    backstop for the await, not a way to abort work in flight.
+    """
+
+    stop_event = getattr(app_instance.state, "retention_purge_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    app_instance.state.retention_purge_stop = None
+
+    task = getattr(app_instance.state, "retention_purge_task", None)
+    app_instance.state.retention_purge_task = None
+    if task is None:
+        return
+    if not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=RETENTION_PURGE_STOP_GRACE_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            logger.info("Cancelling retention purge loop after stop grace period...")
+            task.cancel()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Retention purge loop stopped after failure", exc_info=exc)
+            return
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.error("Retention purge loop stopped after failure", exc_info=exc)
+
+
+def start_temp_file_cleanup_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the background orphaned temp-file cleanup sweep for this process.
+
+    This walks the entire uploads tree and can take minutes on a large tree,
+    so it runs in the background (fire-and-forget scheduling like the
+    uploaded-files reconcile step) instead of being awaited inline, letting
+    the lifespan finish and /health open immediately regardless of tree size.
+
+    Unlike that reconcile task, this one is tracked on app_instance.state and
+    stopped at shutdown: the threading.Event lets the walk unwind
+    cooperatively so a mid-sweep restart does not block process exit on the
+    executor thread. Extracted into its own function (matching
+    start_orphan_upload_gc_task above) so the pytest gate below can be
+    exercised directly in a test without also spinning up the other
+    startup_event background loops.
+    """
+
+    existing_cleanup_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "temp_file_cleanup_task", None),
+    )
+    if existing_cleanup_task is not None and not existing_cleanup_task.done():
+        # WHY: never schedule a second concurrent walk -- it would orphan the
+        # in-flight one and discard its only stop handle. An already-signalled
+        # generation is unwinding, not sweeping, so say so instead of "running".
+        existing_stop = getattr(app_instance.state, "temp_file_cleanup_stop", None)
+        if existing_stop is not None and existing_stop.is_set():
+            logger.warning(
+                "Previous orphaned temp-file cleanup is still unwinding after a "
+                "shutdown signal; this startup gets no sweep"
+            )
+        else:
+            logger.debug(
+                "Orphaned temp-file cleanup already running; not scheduling another"
+            )
+        return existing_cleanup_task
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        # The sweep walks the real uploads tree, which tests must not trigger.
+        logger.info("Skipping orphaned temp-file cleanup (test environment)")
+        return None
+
+    temp_file_cleanup_stop = threading.Event()
+    app_instance.state.temp_file_cleanup_stop = temp_file_cleanup_stop
+
+    async def run_temp_file_cleanup_background() -> None:
+        from .services.storage_maintenance import cleanup_orphaned_temp_files
+
+        started = time.monotonic()
+        logger.info("Background orphaned temp-file cleanup started")
+        try:
+            cleaned_count = await asyncio.to_thread(
+                cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
+            )
+        except Exception:  # noqa: BLE001
+            # WHY: keep the traceback (exc_info) even at WARNING -- the sweep
+            # runs unattended, so a failure has no other surface.
+            logger.warning(
+                "Background orphaned temp-file cleanup failed after %.2fs",
+                time.monotonic() - started,
+                exc_info=True,
+            )
+            return
+        # WHY: this reports duration/count only, and deliberately does NOT
+        # re-read temp_file_cleanup_stop to label the run interrupted. Shutdown
+        # sets that flag as its first statement, so it can flip between the
+        # walk finishing and this coroutine being resumed -- and the walk can
+        # also complete its last directory after the flag is set. Either way a
+        # completed sweep would be logged as truncated. cleanup_orphaned_temp_files
+        # tracks that state internally and logs it authoritatively.
+        logger.info(
+            "Background orphaned temp-file cleanup finished in %.2fs "
+            "(removed %d file(s))",
+            time.monotonic() - started,
+            cleaned_count,
+        )
+
+    task = asyncio.create_task(run_temp_file_cleanup_background())
+    app_instance.state.temp_file_cleanup_task = task
+    logger.info("Scheduled background orphaned temp-file cleanup")
+    return task
 
 
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
@@ -1055,25 +1510,99 @@ app.add_exception_handler(
     SkillRuntimeSessionBoundaryError,
     cast(Any, skill_runtime_session_boundary_error_handler),
 )
+app.add_exception_handler(
+    ConnectorHookSessionBoundaryError,
+    cast(Any, connector_hook_session_boundary_error_handler),
+)
 
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: "*" should not be used in production
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
+
+def _security_header_values(path: str) -> dict[str, str]:
+    """Return headers appropriate for an API, preview, upload, or SPA path."""
+    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    is_upload = path == "/uploads" or path.startswith("/uploads/")
+    is_api = path == "/api" or path.startswith("/api/")
+    is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+    if is_api or is_upload:
+        frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; object-src 'none'; "
+            f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+        )
+    if not is_widget_page and not is_upload and not is_preview:
+        headers["X-Frame-Options"] = "DENY"
+    return headers
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next: Any) -> Any:
+    """Add browser hardening headers without breaking the SPA or previews."""
+    response = await call_next(request)
+    for name, value in _security_header_values(request.url.path).items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
+
 # For static files
+_BLOCKED_UPLOAD_EXTENSIONS = frozenset(
+    {
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".xht",
+        ".xsl",
+        ".xslt",
+        ".mathml",
+        ".svg",
+        ".svgz",
+        ".xml",
+        ".rdf",
+        ".atom",
+        ".rss",
+    }
+)
+
+
+def _blocked_upload_extension(path: str) -> bool:
+    media_type, _encoding = mimetypes.guess_type(path)
+    if is_active_content_type(media_type):
+        return True
+    return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
+
+
+class SafeUploadsStaticFiles(StaticFiles):
+    """Serve only non-active content from the legacy public uploads mount."""
+
+    async def get_response(self, path: str, scope: Scope) -> Any:
+        if _blocked_upload_extension(path):
+            return PlainTextResponse("Not found", status_code=404)
+        return await super().get_response(path, scope)
+
+
 app.mount(
     "/uploads",
-    StaticFiles(directory=str(uploads_dir)),
+    SafeUploadsStaticFiles(directory=str(uploads_dir)),
     name="uploads",
 )
 
@@ -1102,6 +1631,8 @@ app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_interaction_rollout_router)
+app.include_router(execution_budget_router)
+app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)
@@ -1120,14 +1651,120 @@ app.include_router(share_router)
 app.include_router(v1_router)
 
 
-# initial database and skill manager
-@app.on_event("startup")
-async def startup_event() -> None:
-    global _migration_task
-    logger.info("Agent runtime configured: %s", get_agent_runtime())
-    validate_interaction_rollout_at_startup()
+#: Schemas no route signature declares, so the framework never walks them.
+#: A route that reads its own body declares its ``requestBody`` by hand and
+#: references a component; without registering that component here, the served
+#: document would carry a ``$ref`` that resolves to nothing.
+DECLARED_OPENAPI_COMPONENT_SCHEMAS: dict[str, Any] = {
+    **ADMIN_MEMORY_AUTHORITY_SCHEMAS,
+}
+
+_assembled_openapi = app.openapi
+
+
+def openapi_with_declared_components() -> dict[str, Any]:
+    """The assembled document, plus the schemas it cannot infer.
+
+    Merged rather than overwritten: where the framework already inferred a
+    definition from a response model, that one stays authoritative and only
+    the genuinely missing definitions are added.
+    """
+    schema = _assembled_openapi()
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    for name, definition in DECLARED_OPENAPI_COMPONENT_SCHEMAS.items():
+        components.setdefault(name, definition)
+    # ``app.openapi`` caches and returns that same dict, so the merge above
+    # has already landed in the cache; this only covers the first call, which
+    # populates it.
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = openapi_with_declared_components  # type: ignore[method-assign]
+
+
+def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    """Start one event-loop lag sampler for the current app lifespan."""
+
+    existing = getattr(app_instance.state, "runtime_performance_task", None)
+    if existing is not None and not existing.done():
+        return
+    try:
+        if not initialize_runtime_performance_telemetry():
+            app_instance.state.runtime_performance_task = None
+            return
+
+        from .api.websocket import manager
+        from .services.task_execution import background_task_manager
+
+        register_observable_gauge(
+            "xagent.agent_tasks.running",
+            lambda: len(background_task_manager.running_tasks),
+            unit="{task}",
+            description="Current locally running agent tasks",
+        )
+        register_observable_gauge(
+            "xagent.agent_tasks.resuming",
+            lambda: len(background_task_manager.resume_tasks),
+            unit="{task}",
+            description="Current local resume coordinators",
+        )
+        register_observable_gauge(
+            "xagent.websocket.connections",
+            manager.connection_count,
+            unit="{connection}",
+            description="Current task WebSocket connections",
+        )
+        app_instance.state.runtime_performance_task = start_event_loop_lag_monitor()
+    except Exception:
+        # Telemetry is observational and must not block application startup.
+        app_instance.state.runtime_performance_task = None
+        shutdown_runtime_performance_telemetry()
+        logger.warning("Could not start runtime performance monitor", exc_info=True)
+
+
+async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
+    task = getattr(app_instance.state, "runtime_performance_task", None)
+    app_instance.state.runtime_performance_task = None
+    await stop_event_loop_lag_monitor(task)
+    await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+
+
+def start_app_process_diagnostics(app_instance: FastAPI) -> None:
+    """Start this process's diagnostics line once per app lifespan; never raises."""
+
+    from .services.process_diagnostics import start_process_diagnostics
+
+    existing = getattr(app_instance.state, "process_diagnostics_task", None)
+    if existing is not None and not existing.done():
+        return
+    app_instance.state.process_diagnostics_task = start_process_diagnostics()
+
+
+async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
+    from .services.process_diagnostics import stop_process_diagnostics
+
+    task = getattr(app_instance.state, "process_diagnostics_task", None)
+    app_instance.state.process_diagnostics_task = None
+    await stop_process_diagnostics(task)
+
+
+async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
+    """Prepare the database, admit the host, then open runtime work ingress."""
     with _startup_phase("database init"):
         init_db()
+
+    # Host checks may rely on the fully migrated database. Nothing below this
+    # boundary may admit tasks or launch a writer/dispatcher until every check
+    # has passed. An exception deliberately aborts startup unchanged.
+    with _startup_phase("host admission"):
+        await run_host_startup_admissions(app_instance)
+
+    # Validate the default-on async trace backend before opening task ingress.
+    from .services.trace_database import get_trace_database_runtime
+
+    with _startup_phase("trace database init"):
+        get_trace_database_runtime()
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
@@ -1136,15 +1773,85 @@ async def startup_event() -> None:
 
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
-    from .api.websocket import background_task_manager
+    from .services.task_execution import background_task_manager
 
-    background_task_manager.start_accepting()
+    if not get_shared_task_execution_enabled():
+        background_task_manager.start_accepting()
 
-    start_file_storage_startup_sync_task(app)
-    start_trigger_dispatcher_task(app)
-    start_task_lease_recovery_task(app)
-    start_uploaded_file_recovery_task(app)
-    start_orphan_upload_gc_task(app)
+    start_file_storage_startup_sync_task(app_instance)
+    if not get_shared_task_execution_enabled():
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
+        start_task_auto_resume_task(app_instance)
+    start_uploaded_file_recovery_task(app_instance)
+    start_orphan_upload_gc_task(app_instance)
+    start_retention_purge_task(app_instance)
+    start_task_cleanup_retry_task(app_instance)
+
+
+async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
+    """Open shared ingress only after runtime resources and the bridge are ready."""
+    from .api.websocket import manager
+    from .services.task_command_execution import execute_durable_task_command
+    from .services.task_command_transport import (
+        start_task_command_dispatcher,
+        stop_task_command_dispatcher,
+    )
+    from .services.task_coordinator_runtime import close_task_coordinators
+    from .services.task_event_bridge import (
+        start_task_event_bridge,
+        stop_task_event_bridge,
+    )
+    from .services.task_execution import background_task_manager
+
+    global _task_command_dispatcher_task, _trigger_dispatcher_task
+    await start_task_event_bridge(
+        deliver=manager.deliver_shared_event,
+        stream_status=manager.shared_stream_status,
+    )
+    try:
+        manager.start_stream_reconciliation()
+        background_task_manager.start_accepting()
+        start_trigger_dispatcher_task(app_instance)
+        start_task_lease_recovery_task(app_instance)
+        start_task_auto_resume_task(app_instance)
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app_instance.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    except BaseException:
+        await stop_task_command_dispatcher()
+        await stop_task_auto_resume_task(app_instance)
+        await stop_task_lease_recovery_task(app_instance)
+        if _trigger_dispatcher_task is not None:
+            _trigger_dispatcher_task.cancel()
+            await asyncio.gather(_trigger_dispatcher_task, return_exceptions=True)
+            _trigger_dispatcher_task = None
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await manager.stop_stream_reconciliation()
+        await stop_task_event_bridge()
+        raise
+
+
+# initial database and skill manager
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _migration_task
+    from ..config import get_task_execution_role, validate_task_execution_host_config
+
+    validate_auth_config()
+    validate_task_execution_host_config()
+    if get_task_execution_role() == "worker":
+        raise ValueError("Use python -m xagent.web.worker for the worker role")
+    logger.info("Agent runtime configured: %s", get_agent_runtime())
+    validate_interaction_rollout_at_startup()
+    from ..core.tools.core.RAG_tools.storage.vector_backend import (
+        lock_deployment_kb_engine,
+    )
+
+    lock_deployment_kb_engine()
+    await _initialize_database_and_admit_runtime(app)
 
     # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
     # sub-task scoped across process restarts. With no resolver registered
@@ -1207,27 +1914,24 @@ async def startup_event() -> None:
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
     )
 
-    # Log memory store type (using dynamic manager)
-    from .dynamic_memory_store import get_memory_store_manager
+    # Admit persistent memory storage before anything is allowed to use it.
+    # Startup is the only moment at which this process is guaranteed to have no
+    # memory writers, and no store is published unless admission succeeds.
+    # Quiescing the rest of the fleet is the operator's job: the supported
+    # procedure is an all-worker restart, never a rolling one.
+    from .dynamic_memory_store import admit_memory_storage_at_startup
 
-    manager = get_memory_store_manager()
-    store_info = manager.get_store_info()
-
-    if store_info["is_lancedb"]:
-        logger.info("Using LanceDB memory store with vector search capabilities")
-        logger.info(f"Embedding model ID: {store_info['embedding_model_id']}")
-    else:
-        logger.info("Using in-memory store (no vector search capabilities)")
-
-    logger.info(
-        f"Memory store similarity threshold: {store_info['similarity_threshold']}"
-    )
+    with _startup_phase("memory storage admission"):
+        admit_memory_storage_at_startup()
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)
     auto_migrate = os.getenv("LANCEDB_AUTO_MIGRATE", "true").lower() == "true"
 
     try:
+        from ..core.tools.core.RAG_tools.kb.collection_handle import (
+            ledger_holds_vectors,
+        )
         from ..core.tools.core.RAG_tools.LanceDB.schema_manager import (
             check_table_needs_migration,
         )
@@ -1256,7 +1960,7 @@ async def startup_event() -> None:
                 needs_migration = True
 
         # Check embeddings tables (use shared compat helper)
-        if not needs_migration:
+        if not needs_migration and ledger_holds_vectors():
             try:
                 from ..core.tools.core.RAG_tools.utils.lancedb_query_utils import (
                     list_embeddings_table_names,
@@ -1557,32 +2261,6 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements.
-        # This walks the entire uploads tree inline during startup and can take
-        # minutes on a large tree with no log output in between. Wrap it in a
-        # startup phase so its duration is visible and a slow start is easy to
-        # diagnose from the logs alone.
-        # WHY: try/except inside the phase keeps a tolerated failure at a single
-        # WARNING; propagating it would add a spurious ERROR from _startup_phase.
-        # exc_info keeps the traceback so an unexpected bug (not just a transient
-        # FS error) is still diagnosable despite the WARNING-level downgrade.
-        with _startup_phase("orphaned temp-file cleanup"):
-            try:
-                from .api.kb import cleanup_orphaned_temp_files
-
-                cleaned_count = await asyncio.to_thread(cleanup_orphaned_temp_files)
-                if cleaned_count > 0:
-                    logger.info(
-                        "Startup cleanup: removed %d orphaned temporary file(s)",
-                        cleaned_count,
-                    )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "Temporary file cleanup skipped due to error: %s",
-                    e,
-                    exc_info=True,
-                )
-
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
@@ -1622,15 +2300,18 @@ async def startup_event() -> None:
 
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
-    from .api.websocket import execute_durable_task_command
+    from .services.task_command_execution import execute_durable_task_command
     from .services.task_command_transport import start_task_command_dispatcher
 
     global _task_command_dispatcher_task
-    _task_command_dispatcher_task = start_task_command_dispatcher(
-        execute_durable_task_command
-    )
-    app.state.task_command_dispatcher_task = _task_command_dispatcher_task
-    logger.info("Started durable task command dispatcher")
+    if get_shared_task_execution_enabled():
+        await _start_shared_task_runtime(app)
+    else:
+        _task_command_dispatcher_task = start_task_command_dispatcher(
+            execute_durable_task_command
+        )
+        app.state.task_command_dispatcher_task = _task_command_dispatcher_task
+    logger.info("Task command dispatch configured")
 
     # Start configured chat channels.
     try:
@@ -1642,21 +2323,42 @@ async def startup_event() -> None:
         if telegram_channel.enabled:
             logger.info("Initializing Telegram channel manager...")
             app.state.telegram_task = asyncio.create_task(telegram_channel.start())
-            logger.info("Telegram channel background task created successfully")
+            logger.info(
+                "Telegram channel manager scheduled; connection status follows in manager logs"
+            )
 
         feishu_channel = get_feishu_channel()
         if feishu_channel.enabled:
             logger.info("Initializing Feishu channel manager...")
             app.state.feishu_task = asyncio.create_task(feishu_channel.start())
-            logger.info("Feishu channel background task created successfully")
+            logger.info(
+                "Feishu channel manager scheduled; connection status follows in manager logs"
+            )
 
         slack_channel = get_slack_channel()
         if slack_channel.enabled:
             logger.info("Initializing Slack channel manager...")
             app.state.slack_task = asyncio.create_task(slack_channel.start())
-            logger.info("Slack channel background task created successfully")
+            logger.info(
+                "Slack channel manager scheduled; connection status follows in manager logs"
+            )
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
+
+    # Kept under the same migration toggle as the uploaded-files reconcile above;
+    # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
+    #
+    # WHY LAST: a startup exception skips Starlette's ``async with`` teardown, so
+    # shutdown_event -- the only place the sweep's stop flag is set -- never runs.
+    # Scheduling before a step that can raise (sandbox static readiness raises on
+    # a mount conflict) leaves the walk sweeping the whole uploads tree in an
+    # executor thread that asyncio.run()'s teardown joins, untimed before 3.12.
+    # WARN: anything appended below must not raise, or must set the flag itself;
+    # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
+    if auto_migrate:
+        start_temp_file_cleanup_task(app)
+    start_runtime_performance_monitor(app)
+    start_app_process_diagnostics(app)
 
 
 @app.on_event("shutdown")
@@ -1668,6 +2370,26 @@ async def shutdown_event() -> None:
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
 
+    # WHY: signal the background temp-file cleanup walk to unwind before any other
+    # teardown runs. It sweeps in an executor thread that a task cancel cannot
+    # stop, and asyncio.run()'s teardown joins that thread at loop close, so if an
+    # earlier shutdown step hangs (e.g. an unresponsive flush_langfuse) the walk
+    # would keep running and block process exit — the exact F1 regression this
+    # guards against. Setting the flag first is unconditional and cannot hang.
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+
+    # WHY: same shape and same reason as the flag above. The purge runs its
+    # batch in a to_thread worker, which a later task cancel cannot stop, so
+    # the signal has to be set before any step that can hang -- otherwise an
+    # unresponsive flush_langfuse leaves the sweep deleting while the process
+    # tries to exit. Setting it is unconditional and cannot hang; the draining
+    # happens later, in stop_retention_purge_task.
+    retention_purge_stop = getattr(app.state, "retention_purge_stop", None)
+    if retention_purge_stop is not None:
+        retention_purge_stop.set()
+
     flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
@@ -1677,7 +2399,10 @@ async def shutdown_event() -> None:
     _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
+    await stop_retention_purge_task(app)
+    await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
+    await stop_task_auto_resume_task(app)
     await stop_task_lease_recovery_task(app)
 
     if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
@@ -1718,12 +2443,14 @@ async def shutdown_event() -> None:
 
     # Shutdown chat channels before draining task finalizers.
     try:
-        if hasattr(app.state, "telegram_task"):
-            app.state.telegram_task.cancel()
-            logger.info("Cancelled Telegram polling task")
-        if hasattr(app.state, "slack_task"):
-            app.state.slack_task.cancel()
-            logger.info("Cancelled Slack manager task")
+        channel_tasks = [
+            task
+            for name in ("telegram_task", "feishu_task", "slack_task")
+            if (task := getattr(app.state, name, None)) is not None
+        ]
+        for task in channel_tasks:
+            task.cancel()
+        await asyncio.gather(*channel_tasks, return_exceptions=True)
 
         from .channels.feishu.bot import get_feishu_channel
         from .channels.slack.bot import get_slack_channel
@@ -1744,16 +2471,46 @@ async def shutdown_event() -> None:
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.
-    from .api.websocket import background_task_manager
+    from .services.task_coordinator_runtime import close_task_coordinators
+    from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
-    await background_task_manager.shutdown()
-    await wait_for_heartbeat_manager_idle()
+    # The diagnostics line keeps reporting while execution drains, and is
+    # stopped even when a shutdown step below fails.
+    try:
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await wait_for_heartbeat_manager_idle()
+        if get_shared_task_execution_enabled():
+            from .api.websocket import manager
+            from .services.task_event_bridge import stop_task_event_bridge
+
+            await manager.stop_stream_reconciliation()
+            await stop_task_event_bridge()
+
+        from .services.trace_database import close_trace_database_runtime
+
+        await close_trace_database_runtime()
+
+        # Export task-finalization metrics and post-drain gauges before stopping
+        # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+        await stop_runtime_performance_monitor(app)
+    finally:
+        await stop_app_process_diagnostics(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 
     shutdown_task_runtime_hook_executor()
     unregister_local_browser_runtime()
+
+    from .services.chrome_mcp_runtime import (
+        shutdown_chrome_execution_session_pool,
+    )
+
+    try:
+        await shutdown_chrome_execution_session_pool()
+    except Exception:
+        logger.error("Failed to drain Chrome execution sessions", exc_info=True)
 
     # Shutdown all sandboxes
     from .sandbox_manager import get_sandbox_manager
@@ -1761,6 +2518,42 @@ async def shutdown_event() -> None:
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
+
+    # Wait briefly for the background orphaned temp-file cleanup to unwind (its
+    # stop flag was already set at the top of this handler). This runs LAST on
+    # purpose: the wait has no ordering dependency on anything above -- the stop
+    # signal is already delivered and this only collects the task -- so putting
+    # it here donates every preceding teardown step's duration to the walk as
+    # free grace time, and keeps its timeout off the critical path of lease
+    # draining and sandbox cleanup, which must finish inside the orchestrator's
+    # termination grace period.
+    #
+    # Use asyncio.wait rather than asyncio.wait_for: wait_for's cancellation only
+    # kills the awaiting coroutine, not the executor thread doing the real work,
+    # so cancelling early buys nothing. It also keeps the walk collectable after
+    # this wait -- on the timeout branch the completion/failure log is lost
+    # either way, since asyncio.run()'s teardown cancels the pending task and
+    # CancelledError is a BaseException the coroutine's handler does not catch.
+    if hasattr(app.state, "temp_file_cleanup_task"):
+        cleanup_task = app.state.temp_file_cleanup_task
+        if cleanup_task and not cleanup_task.done():
+            timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
+            done, _pending = await asyncio.wait({cleanup_task}, timeout=timeout)
+            if not done:
+                logger.warning(
+                    "Orphaned temp-file cleanup still running %ss after stop "
+                    "signal; the executor thread will unwind at its next "
+                    "stop-check boundary",
+                    timeout,
+                )
+        # WHY: only release the handles once the task is actually finished.
+        # Clearing them while the walk is still running would discard its only
+        # stop handle and let a re-entrant startup schedule a second concurrent
+        # sweep over the same tree -- exactly what the guard in
+        # start_temp_file_cleanup_task exists to prevent.
+        if cleanup_task is None or cleanup_task.done():
+            app.state.temp_file_cleanup_task = None
+            app.state.temp_file_cleanup_stop = None
 
 
 from ..config import get_frontend_dist_dir  # noqa: E402

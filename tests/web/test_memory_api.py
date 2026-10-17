@@ -279,8 +279,35 @@ class TestMemoryListEndpoint:
 
         response = client.get("/api/memory/list", headers=auth_headers)
 
-        assert response.status_code == 500
-        assert "Failed to list memories" in response.json()["detail"]
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Memory storage is temporarily unavailable."
+        assert "Database error" not in response.text
+
+    def test_search_memories_returns_empty_success_for_no_match(
+        self, client, mock_memory_store, auth_headers
+    ):
+        mock_memory_store.search.return_value = []
+
+        response = client.get("/api/memory/list?search=missing", headers=auth_headers)
+
+        assert response.status_code == 200
+        assert response.json()["memories"] == []
+        assert response.json()["total_count"] == 0
+
+    def test_search_memories_sanitizes_backend_failure(
+        self, client, mock_memory_store, auth_headers
+    ):
+        mock_memory_store.search.side_effect = RuntimeError(
+            "lancedb://internal-host/private-table"
+        )
+
+        response = client.get(
+            "/api/memory/list?search=preferences", headers=auth_headers
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Memory storage is temporarily unavailable."
+        assert "internal-host" not in response.text
 
 
 class TestMemoryGetEndpoint:
@@ -393,7 +420,25 @@ class TestMemoryCreateEndpoint:
         response = client.post("/api/memory/", json=memory_data, headers=auth_headers)
 
         assert response.status_code == 500
-        assert "Failed to create memory" in response.json()["detail"]
+        # The route raises ``response.error or "Failed to create memory"``, so
+        # the store's own message is the intended detail. It used to be caught
+        # by the route's own broad handler and re-wrapped, status code and all,
+        # into "Failed to create memory: 500: Storage failed"; that wrapper is
+        # gone because it also swallowed the lifecycle 503.
+        assert response.json()["detail"] == "Storage failed"
+
+    def test_create_memory_error_handling_without_a_store_message(
+        self, client, mock_memory_store, auth_headers
+    ):
+        """A refusal that carries no message still answers the generic 500."""
+        mock_memory_store.add.return_value = Mock(success=False, error=None)
+
+        response = client.post(
+            "/api/memory/", json={"content": "Test memory"}, headers=auth_headers
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Failed to create memory"
 
 
 class TestMemoryUpdateEndpoint:

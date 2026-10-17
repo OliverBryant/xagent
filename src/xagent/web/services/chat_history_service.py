@@ -4,26 +4,46 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
-from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session, defer
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.sql.elements import ColumnElement
 
 from ...core.agent.attachments import build_image_context_references
+from ...core.agent.context.execution import (
+    COMPACT_CONTEXT_REFS_METADATA_KEY,
+    COMPACT_SUMMARY_METADATA_KEY,
+    COMPACT_WATERMARK_METADATA_KEY,
+)
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
     normalize_transcript_messages,
 )
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
+from ..models.task import TraceEvent
+from ..models.task_execution_event import TaskExecutionEvent
+from .assistant_history_safety import (
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
+    assistant_history_has_safe_ancillary_payload,
+    client_safe_assistant_history_content,
+    safe_str,
+)
 from .file_reference_output_service import reconcile_assistant_file_references
 from .ops_signals import (
     CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
     clear_degradation,
     register_degradation,
 )
+from .task_execution_event_writer import (
+    load_event_chat_message,
+    stage_chat_message_no_commit,
+    stage_delivery_fact_no_commit,
+)
+from .task_retention import touch_task_last_activity
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +51,7 @@ DELIVERY_PENDING = "pending"
 DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
+DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -82,6 +103,10 @@ class UserMessageDeliveryClaim:
         return str(self.message.delivery_status) == DELIVERY_FAILED
 
     @property
+    def outcome_unknown(self) -> bool:
+        return str(self.message.delivery_status) == DELIVERY_OUTCOME_UNKNOWN
+
+    @property
     def pending(self) -> bool:
         return str(self.message.delivery_status) == DELIVERY_PENDING
 
@@ -121,6 +146,23 @@ def _delivery_payload_matches(
     ) == _attachment_identity(attachments)
 
 
+def accepted_message_content_matches(
+    storage_version: int, content: str
+) -> ColumnElement[bool]:
+    """Content predicate for acceptance reconciliation's existing control row."""
+    if storage_version != 2:
+        return TaskChatMessage.content == content.strip()
+    return TaskChatMessage.execution_event_id.in_(
+        select(TaskExecutionEvent.event_id).where(
+            TaskExecutionEvent.task_id == TaskChatMessage.task_id,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.kind == "input_accepted",
+            TaskExecutionEvent.payload_version == 1,
+            TaskExecutionEvent.payload["content"].as_string() == content.strip(),
+        )
+    )
+
+
 def inspect_user_message_delivery(
     db: Session,
     task_id: int,
@@ -131,15 +173,41 @@ def inspect_user_message_delivery(
 ) -> Optional[UserMessageDeliveryClaim]:
     """Return the durable outcome for ``turn_id`` without creating a row."""
 
-    existing = (
-        db.query(TaskChatMessage)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "user",
-            TaskChatMessage.turn_id == turn_id,
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        event = db.scalar(
+            select(TaskExecutionEvent).where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.idempotency_key == f"message:{turn_id}",
+                TaskExecutionEvent.kind == "input_accepted",
+            )
         )
-        .first()
-    )
+        if event is None:
+            projection_id = db.scalar(
+                select(TaskChatMessage.id).where(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "user",
+                    TaskChatMessage.turn_id == turn_id,
+                )
+            )
+            if projection_id is not None:
+                raise ValueError(
+                    f"Missing accepted input for task {task_id}, turn {turn_id}"
+                )
+            return None
+        existing = load_event_chat_message(db, event)
+    else:
+        existing = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+            )
+            .first()
+        )
     if existing is None:
         return None
     return UserMessageDeliveryClaim(
@@ -153,66 +221,6 @@ def inspect_user_message_delivery(
     )
 
 
-def claim_user_message_delivery(
-    db: Session,
-    task_id: int,
-    user_id: int,
-    content: str,
-    *,
-    attachments: Optional[List[Dict[str, Any]]] = None,
-    turn_id: str,
-) -> UserMessageDeliveryClaim:
-    """Atomically claim a live-control turn before dispatching it.
-
-    The unique database index is the cross-worker serializer. A concurrent
-    loser rolls back its insert and returns the winner's durable row, so only
-    the claimant may inject the message into an active runtime.
-    """
-
-    existing = inspect_user_message_delivery(
-        db,
-        task_id,
-        content,
-        attachments=attachments,
-        turn_id=turn_id,
-    )
-    if existing is not None:
-        return existing
-
-    message = TaskChatMessage(
-        task_id=task_id,
-        user_id=user_id,
-        role="user",
-        content=content.strip(),
-        message_type="user_message",
-        interactions=None,
-        turn_id=turn_id,
-        delivery_status=DELIVERY_PENDING,
-        attachments=attachments,
-    )
-    db.add(message)
-    try:
-        db.commit()
-        db.refresh(message)
-        return UserMessageDeliveryClaim(
-            message=message,
-            claimed=True,
-            payload_matches=True,
-        )
-    except IntegrityError:
-        db.rollback()
-        raced = inspect_user_message_delivery(
-            db,
-            task_id,
-            content,
-            attachments=attachments,
-            turn_id=turn_id,
-        )
-        if raced is None:
-            raise
-        return raced
-
-
 def claim_user_message_delivery_no_commit(
     db: Session,
     task_id: int,
@@ -222,8 +230,21 @@ def claim_user_message_delivery_no_commit(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: str,
 ) -> UserMessageDeliveryClaim:
-    """Stage a delivery claim without committing the caller's transaction."""
+    """Stage a delivery claim without committing the caller's transaction.
 
+    The unique ``(task_id, role, turn_id)`` index rejects a second row for
+    the same turn. This helper does not recover from that: a racing insert
+    raises ``IntegrityError`` on flush or commit, and the caller rolls back
+    and re-inspects the winner. Which worker may run the turn at all is
+    decided by the task lease, not by this claim. Event-backed claims lock
+    the task before the lookup so a reused projection is not a new claimant.
+    """
+
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        lock_task_execution_events_no_commit(db, task_id)
     existing = inspect_user_message_delivery(
         db,
         task_id,
@@ -245,7 +266,13 @@ def claim_user_message_delivery_no_commit(
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
+    # Before the insert, not after it: this is the one staging path that
+    # flushes, and touching afterwards would make it the only site to take
+    # the task row *after* writing task_chat_messages. Every other writer in
+    # the codebase takes the task row first, so the reversed order here would
+    # be a lock cycle waiting for two turns on one task to interleave.
+    touch_task_last_activity(db, task_id)
     db.flush()
     return UserMessageDeliveryClaim(
         message=message,
@@ -268,18 +295,25 @@ def mark_user_message_delivery(
         DELIVERY_DISPATCHED,
         DELIVERY_COMPLETED,
         DELIVERY_FAILED,
+        DELIVERY_OUTCOME_UNKNOWN,
     }:
         raise ValueError(f"Unknown delivery status: {status}")
+    from .task_execution_event_store import lock_task_execution_events_no_commit
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        # Use the same task-before-message lock order as acceptance/finalization.
+        lock_task_execution_events_no_commit(db, task_id)
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "user",
         TaskChatMessage.turn_id == turn_id,
     )
-    message = query.first()
-    if message is None:
+    current_status = query.with_entities(TaskChatMessage.delivery_status).first()
+    if current_status is None:
         return UserMessageDeliveryTransition(status=None, outcome="missing")
 
-    current = str(message.delivery_status)
+    current = str(current_status[0])
     if current == status:
         return UserMessageDeliveryTransition(status=current, outcome="idempotent")
     allowed_targets = {
@@ -287,6 +321,7 @@ def mark_user_message_delivery(
             DELIVERY_DISPATCHED,
             DELIVERY_COMPLETED,
             DELIVERY_FAILED,
+            DELIVERY_OUTCOME_UNKNOWN,
         },
         DELIVERY_DISPATCHED: {DELIVERY_COMPLETED},
     }
@@ -298,15 +333,18 @@ def mark_user_message_delivery(
         synchronize_session=False,
     )
     if updated:
+        stage_delivery_fact_no_commit(
+            db, task_id=task_id, turn_id=turn_id, status=status
+        )
         return UserMessageDeliveryTransition(status=status, outcome="updated")
 
     # A concurrent terminal transition won after the read. Reload the durable
     # state instead of issuing an unguarded write that could regress it.
     db.expire_all()
-    raced = query.first()
+    raced = query.with_entities(TaskChatMessage.delivery_status).first()
     if raced is None:
         return UserMessageDeliveryTransition(status=None, outcome="missing")
-    raced_status = str(raced.delivery_status)
+    raced_status = str(raced[0])
     return UserMessageDeliveryTransition(
         status=raced_status,
         outcome="idempotent" if raced_status == status else "conflict",
@@ -332,6 +370,37 @@ def mark_user_message_delivery_sync(
         )
         db.commit()
         return transition
+
+
+def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> bool:
+    """Delete a still-pending user row its claimant never injected.
+
+    For a live-control claim whose run ended before the message reached it:
+    removing the row lets the same turn id be accepted as a new turn, which
+    inserts its own row. Only a ``pending`` row is removed, in one conditional
+    DELETE, so a row another writer already settled is left alone. The caller
+    must know the message was never written into a run; a row an earlier
+    attempt may have injected is never withdrawn.
+
+    Returns whether the row was removed.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        removed = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+                TaskChatMessage.delivery_status == DELIVERY_PENDING,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return removed == 1
 
 
 def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
@@ -634,7 +703,8 @@ def persist_user_message_no_commit(
         # "attachments key was set, just empty".
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     return message
 
 
@@ -644,10 +714,11 @@ def persist_assistant_message(
     user_id: int,
     content: str,
     *,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     reconciled_content = (
         content
@@ -671,6 +742,7 @@ def persist_assistant_message(
         message_type=message_type,
         interactions=interactions,
         turn_id=turn_id,
+        source_event_id=source_event_id,
     )
 
 
@@ -680,12 +752,31 @@ def persist_assistant_message_no_commit(
     user_id: int,
     content: str,
     *,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
+    source_event_id: Optional[str] = None,
+    execution_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
+
+    # The outbound writer holds the task lock and supplies the committed
+    # fact's message and interactions, including on an idempotent retry.
+    existing = None
+    if execution_event_id is not None:
+        existing = db.scalar(
+            select(TaskChatMessage)
+            .options(
+                defer(cast(Any, TaskChatMessage.content)),
+                defer(cast(Any, TaskChatMessage.attachments)),
+                defer(cast(Any, TaskChatMessage.interactions)),
+            )
+            .where(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.execution_event_id == execution_event_id,
+            )
+        )
 
     reconciled_content = (
         content
@@ -701,6 +792,11 @@ def persist_assistant_message_no_commit(
         reconciled_content, interactions
     )
     normalized_content = transcript_content.strip()
+    if existing is not None:
+        set_committed_value(existing, "content", normalized_content)
+        set_committed_value(existing, "interactions", interactions)
+        set_committed_value(existing, "attachments", None)
+        return existing
     if not normalized_content:
         return None
     message = TaskChatMessage(
@@ -712,9 +808,142 @@ def persist_assistant_message_no_commit(
         interactions=interactions,
         turn_id=turn_id,
         attachments=None,
+        source_event_id=source_event_id,
+        execution_event_id=execution_event_id,
     )
-    db.add(message)
+    if execution_event_id is not None:
+        db.add(message)
+    else:
+        message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     return message
+
+
+# The stored ``event_type`` for a completed context compaction. Written by
+# ``ws_trace_handlers.get_event_type_mapping`` from
+# ``TraceEventType(ACTION, END, COMPACT)``.
+_COMPACT_END_EVENT_TYPE = "action_end_compact"
+# How far back to keep looking for a reusable summary. The SQL filter below
+# already excludes every event that cannot carry one, so reaching a second
+# candidate means the first had a well-formed key with unusable content --
+# corruption, not a normal outcome. A handful is plenty; the point of looping
+# at all is that "this one is unusable" must never be read as "there is none".
+_COMPACT_SUMMARY_SCAN_LIMIT = 8
+
+
+@dataclass(frozen=True)
+class CompactSummary:
+    """A stored summary and the transcript row it stands in for."""
+
+    content: str
+    watermark_message_id: int
+    context_refs: tuple[Dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class TranscriptWindow:
+    """What a turn replays, plus the point a later summary stands in for.
+
+    ``watermark`` is the largest stored row id this window covers. Hand it to
+    the agent so a compaction during this turn can record what its summary
+    absorbed; without it the summary is unpositionable and the next turn falls
+    back to replaying everything.
+    """
+
+    messages: List[Dict[str, Any]]
+    watermark: Optional[int]
+    event_watermark: dict[str, Any] | None = None
+
+
+def _latest_compact_summary(
+    db: Session,
+    task_id: int,
+    *,
+    before_message_id: Optional[int],
+) -> Optional[CompactSummary]:
+    """The newest usable summary for this task, or None to replay in full.
+
+    Reads down the ordered candidates rather than judging only the newest
+    one. The message-dropping backstop emits an ``action_end_compact`` event
+    too -- same type, deliberately carrying no summary, because it stands in
+    for nothing -- so the newest event is routinely not the newest *usable*
+    one. Stopping at the newest would let one backstop turn mask a perfectly
+    good summary and send every later turn back to replaying everything.
+
+    Selecting on the payload, not on ``strategy``: the question here is "can
+    this be replayed", and only the summary and watermark answer it.
+    ``strategy == "llm_summary"`` answers "how was this produced", which is a
+    different question -- a summary emitted with no watermark, or any event
+    written before this feature existed, carries that strategy and still
+    cannot be positioned.
+
+    ``build_id IS NULL`` is load-bearing, not a tidiness filter. A delegated
+    sub-agent compacts its own context and writes its own compact events under
+    the SAME ``task_id``, carrying a ``build_id``. Those describe a different
+    conversation entirely, and adopting one would silently drop this task's
+    real history behind a watermark that never belonged to it.
+    """
+    query = (
+        db.query(TraceEvent.data)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.event_type == _COMPACT_END_EVENT_TYPE,
+            TraceEvent.build_id.is_(None),
+            # Keeps backstop events and pre-feature rows out of the candidate
+            # set entirely, so a run of them cannot exhaust the scan limit
+            # below. SQL only sees whether the keys are there; whether the
+            # content is usable is settled in Python.
+            #
+            # The ``as_*`` coercions are required, not cosmetic: a bare
+            # ``data[key].isnot(None)`` compares as JSON and matches rows
+            # where the key is absent, which silently filters nothing.
+            TraceEvent.data[COMPACT_SUMMARY_METADATA_KEY].as_string().isnot(None),
+            TraceEvent.data[COMPACT_WATERMARK_METADATA_KEY].as_integer().isnot(None),
+        )
+        .order_by(TraceEvent.timestamp.desc(), TraceEvent.id.desc())
+    )
+    if before_message_id is not None:
+        # Replaying the conversation as of an earlier point (an edit or a
+        # branch) invalidates any summary that already absorbed rows at or
+        # past that point: it speaks for turns this replay is meant to
+        # discard. Watermarks only ever advance, so skipping those leaves the
+        # newest summary that is still entirely in the replayed past.
+        query = query.filter(
+            TraceEvent.data[COMPACT_WATERMARK_METADATA_KEY].as_integer()
+            < before_message_id
+        )
+
+    for (data,) in query.limit(_COMPACT_SUMMARY_SCAN_LIMIT).all():
+        summary = _compact_summary_from_event(data)
+        if summary is not None:
+            return summary
+    return None
+
+
+def _compact_summary_from_event(data: Any) -> Optional[CompactSummary]:
+    """Read one compact event payload, or None if it cannot be replayed."""
+    if not isinstance(data, dict):
+        return None
+    content = data.get(COMPACT_SUMMARY_METADATA_KEY)
+    watermark = data.get(COMPACT_WATERMARK_METADATA_KEY)
+    if not isinstance(content, str) or not content.strip():
+        return None
+    # ``bool`` is an ``int`` subclass, so this rejects a stray ``true`` that
+    # would otherwise be read as "the summary covers rows up to 1" and drop
+    # the entire transcript.
+    if not isinstance(watermark, int) or isinstance(watermark, bool):
+        return None
+    raw_refs = data.get(COMPACT_CONTEXT_REFS_METADATA_KEY)
+    context_refs = (
+        tuple(ref for ref in raw_refs if isinstance(ref, dict))
+        if isinstance(raw_refs, list)
+        else ()
+    )
+    return CompactSummary(
+        content=content,
+        watermark_message_id=watermark,
+        context_refs=context_refs,
+    )
 
 
 def load_task_transcript(
@@ -723,6 +952,26 @@ def load_task_transcript(
     *,
     before_message_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    return load_task_transcript_window(
+        db, task_id, before_message_id=before_message_id
+    ).messages
+
+
+def load_task_transcript_window(
+    db: Session,
+    task_id: int,
+    *,
+    before_message_id: Optional[int] = None,
+) -> TranscriptWindow:
+    from .task_execution_event_writer import uses_execution_events
+
+    if uses_execution_events(db, task_id):
+        from .task_event_context_service import load_task_event_context
+
+        context = load_task_event_context(
+            db, task_id, before_message_id=before_message_id
+        )
+        return TranscriptWindow(context.messages, None, context.watermark)
     if before_message_id is not None:
         # Check if the reference message actually exists
         exists = (
@@ -737,11 +986,18 @@ def load_task_transcript(
             logger.warning(
                 "Message id: {before_message_id} does not exit, returning empty list."
             )
-            return []
+            return TranscriptWindow(messages=[], watermark=None)
+
+    summary = _latest_compact_summary(db, task_id, before_message_id=before_message_id)
 
     query = db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id)
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
+    if summary is not None:
+        # Everything at or below the watermark is what the summary says. The
+        # rows stay in the table -- they are the user-visible chat history --
+        # they just stop being replayed into the model's context.
+        query = query.filter(TaskChatMessage.id > summary.watermark_message_id)
 
     stored_messages = query.order_by(TaskChatMessage.id.asc()).all()
     retained_references: list[tuple[ContextReference, ...]] = [
@@ -751,22 +1007,67 @@ def load_task_transcript(
     for index in range(len(stored_messages) - 1, -1, -1):
         if remaining_references <= 0:
             break
-        references = build_image_context_references(stored_messages[index].attachments)
+        stored_message = stored_messages[index]
+        if safe_str(stored_message.role) == "assistant" and not (
+            assistant_history_has_safe_ancillary_payload(
+                safe_str(stored_message.message_type)
+            )
+        ):
+            continue
+        references = build_image_context_references(stored_message.attachments)
         retained_references[index] = references[:remaining_references]
         remaining_references -= len(retained_references[index])
 
     messages: List[Dict[str, Any]] = []
     for message, references in zip(stored_messages, retained_references):
+        role = safe_str(message.role)
+        content = safe_str(message.content)
+        if role == "assistant":
+            content = client_safe_assistant_history_content(
+                content=content,
+                message_type=safe_str(message.message_type),
+            )
         item: Dict[str, Any] = {
-            "role": str(message.role),
-            "content": str(message.content),
+            "role": role,
+            "content": content,
         }
         if references:
             item[CONTEXT_REFS_KEY] = [
                 reference.durable_dict() for reference in references
             ]
         messages.append(item)
-    return normalize_transcript_messages(messages)
+    if summary is not None:
+        summary_item: Dict[str, Any] = {
+            "role": "system",
+            "content": summary.content,
+        }
+        # The summary stands for the oldest part of the conversation, so it
+        # takes what the newest-first walk above left over -- one allocation
+        # under one rule, not a reserved slice ahead of it. Giving it first
+        # pick starved the images the user had only just sent: a compaction
+        # can legitimately retain more references than this window replays
+        # (its own budget counts tokens, this one counts references), so a
+        # reserved slice can consume the window outright. Recency also
+        # matters more than the age of the decision -- when compaction chose
+        # what to keep, the newest attachment did not exist yet.
+        if summary.context_refs and remaining_references > 0:
+            summary_item[CONTEXT_REFS_KEY] = list(
+                summary.context_refs[:remaining_references]
+            )
+        messages.insert(0, summary_item)
+
+    # The largest row this window covers, for the next compaction to record.
+    # Rows this turn goes on to write land above it and are replayed verbatim
+    # next time; that is deliberate. Their ids do not exist yet, and claiming
+    # a summary covers work whose rows were never seen would lose them.
+    watermark: Optional[int] = summary.watermark_message_id if summary else None
+    if stored_messages:
+        watermark = max(watermark or 0, int(stored_messages[-1].id))
+
+    return TranscriptWindow(
+        messages=normalize_transcript_messages(messages),
+        watermark=watermark,
+    )
 
 
 def get_latest_waiting_question(
@@ -842,6 +1143,7 @@ def _persist_message(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     delivery_status: Optional[str] = None,
+    source_event_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -856,11 +1158,13 @@ def _persist_message(
         interactions=interactions,
         turn_id=turn_id,
         delivery_status=delivery_status,
+        source_event_id=source_event_id,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,
     )
-    db.add(message)
+    message = stage_chat_message_no_commit(db, message)
+    touch_task_last_activity(db, task_id)
     db.commit()
     db.refresh(message)
     return message

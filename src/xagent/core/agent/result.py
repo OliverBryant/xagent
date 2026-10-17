@@ -4,12 +4,24 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-TOOL_FAILURE_CODES = frozenset(
+EXCEL_FAILURE_CODES = frozenset(
     {
-        "oauth_token_required",
-        "unsupported_nested_interaction",
-        "missing_delegated_output",
+        "excel_workbook_access_denied",
+        "excel_site_not_found",
+        "excel_workbook_locked",
     }
+)
+
+TOOL_FAILURE_CODES = (
+    frozenset(
+        {
+            "authentication_required",
+            "oauth_token_required",
+            "unsupported_nested_interaction",
+            "missing_delegated_output",
+        }
+    )
+    | EXCEL_FAILURE_CODES
 )
 
 # Pseudo-tools that drive the run rather than retrieve evidence. They flow
@@ -45,6 +57,18 @@ def is_oauth_token_required_code(value: Any) -> bool:
     return type(value) is str and value == "oauth_token_required"
 
 
+def tool_result_requires_authentication(result: Any) -> bool:
+    """Recognize an adapter-classified authentication failure, not HTTP payloads."""
+
+    return (
+        isinstance(result, dict)
+        and result.get("success") is False
+        and result.get("is_error") is True
+        and normalize_tool_failure_code(result.get("failure_code"))
+        == "authentication_required"
+    )
+
+
 @dataclass(frozen=True)
 class ClassifiedToolFailure:
     """Sentinel an OAuth token resolver returns when it cannot refresh a token.
@@ -75,14 +99,34 @@ def tool_result_succeeded(result: Any) -> bool:
     return not (isinstance(status, str) and status.lower() == "error")
 
 
-def extract_assistant_message(result: dict[str, Any]) -> str | None:
-    """Return the assistant-facing output from a normalized pattern result."""
+FINAL_ANSWER_KEYS = ("response", "answer", "output", "content", "message")
 
-    for key in ("response", "answer", "output", "content", "message"):
+
+def assistant_message_key(result: dict[str, Any]) -> str | None:
+    """Select one canonical answer without treating other strings as aliases."""
+
+    for key in FINAL_ANSWER_KEYS:
         value = result.get(key)
         if isinstance(value, str) and value:
-            return unwrap_final_answer_content(value)
+            return key
     return None
+
+
+def extract_assistant_message(result: dict[str, Any]) -> str | None:
+    """Return the assistant-facing output from a normalized pattern result."""
+    key = assistant_message_key(result)
+    return unwrap_final_answer_content(str(result[key])) if key is not None else None
+
+
+def set_assistant_message(result: dict[str, Any], content: str) -> None:
+    """Replace the canonical answer and exact aliases, preserving other fields."""
+    key = assistant_message_key(result)
+    if key is None:
+        return
+    original = result[key]
+    for candidate in FINAL_ANSWER_KEYS:
+        if result.get(candidate) == original:
+            result[candidate] = content
 
 
 def unwrap_final_answer_content(content: str) -> str:

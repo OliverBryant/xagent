@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 
@@ -5,6 +6,7 @@ import os
 # In Python 3.11, pathlib.Path doesn't have _flavour but PosixPath does
 # This is needed for pytest internal usage
 import pathlib
+import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Iterator
@@ -60,6 +62,77 @@ elif example_env_file.exists():
     load_dotenv(example_env_file, override=False)
 else:
     print("Warning: Neither .env nor example.env file found")
+
+
+@pytest.fixture(autouse=True)
+def local_execution_unless_selected(monkeypatch):
+    """Existing suites select local execution; shared suites opt in explicitly."""
+    # A reachable CI Redis must not silently enable shared caches or rate limits.
+    # Tests that exercise Redis opt in explicitly after this fixture.
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
+
+
+_DATABASE_MODULE = "xagent.web.models.database"
+_DATABASE_ACCESSORS = (
+    "get_session_local",
+    "get_optional_session_local",
+    "get_engine",
+    "get_db",
+)
+# A leaked binding stays leaked for the rest of the process; report it once,
+# against the test that leaked it, instead of failing every later test too.
+_reported_stale_database_accessors: set[str] = set()
+
+
+def _is_real_database_accessor(value: object, name: str) -> bool:
+    return (
+        inspect.isfunction(value)
+        and value.__module__ == _DATABASE_MODULE
+        and value.__qualname__ == name
+    )
+
+
+def _stale_database_accessors() -> list[str]:
+    """Loaded ``xagent`` modules holding a patched database accessor.
+
+    A module first imported while a test patches
+    ``xagent.web.models.database.get_session_local`` (or another accessor) binds
+    the replacement by name through ``from ..models.database import ...`` and
+    keeps it after monkeypatch restores the database module, so every later
+    test in the process silently uses the wrong database. Tests should patch
+    ``database._SessionLocal`` / ``database._engine`` instead.
+    """
+    return sorted(
+        f"{module_name}.{name}"
+        for module_name, module in list(sys.modules.items())
+        if module_name.startswith("xagent.") and module is not None
+        for name in _DATABASE_ACCESSORS
+        if name in vars(module)
+        and not _is_real_database_accessor(vars(module)[name], name)
+    )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    # Runs after every fixture (monkeypatch included) has been finalized, so
+    # anything still patched here outlives the test that patched it.
+    result = yield
+    stale = [
+        binding
+        for binding in _stale_database_accessors()
+        if binding not in _reported_stale_database_accessors
+    ]
+    if stale:
+        _reported_stale_database_accessors.update(stale)
+        raise AssertionError(
+            f"{item.nodeid} leaked patched database accessors into: "
+            f"{', '.join(stale)}. Patch xagent.web.models.database._SessionLocal "
+            "/ _engine instead of the accessors that read them."
+        )
+    return result
 
 
 def pytest_addoption(parser):
@@ -143,6 +216,17 @@ def pytest_collection_modifyitems(config, items):
             if "real_rag" in item.keywords:
                 item.add_marker(skip_real_rag)
 
+    if not os.getenv("MILVUS_URI"):
+        if os.getenv("XAGENT_REQUIRE_MILVUS", "0").strip() == "1":
+            raise pytest.UsageError(
+                "XAGENT_REQUIRE_MILVUS is set but MILVUS_URI is empty; "
+                "the Milvus tests would all be skipped"
+            )
+        skip_milvus = pytest.mark.skip(reason="Requires a Milvus server at MILVUS_URI")
+        for item in items:
+            if item.get_closest_marker("milvus"):
+                item.add_marker(skip_milvus)
+
     # Skip requires_network tests unless --run-special or XAGENT_TESTS_ALLOW_NETWORK=1
     run_special = config.getoption("--run-special", default=False)
     allow_network = os.getenv("XAGENT_TESTS_ALLOW_NETWORK", "0").strip() == "1"
@@ -174,6 +258,41 @@ def temp_dir():
     """Provide a temporary directory for tests."""
     with TemporaryDirectory() as temp_dir:
         yield temp_dir
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_path_config_caches() -> Iterator[None]:
+    """Reset cwd-pinned config paths so test order cannot change results."""
+    from xagent.config import _reset_path_config_caches_for_tests
+
+    _reset_path_config_caches_for_tests()
+    yield
+    _reset_path_config_caches_for_tests()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_process_database_binding() -> Iterator[None]:
+    """Keep temporary Web SQL configuration from leaking into later tests."""
+    from sqlalchemy.engine import Engine
+
+    from xagent.web.models import database
+
+    previous = database._SessionLocal, database._engine
+    try:
+        yield
+    finally:
+        engine = database._engine
+        database._SessionLocal, database._engine = previous
+        if isinstance(engine, Engine) and engine is not previous[1]:
+            engine.dispose()
+
+
+@pytest.fixture
+def monkeypatch(
+    isolate_process_database_binding: None, monkeypatch: pytest.MonkeyPatch
+) -> pytest.MonkeyPatch:
+    """Undo test patches before restoring the original process SQL binding."""
+    return monkeypatch
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -272,6 +391,85 @@ def isolate_execution_scope_hooks() -> Iterator[None]:
     set_execution_scope_snapshot_loader(None)
 
 
+def _reset_task_keyed_process_state() -> None:
+    # Only modules a test already imported can hold state; importing the web
+    # stack here would slow every core-only test.
+    manager_module = sys.modules.get("xagent.core.agent.context.manager")
+    if (
+        manager_module is not None
+        and manager_module.ContextManager._instance is not None
+    ):
+        manager = manager_module.ContextManager()
+        for context in manager.list_active_contexts():
+            manager.remove_context(context.execution_id)
+        with manager._lock:
+            manager._cold_starts.clear()
+    task_execution = sys.modules.get("xagent.web.services.task_execution")
+    if task_execution is not None:
+        task_execution._pause_accepted_task_ids.clear()
+    connector_runtime = sys.modules.get("xagent.web.services.connector_runtime")
+    if connector_runtime is not None:
+        # Keyed by turn id, which is the client message id when one is sent.
+        with connector_runtime._EPHEMERAL_RUNTIME_VALUES_LOCK:
+            connector_runtime._EPHEMERAL_RUNTIME_VALUES.clear()
+            connector_runtime._EPHEMERAL_RUNTIME_MANIFESTS.clear()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_task_keyed_process_state() -> Iterator[None]:
+    """Clear process-wide state keyed by task, execution or turn id around every test.
+
+    Each test's database numbers tasks from 1 again, so an entry a test leaves
+    behind is picked up by the next test on the same worker as if it were its
+    own task: a fenced or finished ``ContextManager`` context becomes the
+    "cached" context of an unrelated injection, and a leaked pause-accepted id
+    routes an unrelated message into the pause-drain branch. Which test pairs
+    collide depends on how xdist distributes files, so these leaks surface as
+    order-dependent failures far from the test that caused them.
+    """
+    _reset_task_keyed_process_state()
+    yield
+    _reset_task_keyed_process_state()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def check_task_extension_registry_leaks() -> Iterator[None]:
+    """Fail the test that leaves the task-extension registry changed.
+
+    The registry in ``xagent.web.services.task_runtime`` is process-wide. A
+    provider left registered (e.g. by running the web app's startup without
+    its shutdown) makes every later test that consults
+    ``registered_task_extensions()`` take the provider branch, which then
+    fails far from the cause depending on xdist scheduling. The registry is
+    restored before failing so the leak cannot cascade.
+    """
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    before = (
+        dict(task_runtime._task_runtime_extensions) if task_runtime is not None else {}
+    )
+    yield
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    if task_runtime is None:
+        return
+    with task_runtime._task_runtime_extensions_lock:
+        after = dict(task_runtime._task_runtime_extensions)
+        if after == before:
+            return
+        task_runtime._task_runtime_extensions.clear()
+        task_runtime._task_runtime_extensions.update(before)
+    leaked = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    replaced = sorted(
+        name for name in set(after) & set(before) if after[name] is not before[name]
+    )
+    pytest.fail(
+        "Test changed the process-wide task extension registry without "
+        f"restoring it (leaked={leaked}, removed={removed}, replaced={replaced}); "
+        "unregister providers the test registers, or run the app shutdown.",
+        pytrace=False,
+    )
+
+
 @pytest.fixture(autouse=True, scope="function")
 def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient proxy env vars so tests are deterministic across hosts.
@@ -291,6 +489,28 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="function")
+def isolate_meta_config_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient Meta Login Configuration env vars for the same reason as
+    isolate_proxy_env above: a developer's real .env can carry META_CONFIG_ID
+    or one of the per-app overrides (META_FACEBOOK_CONFIG_ID /
+    META_INSTAGRAM_CONFIG_ID / META_ADS_CONFIG_ID / META_WHATSAPP_CONFIG_ID --
+    exactly what example.env now documents setting), and without this an
+    otherwise unrelated test exercising the Meta OAuth authorize flow would
+    silently pick up that ambient value instead of the one it explicitly
+    sets/expects. Tests exercising config_id behavior already opt in with
+    ``monkeypatch.setenv(...)`` for the exact var(s) they need.
+    """
+    for name in (
+        "META_CONFIG_ID",
+        "META_FACEBOOK_CONFIG_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_ADS_CONFIG_ID",
+        "META_WHATSAPP_CONFIG_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 

@@ -16,6 +16,7 @@ import {
   Check,
   Shield,
   MessageSquare,
+  CircleSlash,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
@@ -141,7 +142,7 @@ interface StepAction {
   id: string;
   type: 'llm' | 'tool' | 'info' | 'error';
   title: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
   timestamp: number;
   data: {
     model?: string;
@@ -159,6 +160,7 @@ interface StepAction {
     sandboxed?: boolean;
     inline?: boolean;
     workforceSummary?: boolean;
+    statusLine?: boolean;
   };
 }
 
@@ -184,17 +186,18 @@ function formatActionContent(value: unknown, filesDisabled = false): string {
 // DAGNode.data: this status is derived locally from the trace event stream
 // itself (dag_step_start/dag_step_end/etc.), not read off StepExecution, and
 // mixes in whole-TASK states ("paused", "waiting_for_user") that the other
-// three don't carry at the step level. No trace event currently distinguishes
-// a step being "interrupted" or "clarification_invalidated" from plain
-// "running" the way StepExecution's own field does, so this view can't
-// represent those two states without new derivation logic to detect them from
-// the event stream - a step in either state renders here as "running" rather
-// than reporting an unknown/wrong status.
+// three don't carry at the step level. A step only becomes "interrupted"
+// through the process-level status in processTraceEvents' final settling
+// pass. A per-step "interrupted" status is ignored: a react_task_end whose
+// data.status is "interrupted" still marks its step "completed". No trace
+// event distinguishes a step being "clarification_invalidated" from plain
+// "running", so a step in that state renders here as "running" rather than
+// reporting an unknown/wrong status.
 interface ProcessedStep {
   stepId: string;
   stepName: string;
   description: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user' | 'interrupted';
   tools: Array<{ function: { name: string } }>;
   reasoning?: string;
   code: string;
@@ -769,7 +772,10 @@ export function processTraceEvents(
         }
       }
 
-      if (event.event_type === 'dag_step_end' || event.event_type === 'step_completed' || event.event_type === 'react_task_end' || event.event_type === 'task_completion') {
+      // DAG steps emit the same end event for success and failure.
+      const isFailedDagStepEnd = event.event_type === 'dag_step_end' && eventData.status === 'failed';
+      const isFailedDagStep = isFailedDagStepEnd || event.event_type === 'dag_step_failed';
+      if (!isFailedDagStepEnd && (event.event_type === 'dag_step_end' || event.event_type === 'step_completed' || event.event_type === 'react_task_end' || event.event_type === 'task_completion')) {
         step.status = 'completed';
         const shouldShowStepResult = event.event_type === 'dag_step_end' || event.event_type === 'step_completed';
         const result = shouldShowStepResult
@@ -793,13 +799,46 @@ export function processTraceEvents(
         });
       }
 
-      if (['dag_step_failed', 'tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
+      if (isFailedDagStep || ['tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
         const isTerminalFailure =
-          ['dag_step_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
+          isFailedDagStep || ['react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
         if (isTerminalFailure) {
           step.status = 'failed';
         } else if (step.status === 'pending') {
           step.status = 'running';
+        }
+
+        const unavailable = event.event_type === 'tool_execution_failed'
+          ? (event.data?.result as { unavailable_server?: unknown; error?: unknown } | null | undefined)
+          : undefined;
+        const connector = unavailable?.unavailable_server;
+        if (typeof connector === 'string' && connector.trim()) {
+          const callId = event.data?.tool_call_id;
+          const failedTool = getRawToolName(event);
+          // Sibling calls may reuse an id, so the tool name must also match.
+          const ownCards = step.actions.filter(
+            a => a.type === 'tool' && a.status === 'running'
+              && !!callId && a.data.tool_call_id === callId
+              && a.data.tool === failedTool
+          );
+          const ownCard = ownCards.length === 1 ? ownCards[0] : null;
+          const detail = unavailable?.error;
+          const statusLine: StepAction = {
+            id: ownCard?.id ?? eventId,
+            type: 'info',
+            title: t('traceEventRenderer.connectorUnavailable', { connector: connector.trim() }),
+            status: 'completed',
+            timestamp: ownCard?.timestamp ?? timestamp,
+            data: typeof detail === 'string' && detail.trim()
+              ? { statusLine: true, error: detail.trim() }
+              : { statusLine: true },
+          };
+          if (ownCard) {
+            step.actions[step.actions.indexOf(ownCard)] = statusLine;
+          } else {
+            step.actions.push(statusLine);
+          }
+          return;
         }
 
         // Extract error message with more fallback options
@@ -848,6 +887,15 @@ export function processTraceEvents(
             data: { error: errorMessage }
           });
         }
+        if (isFailedDagStep) {
+          // The step has stopped even if the task later delivers a partial answer.
+          step.actions.forEach(action => {
+            if (action.status === 'running') {
+              action.status = 'failed';
+              action.data.error = errorMessage;
+            }
+          });
+        }
       }
     });
 
@@ -880,6 +928,15 @@ export function processTraceEvents(
           step.status = taskStatus;
           runningActions.forEach((action) => {
             action.status = 'completed';
+          });
+        }
+
+        if (taskStatus === 'interrupted') {
+          if (step.status === 'pending' || step.status === 'running') {
+            step.status = 'interrupted';
+          }
+          runningActions.forEach((action) => {
+            action.status = 'interrupted';
           });
         }
       });
@@ -1301,7 +1358,11 @@ function StepActionItem({
 
     if (displayAction.status === 'running') {
       setIsExpanded(true);
-    } else if (displayAction.status === 'completed' || displayAction.status === 'failed') {
+    } else if (
+      displayAction.status === 'completed' ||
+      displayAction.status === 'failed' ||
+      displayAction.status === 'interrupted'
+    ) {
       setIsExpanded(false);
     }
   }, [displayAction.status, userToggled]);
@@ -1425,6 +1486,20 @@ function StepActionItem({
       resizeObserver.disconnect();
     };
   }, [updateToolSummaryVisibility]);
+
+  if (displayAction.data.statusLine) {
+    return (
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-3 py-1.5 text-xs text-muted-foreground">
+        <Info className="w-3.5 h-3.5 flex-shrink-0" />
+        <span className="break-words [overflow-wrap:anywhere]">{displayAction.title}</span>
+        {typeof displayAction.data.error === 'string' && displayAction.data.error && (
+          <span className="break-words [overflow-wrap:anywhere] text-muted-foreground/70">
+            {displayAction.data.error}
+          </span>
+        )}
+      </div>
+    );
+  }
 
   if (displayAction.type === 'info' && displayAction.data.inline) {
     return (
@@ -1616,6 +1691,7 @@ function StepItem({
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
   const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
+  const isInterrupted = step.status === 'interrupted';
   const [isExpanded, setIsExpanded] = useState(() => defaultExpanded || !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = filesDisabled
@@ -1642,6 +1718,15 @@ function StepItem({
         <Info className="w-5 h-5 text-red-500 mt-0.5" />
       ) : isPaused ? (
         <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
+      ) : isInterrupted ? (
+        <>
+          <CircleSlash
+            data-icon="interrupted"
+            className="w-5 h-5 text-muted-foreground mt-0.5"
+            aria-hidden="true"
+          />
+          <span className="sr-only">{t('agent.layout.status.interrupted')}</span>
+        </>
       ) : (
         <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
       )}

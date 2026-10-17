@@ -60,10 +60,16 @@ Caller obligations, because none of them happen here:
   the two a direct caller can still see after the reclaim UPDATE has
   already committed in this transaction.
 
-Zero production callers as of this module's introduction: a static test
-(``tests/web/services/test_interaction_staging_production_gate.py``) asserts
-that no production module imports or calls either entry point. See that
-test's docstring for the removal condition.
+One production caller today: ``task_interaction_service.create`` enters
+``interaction_handoff`` and calls ``stage()``. ``create()`` itself still
+has zero production callers, held there by a live gate
+(``tests/web/services/test_task_interaction_service_create_gate.py``), so
+the chain is not reachable in production yet. The old zero-caller gate on
+this module's two entry points was replaced by three static guards
+(``tests/web/services/test_interaction_handoff_production_surface.py``)
+asserting: the only production use of ``interaction_handoff`` is
+``task_interaction_service``, validation always runs before it is
+entered, and only the three modules that need it import from this one.
 
 Every rejection the database's 23 CHECK constraints could raise on the
 INSERT is rejected in plain Python first, inside
@@ -157,6 +163,7 @@ from .ops_signals import (
 )
 from .task_command_transport import COMMAND_ID_PATTERN
 from .task_lease_service import TaskLease, task_row_matches_lease_attempt
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -299,13 +306,14 @@ class InteractionAttemptMismatch(InteractionHandoffError):
     Raised by ``InteractionHandoff.stage()``, at the start of the call,
     before any staging SQL is issued -- not by ``interaction_handoff``'s
     ``__enter__`` (see ``stage()``'s own docstring for why this
-    precondition has to live there). Raised when
-    ``lease.attempt_id is not None`` and it disagrees with
-    ``task.lease_attempt_id``. See ``TaskLease.attempt_id``'s docstring
-    (``task_lease_service.py``) for the ``is not None`` gate: a permanent
-    ``None`` lease (the ambient snapshot ``_task_lease_snapshot`` builds)
-    must read as "cannot prove attempt identity", never as "matches" or "does
-    not match".
+    precondition has to live there). Raised whenever
+    ``task_row_matches_lease_attempt`` (``task_lease_service.py``) is false:
+    when ``lease.attempt_id`` disagrees with ``task.lease_attempt_id``, and
+    also when ``lease.attempt_id`` is ``None``. See ``TaskLease.attempt_id``'s
+    docstring (``task_lease_service.py``) for why a ``None`` attempt is
+    refused: a permanent ``None`` lease (the ambient snapshot
+    ``_task_lease_snapshot`` builds) must read as "cannot prove attempt
+    identity", never as "matches", so it cannot stage either.
     """
 
 
@@ -513,20 +521,23 @@ class StagedInteractionRequest:
     attempted) and a pre-existing ``active`` row hit by the post-conflict
     re-check (step 6, after this call's own INSERT lost a race). Both
     replay paths return the *other* request's row, not a new one --
-    ``status`` and ``active_slot`` describe that row as it stood at the
-    moment this call read it, which on the step-3 path may already be
-    expired (see ``stage_interaction_request``'s docstring on why step 3
-    does not consult ``expires_at``). Both replay paths match on the
-    identity key alone -- they never compare payload, anchor, or
-    ``expires_at`` against the row they return -- and the key's own
-    derivation contract belongs to the first production writer (see
-    ``request_idempotency_key``'s column comment, ``models/task_interaction.py``).
+    ``status``, ``active_slot``, ``expires_at``, and ``protocol_version``
+    describe that row as it stood at the moment this call read it, which on
+    the step-3 path may already be expired (see
+    ``stage_interaction_request``'s docstring on why step 3 does not
+    consult ``expires_at``). Both replay paths match on the identity key
+    alone -- they never compare payload, anchor, or ``expires_at`` against
+    the row they return -- and the key's own derivation contract belongs to
+    the first production writer (see ``request_idempotency_key``'s column
+    comment, ``models/task_interaction.py``).
     """
 
     staged_db_id: int
     created: bool
     status: str
     active_slot: int | None
+    expires_at: datetime
+    protocol_version: int
 
 
 # ---------------------------------------------------------------------------
@@ -779,12 +790,21 @@ def _identity_lookup_stmt(
 ) -> sa.Select[Any]:
     """The identical Core SELECT used by both the idempotency pre-read (step
     3) and the post-conflict re-check (step 6). Written once so the two
-    statements cannot drift apart at the edges of what they match."""
+    statements cannot drift apart at the edges of what they match.
+
+    ``expires_at`` and ``protocol_version`` are carried for
+    ``StagedInteractionRequest``'s own two fields of the same name -- a
+    replay needs the row's real values for both, not the caller's proposed
+    ones (see that dataclass's docstring). Neither column is added to the
+    ``WHERE`` clause: this remains the identity lookup, matching only on
+    ``(task_id, run_id, request_idempotency_key)``."""
 
     return sa.select(
         TaskInteractionRequest.id,
         TaskInteractionRequest.status,
         TaskInteractionRequest.active_slot,
+        TaskInteractionRequest.expires_at,
+        TaskInteractionRequest.protocol_version,
     ).where(
         TaskInteractionRequest.task_id == task_id,
         TaskInteractionRequest.run_id == run_id,
@@ -872,10 +892,12 @@ def _replay_or_raise_closed(
     snapshots of the same waiting turn, and the fields that could
     disagree cannot. The one key derivation that exists today,
     ``clarification_idempotency_key`` (``task_clarification_draft.py``),
-    honours this by hashing only ``ClarificationDraft.turn_marker``, which
-    is composed from the turn's message count, origin step and ordered
-    pending-request ids and from nothing else -- deliberately not from the
-    message text, so reshaping the payload cannot move the key.
+    honours this by reusing ``ClarificationDraft.event_id``. The runtime
+    allocates that identity before publishing the question and carries it
+    through the waiting checkpoint; ``turn_marker`` is descriptive checkpoint
+    state only. The request payload carries the same event id as correlation
+    metadata, but staging receives it separately as the idempotency key and
+    never extracts or normalizes identity from the payload.
 
     This is the obligation any future key derivation inherits. A key
     derived from anything that can change while the waiting turn stays the
@@ -892,11 +914,26 @@ def _replay_or_raise_closed(
     if row is None:
         return None
     if row.status == "active":
+        # Normalized, not passed through: SQLite's DateTime(timezone=True)
+        # drops tzinfo on the round trip, so a stored value comes back naive
+        # here while the fresh-insert path below returns the caller's own
+        # aware-UTC value. Without this, StagedInteractionRequest.expires_at
+        # would be aware on one path and naive on the other, and the first
+        # consumer to do arithmetic against datetime.now(timezone.utc) would
+        # hit a TypeError on the replay path only. The column is documented
+        # as always-UTC (models/task_interaction.py), so reading it back as
+        # aware UTC is what the column contract already promises;
+        # ``coerce_utc`` is this package's existing owner for exactly that
+        # read (see triggers.py / gmail_provisioning.py / gmail_triggers.py).
+        expires_at = _coerce_utc(row.expires_at)
+        assert expires_at is not None  # expires_at is NOT NULL on this table
         return StagedInteractionRequest(
             staged_db_id=int(row.id),
             created=False,
             status=row.status,
             active_slot=row.active_slot,
+            expires_at=expires_at,
+            protocol_version=row.protocol_version,
         )
     raise InteractionRequestClosed(
         f"request {key!r} on task {task_id} run {run_id!r} is already {row.status}"
@@ -981,9 +1018,13 @@ def stage_interaction_request(
     call's pre-read and its own INSERT. Under REPEATABLE READ or
     SERIALIZABLE the re-read reuses this transaction's original snapshot,
     does not see that row, and classifies a legitimate replay as
-    ``InteractionSlotTaken`` -- measured on PostgreSQL 16 at both levels.
-    That is a degradation, not a corruption: ``InteractionSlotTaken`` is
-    swallowed, so the caller's turn survives and the question is lost.
+    ``InteractionSlotTaken`` at both levels: a query in such a
+    transaction sees a snapshot as of the start of the transaction's
+    first non-transaction-control statement rather than of the current
+    statement, so the re-read cannot see a row committed after that
+    point. That is a degradation, not a corruption:
+    ``InteractionSlotTaken`` is swallowed, so the caller's turn survives
+    and the question is lost.
     READ COMMITTED is PostgreSQL's default and this codebase sets no
     ``isolation_level`` on its engine. Both halves of that are asserted,
     not assumed: one test reads the server's effective
@@ -1112,12 +1153,36 @@ def stage_interaction_request(
             "request in a different slot"
         )
     else:
+        from .task_execution_event_writer import (
+            append_fact_no_commit,
+            uses_execution_events,
+        )
+
+        if uses_execution_events(db, resolved_task_id):
+            append_fact_no_commit(
+                db,
+                task_id=resolved_task_id,
+                run_id=run_id,
+                kind="interaction_requested",
+                key=f"interaction:{new_row.id}",
+                payload={
+                    "interaction_id": int(new_row.id),
+                    "kind": kind,
+                    "protocol_version": protocol_version,
+                    "origin": origin,
+                    "request": request_payload,
+                    "request_idempotency_key": normalized_key,
+                    "expires_at": expires_at.isoformat(),
+                },
+            )
         inner.commit()
         return StagedInteractionRequest(
             staged_db_id=int(new_row.id),
             created=True,
             status="active",
             active_slot=1,
+            expires_at=expires_at,
+            protocol_version=protocol_version,
         )
     finally:
         # Three states are possible here. Active: roll back normally.
@@ -1181,12 +1246,21 @@ class InteractionHandoff:
         # to know whether this round staged an interaction row, without
         # consulting the ops_signals registry.
         self.staged: StagedInteractionRequest | None = None
+        # Which of the six swallowed exception types this round's `with`
+        # block degraded on, or None if it did not degrade at all. Set by
+        # interaction_handoff itself, on this same object, before it
+        # registers a degradation signal or logs -- a caller-local
+        # complement to that call's own process-global signal, letting a
+        # caller distinguish which of the six happened without parsing a
+        # log line or consulting a signal registry that cannot tell them
+        # apart (five of the six share one signal).
+        self.degraded_as: type[BaseException] | None = None
 
     def _assert_current_attempt(self) -> None:
         """Raise unless the task row's current attempt is this lease's.
 
-        The comparison itself, and why ``lease.attempt_id is None`` skips
-        the check rather than failing it, live with the predicate
+        The comparison, including rejection of a missing attempt, lives with
+        the predicate
         (``task_row_matches_lease_attempt``, ``task_lease_service.py``).
 
         What stays here is what the predicate cannot know: this reads
@@ -1209,13 +1283,9 @@ class InteractionHandoff:
         row lock is ever actually taken there (the same fact
         ``get_next_expired_task_lease_candidate_for_update`` in
         ``task_lease_service.py`` documents for its own row-lock read).
-        What keeps this comparison's window closed on SQLite instead is
-        single-writer semantics: SQLite's database-wide writer lock
-        serializes every write regardless of which row it targets. That
-        makes this a TOCTOU (time-of-check-to-time-of-use) gap that happens
-        to stay closed because nothing else can be writing concurrently,
-        not a genuine row-level lock -- a caller that assumes real row
-        locking here is assuming something SQLite does not provide.
+        The caller must acquire SQLite's writer lock before reading the task,
+        for example through ``lock_task_lease_no_commit``. Single-writer
+        semantics alone do not protect a SELECT performed before that lock.
         """
 
         if not task_row_matches_lease_attempt(self.task, self.lease):
@@ -1486,14 +1556,9 @@ def interaction_handoff(
     on the session's own dialect and skipped entirely on PostgreSQL, which
     was checked directly and does not share this behavior at all.
 
-    In the wiring-window while ``lease.attempt_id is None`` is still
-    possible (see ``_assert_current_attempt``'s docstring), this handoff's
-    identity key is already run-scoped (``uq_task_interaction_request_identity``
-    covers ``task_id, run_id, request_idempotency_key``), which is weaker
-    protection against a stale worker than the task-scoped identity an
-    earlier design considered: both the attempt fence and the stale-worker
-    protection a task-scoped key would have given are absent for the same
-    rolling-restart window at once.
+    Missing acquisition tokens are rejected by the attempt check. Existing
+    workers must be drained before enabling strict-owner execution; a new
+    process must not adopt a predecessor's token from the task row.
     """
 
     # A zero-row, SQLite-only, single-column UPDATE, issued deliberately
@@ -1593,6 +1658,12 @@ def interaction_handoff(
     try:
         yield handoff
     except _SWALLOWED as exc:
+        # Recorded on the handoff object itself, before anything else in
+        # this block runs: a caller-local record of which of the six
+        # swallowed types this round degraded on, distinguishable even
+        # among the five that share one process-global signal below (see
+        # InteractionHandoff.degraded_as's own docstring).
+        handoff.degraded_as = type(exc)
         # The except clause matches subclasses (isinstance semantics), so the
         # signal lookup must too: an exact type(exc) key lookup would raise
         # KeyError for a future subclass of a swallowed type, and KeyError is
@@ -1607,17 +1678,34 @@ def interaction_handoff(
                 f"task {_safe(task, 'id')} run {_safe(lease, 'run_id')}: "
                 f"{type(exc).__name__}: {exc}",
             )
-            logger.error(
-                "interaction handoff degraded",
-                extra={
-                    "task_id": _safe(task, "id"),
-                    "lease_run_id": _safe(lease, "run_id"),
-                    "lease_attempt_id": _safe(lease, "attempt_id"),
-                    "anchor_run_partition": _safe(anchor, "resume_run_partition"),
-                    "exception_type": type(exc).__name__,
-                    "degradation_signal": signal,
-                },
-            )
+            log_extra: dict[str, Any] = {
+                "task_id": _safe(task, "id"),
+                "lease_run_id": _safe(lease, "run_id"),
+                "lease_attempt_id": _safe(lease, "attempt_id"),
+                "anchor_run_partition": _safe(anchor, "resume_run_partition"),
+                "exception_type": type(exc).__name__,
+                "degradation_signal": signal,
+            }
+            log_message = "interaction handoff degraded"
+            log_args: tuple[Any, ...] = ()
+            if isinstance(exc, InteractionAttemptMismatch):
+                # An attempt mismatch gets its own message naming both
+                # attempt values, and the task row's attempt as one more
+                # structured field. The message states the two values and
+                # does not infer a cause: a lease that carries no attempt
+                # at all raises here too.
+                task_row_attempt_id = _safe(task, "lease_attempt_id")
+                log_extra["task_row_attempt_id"] = task_row_attempt_id
+                log_message = (
+                    "interaction handoff degraded: InteractionAttemptMismatch "
+                    "for task %s (lease attempt %r, task row attempt %r)"
+                )
+                log_args = (
+                    _safe(task, "id"),
+                    _safe(lease, "attempt_id"),
+                    task_row_attempt_id,
+                )
+            logger.error(log_message, *log_args, extra=log_extra)
         finally:
             # Registration and logging run first, in the try; the rollback
             # lives in finally so it still runs even if logger.error itself

@@ -7,6 +7,9 @@ from cryptography.fernet import Fernet
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, Text
 from sqlalchemy.sql import func
 
+from .....config import DEV_FALLBACK_ENCRYPTION_KEY
+from ...model import MODEL_ID_MAX_LENGTH, MODEL_NAME_MAX_LENGTH
+
 
 def create_model_table(Base: Type[Any]) -> Type[Any]:
     """
@@ -25,20 +28,24 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         __tablename__ = "models"
 
         id = Column(Integer, primary_key=True, index=True)
-        model_id = Column(String(100), unique=True, index=True, nullable=False)
+        model_id = Column(
+            String(MODEL_ID_MAX_LENGTH), unique=True, index=True, nullable=False
+        )
         category = Column(
             String(20), nullable=False, default="llm"
         )  # llm, image, embedding, etc.
         model_provider = Column(
             String(50), nullable=False
         )  # openai, zhipu, dashscope, etc.
-        model_name = Column(String(100), nullable=False)  # gpt-4, glm-4, etc.
+        model_name = Column(String(MODEL_NAME_MAX_LENGTH), nullable=False)
         base_url = Column(String(500), nullable=True)
         temperature = Column(Float, nullable=True)
         max_tokens = Column(Integer, nullable=True)
         context_window = Column(
             Integer, nullable=True
         )  # Total context window in tokens
+        bedrock_region = Column(String(64), nullable=True)
+        bedrock_auth_mode = Column(String(32), nullable=True)
         dimension = Column(
             Integer, nullable=True
         )  # Vector dimension for embedding models
@@ -46,11 +53,14 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             JSON, nullable=True
         )  # Model abilities: ["chat", "vision", etc.]
         description = Column(Text, nullable=True)
+        managed_by = Column(String(50), nullable=True)
         max_retries = Column(Integer, nullable=True, default=10)
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())
         is_active = Column(Boolean, default=True)
-        _api_key_encrypted = Column(String(500), nullable=False)
+        # Fernet expands the plaintext substantially. Cloud credentials and
+        # signed tokens can exceed VARCHAR(500) after encryption.
+        _api_key_encrypted = Column(Text, nullable=False)
 
         # Properties
         @property
@@ -67,7 +77,7 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
             encryption_key = os.getenv("ENCRYPTION_KEY")
             if not encryption_key:
                 # FIXME: For dev only
-                return "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+                return DEV_FALLBACK_ENCRYPTION_KEY
             return encryption_key
 
         @property

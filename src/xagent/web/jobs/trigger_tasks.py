@@ -7,12 +7,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...config import get_kb_milvus_cleanup_enabled
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, init_db
 from ..services.background_jobs import (
     requeue_stale_background_jobs,
     update_job_progress,
 )
+from ..services.trace_database import close_trace_database_runtime
 from ..services.triggers import prepare_trigger_run, scan_due_scheduled_triggers
 from ..services.workforce_runtime import (
     pause_workforce_tasks_after_archive,
@@ -36,12 +38,25 @@ def _reap_and_pause_stale_preview_runs(db: Session) -> int:
     """
     reaped_pause_targets = reap_stale_preview_workforce_runs(db)
     if reaped_pause_targets:
-        asyncio.run(
-            pause_workforce_tasks_after_archive(
-                reaped_pause_targets,
-                reason="preview-reap",
-            )
-        )
+
+        async def pause_and_close() -> None:
+            try:
+                await pause_workforce_tasks_after_archive(
+                    reaped_pause_targets,
+                    reason="preview-reap",
+                )
+            finally:
+                # Prompt dispatch can leave a task behind after its 50ms
+                # handoff. Preserve asyncio.run's cancel-and-drain behavior,
+                # then close trace resources BEFORE this private loop closes.
+                # Cancellation cleanup can itself emit a final trace event.
+                pending = asyncio.all_tasks() - {asyncio.current_task()}
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await close_trace_database_runtime()
+
+        asyncio.run(pause_and_close())
     return len(reaped_pause_targets)
 
 
@@ -144,3 +159,33 @@ def scan_due_triggers() -> dict[str, Any]:
         }
     finally:
         db.close()
+
+
+@celery_app.task(
+    name="xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows",
+    # A lost purge is redone next interval; the global acks_late=True plus the
+    # 3600s visibility timeout would redeliver a long purge instead.
+    acks_late=False,
+)
+def purge_leftover_milvus_rows() -> dict[str, Any]:
+    """Celery Beat entrypoint for the periodic leftover Milvus row purge.
+
+    A failed purge raises so Celery records FAILURE; the next Beat tick runs it again.
+    """
+    if not get_kb_milvus_cleanup_enabled():
+        logger.info("Milvus cleanup disabled")
+        return {
+            "status": "disabled",
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    logger.info("Milvus cleanup tick")
+    from ...core.tools.core.RAG_tools.kb.milvus_cleanup import (
+        purge_leftover_milvus_rows as purge,
+    )
+
+    deleted = purge()
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }

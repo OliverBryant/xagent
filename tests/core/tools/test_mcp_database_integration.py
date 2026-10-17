@@ -442,6 +442,14 @@ class TestToolFactoryMCPIntegration:
         call_args = mock_load_mcp.call_args
         connections_arg = call_args[0][0]  # First positional argument
         assert sample_stdio_config["name"] in connections_arg
+        connector_refs = call_args.kwargs["connector_refs"]
+        persisted_server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
+        assert connector_refs[sample_stdio_config["name"]].to_wire() == {
+            "connector_type": "mcp",
+            "connector_id": persisted_server.id,
+        }
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_exposes_unavailable_oauth_and_loads_other_servers(
@@ -572,6 +580,44 @@ class TestToolFactoryMCPIntegration:
         assert result["error"] == "MCP server could not be started."
         assert "BearerSecretError" not in repr(result)
 
+    @pytest.mark.parametrize(
+        "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+    )
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_hides_auth_rejected_placeholder(
+        self, mock_load_mcp, policy, test_db, sample_stdio_config
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=sample_stdio_config["name"],
+                    phase=MCPFailurePhase.AUTH_REJECTED,
+                    error_type="ExceptionGroup",
+                    cause_type="HTTPStatusError",
+                    status_code=403,
+                ),
+            ),
+        )
+
+        if policy is MCPFailurePolicy.STRICT:
+            with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+                await ToolFactory.create_mcp_tools(test_db, mcp_failure_policy=policy)
+            (summary,) = exc_info.value.summaries
+            assert (summary.reason, summary.cause_type, summary.status_code) == (
+                "auth_rejected",
+                "HTTPStatusError",
+                403,
+            )
+            assert str(exc_info.value) == (
+                "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+            )
+        else:
+            assert await ToolFactory.create_mcp_tools(test_db) == []
+
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_enforces_strict_failure_policy(
         self, mock_load_mcp, test_db, sample_stdio_config
@@ -601,9 +647,15 @@ class TestToolFactoryMCPIntegration:
         assert "BearerSecretError" not in str(exc_info.value)
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
-    async def test_create_mcp_tools_scopes_loader_failure_to_requested_user(
+    async def test_create_mcp_tools_loader_failure_reports_the_outage_to_any_caller(
         self, mock_load_mcp, test_db, sample_stdio_config, monkeypatch
     ):
+        """A loader failure must surface as an outage, not as an access denial.
+
+        The database path used to build the placeholder with an allow-list of
+        the requesting user, so a caller identity that did not match answered
+        "Access denied" instead of naming the failure.
+        """
         manager = DatabaseMCPServerManager(test_db)
         manager.add_server(manager.create_config(**sample_stdio_config))
         server = (
@@ -624,7 +676,9 @@ class TestToolFactoryMCPIntegration:
 
         monkeypatch.setenv("XAGENT_USER_ID", "2")
         result = tools[0].run_json_sync({})
-        assert "Access denied" in result["content"][0]["text"]
+        assert "Access denied" not in result["content"][0]["text"]
+        assert result["reason"] == "loader_failed"
+        assert result["error"] == "MCP server tools could not be loaded."
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):

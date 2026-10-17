@@ -29,6 +29,7 @@ from xagent.web.services.background_jobs import (
     enqueue_background_job,
     is_background_job_enqueue_available,
     requeue_stale_background_jobs,
+    update_job_progress,
 )
 from xagent.web.services.triggers import enqueue_trigger_event_job
 
@@ -36,6 +37,25 @@ from xagent.web.services.triggers import enqueue_trigger_event_job
 def _init_test_db(path: Path):
     init_db(f"sqlite:///{path}")
     return get_session_local()
+
+
+def _age_job(db, job, *, updated_at=None, started_at=None) -> None:
+    """Backdate a job row. A plain ORM write cannot: ``updated_at`` carries
+    ``onupdate=func.now()``, which any flush would overwrite."""
+    values = {}
+    if updated_at is not None:
+        values["updated_at"] = updated_at
+    if started_at is not None:
+        values["started_at"] = started_at
+    if not values:
+        # An empty SET still carries onupdate=func.now(), so this would push
+        # updated_at forward -- the opposite of backdating.
+        raise ValueError("_age_job needs updated_at or started_at")
+    db.query(BackgroundJob).filter(BackgroundJob.id == job.id).update(
+        values, synchronize_session=False
+    )
+    db.commit()
+    db.expire_all()
 
 
 def _create_user(db, username: str = "background-job-test") -> User:
@@ -883,6 +903,59 @@ def test_kb_document_job_exception_keeps_previous_config_before_retry(
         db.close()
 
 
+def test_kb_document_job_without_target_path_fails_before_ingestion(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    SessionLocal = _init_test_db(tmp_path / "kb-no-target-path.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-no-target-path-test")
+        stored_file = tmp_path / "uploads" / "doc.txt"
+        stored_file.parent.mkdir(parents=True)
+        stored_file.write_text("stored content", encoding="utf-8")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "existing-kb",
+                "source_path": str(stored_file),
+                "file_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "filename": "doc.txt",
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+        # Final attempt: a failed staged run would now unlink source_path.
+        job.attempts = job.max_attempts
+        ingest = MagicMock(side_effect=RuntimeError("ingestion ran"))
+        monkeypatch.setattr("xagent.web.jobs.kb_tasks.run_document_ingestion", ingest)
+
+        # Broad on purpose: the file check must still run if the fake's error escapes.
+        with pytest.raises(RuntimeError) as info:
+            handle_kb_ingest_document(db, job)
+
+        assert stored_file.read_text(encoding="utf-8") == "stored content"
+        ingest.assert_not_called()
+        assert isinstance(info.value, BackgroundJobHandlerError)
+        assert info.value.retryable is False
+        assert str(info.value) == (
+            "Document ingest job payload has no target_path; resubmit the upload"
+        )
+        db.refresh(job)
+        assert job.progress["message"] == "Queued"
+    finally:
+        db.close()
+
+
 def test_background_job_progress_manager_mirrors_rag_progress(tmp_path, monkeypatch):
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -1386,9 +1459,7 @@ def test_kb_web_job_zero_pages_without_failures_fails(tmp_path, monkeypatch):
         db.close()
 
 
-def test_background_web_file_new_branch_returns_rollback_callback(
-    tmp_path, monkeypatch
-):
+def test_background_web_file_new_branch_compensates_on_failure(tmp_path, monkeypatch):
     from xagent.core.file_storage.factory import get_unscoped_file_storage
     from xagent.web.jobs.kb_tasks import _handle_web_file
 
@@ -1436,9 +1507,22 @@ def test_background_web_file_new_branch_returns_rollback_callback(
                 is_admin=False,
                 processed_urls={},
             )
-            assert callable(result["rollback_on_failure"])
+            from xagent.core.tools.core.RAG_tools.kb import get_kb_coordinator
+            from xagent.core.tools.core.RAG_tools.pipelines.web_ingestion import (
+                _run_file_handler_compensation,
+            )
 
-            result["rollback_on_failure"](None)
+            assert (
+                _run_file_handler_compensation(
+                    pipeline_facade=get_kb_coordinator().pipeline,
+                    page_operation=None,
+                    file_info=result,
+                    collection="web-kb",
+                    url="https://example.com/page",
+                    warnings=[],
+                )
+                is None
+            )
 
         verify_db = SessionLocal()
         try:
@@ -1470,9 +1554,9 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         )
         old = datetime.now(timezone.utc) - timedelta(hours=3)
         setattr(job, "status", BackgroundJobStatus.RUNNING.value)
-        setattr(job, "started_at", old)
         db.add(job)
         db.commit()
+        _age_job(db, job, updated_at=old, started_at=old)
         db.refresh(job)
 
         requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
@@ -1483,6 +1567,83 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.celery_task_id is None
         assert job.started_at is None
         assert job.progress["message"] == "Requeued stale background job"
+    finally:
+        db.close()
+
+
+def test_requeue_spares_running_job_that_is_still_reporting_progress(
+    tmp_path, monkeypatch
+):
+    """A long job that keeps working must not be requeued.
+
+    ``started_at`` never advances, so judging a RUNNING job by it means any job
+    outliving the cutoff gets a second copy started alongside it.
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-live.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="live-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        old = datetime.now(timezone.utc) - timedelta(hours=4)
+        _age_job(db, job, updated_at=old, started_at=old)
+        db.refresh(job)
+        stale_updated_at = job.updated_at
+
+        # Go through the real reporting path, not a hand-set timestamp: that
+        # progress advances updated_at is the premise the whole predicate rests
+        # on, so the test has to fail if it ever stops holding.
+        update_job_progress(db, job, message="Still working", completed=536, total=699)
+        db.refresh(job)
+        assert job.updated_at > stale_updated_at
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert requeued == []
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.RUNNING.value
+        assert job.started_at is not None
+    finally:
+        db.close()
+
+
+def test_requeue_reclaims_running_job_that_stopped_reporting(tmp_path, monkeypatch):
+    """A RUNNING job whose heartbeat went stale is still reclaimed."""
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-dead.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="dead-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        # Started recently, but has not touched the row since.
+        _age_job(db, job, updated_at=datetime.now(timezone.utc) - timedelta(hours=3))
+        db.refresh(job)
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert [item.id for item in requeued] == [job.id]
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.PENDING.value
     finally:
         db.close()
 

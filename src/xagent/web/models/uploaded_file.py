@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -39,7 +39,11 @@ class UploadedFile(Base):  # type: ignore
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True)
+    task_id = Column(
+        Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+    detached_reason = Column(String(32), nullable=True)
+    detached_at = Column(DateTime(timezone=True), nullable=True)
     # Index is created by migration 20260410_add_index_on_uploaded_files_filename.py
     # to ensure existing databases have the index for URL deduplication queries.
     filename = Column(String(512), nullable=False)
@@ -58,6 +62,8 @@ class UploadedFile(Base):  # type: ignore
     # reap a logged-in user's un-sent draft attachments.
     upload_source = Column(String(64), nullable=True)
     storage_status = Column(String(32), nullable=False, default="legacy")
+    # SQL NULL means no persisted cleanup manifest for downgrade checks.
+    cleanup_manifest = Column(JSON(none_as_null=True), nullable=True)
     mime_type = Column(String(255), nullable=True)
     file_size = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

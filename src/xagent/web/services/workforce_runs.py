@@ -15,6 +15,7 @@ from xagent.web.models.database import (
     release_db_connection_if_clean,
 )
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
@@ -30,7 +31,8 @@ from .file_turn import bind_turn_files_no_commit
 from .task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
-    _ClaimedTurn,
+    _PreparedTurn,
+    timezone_schedule_context,
 )
 from .workforce_access import ensure_workforce_access, get_workforce_policy
 from .workforce_errors import WorkforceRunError, WorkforceRunErrorCode
@@ -88,7 +90,7 @@ class _PreparedWorkforceRunStart:
     workforce_run: WorkforceRunStartSnapshot
     task: WorkforceTaskStartSnapshot
     payload: TaskTurnPayload | None
-    claimed_turn: _ClaimedTurn | None
+    claimed_turn: _PreparedTurn | None
     created: bool
 
 
@@ -102,6 +104,7 @@ class _NormalizedWorkforceRunRequest:
     source: str
     idempotency_key: str | None
     extra_agent_config: dict[str, Any] | None
+    timezone: str | None
 
 
 def normalize_execution_mode(value: str | None) -> str:
@@ -181,6 +184,7 @@ def _normalize_workforce_run_request(
     source: str | None,
     idempotency_key: str | None,
     extra_agent_config: dict[str, Any] | None,
+    timezone: str | None = None,
 ) -> _NormalizedWorkforceRunRequest:
     """Normalize caller input once before either transaction owner runs."""
 
@@ -195,6 +199,7 @@ def _normalize_workforce_run_request(
         extra_agent_config=(
             dict(extra_agent_config) if extra_agent_config is not None else None
         ),
+        timezone=(timezone.strip() or None) if isinstance(timezone, str) else None,
     )
 
 
@@ -520,6 +525,17 @@ def _build_start_snapshots(
         .one()
     )
 
+    run_id = task_row.run_id
+    if task_row.status == TaskStatus.PENDING and run_id is None:
+        run_id = (
+            db.query(TaskExecutionCommand.target_run_id)
+            .filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == "start",
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            .scalar()
+        )
     return (
         WorkforceTaskStartSnapshot(
             id=int(task_row.id),
@@ -527,7 +543,7 @@ def _build_start_snapshots(
             title=str(task_row.title),
             status=cast(TaskStatus, task_row.status),
             created_at=cast(datetime | None, task_row.created_at),
-            run_id=(str(task_row.run_id) if task_row.run_id is not None else None),
+            run_id=(str(run_id) if run_id is not None else None),
             state_version=int(task_row.state_version or 0),
             control_state=str(task_row.control_state or "idle"),
             channel_id=(
@@ -581,14 +597,18 @@ def _create_claimed_workforce_run_isolated(
                 created=False,
             )
 
-        payload = TaskTurnPayload(transcript_message=request.message)
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
+            actor_user_id=user_id,
             payload=payload,
+            context=timezone_schedule_context(request.timezone),
         )
-        sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,
@@ -665,14 +685,18 @@ def _create_claimed_preview_run_isolated(
             request=request,
         )
 
-        payload = TaskTurnPayload(transcript_message=request.message)
+        payload = TaskTurnPayload(
+            transcript_message=request.message, file_ids=request.selected_file_ids
+        )
         claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
             db,
             task_id=int(record.task.id),
             task_owner_user_id=user_id,
+            actor_user_id=user_id,
             payload=payload,
+            context=timezone_schedule_context(request.timezone),
         )
-        sync_workforce_run_status(db, record.task, TaskStatus.RUNNING)
+        sync_workforce_run_status(db, record.task, claimed_turn.status)
         db.flush()
         task_snapshot, run_snapshot = _build_start_snapshots(
             db,
@@ -727,6 +751,7 @@ async def _start_normalized_workforce_run(
             actor_user_id=user_id,
             payload=prepared.payload,
             claimed=prepared.claimed_turn,
+            context=timezone_schedule_context(request.timezone),
         )
         return WorkforceRunStartResult(
             workforce_run=prepared.workforce_run,
@@ -753,6 +778,7 @@ async def create_workforce_run_by_id(
     source: str | None = None,
     idempotency_key: str | None = None,
     extra_agent_config: dict[str, Any] | None = None,
+    timezone: str | None = None,
 ) -> WorkforceRunStartResult:
     """Create a run from detached identities.
 
@@ -770,6 +796,7 @@ async def create_workforce_run_by_id(
         source=source,
         idempotency_key=idempotency_key,
         extra_agent_config=extra_agent_config,
+        timezone=timezone,
     )
     return await _start_normalized_workforce_run(
         user_id=int(user_id),
@@ -791,6 +818,7 @@ async def create_workforce_run(
     source: str | None = None,
     idempotency_key: str | None = None,
     extra_agent_config: dict[str, Any] | None = None,
+    timezone: str | None = None,
 ) -> WorkforceRunStartResult:
     """Compatibility entry point for callers that still own ORM identities."""
 
@@ -807,6 +835,7 @@ async def create_workforce_run(
         source=source,
         idempotency_key=idempotency_key,
         extra_agent_config=extra_agent_config,
+        timezone=timezone,
     )
     if not release_db_connection_if_clean(db):
         raise RuntimeError("request DB transaction is not clean at turn boundary")
@@ -829,6 +858,7 @@ async def create_preview_workforce_run(
     selected_file_ids: list[str] | None = None,
     execution_mode: str | None = None,
     source: str | None = None,
+    timezone: str | None = None,
 ) -> WorkforceRunStartResult:
     """Test-run an unsaved workforce draft: a manager + inline worker configs
     that were never persisted as a Workforce row.
@@ -855,6 +885,7 @@ async def create_preview_workforce_run(
         source=source,
         idempotency_key=None,
         extra_agent_config=None,
+        timezone=timezone,
     )
 
     async def _create_and_schedule() -> WorkforceRunStartResult:
@@ -873,7 +904,8 @@ async def create_preview_workforce_run(
             task_owner_user_id=user_id,
             actor_user_id=user_id,
             payload=cast(TaskTurnPayload, prepared.payload),
-            claimed=cast(_ClaimedTurn, prepared.claimed_turn),
+            claimed=cast(_PreparedTurn, prepared.claimed_turn),
+            context=timezone_schedule_context(request.timezone),
         )
         return WorkforceRunStartResult(
             workforce_run=prepared.workforce_run,

@@ -4,26 +4,32 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy import String
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
 from ...core.agent.language import (
     detect_prose_script_mismatch,
-    response_language_rules,
+    render_structured_request_language_policy,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.agent import Agent, AgentOrigin
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
+from ..models.task import Task
 from ..models.user import User
 from ..schemas.agent_api_key import (
     APIKeyGenerateResponse,
@@ -31,6 +37,7 @@ from ..schemas.agent_api_key import (
     APIKeyRevokeResponse,
 )
 from ..schemas.widget import WidgetAllowedDomain
+from ..services import agent_prompt as agent_prompt_service
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -57,10 +64,13 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
-from ..services.llm_utils import UserAwareModelStorage
+from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from ..services.execution_budget import budget_policy_provider
+from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
+from .auth import VALID_USER_VOICES
 from .templates import get_or_create_template_stats, increment_template_used_count
 
 logger = logging.getLogger(__name__)
@@ -165,6 +175,7 @@ class AgentListItem(BaseModel):
     description: Optional[str]
     template_id: Optional[str] = None
     logo_url: Optional[str]
+    suggested_prompts: List[str] = []
     status: str
     visibility: str = "team"
     created_at: str
@@ -280,29 +291,21 @@ def _serialize_share_link_response(agent: Agent) -> AgentShareLinkResponse:
     )
 
 
-def enhance_system_prompt_with_kb(
-    system_prompt: Optional[str], knowledge_bases: Optional[List[str]]
-) -> Optional[str]:
-    """Append knowledge-base priority instructions when KBs are configured."""
-    if not knowledge_bases:
-        return system_prompt
-
-    kb_list = ", ".join(knowledge_bases)
-    kb_prompt = (
-        f"\n\nAvailable knowledge bases: {kb_list}. "
-        "These knowledge bases are already selected. "
-        "Do not call list_knowledge_bases to discover them; "
-        "use knowledge_search directly for answers. "
-        "For specific how-to or factual questions, start with one targeted "
-        "knowledge_search, inspect all returned results as one evidence set, "
-        "and answer from that evidence when it is relevant. Search again only "
-        "when the returned results as a group are missing the information "
-        "needed to answer the current question."
+# Re-exported from core.agent.voice_policy (not defined here) so a
+# delegated AgentTool child - built in core/tools/adapters/vibe/agent_tool.py,
+# which cannot import a web route module - applies the exact same policy.
+# See VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py for the
+# schema-level source of truth this module-level check guards.
+_VOICE_INSTRUCTIONS = _core_voice_instructions
+if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
+    # A plain assert would be stripped under `python -O`, silently losing
+    # this consistency guarantee in production rather than failing loudly.
+    raise ValueError(
+        "core.agent.voice_policy._VOICE_INSTRUCTIONS must define exactly the "
+        "voices UpdatePreferencesRequest accepts (api/auth.py's "
+        "VALID_USER_VOICES) - otherwise a valid, storable voice preference "
+        "could silently have no prompt effect."
     )
-
-    if system_prompt:
-        return system_prompt + kb_prompt
-    return kb_prompt.lstrip("\n")
 
 
 # ===== Helper Functions =====
@@ -498,12 +501,13 @@ async def optimize_instructions(
             "Your task is to refine and optimize the user's draft instructions for an AI agent. "
             "The output should be clear, structured, and effective for an LLM to follow. "
             "Do not include any conversational filler. Just output the optimized instructions. "
-            "Preserve the draft's natural language and Chinese script; do not switch languages "
-            "because the surrounding API prompt is written in English. "
-            f"{response_language_rules(subject='draft instructions')}"
+            "Use draft_instructions as the independent user request. "
+            "The surrounding API prompt is written in English only as an execution "
+            "environment; it is not language evidence for the optimized instructions. "
+            f"{render_structured_request_language_policy(request_field='draft_instructions', pending_field='pending_response', output_language=None)}"
         )
 
-        user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."
+        user_prompt = f"draft_instructions:\n{request.instructions}"
 
         # Call LLM
         response = await llm.chat(
@@ -530,6 +534,8 @@ async def optimize_instructions(
 
         return {"optimized_instructions": content}
 
+    except AutoModelUnavailableError as exc:
+        raise HTTPException(409, detail=CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE) from exc
     except Exception as e:
         logger.error(f"Failed to optimize instructions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -826,6 +832,106 @@ async def get_agent(
     except Exception as e:
         logger.error(f"Failed to get agent {agent_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class AgentPreviewTaskResponse(BaseModel):
+    task_id: int
+    config_key: str | None
+    message: str
+    attachments: list[dict[str, Any]]
+
+
+class AgentPreviewTaskBinding(BaseModel):
+    task_id: int = Field(gt=0)
+
+
+@router.get("/{agent_id}/preview-task", response_model=AgentPreviewTaskResponse | None)
+async def get_agent_preview_task(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AgentPreviewTaskResponse | None:
+    """Find this editor's latest preview, without exposing teammates' transcripts."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(
+            Task.user_id == user_id,
+            Task.is_visible.is_(False),
+            # A task is allocated before attachment upload. Until a user turn
+            # is persisted it is only staging, not a restorable preview. Keep
+            # submitted failed/unknown turns: they still contain the sample.
+            db.query(TaskChatMessage.id)
+            .filter(
+                TaskChatMessage.task_id == Task.id,
+                TaskChatMessage.role == "user",
+            )
+            .exists(),
+            # Compare serialized JSON scalars, never cast client JSON to an
+            # integer/bool: malformed legacy values must not break PostgreSQL
+            # history reads. SQLite serializes JSON true as 1.
+            sql_cast(Task.agent_config["is_preview"], String).in_(("true", "1")),
+            or_(
+                sql_cast(Task.agent_config["preview_agent_id"], String)
+                == str(agent_id),
+                sql_cast(Task.agent_config["preview_history_agent_id"], String)
+                == str(agent_id),
+            ),
+        )
+        .order_by(Task.id.desc())
+        .first()
+    )
+    if task is None:
+        return None
+    sample = (
+        db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .order_by(TaskChatMessage.id.asc())
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {})
+    key = config.get("preview_config_key")
+    return AgentPreviewTaskResponse(
+        task_id=int(task.id),
+        config_key=key if isinstance(key, str) else None,
+        # Retry the original submitted sample even if delivery failed or is
+        # unknown. A pre-upload staging task was excluded by the query above.
+        message=str(sample.content) if sample is not None else "",
+        attachments=(sample.attachments or []) if sample is not None else [],
+    )
+
+
+@router.put("/{agent_id}/preview-task", status_code=204)
+async def bind_agent_preview_task(
+    agent_id: int,
+    binding: AgentPreviewTaskBinding,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Associate a pre-save preview after creating the agent; never reparent it."""
+    user_id = int(current_user.id)
+    if AgentStore(db).get_owned_agent(user_id, agent_id) is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    task = (
+        db.query(Task)
+        .filter(Task.id == binding.task_id, Task.user_id == user_id)
+        .with_for_update()
+        .first()
+    )
+    config = cast(dict[str, Any], task.agent_config or {}) if task is not None else {}
+    if task is None or task.is_visible or config.get("is_preview") is not True:
+        raise HTTPException(status_code=404, detail="Preview task not found")
+    if any(
+        config.get(key) not in (None, agent_id)
+        for key in ("preview_agent_id", "preview_history_agent_id")
+    ):
+        raise HTTPException(status_code=409, detail="Preview belongs to another agent")
+    # History association is deliberately separate from preview_agent_id: binding
+    # must not change the tool/runtime identity of a preview already executing.
+    task.agent_config = {**config, "preview_history_agent_id": agent_id}  # type: ignore[assignment]
+    db.commit()
 
 
 @router.put("/{agent_id}", response_model=AgentResponse)
@@ -1402,7 +1508,7 @@ async def generate_agent_api_key(
     endpoint revokes it and inserts a new active row in a single
     transaction. The new ``full_key`` is returned exactly once in the
     response; the plaintext secret is never persisted server-side, only
-    its bcrypt hash.
+    its one-way verifier.
 
     Args:
         agent_id: Path parameter; the target agent's primary key.
@@ -1433,7 +1539,7 @@ async def generate_agent_api_key(
           the multi-key endpoints; two racing legacy rotations both succeed
           sequentially, and the later rotation leaves its key active.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
-          the secret half, or the bcrypt hash.
+          the secret half, or the stored verifier.
     """
     try:
         # Ownership gate. Raises 404 on miss; never reveals "exists but
@@ -1687,6 +1793,7 @@ async def preview_agent(
             exclude_custom_api_when_unconfigured=True,
         )
 
+        current_user_voice = agent_prompt_service.voice_from_runtime_user(current_user)
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
@@ -1706,6 +1813,10 @@ async def preview_agent(
             # on. The live agent (once promoted) can still diverge from
             # this preview for a team connector -- a known, accepted gap.
             connector_team_id=None,
+            # Threaded through so a delegated AgentTool child the preview
+            # calls also honors the previewing user's voice (see
+            # BaseToolConfig.get_voice's docstring).
+            voice=current_user_voice,
         )
 
         # Determine execution mode (default to "think")
@@ -1727,14 +1838,20 @@ async def preview_agent(
             },
         )
 
-        enhanced_system_prompt = enhance_system_prompt_with_kb(
+        enhanced_system_prompt = agent_prompt_service.enhance_system_prompt_with_kb(
             request.instructions if request.instructions else None,
             request.knowledge_bases if request.knowledge_bases is not None else None,
+        )
+        enhanced_system_prompt = agent_prompt_service.apply_user_voice(
+            enhanced_system_prompt, current_user_voice
         )
 
         # Create agent service (Langfuse only, no database/websocket logging)
         memory = InMemoryMemoryStore()
         agent_service = AgentService(
+            budget_policy_provider=budget_policy_provider(
+                user_id=int(current_user.id), task_id=preview_task_id, scope=None
+            ),
             name="preview_agent",
             llm=default_llm,
             fast_llm=fast_llm,

@@ -144,7 +144,7 @@ function agentResponse(ownerId: number, canEdit = true) {
   }
 }
 
-// Base handler for the mount-time fetchData resources + agent detail. `ownerId`
+// Base handler for the mount-time catalog resources + agent detail. `ownerId`
 // controls who owns the loaded agent; `agentPromise` lets a test defer the agent
 // response to drive the mid-flight teardown case.
 function installApi(
@@ -156,7 +156,7 @@ function installApi(
       return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
     if (url.endsWith("/api/skills/"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.endsWith("/api/tools/available"))
+    if (url.endsWith("/api/tools/available?include_usage=false"))
       return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
     if (url.endsWith("/api/models/?category=llm"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))

@@ -15,7 +15,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -64,6 +64,15 @@ _internal_file_registry: Dict[Tuple[str, str], Path] = {}
 _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
+# The name of the output subtree the engine owns for spilled tool results.
+# It is defined here, on the workspace side, and the spill module imports it
+# from here: tool modules import core.workspace, never the other way round.
+SPILL_DIR_NAME = "tool-results"
+# Reserved-name collisions already announced by this process, keyed by the
+# reserved path, so that a workspace built many times over -- once per tool
+# family, per call on some paths -- announces the same collision once.
+_announced_reserved_names: set[str] = set()
+_announced_reserved_names_lock = Lock()
 
 
 def scoped_user_root(
@@ -242,6 +251,7 @@ class TaskWorkspace:
 
         # Create directory structure
         self._ensure_directories()
+        self._warn_if_reserved_output_name_is_taken()
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize durable workspace state without process-local synchronization."""
@@ -261,6 +271,167 @@ class TaskWorkspace:
         """Return the reserved root for process-local runtime scratch data."""
 
         return self.temp_dir / _INTERNAL_TEMP_DIR_NAME
+
+    @property
+    def engine_owned_output_dir(self) -> Path:
+        """Return the output subtree the engine owns and the model may not write.
+
+        :meth:`is_engine_owned_path` says what that reservation covers.
+        """
+
+        return self.output_dir / SPILL_DIR_NAME
+
+    def is_engine_owned_path(self, file_path: Path) -> bool:
+        """Return whether a path is the engine-owned output subtree or inside it.
+
+        The argument and the parent of the reserved segment are resolved; the
+        reserved segment itself is compared by name, so a symlink standing at
+        the reserved name is an ordinary entry whose target is not reserved.
+        A file at such a hijacked location is kept free of the engine's bytes
+        by the spill writer's refusal to write through the link, not by this
+        check. Equality counts as containment. A symlink loop in the argument
+        propagates from ``resolve()``: a write guard fails rather than
+        answering False on an unanswered question.
+        """
+
+        reserved_root = self.engine_owned_output_dir
+        # The reserved segment is not resolved because a direct writer can
+        # put a symlink there, and following it would let that writer choose
+        # which directory is protected.
+        parent_root = reserved_root.parent.resolve()
+        resolved_path = file_path.resolve()
+        # Every compared segment is case-folded on every file system: one
+        # rule and one test expectation hold everywhere, at the price of also
+        # reserving other spellings on a case-sensitive file system.
+        parent_parts = tuple(part.casefold() for part in parent_root.parts)
+        path_parts = tuple(part.casefold() for part in resolved_path.parts)
+        if path_parts[: len(parent_parts)] != parent_parts:
+            return False
+        relative_parts = path_parts[len(parent_parts) :]
+        if not relative_parts:
+            return False
+        return relative_parts[0] == reserved_root.name.casefold()
+
+    def refuse_engine_owned_write(self, resolved_path: Path, requested: str) -> Path:
+        """Refuse one resolved write target that lands in the engine-owned subtree.
+
+        The one place :meth:`is_engine_owned_path` becomes a write refusal;
+        the file tools' resolvers and :meth:`resolve_write_path` reach it,
+        reads never do. Raises ValueError, the class the resolvers raise for
+        a target outside the workspace, naming the path and the reason.
+        """
+
+        if self.is_engine_owned_path(resolved_path):
+            raise ValueError(
+                f"Path '{requested}' is inside the engine-owned "
+                f"'{SPILL_DIR_NAME}' directory. The engine stores oversized "
+                "tool results there and that directory is read-only for file "
+                "tools: you can read those files, but you cannot write, edit, "
+                "delete or create anything inside it. Write your own files "
+                "somewhere else under output/."
+            )
+        return resolved_path
+
+    def resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a target the caller is about to write, then apply the policy.
+
+        Same resolution as :meth:`resolve_path`, followed by
+        :meth:`refuse_engine_owned_write`. Tools that take a destination from
+        the model and write to it directly -- rather than through the
+        workspace file tools -- resolve it here, so the engine-owned subtree
+        is refused on that path as well.
+        """
+
+        return self.refuse_engine_owned_write(
+            self.resolve_path(file_path, default_dir), file_path
+        )
+
+    def stage_file_for_external_upload(self, file_id: str) -> Path:
+        """Materialize a durable file into this task's upload-safe temp area.
+
+        Connectors intentionally accept only paths under the current task
+        workspace.  A durable ``FileRef`` may resolve to the shared
+        materialization cache instead, so copy it into the workspace before
+        handing it to an external upload connector.  The staging directory is
+        internal scratch and is removed with the task workspace; it is never
+        registered as a user-visible file.
+        """
+
+        source = self.resolve_file_id_detached(file_id)
+        if source is None:
+            raise FileNotFoundError(f"File not found: {file_id}")
+        raw_source = Path(source)
+        probe = raw_source
+        while probe != probe.parent:
+            if probe.is_symlink():
+                # A registered path can be replaced after lookup. Refuse
+                # symlink sources entirely so a later swap cannot redirect
+                # bytes to a different tenant's file before containment.
+                raise FileNotFoundError(f"File not found: {file_id}")
+            probe = probe.parent
+        try:
+            source = raw_source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            # Python 3.11/3.12 raise RuntimeError for symlink loops. Treat
+            # both that case and a disappearing source as an unavailable file.
+            raise FileNotFoundError(f"File not found: {file_id}") from exc
+        if not source.is_file() or not self._file_operation_path_in_authorized_storage(
+            source
+        ):
+            raise FileNotFoundError(f"File not found: {file_id}")
+
+        staging_root = self._external_upload_staging_root()
+        staging_dir = staging_root / uuid4().hex
+        staging_dir.mkdir(parents=True, exist_ok=False)
+        target = staging_dir / source.name
+        try:
+            shutil.copy2(source, target)
+            os.chmod(target, 0o600)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        return target
+
+    def discard_staged_external_upload(self, file_path: str | Path) -> None:
+        """Remove a file previously returned by staging.
+
+        Cleanup is deliberately confined to the per-task internal staging
+        root, so a connector cannot cause arbitrary workspace deletion.
+        """
+
+        staging_root = self._external_upload_staging_root()
+        try:
+            candidate = Path(file_path).resolve()
+        except RuntimeError:
+            # A symlink loop must not escape cleanup's confined-path check.
+            candidate = Path(file_path)
+        if not candidate.is_relative_to(staging_root) or candidate == staging_root:
+            raise ValueError("staged upload path is outside the task staging area")
+        try:
+            candidate.unlink(missing_ok=True)
+        finally:
+            parent = candidate.parent
+            while parent != staging_root and parent.is_relative_to(staging_root):
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+
+    def _external_upload_staging_root(self) -> Path:
+        """Return the staging root only when it remains under task temp/.
+
+        ``temp/`` is writable by code-exec tools, so both the internal marker
+        and the upload directory may be replaced with symlinks between task
+        runs. Resolve the complete path before creating or deleting anything,
+        and fail closed if either link escapes the task's temporary directory.
+        """
+
+        temp_root = self.temp_dir.resolve()
+        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
+        if staging_root == temp_root or not staging_root.is_relative_to(temp_root):
+            raise ValueError("task upload staging area is outside temp directory")
+        return staging_root
 
     def register_internal_file(
         self,
@@ -361,16 +532,64 @@ class TaskWorkspace:
             return file_id
 
     def _is_internal_workspace_path(self, file_path: Path) -> bool:
-        """Return whether a path is reserved or registered runtime scratch data."""
+        """Return whether a path is reserved or registered runtime scratch data.
+
+        Three reserved kinds, skipped by every listing that consults this
+        predicate (get_all_files, get_output_files, _scan_all_files): the
+        process-local scratch root under temp (and, when that name is an
+        alias, the directory directly under temp/ it points at), the engine-owned
+        output subtree (see :meth:`is_engine_owned_path`), and any path
+        registered as an internal file id. The file tool's named-directory
+        listing calls is_engine_owned_path directly instead, so it hides only
+        the engine tool-results directory, not the other two kinds.
+        """
 
         resolved_path = file_path.resolve()
-        reserved_root = self.internal_temp_dir.resolve()
+        # The reserved root is the name under temp/, not whatever that name
+        # points at: resolve the parent, never the reserved segment itself.
+        # Following it would put the failure, and the answer, in the hands of
+        # whoever can create a symlink there -- and a loop there would make
+        # this shared check raise for every caller, about every path. The
+        # name itself is compared as written, not case folded: it is a
+        # dot-name the engine creates itself, and no file tool resolves a
+        # write through it.
+        reserved_root = self.temp_dir.resolve() / _INTERNAL_TEMP_DIR_NAME
         if resolved_path.is_relative_to(reserved_root):
+            return True
+        # Unlike the engine-owned output subtree, a directory this name
+        # currently points at is ALSO treated as reserved, but only when
+        # that directory is a direct child of temp/ -- the one layout the
+        # engine's own scratch writer accepts for this root (computer/store):
+        # the engine never puts a symlink here itself, so the only way the
+        # name points elsewhere is an alias placed by something else, and
+        # scratch data that already lives at that alias stays internal
+        # rather than surfacing as a new user file. An alias to temp/ itself
+        # would make every temp/ file "inside" it and empty the temp listing;
+        # a deeper directory is one the engine never writes into; and nothing
+        # the engine writes ever lives outside temp/, so an alias reaching
+        # further out names no scratch data to protect -- honouring it there
+        # would let a symlink placed under temp/ blank out listings anywhere
+        # else in the workspace. A loop has no target to follow, so it is
+        # left to the name-based answer above instead of raising here.
+        try:
+            aliased_target = reserved_root.resolve()
+        except RuntimeError:
+            aliased_target = None
+        if (
+            aliased_target is not None
+            and aliased_target != reserved_root
+            and aliased_target.parent == reserved_root.parent
+            and resolved_path.is_relative_to(aliased_target)
+        ):
+            return True
+        if self.is_engine_owned_path(resolved_path):
             return True
         return self._get_internal_file_id_from_path(resolved_path) is not None
 
     def _forget_internal_files(self) -> None:
         workspace_key = str(self.workspace_dir.resolve())
+        with _announced_reserved_names_lock:
+            _announced_reserved_names.discard(str(self.engine_owned_output_dir))
         with _internal_file_registry_lock:
             file_keys = [
                 key for key in _internal_file_registry if key[0] == workspace_key
@@ -390,6 +609,15 @@ class TaskWorkspace:
             db_session=db_session,
         )
         return registered[0]
+
+    def register_delivery_file(self, file_path: str) -> str:
+        """Register a host-delivered attachment only with durable task ownership."""
+        if in_sandbox_tool_runner():
+            raise ValueError("User delivery requires host-side registration")
+        with self._registration_lock:
+            return self._register_files_locked(
+                ((file_path, None),), db_session=None, require_persistence=True
+            )[0]
 
     def register_files(
         self,
@@ -414,6 +642,7 @@ class TaskWorkspace:
         files: Sequence[tuple[str, Optional[str]]],
         *,
         db_session: Any,
+        require_persistence: bool = False,
     ) -> tuple[str, ...]:
         """Register files through detached read, storage, and metadata phases.
 
@@ -435,6 +664,8 @@ class TaskWorkspace:
             registrations,
             db_session=resolved_db_session,
         )
+        if require_persistence and any(not plan.should_persist for plan in plans):
+            raise ValueError("Attachment registration requires a persisted task owner")
 
         prepared: list[PreparedWorkspaceFileRegistration] = []
         try:
@@ -519,8 +750,7 @@ class TaskWorkspace:
                     existing_path = path_by_requested_file_id.get(requested_file_id)
                     if existing_path is not None and existing_path != path_key:
                         raise ValueError(
-                            "One file id cannot identify multiple workspace paths "
-                            "in the same batch"
+                            "One file id cannot identify multiple workspace paths in the same batch"
                         )
                     path_by_requested_file_id[requested_file_id] = path_key
                 result_indexes.append(existing_index)
@@ -530,8 +760,7 @@ class TaskWorkspace:
                 existing_path = path_by_requested_file_id.get(requested_file_id)
                 if existing_path is not None and existing_path != path_key:
                     raise ValueError(
-                        "One file id cannot identify multiple workspace paths "
-                        "in the same batch"
+                        "One file id cannot identify multiple workspace paths in the same batch"
                     )
                 path_by_requested_file_id[requested_file_id] = path_key
 
@@ -666,8 +895,11 @@ class TaskWorkspace:
             record_user_id = int(existing_record.user_id)
             if record_user_id != task_user_id:
                 raise PermissionError(
-                    "Cannot register a workspace file over metadata owned by "
-                    "another user"
+                    "Cannot register a workspace file over metadata owned by another user"
+                )
+            if existing_record.detached_reason is not None:
+                raise ValueError(
+                    "Retained files must be explicitly reattached before registration"
                 )
             existing = WorkspaceUploadedFileSnapshot(
                 version=snapshot_uploaded_file_version(existing_record),
@@ -1164,6 +1396,11 @@ class TaskWorkspace:
     def _file_record_allowed_for_workspace(
         self, record: Any, path: Optional[Path] = None
     ) -> bool:
+        if (
+            getattr(record, "detached_reason", None) is not None
+            or getattr(record, "storage_status", None) == "compensating"
+        ):
+            return False
         if path is not None:
             workspace_abs = self.workspace_dir.resolve()
             resolved_path = path.resolve()
@@ -1361,7 +1598,13 @@ class TaskWorkspace:
                 if should_close:
                     db.close()
         except Exception as e:
-            logger.warning(f"Failed to resolve file_id from database: {e}")
+            # ``exc_info`` because this fault is swallowed -- the caller only
+            # sees ``None`` -- so this is its only record. A durable-storage
+            # fault arrives here from ``materialize()`` carrying just the
+            # storage key; its cause lives in ``__cause__`` (#1467).
+            logger.warning(
+                f"Failed to resolve file_id from database: {e}", exc_info=True
+            )
             return None
 
     def _file_operation_path_in_authorized_storage(self, path: Path) -> bool:
@@ -1434,8 +1677,7 @@ class TaskWorkspace:
             # Preserve File Operation's public not-found shape while failing
             # closed on malformed policy state or database infrastructure.
             logger.warning(
-                "File Operation selector policy validation failed for "
-                "workspace %s and task %s",
+                "File Operation selector policy validation failed for workspace %s and task %s",
                 self.id,
                 self.db_task_id,
                 exc_info=True,
@@ -1528,6 +1770,28 @@ class TaskWorkspace:
         self.input_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
+
+    def _warn_if_reserved_output_name_is_taken(self) -> None:
+        """Log once per process and workspace that the reserved output name is taken."""
+        reserved = self.engine_owned_output_dir
+        # Any entry at the name counts, a dangling symlink included (lexists).
+        # The reservation goes by name, not by origin, so the engine's own
+        # directory is announced too; once per process keeps that off the
+        # happy path.
+        if os.path.lexists(reserved):
+            key = str(reserved)
+            with _announced_reserved_names_lock:
+                if key in _announced_reserved_names:
+                    return
+                _announced_reserved_names.add(key)
+            logger.warning(
+                "Workspace %s already has an entry at %s. That name is reserved "
+                "for the engine's spilled tool results: nothing under it is "
+                "listed as a deliverable and the workspace file tools refuse "
+                "to write there.",
+                self.id,
+                reserved,
+            )
 
     def get_allowed_dirs(self) -> List[str]:
         """Get list of allowed directories for this workspace"""
@@ -1795,8 +2059,7 @@ class TaskWorkspace:
                 match = self._find_existing_candidate(search_dirs, normalized_clean)
                 if match is not None:
                     logger.info(
-                        f"File '{file_path}' matched via normalized name: "
-                        f"'{normalized_name}'"
+                        f"File '{file_path}' matched via normalized name: '{normalized_name}'"
                     )
                     return match
 
@@ -1836,8 +2099,7 @@ class TaskWorkspace:
                         except ValueError:
                             continue
                         logger.info(
-                            f"File '{file_path}' fuzzy matched to: "
-                            f"'{existing_file.name}'"
+                            f"File '{file_path}' fuzzy matched to: '{existing_file.name}'"
                         )
                         return resolved
 
@@ -1854,6 +2116,10 @@ class TaskWorkspace:
         """
         Get all output files in the workspace.
 
+        Reserved paths are left out on both branches, matching get_all_files:
+        this list is what the user and a calling agent receive as the task's
+        deliverables, and engine-owned files are not deliverables.
+
         Args:
             include_subdirs: Whether to include files in subdirectories
 
@@ -1865,12 +2131,16 @@ class TaskWorkspace:
         if include_subdirs:
             # Recursively scan output directory
             for file_path in self.output_dir.rglob("*"):
-                if file_path.is_file():
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
         else:
             # Only scan top-level of output directory
             for file_path in self.output_dir.iterdir():
-                if file_path.is_file():
+                if file_path.is_file() and not self._is_internal_workspace_path(
+                    file_path
+                ):
                     output_files.append(self._get_file_info(file_path, "output"))
 
         return output_files
@@ -1949,11 +2219,27 @@ class TaskWorkspace:
                     )
 
     def cleanup(self) -> None:
-        """Clean up the entire workspace"""
+        """Clean up the entire workspace.
+
+        Tolerates a concurrent remover. Task deletion can race a cancelled
+        turn's own runtime cleanup -- both unwind through ``remove_agent``, on
+        separate worker threads, onto the same tree -- and the loser would
+        otherwise surface a ``FileNotFoundError`` from the middle of the walk.
+        The tree being gone is the outcome this method promises, so the caller
+        learns nothing useful from which thread removed it, and reporting it as
+        a failure would tell deletion the directory leaked when it did not.
+        """
         self._forget_internal_files()
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
-            shutil.rmtree(self.workspace_dir)
+            try:
+                shutil.rmtree(self.workspace_dir)
+            except FileNotFoundError:
+                logger.info(
+                    f"Workspace directory already removed concurrently: "
+                    f"{self.workspace_dir}"
+                )
+                return
             logger.info(f"Workspace directory removed: {self.workspace_dir}")
 
     def copy_to_workspace(self, source_path: str, target_subdir: str = "input") -> Path:
@@ -2546,6 +2832,26 @@ class MockWorkspace:
             return self.temp_dir / file_path
         else:
             return self.workspace_dir / file_path
+
+    def resolve_write_path(self, file_path: str, default_dir: str = "output") -> Path:
+        """Resolve a write target the same way as :meth:`resolve_path`.
+
+        The mock never writes to disk, so there is no engine-owned subtree to
+        refuse; the method exists so that tools built against this workspace
+        for listing keep the write-side entry point they call.
+        """
+
+        return self.resolve_path(file_path, default_dir)
+
+    def is_engine_owned_path(self, file_path: Path) -> bool:
+        """Answer False: a workspace that never writes to disk owns nothing."""
+
+        return False
+
+    def refuse_engine_owned_write(self, resolved_path: Path, requested: str) -> Path:
+        """Return the target unchanged; see :meth:`is_engine_owned_path`."""
+
+        return resolved_path
 
     def register_file(self, file_path: str, file_id: Optional[str] = None) -> str:
         """

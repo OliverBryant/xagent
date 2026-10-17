@@ -136,7 +136,8 @@ def test_task_lease_recovery_start_skips_automatic_task_under_pytest(
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test")
 
     assert app_module.start_task_lease_recovery_task(app_module.app) is None
-    assert app_module.app.state.task_lease_recovery_task is None
+    # Independent of whether an earlier test left the attribute behind.
+    assert getattr(app_module.app.state, "task_lease_recovery_task", None) is None
 
 
 @pytest.mark.asyncio
@@ -157,6 +158,10 @@ async def test_application_shutdown_stops_task_lease_recovery(
 
     async def fake_wait_for_heartbeat_idle() -> None:
         shutdown_order.append("heartbeat_idle")
+
+    async def fake_stop_telemetry(app_instance) -> None:
+        assert app_instance is app_module.app
+        shutdown_order.append("telemetry")
 
     class _FakeChannel:
         enabled = False
@@ -190,6 +195,9 @@ async def test_application_shutdown_stops_task_lease_recovery(
         fake_slack_bot,
     )
     monkeypatch.setattr(app_module, "flush_langfuse", lambda: None)
+    monkeypatch.setattr(
+        app_module, "stop_runtime_performance_monitor", fake_stop_telemetry
+    )
     monkeypatch.setattr(app_module, "stop_task_lease_recovery_task", fake_stop)
     monkeypatch.setattr(
         app_module,
@@ -197,7 +205,7 @@ async def test_application_shutdown_stops_task_lease_recovery(
         fake_stop_uploaded_file_recovery,
     )
     monkeypatch.setattr(
-        "xagent.web.api.websocket.background_task_manager.shutdown",
+        "xagent.web.services.task_execution.background_task_manager.shutdown",
         fake_shutdown_background_tasks,
     )
     monkeypatch.setattr(
@@ -225,5 +233,6 @@ async def test_application_shutdown_stops_task_lease_recovery(
     assert shutdown_order == [
         "background_tasks",
         "heartbeat_idle",
+        "telemetry",
         "sandbox",
     ]

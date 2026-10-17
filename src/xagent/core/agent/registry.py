@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable
 
-from .context import ExecutionContext
+from .runner import UserMessageInjectionOutcome, UserMessageInjectionResult
 
 if TYPE_CHECKING:
     from .runner import AgentRunner
@@ -195,7 +195,23 @@ class ExecutionRegistry:
             return None
         if handle.status == ExecutionLifecycleStatus.CANCELLED:
             return None
-        result = await handle.runner.resume(execution_id, **kwargs)
+        try:
+            result = await handle.runner.resume(execution_id, **kwargs)
+        except Exception:
+            # A raised exception (for example CheckpointPersistenceError)
+            # means this resume never reached a normalized result, so
+            # ``_apply_result`` below never runs. Leaving the handle in its
+            # previous ``is_resumable`` state would let a caller resume it
+            # again and repeat whatever non-idempotent work already
+            # happened before the failure -- settle it the same way
+            # ``_on_task_done`` already does for the async ``start()`` path,
+            # then let the caller see the original exception.
+            handle.status = ExecutionLifecycleStatus.FAILED
+            handle.last_error = "Execution resume failed without a normalized result."
+            handle.updated_at = _utcnow()
+            self._emit_event("execution.failed", handle)
+            self.unregister(execution_id)
+            raise
         self._apply_result(handle, result)
         if not handle.is_resumable:
             self.unregister(execution_id)
@@ -212,10 +228,13 @@ class ExecutionRegistry:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> ExecutionContext | None:
+    ) -> UserMessageInjectionResult:
         handle = self.get(execution_id)
         if handle is None:
-            return None
+            return UserMessageInjectionResult(
+                context=None,
+                outcome=UserMessageInjectionOutcome.NOT_POSTED,
+            )
         handle.updated_at = _utcnow()
         return await handle.runner.inject_user_message(
             execution_id,
@@ -239,8 +258,8 @@ class ExecutionRegistry:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> ExecutionContext | None:
-        context = await self.inject_user_message(
+    ) -> UserMessageInjectionResult:
+        result = await self.inject_user_message(
             execution_id,
             message,
             execution_message=execution_message,
@@ -251,7 +270,15 @@ class ExecutionRegistry:
             reason=reason,
         )
         handle = self.get(execution_id)
-        if handle is not None and context is not None:
+        if (
+            handle is not None
+            and result.context is not None
+            and result.outcome
+            in (
+                UserMessageInjectionOutcome.POSTED_FRESH,
+                UserMessageInjectionOutcome.POSTED_REPLAY,
+            )
+        ):
             resolved_execution_message = (
                 execution_message if execution_message is not None else message
             )
@@ -270,7 +297,7 @@ class ExecutionRegistry:
                     "request_interrupt": request_interrupt,
                 },
             )
-        return context
+        return result
 
     def _on_task_done(
         self,
@@ -322,7 +349,7 @@ class ExecutionRegistry:
         handle.last_error = None
 
         status = result.get("status")
-        if status == "interrupted":
+        if result.get("injection_outcome_unknown") or status == "interrupted":
             handle.status = ExecutionLifecycleStatus.INTERRUPTED
             error = result.get("error")
             handle.last_error = str(error) if error is not None else None

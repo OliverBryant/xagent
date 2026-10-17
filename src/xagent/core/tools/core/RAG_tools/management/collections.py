@@ -23,6 +23,7 @@ from ..core.config import (
     DEFAULT_LANCEDB_SCAN_BATCH_SIZE,
     DEFAULT_VECTOR_STORE_EXTENDED_SCAN_LIMIT,
 )
+from ..core.exceptions import DatabaseOperationError
 from ..core.schemas import (
     CollectionDocumentMetadata,
     CollectionInfo,
@@ -53,7 +54,7 @@ from ..utils.user_scope import resolve_user_scope
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ..kb import KBCoreManagementCompatibilityFacade
+    from ..kb import KBCoordinator, KBCoreManagementCompatibilityFacade
 
 DEFAULT_BATCH_SIZE = DEFAULT_LANCEDB_SCAN_BATCH_SIZE
 
@@ -62,6 +63,23 @@ def _get_management_facade() -> "KBCoreManagementCompatibilityFacade":
     from ..kb import get_kb_coordinator
 
     return get_kb_coordinator().management
+
+
+def _resolve_coordinator(coordinator: "KBCoordinator | None") -> "KBCoordinator":
+    from ..kb import get_kb_coordinator
+
+    return coordinator if coordinator is not None else get_kb_coordinator()
+
+
+def _count_rows_uncached(conn: Any, table_name: str, filter_expr: str) -> int:
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        return _safe_count_rows(table, filter_expr)
+    except Exception:  # noqa: BLE001 - a missing table holds no rows
+        return 0
+    finally:
+        _safe_close_table(table)
 
 
 def _extract_user_id_from_source_path(source_path: Optional[str]) -> Optional[int]:
@@ -719,6 +737,8 @@ async def _list_collections_impl(
     user_id: Optional[int] = None,
     is_admin: Optional[bool] = None,
     force_realtime: bool = False,
+    *,
+    coordinator: "KBCoordinator | None" = None,
 ) -> ListCollectionsResult:
     """List all knowledge base collections along with aggregated statistics.
 
@@ -748,8 +768,6 @@ async def _list_collections_impl(
         metadata_collections: List[CollectionInfo] = []
         metadata_collection_names: Set[str] = set()
         metadata_collections_by_name: Dict[str, CollectionInfo] = {}
-        metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
-        metadata_processed_documents_by_name: Dict[str, int] = {}
         try:
             metadata_collections = list(
                 await metadata_store.list_collections(
@@ -767,21 +785,6 @@ async def _list_collections_impl(
                 for collection in metadata_collections
                 if collection.name
             }
-            metadata_stats_by_name = {
-                collection.name: {
-                    "documents": collection.documents,
-                    "parses": collection.parses,
-                    "chunks": collection.chunks,
-                    "embeddings": collection.embeddings,
-                }
-                for collection in metadata_collections
-                if collection.name
-            }
-            metadata_processed_documents_by_name = {
-                collection.name: collection.processed_documents
-                for collection in metadata_collections
-                if collection.name
-            }
         except Exception as exc:
             logger.warning("Could not load persisted collection metadata: %s", exc)
 
@@ -796,22 +799,8 @@ async def _list_collections_impl(
 
         collection_keys = sorted(document_names.keys() | metadata_collection_names)
 
-        # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
+        # Step 2: Stats are always read from the engine; persisted counters can drift.
         stats: Dict[str, Dict[str, int]] = {}
-        if not force_realtime and is_admin:
-            try:
-                for info in metadata_collections:
-                    if info.name in collection_keys or is_admin:
-                        stats[info.name] = {
-                            "documents": info.documents,
-                            "parses": info.parses,
-                            "chunks": info.chunks,
-                            "embeddings": info.embeddings,
-                        }
-            except Exception as exc:
-                logger.debug(
-                    "Metadata cache unavailable, falling back to realtime: %s", exc
-                )
 
         def _build_collection_info(
             collection_name: str,
@@ -882,66 +871,18 @@ async def _list_collections_impl(
                 collection_kwargs["last_accessed_at"] = timestamp_now
             return CollectionInfo(**collection_kwargs)
 
-        # Fallback to realtime aggregation for missing collections or cache failure
-        used_realtime = False
-        realtime_timestamp: Optional[datetime] = None
-        if (
-            force_realtime
-            or not stats
-            or any(key not in stats for key in collection_keys)
-        ):
-            used_realtime = True
-            realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
-            realtime_stats = await asyncio.to_thread(
-                vector_store.aggregate_collection_stats,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for key in collection_keys:
-                if key not in stats:
-                    if key in realtime_stats:
-                        stats[key] = realtime_stats[key]
-                    elif is_admin and key in metadata_stats_by_name:
-                        stats[key] = metadata_stats_by_name[key]
-                    else:
-                        stats[key] = {
-                            "documents": 0,
-                            "parses": 0,
-                            "chunks": 0,
-                            "embeddings": 0,
-                        }
-
-        # Async write stats back to metadata cache for next request
-        if used_realtime and is_admin:
-            try:
-                metadata_store = get_metadata_store()
-                refreshed_infos: Dict[str, CollectionInfo] = {}
-                for collection in collection_keys:
-                    existing_metadata_info = metadata_collections_by_name.get(
-                        collection
-                    )
-                    info = _build_collection_info(
-                        collection,
-                        metadata_info=existing_metadata_info,
-                        ingestion_config=(
-                            existing_metadata_info.ingestion_config
-                            if existing_metadata_info
-                            else None
-                        ),
-                        processed_documents=stats[collection]["parses"],
-                        timestamp_now=realtime_timestamp,
-                    )
-                    refreshed_infos[collection] = info
-                await metadata_store.save_collections(list(refreshed_infos.values()))
-                metadata_collections_by_name.update(refreshed_infos)
-                for collection in refreshed_infos:
-                    metadata_collection_names.add(collection)
-            except Exception as exc:
-                logger.debug("Failed to cache collection metadata: %s", exc)
-        collection_keys = sorted(
-            stats.keys() | document_names.keys() | metadata_collection_names
+        realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        realtime_stats = await asyncio.to_thread(
+            _resolve_coordinator(coordinator).aggregate_collection_stats_sync,
+            user_id=user_id,
+            is_admin=is_admin,
         )
-
+        for key in collection_keys:
+            engine = realtime_stats.get(key) or {}
+            stats[key] = {
+                name: engine.get(name, 0)
+                for name in ("documents", "parses", "chunks", "embeddings")
+            }
         # Load configs for collections (admin sees cross-tenant configs)
         collection_configs: Dict[str, IngestionConfig] = {}
         try:
@@ -951,19 +892,6 @@ async def _list_collections_impl(
         except Exception as e:
             logger.warning("Could not load collection configs: %s", e)
 
-        # Ensure all collections have complete stats
-        for collection in collection_keys:
-            if collection not in stats:
-                stats[collection] = {
-                    "documents": 0,
-                    "parses": 0,
-                    "chunks": 0,
-                    "embeddings": 0,
-                }
-            for key in ["documents", "parses", "chunks", "embeddings"]:
-                if key not in stats[collection]:
-                    stats[collection][key] = 0
-
         collections = []
         for collection in collection_keys:
             metadata_info = metadata_collections_by_name.get(collection)
@@ -972,16 +900,8 @@ async def _list_collections_impl(
                     collection,
                     metadata_info=metadata_info,
                     ingestion_config=collection_configs.get(collection),
-                    processed_documents=(
-                        stats[collection]["parses"]
-                        if stats[collection]["parses"] > 0
-                        else (
-                            metadata_processed_documents_by_name.get(collection, 0)
-                            if is_admin
-                            else 0
-                        )
-                    ),
-                    timestamp_now=realtime_timestamp if used_realtime else None,
+                    processed_documents=stats[collection]["parses"],
+                    timestamp_now=None if is_admin else realtime_timestamp,
                 )
             )
 
@@ -1029,6 +949,8 @@ def _get_document_stats_impl(
     model_tag: Optional[str] = None,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    *,
+    coordinator: "KBCoordinator | None" = None,
 ) -> DocumentStatsResult:
     """Return statistics for a single document within a collection.
 
@@ -1047,63 +969,44 @@ def _get_document_stats_impl(
     warnings: List[str] = []
 
     try:
-        # Use storage abstraction for basic aggregation
-        vector_store = get_vector_index_store()
-        raw_stats = vector_store.aggregate_document_stats(
-            collection_name=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
+        # Uncached on purpose: a cached table misses rows other processes wrote.
+        conn = get_vector_index_store().get_raw_connection()
+        doc_filter = (
+            f"collection = '{escape_lancedb_string(collection)}' "
+            f"AND doc_id = '{escape_lancedb_string(doc_id)}'"
         )
-
-        document_count = raw_stats["documents"]
+        document_count = _count_rows_uncached(conn, "documents", doc_filter)
         document_exists = document_count > 0
-        parse_count = raw_stats["parses"]
-        chunk_count = raw_stats["chunks"]
+        parse_count = _count_rows_uncached(conn, "parses", doc_filter)
 
-        # Handle model_tag specific embeddings filtering
-        embedding_breakdown: Dict[str, int] = {}
-
+        resolved_coordinator = _resolve_coordinator(coordinator)
+        # Totals ignore the caller; the breakdown is caller-scoped.
+        totals = resolved_coordinator.count_rows_by_document_sync(
+            collection, user_id=None, is_admin=True, doc_id=doc_id
+        ).get(doc_id, {})
+        scoped = (
+            totals
+            if is_admin
+            else resolved_coordinator.count_rows_by_document_sync(
+                collection, user_id=user_id, is_admin=is_admin, doc_id=doc_id
+            ).get(doc_id, {})
+        )
+        chunk_count = totals.get("chunks", 0)
+        embedding_breakdown = {
+            name: count
+            for name, count in scoped.items()
+            if name.startswith("embeddings_")
+        }
         if model_tag:
-            # When model_tag is specified, only count embeddings for that specific table
-            safe_collection = escape_lancedb_string(collection)
-            safe_doc_id = escape_lancedb_string(doc_id)
-            filters = {"collection": safe_collection, "doc_id": safe_doc_id}
             table_name = embeddings_table_name(model_tag)
-            embedding_count = vector_store.count_rows(
-                table_name=table_name,
-                filters=filters,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            embedding_breakdown[table_name] = embedding_count
+            embedding_count = embedding_breakdown.get(table_name, 0)
+            embedding_breakdown = {table_name: embedding_count}
         else:
-            # Use the aggregated count from storage abstraction
-            embedding_count = raw_stats["embeddings"]
-            # Optionally include breakdown by table if needed
-            safe_collection = escape_lancedb_string(collection)
-            safe_doc_id = escape_lancedb_string(doc_id)
-            filters = {"collection": safe_collection, "doc_id": safe_doc_id}
-
-            try:
-                table_names = vector_store.list_table_names()
-            except Exception as exc:  # noqa: BLE001 - convert to warning
-                message = f"Unable to enumerate embeddings tables: {exc}"
-                logger.warning(message)
-                warnings.append(message)
-                table_names = []
-
-            for table_name in table_names:
-                if not table_name.startswith("embeddings_"):
-                    continue
-                count = vector_store.count_rows(
-                    table_name=table_name,
-                    filters=filters,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-                if count:
-                    embedding_breakdown[table_name] = count
+            embedding_count = sum(
+                count
+                for name, count in totals.items()
+                if name.startswith("embeddings_")
+            )
 
     except Exception as exc:  # noqa: BLE001 - convert to structured failure
         logger.error("Failed to get document stats: %s", exc, exc_info=True)
@@ -1195,6 +1098,8 @@ def _list_documents_impl(
     collection: str,
     user_id: Optional[int] = None,
     is_admin: bool = False,
+    *,
+    coordinator: "KBCoordinator | None" = None,
 ) -> DocumentListResult:
     """List documents for a collection including latest processing status.
 
@@ -1228,6 +1133,10 @@ def _list_documents_impl(
                 "uploaded_at": None,  # Not available in DocumentRecord
             }
 
+        row_counts = _resolve_coordinator(coordinator).count_rows_by_document_sync(
+            collection, user_id=user_id, is_admin=is_admin
+        )
+
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to list documents: %s", exc, exc_info=True)
         return DocumentListResult(
@@ -1238,30 +1147,6 @@ def _list_documents_impl(
             warnings=warnings,
         )
 
-    # Collect chunk counts using storage abstraction
-    chunk_counts = vector_store.aggregate_document_counts(
-        table_name="chunks",
-        doc_id_column="doc_id",
-        collection_name=collection,
-        user_id=user_id,
-        is_admin=is_admin,
-    )
-
-    # Collect embedding counts
-    embedding_counts: Dict[str, int] = defaultdict(int)
-    for table_name in vector_store.list_table_names():
-        if not table_name.startswith("embeddings_"):
-            continue
-        table_counts = vector_store.aggregate_document_counts(
-            table_name=table_name,
-            doc_id_column="doc_id",
-            collection_name=collection,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        for doc_id, value in table_counts.items():
-            embedding_counts[doc_id] += value
-
     # Load status records
     status_records = {
         entry["doc_id"]: entry
@@ -1270,10 +1155,7 @@ def _list_documents_impl(
 
     # Combine all doc_ids from various sources
     doc_ids = (
-        set(document_info.keys())
-        | set(chunk_counts.keys())
-        | set(embedding_counts.keys())
-        | set(status_records.keys())
+        set(document_info.keys()) | set(row_counts.keys()) | set(status_records.keys())
     )
 
     # Build summaries
@@ -1281,8 +1163,11 @@ def _list_documents_impl(
     for doc_id in sorted(doc_ids):
         info = document_info.get(doc_id, {})
         status_entry = status_records.get(doc_id)
-        chunk_count = chunk_counts.get(doc_id, 0)
-        embedding_count = embedding_counts.get(doc_id, 0)
+        per_table = row_counts.get(doc_id, {})
+        chunk_count = per_table.get("chunks", 0)
+        embedding_count = sum(
+            count for name, count in per_table.items() if name.startswith("embeddings_")
+        )
 
         if status_entry and isinstance(status_entry.get("status"), str):
             try:
@@ -1354,7 +1239,12 @@ def delete_document(
 
 
 def _delete_document_impl(
-    collection: str, doc_id: str, user_id: int, is_admin: bool = False
+    collection: str,
+    doc_id: str,
+    user_id: int,
+    is_admin: bool = False,
+    *,
+    coordinator: "KBCoordinator",
 ) -> DocumentOperationResult:
     """Delete a document and all its associated data.
 
@@ -1429,12 +1319,8 @@ def _delete_document_impl(
         authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
 
     try:
-        vector_store = get_vector_index_store()
-        counts = vector_store.delete_document_data(
-            collection_name=collection,
-            doc_id=doc_id,
-            user_id=user_id,
-            is_admin=is_admin,
+        counts = coordinator.delete_documents_data_sync(
+            collection, [doc_id], user_id=user_id, is_admin=is_admin
         )
         _clear_ingestion_status_impl(
             collection,
@@ -1443,13 +1329,25 @@ def _delete_document_impl(
             is_admin=is_admin or authorized_via_legacy_source_path,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to delete document %s/%s: %s", collection, doc_id, exc)
+        # The store wraps delete failures; report the root cause as before.
+        cause = (
+            exc.__cause__
+            if isinstance(exc, DatabaseOperationError) and exc.__cause__ is not None
+            else exc
+        )
+        logger.error(
+            "Failed to delete document %s/%s: %s",
+            collection,
+            doc_id,
+            cause,
+            exc_info=True,
+        )
         return DocumentOperationResult(
             status="error",
             collection=collection,
             doc_id=doc_id,
             new_status=DocumentProcessingStatus.FAILED,
-            message=f"Failed to delete document: {exc}",
+            message=f"Failed to delete document: {cause}",
             warnings=[],
             details={},
         )

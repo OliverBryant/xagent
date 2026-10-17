@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
+from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -126,6 +130,72 @@ class ReusedExecutionAdapter:
         return {"success": True}
 
 
+def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="builtin:internal_worker",
+            pattern="single_call",
+            llm=FakeLLM([]),
+            allowed_skills=["must-not-load"],
+            skills_enabled=False,
+            user_interaction_enabled=False,
+            execution_metadata={
+                "agent_type": "builtin",
+                "builtin_agent_name": "internal_worker",
+            },
+        )
+    )
+
+    runner, execution_type = adapter._build_runner()
+    metadata = adapter._execution_metadata(execution_type=execution_type)
+    normalized = adapter._normalize_result(
+        result={"success": True, "output": "ok"},
+        execution_type=execution_type,
+        execution_id="run-1",
+    )
+
+    assert runner.agent.skill_manager is None
+    assert runner.agent.allowed_skills is None
+    assert [
+        schema["function"]["name"]
+        for schema in runner.agent.patterns[0]._builtin_tool_schemas()
+    ] == ["final_answer"]
+    assert runner.agent.metadata == {
+        "agent_type": "builtin",
+        "builtin_agent_name": "internal_worker",
+        "pattern": "single_call",
+    }
+    assert metadata["agent_type"] == "builtin"
+    assert metadata["builtin_agent_name"] == "internal_worker"
+    assert normalized["metadata"]["agent_type"] == "builtin"
+    assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
+
+
+@pytest.mark.parametrize("pattern_name", ["dag_plan_execute", "auto"])
+def test_execution_adapter_propagates_interaction_policy_to_nested_patterns(
+    pattern_name: str,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="builtin:nested_worker",
+            pattern=pattern_name,
+            llm=FakeLLM([]),
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    runner, _ = adapter._build_runner()
+    pattern = runner.agent.patterns[0]
+
+    assert runner.agent.skill_manager is None
+    if pattern_name == "dag_plan_execute":
+        assert pattern.user_interaction_enabled is False
+    else:
+        assert pattern.react_pattern.user_interaction_enabled is False
+        assert pattern.dag_pattern.user_interaction_enabled is False
+
+
 def test_execution_metadata_carries_runtime_modality_preferences() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -167,7 +237,6 @@ def auto_decision(
                     "arguments": {
                         "action": action,
                         "reason": reason,
-                        "response_language": "English",
                         "answer": answer,
                         "requires_current_or_external_facts": False,
                         "existing_context_sufficient": True,
@@ -297,7 +366,22 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
                     }
                 ]
             },
-            {"content": "done", "done": True},
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "done",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
         ]
     )
     tool = FakeTool()
@@ -348,6 +432,87 @@ async def test_execution_adapter_routes_react_to_react() -> None:
     assert result["metadata"]["execution_type"] == "agent_react"
     assert result["agent_result"]["pattern"] == "ReActPattern"
     assert llm.calls[0]["tools"] is not None
+
+
+@pytest.mark.asyncio
+async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
+    """Covers the transport the renderer depends on: request context ->
+    metadata["request_context"] -> _apply_request_context -> metadata. The
+    renderer's own formatting is unit-tested in tests/core/agent/test_context.py.
+    """
+    llm = FakeLLM(["tz done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="tz",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="tz-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(
+        task="how many shifts do we have on tomorrow?",
+        task_id="tz-exec",
+        context={"timezone": "Australia/Melbourne"},
+    )
+
+    assert result["success"] is True
+    system_prompt = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+
+    # created_at is a dataclass default_factory, so it cannot be monkeypatched
+    # from here. Reading the UTC stamp back out of the prompt pins the pair
+    # without a wall-clock race.
+    stamped_utc = re.search(
+        r"which is (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\.", system_prompt
+    )
+    assert stamped_utc is not None, system_prompt
+    expected_local = (
+        datetime.strptime(stamped_utc.group(1), "%Y-%m-%d %H:%M:%S")
+        .replace(tzinfo=timezone.utc)
+        .astimezone(ZoneInfo("Australia/Melbourne"))
+    )
+
+    assert (
+        f"Turn started at: {expected_local.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"(Australia/Melbourne, UTC+" in system_prompt
+    )
+    assert (
+        f"Turn-start date (Australia/Melbourne): {expected_local.date().isoformat()}. "
+        in system_prompt
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_context_without_timezone_keeps_utc_clocks() -> None:
+    llm = FakeLLM(["utc done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="utc",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="utc-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(task="Say done", task_id="utc-exec", context={})
+
+    assert result["success"] is True
+    system_prompt = next(
+        message["content"]
+        for message in llm.calls[0]["messages"]
+        if message["role"] == "system"
+    )
+    assert "Turn-start date (UTC): " in system_prompt
+    assert " UTC. Real time keeps advancing" in system_prompt
+    assert "which is" not in system_prompt
 
 
 @pytest.mark.asyncio
@@ -791,6 +956,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
             recovered_skill_context=None,
             memory_store=None,
             allowed_skills=None,
+            skills_enabled=True,
+            workspace_enabled=True,
+            user_interaction_enabled=True,
+            execution_metadata={"old": True},
         )
     )
     service = AgentService(
@@ -801,6 +970,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
         compact_llm=cast(Any, initial_compact_llm),
         tools=[],
         tool_config=None,
+        enable_workspace=False,
+        skills_enabled=False,
+        user_interaction_enabled=False,
+        execution_metadata={"agent_type": "builtin"},
     )
     service._execution_adapter = cast(Any, adapter)
 
@@ -815,6 +988,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
     assert adapter.config.current_task_id == "task-compact-refresh"
     assert adapter.config.llm is updated_llm
     assert adapter.config.compact_llm is updated_compact_llm
+    assert adapter.config.skills_enabled is False
+    assert adapter.config.workspace_enabled is False
+    assert adapter.config.user_interaction_enabled is False
+    assert adapter.config.execution_metadata == {"agent_type": "builtin"}
 
 
 @pytest.mark.asyncio
@@ -876,6 +1053,57 @@ async def test_execution_adapter_routes_dag_to_dag() -> None:
     assert result["output"] == "dag done"
     assert result["metadata"]["execution_type"] == "agent_dag"
     assert result["agent_result"]["pattern"] == "DAGPattern"
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_preserves_dag_failure_delivery_reason() -> None:
+    class FailingStepLLM(FakeLLM):
+        async def chat(self, **kwargs: Any) -> Any:
+            if len(self.calls) == 2:
+                self.calls.append(kwargs)
+                raise RuntimeError("Step provider failed after the tool result")
+            return await super().chat(**kwargs)
+
+    llm = FailingStepLLM(
+        [
+            dag_plan([{"id": "work", "task": "Run a tool and verify it"}]),
+            {"tool_calls": [{"id": "work", "name": "noop", "args": {}}]},
+            {
+                "tool_calls": [
+                    {
+                        "id": "delivery",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": {
+                                "answer": "Tool ran; verification unfinished.",
+                                "outcome": "partial",
+                            },
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag-partial",
+            pattern="dag_plan_execute",
+            llm=llm,
+            tools=[FakeTool()],
+            workspace_enabled=False,
+            skills_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(
+        task="Run a tool and verify it", task_id="dag-partial"
+    )
+
+    assert result["completion_outcome"] == "partial"
+    assert result["termination_reason"] == "step_failed"
+    assert result["metadata"]["termination_reason"] == "step_failed"
+    assert "not a completed task" in result["output"]
+    assert len(llm.calls) == 4
 
 
 def test_execution_adapter_passes_dag_max_concurrency_to_pattern() -> None:
@@ -1081,6 +1309,73 @@ async def test_execution_adapter_exposes_pause_and_message_controls() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_execution_adapter_post_user_message_reports_fresh_vs_replay(
+    scenario: str,
+) -> None:
+    """This layer forwards the registry's report unmodified as a bare
+    UserMessageInjectionOutcome (dropping the raw context, which nothing
+    past this boundary reads): a first write is POSTED_FRESH, a repeat of
+    the same turn id with the same content short-circuits as
+    POSTED_REPLAY, and a repeat with different content still raises."""
+    llm = BlockingLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-noop",
+                    "name": "noop",
+                    "args": {},
+                }
+            ],
+        }
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="fresh-replay",
+            pattern="react",
+            llm=llm,
+            tools=[FakeTool()],
+            service_id="fresh-replay-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+    adapter.start(task="Wait", task_id="fresh-replay-exec")
+    handle = adapter.registry.get("fresh-replay-exec")
+    assert handle is not None
+    await llm.started.wait()
+    assert adapter.pause("fresh-replay-exec", reason="pause from test") is True
+
+    first = await adapter.post_user_message(
+        "fresh-replay-exec",
+        "Choose B",
+        turn_id="turn-adapter-fresh-replay",
+        request_interrupt=False,
+    )
+    assert first is UserMessageInjectionOutcome.POSTED_FRESH
+
+    if scenario == "replay":
+        second = await adapter.post_user_message(
+            "fresh-replay-exec",
+            "Choose B",
+            turn_id="turn-adapter-fresh-replay",
+            request_interrupt=False,
+        )
+        assert second is UserMessageInjectionOutcome.POSTED_REPLAY
+    elif scenario == "conflicting_content":
+        with pytest.raises(ValueError, match="different user message"):
+            await adapter.post_user_message(
+                "fresh-replay-exec",
+                "Choose C",
+                turn_id="turn-adapter-fresh-replay",
+                request_interrupt=False,
+            )
+
+    llm.release.set()
+    await handle.task
+
+
+@pytest.mark.asyncio
 async def test_execution_adapter_exposes_cancel_control() -> None:
     llm = BlockingLLM()
     adapter = AgentExecutionAdapter(
@@ -1155,6 +1450,195 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("control_name", "control_args"),
+    [
+        (
+            "send_message",
+            {
+                "message": "Should stay internal",
+                "message_type": "progress",
+                "expect_response": False,
+            },
+        ),
+        (
+            "ask_user_question",
+            {
+                "message": "Should stay internal",
+                "interactions": [],
+            },
+        ),
+    ],
+)
+async def test_execution_adapter_rejects_outbound_control_calls_when_disabled(
+    control_name: str,
+    control_args: dict[str, Any],
+) -> None:
+    sent_messages: list[dict[str, Any]] = []
+    work_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-work-before",
+                        "function": {
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
+                        },
+                    },
+                    {
+                        "id": "call-control",
+                        "function": {
+                            "name": control_name,
+                            "arguments": json.dumps(control_args),
+                        },
+                    },
+                    {
+                        "id": "call-work-after",
+                        "function": {
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
+                        },
+                    },
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "en",
+                                    "answer": "done",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="noninteractive",
+            pattern="single_call",
+            llm=llm,
+            tools=[work_tool],
+            outbound_message_handler=sent_messages.append,
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(task="Stay internal", task_id="internal-exec")
+
+    assert result["success"] is True
+    assert result["output"] == "done"
+    assert sent_messages == []
+    assert work_tool.calls == []
+    assert [schema["function"]["name"] for schema in llm.calls[0]["tools"]] == [
+        "noop",
+        "final_answer",
+    ]
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "final_answer"
+    ]
+    cancelled_work_ids = {
+        message.get("tool_call_id")
+        for message in llm.calls[1]["messages"]
+        if message.get("role") == "tool" and "cancelled" in message["content"]
+    }
+    assert cancelled_work_ids == {"call-work-before", "call-work-after"}
+    assert "call ask_user_question" not in llm.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_control_prescan_runs_when_control_is_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled_batches: list[list[str]] = []
+    original_cancel = ReActPattern._cancel_tool_calls
+
+    def record_cancelled_batch(
+        self: ReActPattern,
+        tool_calls: list[dict[str, Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        cancelled_batches.append([str(call.get("id")) for call in tool_calls])
+        original_cancel(self, tool_calls, *args, **kwargs)
+
+    monkeypatch.setattr(ReActPattern, "_cancel_tool_calls", record_cancelled_batch)
+    work_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-control",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Do not send",
+                                    "message_type": "progress",
+                                    "expect_response": False,
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call-work-after",
+                        "function": {
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
+                        },
+                    },
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "en",
+                                    "answer": "done",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="noninteractive",
+            pattern="single_call",
+            llm=llm,
+            tools=[work_tool],
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(task="Stay internal", task_id="internal-exec")
+
+    assert result["success"] is True
+    assert work_tool.calls == []
+    assert cancelled_batches[0] == []
+    assert ["call-work-after"] in cancelled_batches
+
+
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -1178,6 +1662,121 @@ def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> 
     )
 
     assert result["output"] == "answer from context"
+
+
+def _plain_react_adapter() -> AgentExecutionAdapter:
+    return AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="provider-failure",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+
+def test_execution_adapter_promotes_model_error_keys_and_keeps_output_backfill() -> (
+    None
+):
+    aggregate = "All 1 patterns failed or returned unsuccessful results."
+    model_error = {
+        "kind": "access_denied",
+        "status_code": 403,
+        "provider_code": "provider_code_4204",
+        "message": "Model is decommissioned",
+    }
+
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "error": aggregate,
+            "diagnostic_error": "Provider API error (403): denied",
+            "model_error": model_error,
+        },
+        execution_type="agent_react",
+        execution_id="provider-failure-exec",
+    )
+
+    assert result["diagnostic_error"] == "Provider API error (403): denied"
+    assert result["model_error"] == model_error
+    assert result["output"] == aggregate
+    assert result["error"] == aggregate
+
+
+def test_execution_adapter_propagates_allowlisted_tool_failure_code() -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "failure_code": "excel_workbook_access_denied",
+        },
+        execution_type="agent_react",
+        execution_id="client-safe-error-exec",
+    )
+
+    assert result["failure_code"] == "excel_workbook_access_denied"
+
+
+@pytest.mark.parametrize("status", ["error", "max_iterations", "model_error"])
+def test_execution_adapter_propagates_failure_code_on_any_failed_status(status):
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": status,
+            "error": "failed",
+            "failure_code": "excel_workbook_locked",
+        },
+        execution_type="agent_react",
+        execution_id="failure-code-status-exec",
+    )
+
+    assert result["failure_code"] == "excel_workbook_locked"
+
+
+@pytest.mark.parametrize("value", ["arbitrary", "x" * 501, 123, None])
+def test_execution_adapter_rejects_unallowlisted_tool_failure_code(
+    value: Any,
+) -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "failure_code": value,
+        },
+        execution_type="agent_react",
+        execution_id="invalid-client-safe-error-exec",
+    )
+
+    assert "failure_code" not in result
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_error", "model_error"),
+    [
+        ("", "not a dict"),
+        ("   ", ["kind", "access_denied"]),
+        (None, None),
+        (403, 403),
+    ],
+)
+def test_execution_adapter_ignores_malformed_model_error_keys(
+    diagnostic_error: Any, model_error: Any
+) -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "error": "All 1 patterns failed or returned unsuccessful results.",
+            "diagnostic_error": diagnostic_error,
+            "model_error": model_error,
+        },
+        execution_type="agent_react",
+        execution_id="provider-failure-malformed",
+    )
+
+    assert "diagnostic_error" not in result
+    assert "model_error" not in result
 
 
 def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None:
@@ -1204,7 +1803,8 @@ def test_execution_adapter_hides_internal_error_for_interrupted_result() -> None
     assert result["error"] == "ReActPattern interrupted."
 
 
-def test_execution_adapter_preserves_completion_outcome() -> None:
+@pytest.mark.parametrize("reason", ["max_iterations", "step_failed"])
+def test_execution_adapter_preserves_completion_outcome(reason: str) -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
             name="partial",
@@ -1220,6 +1820,7 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
             "success": True,
             "output": "One item remains.",
             "completion_outcome": "partial",
+            "termination_reason": reason,
         },
         execution_type="agent_react",
         execution_id="partial-exec",
@@ -1227,6 +1828,91 @@ def test_execution_adapter_preserves_completion_outcome() -> None:
 
     assert result["completion_outcome"] == "partial"
     assert result["metadata"]["completion_outcome"] == "partial"
+    assert result["termination_reason"] == reason
+    assert result["metadata"]["termination_reason"] == reason
+
+
+@pytest.mark.parametrize("reason", [None, "provider token=secret", [], {}])
+def test_execution_adapter_does_not_promote_unknown_termination_reason(
+    reason: Any,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="dag", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={
+            "success": True,
+            "output": "Partial result",
+            "termination_reason": reason,
+        },
+        execution_type="agent_dag",
+        execution_id="test",
+    )
+    assert "termination_reason" not in result
+    assert "termination_reason" not in result["metadata"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_tool", [False, True])
+async def test_execution_adapter_resume_refreshes_cached_runner_tools(
+    remove_tool: bool,
+) -> None:
+    old_tool = FakeTool()
+    new_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {
+                            "message": "Reconnect the data source, then continue."
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="refresh-tools",
+            pattern="react",
+            llm=llm,
+            tools=[old_tool],
+            tracer=TracerCheckpointStore(),
+            skill_manager=NoSkillManager(),
+        )
+    )
+    waiting = await adapter.execute(task="Read data", task_id="refresh-tools-exec")
+    assert waiting["status"] == "waiting_for_user"
+    handle = adapter.registry.get("refresh-tools-exec")
+    assert handle is not None
+    assert handle.runner.agent.tools == [old_tool]
+
+    await adapter.post_user_message(
+        "refresh-tools-exec", "Connection settings updated.", request_interrupt=False
+    )
+    # AgentService rebuilds its tools before resuming an existing runner.
+    # The refreshed objects (including removals) must reach that runner too.
+    adapter.config.tools = [] if remove_tool else [new_tool]
+    # Even if the model repeats the old tool name, a removed tool must not run.
+    llm.responses.append(
+        {"tool_calls": [{"id": "call-noop", "name": "noop", "args": {}}]}
+    )
+    llm.responses.append("done")
+
+    resumed = await adapter.resume("refresh-tools-exec")
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    assert old_tool.calls == []
+    assert old_tool.setup_calls == ["refresh-tools-exec"]
+    assert old_tool.teardown_calls == ["refresh-tools-exec"]
+    assert new_tool.calls == ([] if remove_tool else [{}])
+    assert handle.runner.agent.tools == adapter.config.tools
+    resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
+    assert ("noop" in resumed_names) is not remove_tool
 
 
 @pytest.mark.asyncio
@@ -1366,6 +2052,111 @@ async def test_execution_adapter_posts_user_message_after_restart() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execution_adapter_resume_uses_handler_installed_after_post_user_message() -> (
+    None
+):
+    """A resumed run must use the outbound handler installed on the host's
+    config, even when the runner handle already existed before that
+    installation happened.
+
+    post_user_message builds and registers a runner via _build_runner()
+    when no handle exists yet, copying config.outbound_message_handler at
+    construction time. Every non-WebSocket resume caller (task_resume.py,
+    the SaaS dispatcher) calls post_user_message before it installs its
+    outbound handler, so the runner would otherwise be frozen with a None
+    handler and resume() would silently drop the resumed agent's next
+    message (#1328).
+    """
+    tracer = TracerCheckpointStore()
+    first_llm = BlockingLLM(
+        {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-noop",
+                    "name": "noop",
+                    "args": {},
+                }
+            ],
+        }
+    )
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=first_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    first_adapter.start(task="Wait for message", task_id="resume-handler-ordering-exec")
+    first_handle = first_adapter.registry.get("resume-handler-ordering-exec")
+    assert first_handle is not None
+    assert first_handle.task is not None
+    await first_llm.started.wait()
+    assert first_adapter.pause(
+        "resume-handler-ordering-exec", reason="pause before restart"
+    )
+    first_llm.release.set()
+    interrupted = await first_handle.task
+    assert interrupted["status"] == "interrupted"
+
+    sent_messages: list[dict[str, Any]] = []
+    restarted_llm = FakeLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-message",
+                        "name": "send_message",
+                        "args": {
+                            "message": "Still working",
+                            "message_type": "progress",
+                            "expect_response": False,
+                        },
+                    }
+                ],
+            },
+            "resumed done",
+        ]
+    )
+    restarted_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="resume-handler-ordering",
+            pattern="react",
+            llm=restarted_llm,
+            tools=[FakeTool()],
+            tracer=tracer,
+            outbound_message_handler=None,
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    # post_user_message runs first, while config.outbound_message_handler
+    # is still None, so it would build and register the runner handler-less.
+    assert await restarted_adapter.post_user_message(
+        "resume-handler-ordering-exec",
+        "New message after process restart.",
+        request_interrupt=False,
+    )
+
+    # The host installs its outbound handler only now, after the runner
+    # handle already exists (mirrors execute_resume_background's ordering).
+    restarted_adapter.config.outbound_message_handler = sent_messages.append
+
+    resumed = await restarted_adapter.resume("resume-handler-ordering-exec")
+
+    assert resumed is not None
+    assert resumed["success"] is True
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["type"] == "agent_message"
+    assert sent_messages[0]["message"] == "Still working"
+
+
+@pytest.mark.asyncio
 async def test_set_interrupt_checker_propagates_to_prebuilt_adapter() -> None:
     # The mid-run quota checker is normally installed before a run, but
     # set_interrupt_checker must also push onto an already-built adapter — the
@@ -1472,3 +2263,61 @@ def test_execution_adapter_stays_silent_when_a_paused_run_has_no_output(
         )
 
     assert _placeholder_warning_records(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("agent_result", "expected"),
+    [
+        ({"success": False, "status": "invalid_tool_protocol"}, "model_output_invalid"),
+        (
+            {"success": False, "interruption_reason": "llm_unavailable"},
+            "llm_unavailable",
+        ),
+        (
+            {
+                "success": False,
+                "error": "All 1 patterns failed",
+                "interruption_reason": "persistence_failure",
+            },
+            "persistence_failure",
+        ),
+    ],
+)
+def test_execution_adapter_forwards_interruption_reason(
+    agent_result: dict[str, Any], expected: str
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={"output": "", **agent_result},
+        execution_type="agent_react",
+        execution_id="interrupted",
+    )
+    assert result["interruption_reason"] == expected
+    assert type(result["interruption_reason"]) is str
+    assert result["metadata"]["interruption_reason"] == expected
+
+
+@pytest.mark.parametrize(
+    "agent_result",
+    [
+        {"success": False, "error": "bad request"},
+        {"success": False, "interruption_reason": "not_a_real_reason"},
+        {"success": False, "interruption_reason": 42},
+        {"success": True, "output": "done", "interruption_reason": "llm_unavailable"},
+    ],
+)
+def test_execution_adapter_does_not_forward_invalid_interruption_reason(
+    agent_result: dict[str, Any],
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result=agent_result,
+        execution_type="agent_react",
+        execution_id="not-interrupted",
+    )
+    assert "interruption_reason" not in result
+    assert "interruption_reason" not in result["metadata"]

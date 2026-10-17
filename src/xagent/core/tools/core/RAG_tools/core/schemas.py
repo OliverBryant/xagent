@@ -617,7 +617,7 @@ class SearchResult(BaseModel):
         None,
         description="Additional metadata for the chunk (page_number, section, source, etc.)",
     )
-    # Original scores and ranks for RRF fallback (optional, populated during hybrid search)
+    # Original scores and ranks from hybrid fusion (optional, populated during hybrid search)
     vector_score: Optional[float] = Field(
         None,
         description="Original vector search score (before rerank/fusion)",
@@ -1531,15 +1531,21 @@ class CollectionInfo(BaseModel):
             }
         )
 
-        # Serialize complex types to JSON strings for LanceDB
-        data["extra_metadata"] = json.dumps(data["extra_metadata"])
+        # Serialize complex types to JSON strings for LanceDB. extra_metadata is
+        # caller-supplied and untyped (Dict[str, Any]), so default=str is the
+        # fallback for values json.dumps() can't otherwise serialize (e.g. an
+        # Enum, datetime, or UUID a caller stuffed in there).
+        data["extra_metadata"] = json.dumps(data["extra_metadata"], default=str)
         data["document_names"] = json.dumps(data["document_names"])
         # Do not persist owners; they are computed from user_id when listing
         data["owners"] = "[]"
 
-        # Serialize ingestion_config if present
-        if data.get("ingestion_config"):
-            data["ingestion_config"] = json.dumps(data["ingestion_config"])
+        # model_dump_json() serializes ingestion_config's enum fields to their
+        # .value per the type annotation, unlike json.dumps() on the
+        # model_dump()'d dict above (which left them as ParseMethod/
+        # ChunkStrategy instances and crashed on any non-null ingestion_config).
+        if self.ingestion_config is not None:
+            data["ingestion_config"] = self.ingestion_config.model_dump_json()
         else:
             # Use empty string sentinel instead of None to prevent LanceDB non-null schema errors
             data["ingestion_config"] = LANCEDB_NULL_STR_SENTINEL
@@ -2269,7 +2275,20 @@ class WebIngestionResult(BaseModel):
 
     status: str = Field(
         ...,
-        description="Overall status: success|error|partial",
+        description=(
+            "Overall status: success|error|partial. A crawl the site blocked "
+            "is still success when its pages were ingested; see "
+            "crawl_blocked_by_site."
+        ),
+    )
+    crawl_blocked_by_site: bool = Field(
+        default=False,
+        description=(
+            "The crawl ended because the site refused every link past the "
+            "start page. Only ever set alongside status='success' - a run with "
+            "page failures is already partial or error, and this flag is about "
+            "what the site did rather than about how ingestion went."
+        ),
     )
     collection: str = Field(..., description="Target collection name")
 

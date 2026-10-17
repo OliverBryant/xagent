@@ -12,23 +12,29 @@ from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
-    _append_uploaded_files_context_to_message,
-    _build_uploaded_files_context,
-    _display_file_refs_from_file_info,
-    _display_message_for_user,
-    _normalize_attachments_for_persistence,
     _normalize_file_outputs,
     _normalize_task_file_outputs,
-    _register_uploaded_files_for_agent,
-    _rewrite_file_links_to_file_id,
-    _selected_file_refs_from_task,
-    execute_task_background,
     handle_file_upload_for_task,
 )
 from xagent.web.models import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _append_uploaded_files_context_to_message,
+    _build_uploaded_files_context,
+    _display_file_refs_from_file_info,
+    _display_message_for_user,
+    _normalize_attachments_for_persistence,
+    _selected_file_refs_from_task,
+)
+from xagent.web.services.task_execution import (
+    _register_uploaded_files_for_agent,
+    _rewrite_file_links_to_file_id,
+    execute_task_background,
+)
 from xagent.web.services.task_lease_service import TaskLease
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
@@ -38,13 +44,14 @@ from xagent.web.services.task_setup_snapshot import (
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'test.db'}",
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     db = SessionLocal()
     try:
         yield db
@@ -77,6 +84,7 @@ def _create_task(
         title=f"task-{task_id}",
         description="task",
         status=status,
+        lease_attempt_id="test-attempt" if runner_id is not None else None,
         runner_id=runner_id,
         run_id=run_id,
         agent_config=(
@@ -127,6 +135,7 @@ def _task_setup_snapshot(
 
 def _task_lease(task_id: int) -> TaskLease:
     return TaskLease(
+        attempt_id="test-attempt",
         task_id=task_id,
         runner_id="test-runner",
         run_id=f"run-{task_id}",
@@ -193,7 +202,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["broadcast_task_id"] = task_id
 
     class AgentService:
-        def set_conversation_history(self, history):
+        def set_conversation_history(
+            self, history, *, watermark=None, event_watermark=None
+        ):
             captured["conversation_history"] = history
 
         def set_execution_context_messages(self, messages):
@@ -216,13 +227,15 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             return {"success": True, "output": "ok", "file_outputs": []}
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "background_task_manager",
         BackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+    monkeypatch.setattr(
+        task_execution_service, "get_session_local", lambda: test_sessionmaker
+    )
 
     await execute_task_background(
         task_id=10,
@@ -248,7 +261,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
 
 
 class _NoopAgentService:
-    def set_conversation_history(self, history):
+    def set_conversation_history(
+        self, history, *, watermark=None, event_watermark=None
+    ):
         pass
 
     def set_execution_context_messages(self, messages):
@@ -278,10 +293,14 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
 
     monkeypatch.setattr(
-        websocket_api, "background_task_manager", _NoopBackgroundTaskManager()
+        task_execution_service,
+        "background_task_manager",
+        _NoopBackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", manager)
-    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+    monkeypatch.setattr(
+        task_execution_service, "get_session_local", lambda: test_sessionmaker
+    )
 
 
 @pytest.mark.asyncio
@@ -332,7 +351,9 @@ async def test_completion_broadcast_failure_keeps_task_completed(
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     await execute_task_background(
         task_id=10,
@@ -472,7 +493,9 @@ async def test_execution_failure_is_deferred_to_concrete_lease_owner(
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     with pytest.raises(RuntimeError, match="agent boom xyz"):
         await execute_task_background(
@@ -558,7 +581,9 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
         "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         boom,
     )
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     with pytest.raises(RuntimeError, match="durable persist failed"):
         await execute_task_background(
@@ -632,7 +657,9 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
         "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+    monkeypatch.setattr(
+        task_execution_service, "_terminal_task_error_payload", fake_payload
+    )
 
     await execute_task_background(
         task_id=13,
@@ -660,7 +687,7 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
     assert payload_calls == []
 
 
-def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
+def test_build_uploaded_files_context_lists_file_ids_and_reference_rules():
     context = _build_uploaded_files_context(
         [
             {
@@ -668,23 +695,18 @@ def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
                 "name": "faq.docx",
                 "original_name": "FAQ.docx",
             }
-        ],
-        is_agent_builder=True,
+        ]
     )
 
     assert "FAQ.docx: file_id=file-123" in context
     assert "## FILE REFERENCES" in context
     assert "Treat file_id as the canonical file handle" in context
     assert "call prepare_html_asset(file_id, html_path, alias) first" in context
-    assert "create_knowledge_base_from_file" in context
-    assert 'file_ids = ["file-123"]' in context
-    assert "Do NOT ask the user to upload again" in context
 
 
 def test_append_uploaded_files_context_to_message_is_idempotent():
     context = _build_uploaded_files_context(
         [{"file_id": "file-123", "name": "faq.docx"}],
-        is_agent_builder=False,
     )
 
     message = _append_uploaded_files_context_to_message("Upload File", context)
@@ -1195,10 +1217,8 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     # production boundary instead of carrying fixture writes into storage I/O.
     db_session.commit()
 
-    import xagent.web.api.chat as chat_api
-
     monkeypatch.setattr(
-        chat_api,
+        agent_runtime_service,
         "get_agent_manager",
         lambda: pytest.fail("file staging must not create an AgentService"),
     )

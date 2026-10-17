@@ -5,13 +5,13 @@ Agent Tool - Convert published agents into callable tools
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Type, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
 from .....config import get_agent_pattern_for_execution_mode, get_uploads_dir
-from .....web.services.agent_store import AgentStore
+from .....web.services.agent_store import AgentStore, UnsharedConnectorsError
 from .....web.services.model_service import (
     _get_visible_user_ids,
     _is_model_visible_to_user,
@@ -21,7 +21,9 @@ from .....web.services.model_service import (
 # so the nested sub-agent's config is constructed via the module attribute
 # (which also keeps it patchable in tests).
 from .....web.tools.config import WebToolConfig
+from ....agent.checkpoint import ExecutionEventPersistenceError
 from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
+from ....agent.voice_policy import apply_output_voice
 from ....task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
@@ -34,18 +36,86 @@ from .base import (
     ToolCategory,
     ToolVisibility,
 )
-from .config import run_with_tool_runtime_cleanup
+from .config import (
+    NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+    run_with_tool_runtime_cleanup,
+)
+from .mcp_approval_gate import (
+    current_tool_call_execution_context,
+    has_approval_gate_for_source,
+)
 
 logger = logging.getLogger(__name__)
 MAX_AGENT_NAME_LENGTH = 200
 
 
 def _assignable_tool_categories() -> list[str]:
+    """What the model may assign; connectors are never model-writable."""
     return [
         cat.value
         for cat in ToolCategory
         if cat.value not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+        and cat is not ToolCategory.MCP
     ]
+
+
+_BUILDER_CONNECTOR_ERROR = (
+    "are connectors, which the user manages in the agent builder; do not pass them."
+)
+
+
+def _is_connector_category(category: str) -> bool:
+    # Untrimmed on purpose: ToolSelectionSpec.from_raw treats " mcp" as inert.
+    return category == ToolCategory.MCP.value or category.startswith("mcp:")
+
+
+def resolve_llm_tool_categories(raw: Any, connector_error: str) -> list[str]:
+    """Raises ``ValueError`` for the model instead of silently dropping bad entries."""
+    choices = _assignable_tool_categories()
+    parsed = ensure_list(raw)
+    if parsed is None:
+        raise ValueError(
+            f"tool_categories must be a list of category names, got {raw!r}. "
+            f"Choose from: {', '.join(choices)}."
+        )
+    selected: list[str] = []
+    invalid: list[str] = []
+    connectors: list[str] = []
+    for category in parsed:
+        name = category.strip()
+        if _is_connector_category(name):
+            connectors.append(category)
+        elif name not in choices:
+            invalid.append(category)
+        elif name not in selected:
+            selected.append(name)
+    problems: list[str] = []
+    if invalid:
+        problems.append(
+            f"tool_categories {invalid!r} are not assignable. "
+            f"Choose from: {', '.join(choices)}."
+        )
+    if connectors:
+        problems.append(f"{connectors!r} {connector_error}")
+    if problems:
+        raise ValueError(" ".join(problems) + " Nothing was saved.")
+    return selected
+
+
+_STORED_TOOL_CATEGORIES_FIELD = Field(
+    default=None,
+    description=(
+        "Stored non-connector tool categories; only meaningful when status is "
+        "``success``. ``null`` means unconfigured (every default tool)."
+    ),
+)
+
+
+def without_connector_categories(categories: Any) -> list[str] | None:
+    parsed = ensure_list(categories)
+    if parsed is None:
+        return None
+    return [c for c in parsed if not _is_connector_category(c)]
 
 
 class _DelegatedAgentDatabaseTraceHandler:
@@ -58,12 +128,12 @@ class _DelegatedAgentDatabaseTraceHandler:
         build_id: str,
         metadata: Mapping[str, Any],
     ) -> None:
-        from .....web.api.trace_handlers import DatabaseTraceHandler
+        from .....web.tracing import task_database_handler
 
         self.task_id = task_id
         self.build_id = build_id
         self.metadata = dict(metadata)
-        self._handler = DatabaseTraceHandler(task_id, build_id=build_id)
+        self._handler = task_database_handler(task_id, build_id=build_id)
 
     async def handle_event(self, event: Any) -> None:
         original_data = event.data
@@ -74,13 +144,21 @@ class _DelegatedAgentDatabaseTraceHandler:
         finally:
             event.data = original_data
 
+    async def commit_event(self, event: Any) -> None:
+        original_data = event.data
+        event.data = {**(original_data or {}), **self.metadata}
+        try:
+            await cast(Any, self._handler).commit_event(event)
+        finally:
+            event.data = original_data
+
     async def load_latest_checkpoint(
         self, execution_id: str
     ) -> Optional[dict[str, Any]]:
         return await self._handler.load_latest_checkpoint(execution_id)
 
 
-class _DelegatedAgentWebSocketTraceHandler:
+class _DelegatedAgentTaskEventTraceHandler:
     """Broadcast safe child-agent traces on the parent task stream."""
 
     def __init__(
@@ -88,14 +166,20 @@ class _DelegatedAgentWebSocketTraceHandler:
         *,
         task_id: int,
         metadata: Mapping[str, Any],
+        event_backed: bool = False,
     ) -> None:
-        from .....web.api.ws_trace_handlers import WebSocketTraceHandler
+        from .....web.services.task_event_trace_handler import TaskEventTraceHandler
 
         self.task_id = task_id
+        self.event_backed = event_backed
         self.metadata = dict(metadata)
-        self._handler = WebSocketTraceHandler(task_id)
+        self._handler = TaskEventTraceHandler(task_id)
 
     async def handle_event(self, event: Any) -> None:
+        # V2 root streams contain root facts only. The authorized worker drawer
+        # reads this delegated scope directly from its durable events.
+        if self.event_backed:
+            return
         original_data = event.data
         base_data = original_data if isinstance(original_data, dict) else {}
         event.data = {**base_data, **self.metadata}
@@ -438,6 +522,7 @@ class CreateAgentToolResult(BaseModel):
     )
     status: str = Field(description="Creation status")
     message: str = Field(description="Detailed message about the created agent")
+    tool_categories: Optional[list[str]] = _STORED_TOOL_CATEGORIES_FIELD
 
 
 class UpdateAgentToolArgs(BaseModel):
@@ -495,6 +580,7 @@ class UpdateAgentToolResult(BaseModel):
     )
     status: str = Field(description="Update status")
     message: str = Field(description="Detailed message about the updated agent")
+    tool_categories: Optional[list[str]] = _STORED_TOOL_CATEGORIES_FIELD
 
 
 class ListAgentsToolArgs(BaseModel):
@@ -752,6 +838,8 @@ class CreateAgentTool(AbstractBaseTool):
             "- description: IMPORTANT - Clear description of when to use this agent (e.g., 'Use this agent for data analysis tasks involving CSV files'). This helps users understand the agent's purpose. Write this in the same natural language as the current output language policy unless the user explicitly asks for another language.\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
             f"  Example: ['file', 'knowledge', 'basic']\n"
+            "  Any other value, including a connector ('mcp' or 'mcp:<server>'), rejects "
+            "the whole call; the user manages connectors in the agent builder.\n"
             f"- knowledge_bases (optional): List of knowledge base names or IDs to link to this agent.\n"
             "  Only pass knowledge bases that already exist and are visible. "
             "If the requested knowledge base is missing, ask the user for a URL, "
@@ -766,7 +854,9 @@ class CreateAgentTool(AbstractBaseTool):
             "- tool_name: Tool name that can be used to call this agent\n"
             "- markdown_link: Markdown link in format [Agent Name](agent://agent_id) - USE THIS FORMAT in your response\n"
             "- status: 'success' or 'error'\n"
-            "- message: Detailed information about the created agent\n\n"
+            "- message: Detailed information about the created agent\n"
+            "- tool_categories: On success, the non-connector categories stored "
+            "(null = unconfigured, every default tool; [] = zero tools)\n\n"
             "IMPORTANT: Always include the markdown_link in your response when creating an agent successfully. "
             "Use the format: [Agent Name](agent://agent_id). Use plain link syntax only — "
             "NEVER image syntax like ![name](agent://id); agent:// cannot render as an image."
@@ -887,6 +977,25 @@ class CreateAgentTool(AbstractBaseTool):
                         message="Error: Agent instructions are required",
                     ).model_dump()
 
+                # ``is not None``, not truthiness: ``[]`` is the zero-tool agent, and
+                # a falsy malformed value must be refused, not persisted as NULL.
+                requested_categories = args.get("tool_categories")
+                tool_categories: list[str] | None = None
+                if requested_categories is not None:
+                    try:
+                        tool_categories = resolve_llm_tool_categories(
+                            requested_categories, _BUILDER_CONNECTOR_ERROR
+                        )
+                    except ValueError as exc:
+                        return CreateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=f"Error: {exc}",
+                        ).model_dump()
+
                 requested_agent_name = agent_name
                 agent_name, auto_renamed_from = self._resolve_available_agent_name(
                     requested_agent_name, db
@@ -980,7 +1089,7 @@ class CreateAgentTool(AbstractBaseTool):
                     models=models_config if models_config else None,
                     knowledge_bases=knowledge_bases,
                     skills=ensure_list(args.get("skills")),
-                    tool_categories=ensure_list(args.get("tool_categories")),
+                    tool_categories=tool_categories,
                     status=AgentStatus.DRAFT,  # Create as DRAFT, not PUBLISHED
                     suggested_prompts=[],
                 )
@@ -1006,6 +1115,7 @@ class CreateAgentTool(AbstractBaseTool):
                     tool_name=tool_name,
                     markdown_link=markdown_link,
                     status="success",
+                    tool_categories=tool_categories,
                     message=(
                         f"✅ Agent created successfully\n\n"
                         f"{rename_note}"
@@ -1103,6 +1213,9 @@ class UpdateAgentTool(AbstractBaseTool):
             "- description (optional): New description of when to use this agent\n"
             f"- tool_categories (optional): Available categories: {categories_list}\n"
             f"  Example: ['file', 'knowledge', 'basic']\n"
+            "  Replaces the agent's non-connector categories; any other value, including a "
+            "connector ('mcp' or 'mcp:<server>'), rejects the whole call. The user manages "
+            "connectors in the agent builder and they are kept automatically; do not pass them.\n"
             f"- knowledge_bases (optional): New list of knowledge base names or IDs to link to this agent.\n"
             "  Only pass knowledge bases that already exist and are visible. "
             "If the requested knowledge base is missing, ask the user for a URL, "
@@ -1117,7 +1230,9 @@ class UpdateAgentTool(AbstractBaseTool):
             "- tool_name: Tool name that can be used to call this agent\n"
             "- markdown_link: Markdown link in format [Agent Name](agent://agent_id)\n"
             "- status: 'success' or 'error'\n"
-            "- message: Detailed information about the updated agent\n\n"
+            "- message: Detailed information about the updated agent\n"
+            "- tool_categories: On success, the non-connector categories stored "
+            "(null = unconfigured, every default tool)\n\n"
             "IMPORTANT: Updating a PUBLISHED agent does not unpublish it. "
             "It remains PUBLISHED with the updated configuration."
         )
@@ -1191,6 +1306,23 @@ class UpdateAgentTool(AbstractBaseTool):
                         ),
                     ).model_dump()
 
+                requested_categories = args.get("tool_categories")
+                model_categories: list[str] | None = None
+                if requested_categories is not None:
+                    try:
+                        model_categories = resolve_llm_tool_categories(
+                            requested_categories, _BUILDER_CONNECTOR_ERROR
+                        )
+                    except ValueError as exc:
+                        return UpdateAgentToolResult(
+                            agent_id=0,
+                            agent_name="",
+                            tool_name="",
+                            markdown_link="",
+                            status="error",
+                            message=f"Error: {exc}",
+                        ).model_dump()
+
                 # Track changes
                 changes = []
                 updates: dict[str, Any] = {}
@@ -1240,11 +1372,8 @@ class UpdateAgentTool(AbstractBaseTool):
                     updates["instructions"] = new_instructions
                     changes.append("instructions updated")
 
-                # Update tool_categories if provided
-                new_tool_categories = ensure_list(args.get("tool_categories"))
-                if new_tool_categories is not None:
-                    updates["tool_categories"] = new_tool_categories
-                    changes.append(f"tool_categories → {new_tool_categories}")
+                if model_categories is not None:
+                    changes.append(f"tool_categories → {model_categories}")
 
                 # Update knowledge_bases if provided
                 new_knowledge_bases = ensure_list(args.get("knowledge_bases"))
@@ -1287,15 +1416,71 @@ class UpdateAgentTool(AbstractBaseTool):
                         tool_name=gen_agent_tool_name(agent.id, agent.name),
                         markdown_link=f"[{agent.name}](agent://{agent.id})",
                         status="success",
+                        tool_categories=without_connector_categories(
+                            agent.tool_categories
+                        ),
                         message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
                         f"Status: {agent.status.value.upper()}. "
                         f"All fields were the same or no values were provided.",
                     ).model_dump()
 
-                agent = (
-                    AgentStore(db).update_agent_fields(self._user_id, agent_id, updates)
-                    or agent
-                )
+                connector_note = ""
+                if model_categories is not None:
+                    # Re-read and lock after the awaits above: a builder save may
+                    # have changed the connectors meanwhile.
+                    db.refresh(agent, with_for_update=True)
+                    connectors = list(
+                        dict.fromkeys(
+                            c
+                            for c in ensure_list(agent.tool_categories) or []
+                            if _is_connector_category(c)
+                        )
+                    )
+                    updates["tool_categories"] = model_categories + connectors
+                    if connectors:
+                        connector_note = (
+                            "\n\nThe agent's connectors were left unchanged; "
+                            "the user manages them in the agent builder."
+                        )
+
+                try:
+                    agent = (
+                        AgentStore(db).update_agent_fields(
+                            self._user_id, agent_id, updates
+                        )
+                        or agent
+                    )
+                except UnsharedConnectorsError as exc:
+                    missing = [
+                        c for c in exc.connectors if c.get("reason") == "unresolved"
+                    ]
+                    unshared = [c for c in exc.connectors if c not in missing]
+                    problems = [
+                        f"{label}: {', '.join(str(c['name']) for c in found)}"
+                        for label, found in (
+                            ("not shared with the team", unshared),
+                            ("not found", missing),
+                        )
+                        if found
+                    ]
+                    fix = (
+                        "it grants every MCP server ('mcp'), so the user must share "
+                        "these or change that grant"
+                        if "mcp" in updates["tool_categories"]
+                        else "the user must share or remove them"
+                    )
+                    return UpdateAgentToolResult(
+                        agent_id=0,
+                        agent_name="",
+                        tool_name="",
+                        markdown_link="",
+                        status="error",
+                        message=(
+                            f"Error: this team agent's connectors are {'; '.join(problems)}. "
+                            f"Nothing was saved: {fix} in the agent builder. Retry "
+                            "without tool_categories to save the other fields."
+                        ),
+                    ).model_dump()
 
                 # Generate the tool name and markdown link
                 agent_name = str(agent.name)
@@ -1312,6 +1497,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     tool_name=tool_name,
                     markdown_link=markdown_link,
                     status="success",
+                    tool_categories=without_connector_categories(agent.tool_categories),
                     message=(
                         f"✅ Agent updated successfully\n\n"
                         f"**Agent Details:**\n"
@@ -1321,6 +1507,7 @@ class UpdateAgentTool(AbstractBaseTool):
                         f"- Status: {agent.status.value.upper()}\n\n"
                         f"**Changes Applied:**\n"
                         + "\n".join(f"- {change}" for change in changes)
+                        + connector_note
                         + f"\n\n**How to use this agent:**\n"
                         f"Include this link in your response: {markdown_link}\n"
                         f"Or use the tool: {tool_name}\n\n"
@@ -1645,6 +1832,37 @@ def _delegated_child_final_output(result: Mapping[str, Any]) -> tuple[Any, bool]
     return result.get("output"), True
 
 
+def _nested_mcp_refusal_reason() -> Optional[str]:
+    """Why a delegated run may not materialize MCP connectors, or ``None``.
+
+    A delegated run must not dispatch connector writes that the delegating run
+    would have had to get approved. The child builds its own execution context
+    and inherits no ``task_source``, so the approval gate would see an unbound
+    source and pass the call straight through -- an approval bypass the model
+    itself can reach, just by calling this tool with a published agent whose
+    persisted selection contains ``mcp:<server>``.
+
+    Inheriting the parent's source instead would only move the problem: the
+    gate would pause the child, and a paused child is classified as an
+    unsupported nested interaction (see
+    :func:`_classify_delegated_child_failure`), so the approval could never be
+    resumed and the host would be left holding a dangling prompt. The
+    connectors are therefore refused for the child instead.
+
+    The parent source comes from the execution identity ReAct binds around
+    this very tool call -- server-owned, never model-supplied. An unbound
+    parent, or a parent whose source has no registration, yields ``None`` and
+    changes nothing: this is scoped to the exact case where an approval was
+    actually required.
+    """
+
+    parent_call = current_tool_call_execution_context()
+    parent_source = parent_call.task_source if parent_call is not None else None
+    if not has_approval_gate_for_source(parent_source):
+        return None
+    return NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+
 def _classify_delegated_child_failure(
     result: Mapping[str, Any],
 ) -> Optional[dict[str, Any]]:
@@ -1672,6 +1890,16 @@ def _classify_delegated_child_failure(
             _NESTED_WAIT_UNSUPPORTED_MESSAGE,
             failure_code="unsupported_nested_interaction",
         )
+
+    # A delivered partial answer ends the child's run, not the delegated work.
+    # In particular, iteration-limit delivery must not unlock a parent step
+    # as though the child completed all of its requested actions.
+    if result.get("completion_outcome") in ("partial", "blocked"):
+        output = result.get("output")
+        message = "The delegated task did not complete."
+        if isinstance(output, str) and output.strip():
+            message = f"{message}\n\n{output}"
+        return _classified_failure(message)
 
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
@@ -1735,6 +1963,8 @@ class AgentTool(AbstractBaseTool):
         runtime_metadata: Optional[dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
         file_operation_access_version: Any = None,
+        voice: Optional[str] = None,
+        inherited_mcp_unavailable_reason: Optional[str] = None,
     ):
         """
         Initialize an agent tool.
@@ -1765,6 +1995,21 @@ class AgentTool(AbstractBaseTool):
             execution_scope: Parent execution scope inherited by the child
             file_operation_access_version: Server-derived parent File Operation
                 policy version. ``None`` preserves legacy behavior.
+            voice: Already-resolved onboarding output-voice preference,
+                applied to this delegated agent's own system prompt and
+                propagated into any further tool set it builds (see
+                core.agent.voice_policy.apply_output_voice and
+                BaseToolConfig.get_voice), so a task's chosen voice reaches
+                every agent this user talks to, not just the top-level one.
+            inherited_mcp_unavailable_reason: The MCP refusal reason the
+                config that built this tool was itself refused under, if
+                any (see BaseToolConfig.get_mcp_unavailable_reason). Propagated
+                the same way ``voice`` is, so a refusal computed one hop up
+                the delegation chain -- where the ReAct-bound execution
+                context that ``_nested_mcp_refusal_reason`` reads was still
+                populated -- keeps holding for every further hop, where that
+                context is empty and the call would otherwise read as
+                unregistered and dispatch ungated.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1797,6 +2042,8 @@ class AgentTool(AbstractBaseTool):
         )
         self._runtime_metadata = dict(runtime_metadata or {})
         self._file_operation_access_version = file_operation_access_version
+        self._voice = voice
+        self._inherited_mcp_unavailable_reason = inherited_mcp_unavailable_reason
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -1886,7 +2133,10 @@ class AgentTool(AbstractBaseTool):
         if (
             self._parent_tracer is None
             or self._parent_task_id is None
-            or not self._runtime_metadata
+            or (
+                not self._runtime_metadata
+                and getattr(self._parent_tracer, "event_writer", None) is None
+            )
         ):
             return
 
@@ -1924,6 +2174,8 @@ class AgentTool(AbstractBaseTool):
             )
             if inspect.isawaitable(result):
                 await result
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
             logger.debug("Failed to emit workforce delegation trace", exc_info=True)
 
@@ -1956,13 +2208,14 @@ class AgentTool(AbstractBaseTool):
                 )
             )
             handlers.append(
-                _DelegatedAgentWebSocketTraceHandler(
+                _DelegatedAgentTaskEventTraceHandler(
                     task_id=parent_db_task_id,
                     metadata=metadata,
+                    event_backed=handlers[0]._handler.authoritative,
                 )
             )
 
-        return create_agent_tracer(
+        tracer = create_agent_tracer(
             handlers=handlers,
             task_id=execution_task_id,
             user_id=self._user_id,
@@ -1972,17 +2225,25 @@ class AgentTool(AbstractBaseTool):
             metadata=metadata,
         )
 
+        if parent_db_task_id is not None and handlers[0]._handler.authoritative:
+            tracer.event_writer = handlers[0].commit_event
+        return tracer
+
     def _resolve_delegated_output_path(self, workspace: Any, raw_path: str) -> Path:
         raw = raw_path.strip()
         path = Path(raw)
+        # A delegated output is about to be registered as one of the parent
+        # task's own files, so it resolves through the write-side entry: a
+        # path inside the engine-owned subtree is refused there and skipped
+        # by the caller like any other unresolvable path.
         if path.is_absolute():
-            return Path(workspace.resolve_path(raw))
+            return Path(workspace.resolve_write_path(raw))
 
         first_part = Path(raw).parts[0] if Path(raw).parts else ""
         default_dir = (
             "workspace" if first_part in {"input", "output", "temp"} else "output"
         )
-        return Path(workspace.resolve_path(raw, default_dir=default_dir))
+        return Path(workspace.resolve_write_path(raw, default_dir=default_dir))
 
     def _parent_owned_file_outputs(
         self, file_outputs: Any, workspace: Any, db: Any
@@ -2038,11 +2299,17 @@ class AgentTool(AbstractBaseTool):
 
             if file_record is None and workspace is not None:
                 for raw_path in raw_paths:
+                    # RuntimeError is what Path.resolve() raises for a
+                    # symlink loop on the interpreters this project supports;
+                    # OSError covers the OS-level failures resolve() can also
+                    # raise, such as a path too long for the filesystem; such
+                    # an output is skipped like any other that does not
+                    # resolve, as the file tool's write resolver does.
                     try:
                         resolved_path = self._resolve_delegated_output_path(
                             workspace, raw_path
                         )
-                    except (FileNotFoundError, ValueError):
+                    except (FileNotFoundError, ValueError, RuntimeError, OSError):
                         logger.debug(
                             "Failed to resolve delegated file output: %s",
                             raw_path,
@@ -2166,14 +2433,45 @@ class AgentTool(AbstractBaseTool):
                 # Resolve models
                 storage = UserAwareModelStorage(db)
 
-                if agent_models:
-                    from .agent_model_resolution import resolve_agent_model_llms
+                from .agent_model_resolution import resolve_agent_model_llms
 
-                    default_llm, fast_llm, vision_llm, compact_llm = (
-                        resolve_agent_model_llms(
-                            db, storage, agent_models, self._user_id
+                default_llm, fast_llm, vision_llm, compact_llm = (
+                    resolve_agent_model_llms(db, storage, agent_models, self._user_id)
+                )
+                # Keyed on the general slot, not on the whole mapping: an
+                # agent carrying only e.g. {"compact": id} has an unset general
+                # slot too. Anything else keeps failing closed when it will not
+                # resolve -- a model *name* forwarded from template YAML (which
+                # resolves by id only), or a payload that is not even a mapping,
+                # which is a stated-but-corrupt config rather than an unset one.
+                general_unset = agent_models is None or (
+                    isinstance(agent_models, Mapping)
+                    and not agent_models.get("general")
+                )
+                if general_unset and not default_llm:
+                    from .....web.services.llm_utils import AutoModelUnavailableError
+
+                    try:
+                        default_llm, _, _, _ = storage.get_configured_defaults(
+                            self._user_id, config_types=("general",)
                         )
-                    )
+                    except AutoModelUnavailableError:
+                        logger.warning(
+                            "Agent %s has no general model and no default is "
+                            "configured for user %s; failing the delegation",
+                            self._agent_id,
+                            self._user_id,
+                        )
+                        default_llm = None
+                    if default_llm is not None:
+                        logger.info(
+                            "Agent %s has no general model set; delegating on "
+                            "the resolved default %s",
+                            self._agent_id,
+                            getattr(
+                                default_llm, "model_name", type(default_llm).__name__
+                            ),
+                        )
             # ---- Phase 1 session closed here. ----
 
             if not default_llm:
@@ -2236,6 +2534,23 @@ class AgentTool(AbstractBaseTool):
                 # _SpecAll still admits MCP at the final filter layer for
                 # compatibility, but it does not opt into MCP server init.
                 include_mcp_tools=should_load_mcp_server_configs(tool_selection_spec),
+                # The connectors are refused rather than the parent's
+                # task_source being inherited -- see
+                # ``_nested_mcp_refusal_reason`` for why a paused child cannot
+                # be the answer here. But the refusal itself must survive
+                # past this one hop: this call site sees the live ReAct
+                # binding only for the *first* delegation, because the
+                # child's own execution context carries no task_source (see
+                # ``execute_delegated_runtime`` below), so a grandchild
+                # delegated from here would otherwise read the immediate
+                # context as unbound and dispatch ungated. ``or
+                # self._inherited_mcp_unavailable_reason`` makes a refusal
+                # sticky for the rest of the chain once any ancestor hop
+                # triggers it.
+                mcp_unavailable_reason=(
+                    _nested_mcp_refusal_reason()
+                    or self._inherited_mcp_unavailable_reason
+                ),
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
@@ -2243,6 +2558,7 @@ class AgentTool(AbstractBaseTool):
                 parent_task_id=self._parent_task_id,
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
+                voice=self._voice,
                 task_id=execution_task_id,
                 workspace_config={
                     "base_dir": self._workspace_base_dir,
@@ -2287,6 +2603,10 @@ class AgentTool(AbstractBaseTool):
                     vision_llm=vision_llm,
                     compact_llm=compact_llm,
                     memory_enabled=False,
+                    # One-shot delegated calls cannot forward or resume a
+                    # user interaction. Keep failures available to the child
+                    # for reporting instead of parking an unreachable run.
+                    user_interaction_enabled=False,
                     tool_config=tool_config,
                     pattern=get_agent_pattern_for_execution_mode(agent_execution_mode),
                     id=execution_task_id,
@@ -2304,8 +2624,14 @@ class AgentTool(AbstractBaseTool):
                     system_prompts.append(agent_instructions)
                 if self._extra_system_prompt:
                     system_prompts.append(self._extra_system_prompt)
-                if system_prompts:
-                    execution_context["system_prompt"] = "\n\n".join(system_prompts)
+                delegated_system_prompt = (
+                    "\n\n".join(system_prompts) if system_prompts else None
+                )
+                delegated_system_prompt = apply_output_voice(
+                    delegated_system_prompt, self._voice
+                )
+                if delegated_system_prompt:
+                    execution_context["system_prompt"] = delegated_system_prompt
 
                 # Execute task. Re-activate the parent turn's scope snapshot
                 # around the nested run (no re-resolution — the nested call
@@ -2385,6 +2711,8 @@ class AgentTool(AbstractBaseTool):
                 file_outputs=file_outputs,
             ).model_dump(exclude_none=True)
 
+        except ExecutionEventPersistenceError:
+            raise
         except Exception as e:
             error_msg = f"Error executing agent {self._agent_id}: {str(e)}"
             logger.error(error_msg, exc_info=True)
@@ -2501,6 +2829,8 @@ def build_published_agent_tools_from_records(
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
+    voice: Optional[str] = None,
+    inherited_mcp_unavailable_reason: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2588,6 +2918,8 @@ def build_published_agent_tools_from_records(
             runtime_metadata=runtime_metadata,
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
+            voice=voice,
+            inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2612,6 +2944,8 @@ def get_published_agents_tools(
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
+    voice: Optional[str] = None,
+    inherited_mcp_unavailable_reason: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2673,6 +3007,8 @@ def get_published_agents_tools(
             agent_call_stack=agent_call_stack,
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
+            voice=voice,
+            inherited_mcp_unavailable_reason=inherited_mcp_unavailable_reason,
         )
 
     except Exception as e:
@@ -2737,6 +3073,8 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             file_operation_access_version=(config.get_workspace_config() or {}).get(
                 FILE_OPERATION_ACCESS_VERSION_KEY
             ),
+            voice=config.get_voice(),
+            inherited_mcp_unavailable_reason=config.get_mcp_unavailable_reason(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

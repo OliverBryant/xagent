@@ -8,14 +8,18 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy import case, func, text
+from sqlalchemy.orm import Query, Session
 
 from ...config import get_uploads_dir
+from ...core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
+from ...core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
 from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
-from ..models.tool_config import ToolConfig, ToolUsage
+from ..models.task import TraceEvent
+from ..models.tool_config import ToolConfig
 from ..models.user import User
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
@@ -30,6 +34,55 @@ from ..services.tool_credentials import (
 from ..tools.config import WebToolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_usage_query(db: Session) -> Query[Any]:
+    """Count persisted completion events, shared by the list and usage endpoints."""
+    tool_name = TraceEvent.data["tool_name"].as_string()
+    query: Query[Any] = (
+        db.query(
+            tool_name.label("tool_name"),
+            func.count(TraceEvent.id).label("usage_count"),
+        )
+        .filter(
+            TraceEvent.event_type == "tool_execution_end",
+            tool_name.isnot(None),
+            tool_name != "",
+        )
+        .group_by(tool_name)
+    )
+    return query
+
+
+# Counts are decoration on the tool list, so they get a short budget of their own
+# rather than the database-wide statement timeout.
+_USAGE_STATS_STATEMENT_TIMEOUT_MS = 3_000
+
+
+def _load_tool_usage_counts(db: Session) -> dict[str, int]:
+    """Best-effort usage counts for the tool list; empty when they cannot be read.
+
+    The query runs in a SAVEPOINT that is always rolled back. On PostgreSQL that
+    both recovers the request transaction after a failed statement and undoes
+    the transaction-local timeout, so later reads on ``db`` are unaffected.
+    """
+    try:
+        savepoint = db.begin_nested()
+        try:
+            if db.get_bind().dialect.name == "postgresql":
+                # On the connection, not ``db.execute``: a text() statement would
+                # mark the request session as possibly written.
+                db.connection().execute(
+                    text("SELECT set_config('statement_timeout', :statement, true)"),
+                    {"statement": f"{_USAGE_STATS_STATEMENT_TIMEOUT_MS}ms"},
+                )
+            rows = _tool_usage_query(db).all()
+            return {row.tool_name: row.usage_count for row in rows}
+        finally:
+            savepoint.rollback()
+    except Exception as e:
+        logger.error("Failed to fetch tool usage stats: %s", e)
+        return {}
 
 
 def _require_user_id(current_user: User) -> int:
@@ -220,6 +273,7 @@ def _create_tool_info(
         "category": category,
         "display_category": CATEGORY_DISPLAY_NAMES.get(category, category.capitalize()),
         "enabled": enabled,
+        "always_available": tool_name in INTRINSIC_TOOL_NAMES,
         "requires_configuration": False,
         "status": status,
         "status_reason": status_reason,
@@ -259,11 +313,15 @@ def _withheld_edit_image_row(
 async def get_available_tools(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    include_usage: bool = True,
 ) -> dict[str, Any]:
     """Get list of all available tools, including MCP tools.
 
     Tools are self-describing - each tool declares its own category via
     metadata.category field. No manual category mapping needed.
+
+    ``include_usage=false`` skips the usage aggregation and omits
+    ``usage_count`` for callers that only need the tool list.
     """
 
     # Create a temporary request object (simulating WebToolConfig requirements)
@@ -390,19 +448,10 @@ async def get_available_tools(
         if withheld is not None:
             tools.append(withheld)
 
-        from collections import defaultdict
-
-        usage_map: defaultdict[str, int] = defaultdict(int)
-        try:
-            usage_stats: list[Any] = db.query(ToolUsage).all()
-            for stat in usage_stats:
-                usage_map[stat.tool_name] = stat.usage_count
-        except Exception as e:
-            logger.error(f"Failed to fetch tool usage stats: {e}")
-
-        for tool_item in tools:
-            tool_name = tool_item.get("name", "")
-            tool_item["usage_count"] = usage_map[tool_name]
+        if include_usage:
+            usage_map = await asyncio.to_thread(_load_tool_usage_counts, db)
+            for tool_item in tools:
+                tool_item["usage_count"] = usage_map.get(tool_item.get("name", ""), 0)
 
         default_configs = {
             item["tool_name"]: item for item in get_default_tool_configs()
@@ -452,6 +501,7 @@ async def get_available_tools(
         return {
             "tools": tools,
             "count": len(tools),
+            "skill_loader_tool": LOAD_SKILL_TOOL_NAME,
         }
 
     return await run_with_tool_runtime_cleanup(
@@ -647,7 +697,17 @@ async def get_tool_usage(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
         def _get_tool_usage_sync() -> list[dict[str, Any]]:
-            usage_stats = db.query(ToolUsage).all()
+            # Completion payloads carry a boolean; older events omit it on success.
+            success = func.coalesce(TraceEvent.data["success"].as_boolean(), True)
+            usage_stats = (
+                _tool_usage_query(db)
+                .add_columns(
+                    func.sum(case((success, 1), else_=0)).label("success_count"),
+                    func.sum(case((success, 0), else_=1)).label("error_count"),
+                    func.max(TraceEvent.timestamp).label("last_used_at"),
+                )
+                .all()
+            )
 
             result = []
             for stat in usage_stats:

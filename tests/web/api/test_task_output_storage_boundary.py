@@ -10,16 +10,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 from xagent.web.services.uploaded_file_store import (
     UploadedFileStore,
     UploadedFileVersionConflict,
@@ -47,6 +50,7 @@ def _seed_running_task(*, runner_id: str, run_id: str) -> tuple[int, int]:
             user_id=int(user.id),
             title="Durable output",
             status=TaskStatus.RUNNING,
+            lease_attempt_id="test-attempt",
             runner_id=runner_id,
             run_id=run_id,
         )
@@ -57,7 +61,8 @@ def _seed_running_task(*, runner_id: str, run_id: str) -> tuple[int, int]:
         db.close()
 
 
-def test_output_prepare_excludes_compensating_metadata() -> None:
+@pytest.mark.parametrize("state", ["detached", "compensating"])
+def test_output_prepare_excludes_unavailable_metadata(state) -> None:
     task_id, user_id = _seed_running_task(
         runner_id="compensating-runner",
         run_id="compensating-run",
@@ -68,14 +73,17 @@ def test_output_prepare_excludes_compensating_metadata() -> None:
             UploadedFile(
                 file_id="compensating-output",
                 user_id=user_id,
-                task_id=task_id,
+                task_id=None if state == "detached" else task_id,
                 filename="compensating.txt",
                 storage_path="/tmp/compensating.txt",
                 storage_key=(
                     f"users/{user_id}/tasks/{task_id}/outputs/"
                     "compensating-output/compensating.txt"
                 ),
-                storage_status="compensating",
+                storage_status="compensating"
+                if state == "compensating"
+                else "available",
+                detached_reason="task_deleted" if state == "detached" else None,
                 mime_type="text/plain",
                 file_size=12,
             )
@@ -84,7 +92,7 @@ def test_output_prepare_excludes_compensating_metadata() -> None:
     finally:
         db.close()
 
-    prepared = websocket_api._prepare_task_file_outputs_isolated(
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
         task_id=task_id,
         task_user_id=user_id,
         file_outputs=[{"file_id": "compensating-output"}],
@@ -117,7 +125,7 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
 
     second_resolution_started = threading.Event()
     allow_second_resolution = threading.Event()
-    original_resolve = websocket_api._resolve_output_storage_path
+    original_resolve = task_execution_service._resolve_output_storage_path
     resolution_count = 0
 
     def gated_resolve(raw_path: str):
@@ -130,15 +138,15 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
         return resolved
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_resolve_output_storage_path",
         gated_resolve,
     )
-    prepared: websocket_api._PreparedTaskFileOutputs | None = None
+    prepared: task_execution_service._PreparedTaskFileOutputs | None = None
     try:
         worker = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[
@@ -147,14 +155,16 @@ async def test_output_path_resolution_releases_pool_between_multiple_outputs(
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(second_resolution_started.wait, 2)
+        assert await asyncio.to_thread(
+            second_resolution_started.wait, DB_PROGRESS_TIMEOUT
+        )
         assert engine.pool.checkedout() == 0
         allow_second_resolution.set()
         prepared = await worker
     finally:
         allow_second_resolution.set()
         if prepared is not None:
-            websocket_api._settle_prepared_task_file_outputs(
+            task_execution_service._settle_prepared_task_file_outputs(
                 prepared,
                 metadata_committed=False,
             )
@@ -184,7 +194,7 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
 
     resolution_started = threading.Event()
     allow_resolution = threading.Event()
-    original_resolve = websocket_api._resolve_output_storage_path
+    original_resolve = task_execution_service._resolve_output_storage_path
 
     def gated_resolve(raw_path: str):
         resolved = original_resolve(raw_path)
@@ -193,29 +203,29 @@ async def test_output_path_resolution_releases_pool_after_owner_lookup(
         return resolved
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_resolve_output_storage_path",
         gated_resolve,
     )
-    prepared: websocket_api._PreparedTaskFileOutputs | None = None
+    prepared: task_execution_service._PreparedTaskFileOutputs | None = None
     try:
         worker = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=None,
                 file_outputs=[{"path": str(output_path), "filename": output_path.name}],
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(resolution_started.wait, 2)
+        assert await asyncio.to_thread(resolution_started.wait, DB_PROGRESS_TIMEOUT)
         assert engine.pool.checkedout() == 0
         allow_resolution.set()
         prepared = await worker
     finally:
         allow_resolution.set()
         if prepared is not None:
-            websocket_api._settle_prepared_task_file_outputs(
+            task_execution_service._settle_prepared_task_file_outputs(
                 prepared,
                 metadata_committed=False,
             )
@@ -252,21 +262,21 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
     ):
         assert engine.pool.checkedout() == 0
         put_started.set()
-        assert allow_put.wait(timeout=3)
+        assert allow_put.wait(timeout=DB_PROGRESS_TIMEOUT)
         return original_put_file(self, source, key, content_type)
 
     monkeypatch.setattr(FsspecFileStorage, "put_file", blocking_put_file)
     try:
         staging = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[{"path": str(output_path), "filename": "a.txt"}],
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(put_started.wait, 2)
+        assert await asyncio.to_thread(put_started.wait, DB_PROGRESS_TIMEOUT)
         assert engine.pool.checkedout() == 0
 
         def read_and_lock_task() -> tuple[str, str]:
@@ -282,13 +292,14 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
         prepared = await staging
         assert "/_versions/" in prepared.staged_files[0].storage_key
 
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="run-a",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-a",
                 run_id="run-a",
@@ -300,6 +311,7 @@ async def test_output_staging_holds_no_pool_slot_or_task_lock(
         assert not finalized.late_result
         check_db = _direct_db_session()
         try:
+            assert check_db.get(Task, task_id).output == "done"
             assert (
                 check_db.query(UploadedFile)
                 .filter(UploadedFile.task_id == task_id)
@@ -344,21 +356,21 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
     ):
         assert engine.pool.checkedout() == 0
         put_started.set()
-        assert allow_put.wait(timeout=3)
+        assert allow_put.wait(timeout=DB_PROGRESS_TIMEOUT)
         return original_put_file(self, source, key, content_type)
 
     monkeypatch.setattr(FsspecFileStorage, "put_file", blocking_put_file)
     try:
         staging = asyncio.create_task(
             asyncio.to_thread(
-                websocket_api._prepare_task_file_outputs_isolated,
+                task_execution_service._prepare_task_file_outputs_isolated,
                 task_id=task_id,
                 task_user_id=user_id,
                 file_outputs=[{"path": str(output_path), "filename": "stale.txt"}],
                 resolved_scope_segments=(),
             )
         )
-        assert await asyncio.to_thread(put_started.wait, 2)
+        assert await asyncio.to_thread(put_started.wait, DB_PROGRESS_TIMEOUT)
 
         takeover_db = _direct_db_session()
         try:
@@ -371,13 +383,14 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
 
         allow_put.set()
         prepared = await staging
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "stale", "file_outputs": []},
             expected_run_id="run-old",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="runner-old",
                 run_id="run-old",
@@ -398,6 +411,205 @@ async def test_takeover_during_output_upload_cannot_commit_old_run_metadata(
     finally:
         allow_put.set()
         engine.dispose()
+        get_unscoped_file_storage.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "result_status", "expect_committed"),
+    [
+        ("a2a_canceled", "completed", False),
+        ("unknown_failed", "completed", False),
+        ("running", "interrupted", True),
+    ],
+)
+def test_late_result_files_commit_only_with_a_pause_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_state: str,
+    result_status: str,
+    expect_committed: bool,
+) -> None:
+    """A result the finalizer ignores must not persist its file outputs."""
+    run_id = f"late-{terminal_state}"
+    task_id, user_id = _seed_running_task(runner_id="late-runner", run_id=run_id)
+    uploads_dir = tmp_path / "uploads"
+    output_path = (
+        uploads_dir / f"user_{user_id}" / f"web_task_{task_id}" / "output" / "late.txt"
+    )
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("late output", encoding="utf-8")
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    try:
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            file_outputs=[{"path": str(output_path), "filename": "late.txt"}],
+            resolved_scope_segments=(),
+        )
+        assert prepared.staged_files
+        assert any(path.is_file() for path in object_root.rglob("*"))
+        if terminal_state != "running":
+            db = _direct_db_session()
+            try:
+                task = db.query(Task).filter(Task.id == task_id).one()
+                task.status = TaskStatus.FAILED
+                task.error_message = "Task canceled."
+                if terminal_state == "a2a_canceled":
+                    task.agent_config = {"a2a_state": "TASK_STATE_CANCELED"}
+                db.commit()
+            finally:
+                db.close()
+        result: dict[str, Any] = {
+            "success": result_status == "completed",
+            "status": result_status,
+            "output": "late result",
+            "file_outputs": [],
+        }
+        if terminal_state == "unknown_failed":
+            result["injection_outcome_unknown"] = True
+
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id=run_id,
+            task_lease=TaskLease(
+                attempt_id="test-attempt",
+                task_id=task_id,
+                runner_id="late-runner",
+                run_id=run_id,
+            ),
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+
+        assert finalized.waiting_for_control
+        check_db = _direct_db_session()
+        try:
+            file_count = (
+                check_db.query(UploadedFile)
+                .filter(UploadedFile.task_id == task_id)
+                .count()
+            )
+            task = check_db.get(Task, task_id)
+            if expect_committed:
+                assert file_count == 1
+                assert task.status == TaskStatus.PAUSED
+            else:
+                assert file_count == 0
+                assert task.status == TaskStatus.FAILED
+                assert task.error_message == "Task canceled."
+                assert task.output is None
+        finally:
+            check_db.close()
+        assert (
+            any(path.is_file() for path in object_root.rglob("*")) is expect_committed
+        )
+    finally:
+        get_unscoped_file_storage.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "variant", ["unknown_success", "unknown_waiting", "interrupted"]
+)
+def test_first_run_keeps_a_pending_resume_for_input_accepted_earlier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    variant: str,
+) -> None:
+    """A resume requested for earlier input survives later unknown input.
+
+    Message A was accepted and its handoff is waiting on this run; message B
+    then became unknown. The finalizer keeps ``resume_requested`` and A's
+    handoff still acquires the lease, since acquisition never reads the
+    control state.
+    """
+    run_id = f"first-run-{variant}"
+    task_id, user_id = _seed_running_task(runner_id="first-runner", run_id=run_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.control_state = "resume_requested"
+        db.commit()
+    finally:
+        db.close()
+    uploads_dir = tmp_path / "uploads"
+    output_path = (
+        uploads_dir / f"user_{user_id}" / f"web_task_{task_id}" / "output" / "kept.txt"
+    )
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("kept output", encoding="utf-8")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_unscoped_file_storage.cache_clear()
+    try:
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            file_outputs=[{"path": str(output_path), "filename": "kept.txt"}],
+            resolved_scope_segments=(),
+        )
+        result: dict[str, Any] = {
+            "success": variant == "unknown_success",
+            "status": {
+                "unknown_success": "completed",
+                "unknown_waiting": "waiting_for_user",
+                "interrupted": "interrupted",
+            }[variant],
+            "output": "answer produced before the unknown input",
+            "file_outputs": [],
+        }
+        if variant != "interrupted":
+            result["injection_outcome_unknown"] = True
+
+        task_execution_service._finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result=result,
+            expected_run_id=run_id,
+            task_lease=TaskLease(
+                attempt_id="test-attempt",
+                task_id=task_id,
+                runner_id="first-runner",
+                run_id=run_id,
+            ),
+            resolved_scope_segments=(),
+            prepared_outputs=prepared,
+        )
+
+        check_db = _direct_db_session()
+        try:
+            task = check_db.get(Task, task_id)
+            assert task.status == TaskStatus.PAUSED
+            assert task.control_state == "resume_requested"
+            # A pause transition owns its files, including an unknown success
+            # whose answer is preserved in history.
+            assert (
+                check_db.query(UploadedFile)
+                .filter(UploadedFile.task_id == task_id)
+                .count()
+                == 1
+            )
+            if variant == "unknown_success":
+                assert task.output == "answer produced before the unknown input"
+        finally:
+            check_db.close()
+
+        handoff = task_execution_service._acquire_resume_task_lease(
+            task_id, user_id, run_id
+        )
+        assert handoff is not None
+        check_db = _direct_db_session()
+        try:
+            assert check_db.get(Task, task_id).status == TaskStatus.RUNNING
+        finally:
+            check_db.close()
+    finally:
         get_unscoped_file_storage.cache_clear()
 
 
@@ -441,7 +653,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
             db.close()
 
         output_path.write_text("stale finalizer bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "cas.txt"}],
@@ -469,7 +681,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
             concurrent_db.close()
 
         with pytest.raises(UploadedFileVersionConflict):
-            websocket_api._finalize_task_execution_result_isolated(
+            task_execution_service._finalize_task_execution_result_isolated(
                 task_id=task_id,
                 task_user_id=user_id,
                 pre_run_status=TaskStatus.RUNNING,
@@ -480,6 +692,7 @@ def test_metadata_version_change_rolls_back_entire_task_finalization(
                 },
                 expected_run_id="cas-run",
                 task_lease=TaskLease(
+                    attempt_id="test-attempt",
                     task_id=task_id,
                     runner_id="cas-runner",
                     run_id="cas-run",
@@ -530,13 +743,13 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     get_unscoped_file_storage.cache_clear()
     try:
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "resume.txt"}],
             resolved_scope_segments=(),
         )
-        finalized = websocket_api._finalize_resumed_task(
+        finalized = task_execution_service._finalize_resumed_task(
             task_id,
             status="completed",
             success=True,
@@ -544,6 +757,7 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
             task_owner_user_id=user_id,
             result={"success": True, "output": "resume done", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="resume-runner",
                 run_id="resume-run",
@@ -610,7 +824,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
             db.close()
 
         output_path.write_text("stale replacement", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "versioned.txt"}],
@@ -627,7 +841,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
         finally:
             takeover_db.close()
 
-        finalized = websocket_api._finalize_resumed_task(
+        finalized = task_execution_service._finalize_resumed_task(
             task_id,
             status="completed",
             success=True,
@@ -635,6 +849,7 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
             task_owner_user_id=user_id,
             result={"success": True, "output": "stale", "file_outputs": []},
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="version-runner-old",
                 run_id="version-run-old",
@@ -660,6 +875,120 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
         )
     finally:
         get_unscoped_file_storage.cache_clear()
+
+
+@pytest.mark.parametrize("release_succeeds", [True, False])
+def test_resumed_unknown_failed_result_commits_only_a_confirmed_release(
+    monkeypatch: pytest.MonkeyPatch,
+    release_succeeds: bool,
+) -> None:
+    task_id, user_id = _seed_running_task(
+        runner_id="failed-runner",
+        run_id="failed-run",
+    )
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.FAILED
+        db.commit()
+    finally:
+        db.close()
+
+    real_release = task_execution_service.release_task_lease_no_commit
+
+    def release(db: Any, lease: TaskLease, **kwargs: Any) -> bool:
+        db.query(Task).filter(Task.id == lease.task_id).update(
+            {Task.error_message: "written before release"},
+            synchronize_session=False,
+        )
+        if release_succeeds:
+            return real_release(db, lease, **kwargs)
+        return False
+
+    monkeypatch.setattr(task_execution_service, "release_task_lease_no_commit", release)
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        file_outputs=[],
+        resolved_scope_segments=(),
+    )
+
+    finalized = task_execution_service._finalize_resumed_task(
+        task_id,
+        status="interrupted",
+        success=False,
+        output=None,
+        task_owner_user_id=user_id,
+        result={"success": False, "injection_outcome_unknown": True},
+        task_lease=TaskLease(
+            attempt_id="test-attempt",
+            task_id=task_id,
+            runner_id="failed-runner",
+            run_id="failed-run",
+        ),
+        prepared_outputs=prepared,
+    )
+
+    assert finalized["late_result"]
+    check_db = _direct_db_session()
+    try:
+        task = check_db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.FAILED
+        if release_succeeds:
+            assert task.runner_id is None
+            assert task.error_message == "written before release"
+        else:
+            # A failed release must not commit anything flushed before it.
+            assert task.runner_id == "failed-runner"
+            assert task.error_message != "written before release"
+    finally:
+        check_db.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "success"),
+    [
+        ("waiting_for_user", False),
+        ("interrupted", False),
+        ("completed", True),
+    ],
+)
+def test_resumed_unknown_input_pauses_whatever_the_run_reported(
+    status: str, success: bool
+) -> None:
+    run_id = f"resumed-unknown-{status}"
+    task_id, user_id = _seed_running_task(runner_id="resumed-runner", run_id=run_id)
+    prepared = task_execution_service._prepare_task_file_outputs_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        file_outputs=[],
+        resolved_scope_segments=(),
+    )
+
+    finalized = task_execution_service._finalize_resumed_task(
+        task_id,
+        status=status,
+        success=success,
+        output="answer before the unknown input" if success else None,
+        task_owner_user_id=user_id,
+        result={"success": success, "injection_outcome_unknown": True},
+        task_lease=TaskLease(
+            attempt_id="test-attempt",
+            task_id=task_id,
+            runner_id="resumed-runner",
+            run_id=run_id,
+        ),
+        prepared_outputs=prepared,
+    )
+
+    assert not finalized.get("late_result")
+    check_db = _direct_db_session()
+    try:
+        task = check_db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.PAUSED
+        assert task.control_state == "paused"
+    finally:
+        check_db.close()
 
 
 def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
@@ -706,7 +1035,7 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
             db.close()
 
         output_path.write_text("new bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": "committed.txt"}],
@@ -717,7 +1046,9 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
         assert storage.exists(old_key)
         assert storage.exists(new_key)
 
-        original_cleanup = websocket_api.cleanup_superseded_uploaded_file_objects
+        original_cleanup = (
+            task_execution_service.cleanup_superseded_uploaded_file_objects
+        )
         cleanup_observations: list[tuple[str, TaskStatus]] = []
 
         def observe_committed_metadata(claims):  # type: ignore[no-untyped-def]
@@ -737,17 +1068,18 @@ def test_superseded_output_is_deleted_only_after_exact_metadata_commit(
             return original_cleanup(claims)
 
         monkeypatch.setattr(
-            websocket_api,
+            task_execution_service,
             "cleanup_superseded_uploaded_file_objects",
             observe_committed_metadata,
         )
-        finalized = websocket_api._finalize_task_execution_result_isolated(
+        finalized = task_execution_service._finalize_task_execution_result_isolated(
             task_id=task_id,
             task_user_id=user_id,
             pre_run_status=TaskStatus.RUNNING,
             result={"success": True, "output": "done", "file_outputs": []},
             expected_run_id="commit-run",
             task_lease=TaskLease(
+                attempt_id="test-attempt",
                 task_id=task_id,
                 runner_id="commit-runner",
                 run_id="commit-run",
@@ -811,7 +1143,7 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             db.close()
 
         output_path.write_text("new bytes", encoding="utf-8")
-        prepared = websocket_api._prepare_task_file_outputs_isolated(
+        prepared = task_execution_service._prepare_task_file_outputs_isolated(
             task_id=task_id,
             task_user_id=user_id,
             file_outputs=[{"path": str(output_path), "filename": output_path.name}],
@@ -843,17 +1175,18 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             raise RuntimeError("cleanup reference query unavailable")
 
         monkeypatch.setattr(
-            websocket_api,
+            task_execution_service,
             "cleanup_superseded_uploaded_file_objects",
             fail_cleanup_after_commit,
         )
         lease = TaskLease(
+            attempt_id="test-attempt",
             task_id=task_id,
             runner_id=runner_id,
             run_id=run_id,
         )
         if resume:
-            resumed_finalization = websocket_api._finalize_resumed_task(
+            resumed_finalization = task_execution_service._finalize_resumed_task(
                 task_id,
                 status="completed",
                 success=True,
@@ -867,7 +1200,7 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
             assert resumed_finalization["final_status"] == TaskStatus.COMPLETED.value
         else:
             background_finalization = (
-                websocket_api._finalize_task_execution_result_isolated(
+                task_execution_service._finalize_task_execution_result_isolated(
                     task_id=task_id,
                     task_user_id=user_id,
                     pre_run_status=TaskStatus.RUNNING,
@@ -1061,14 +1394,14 @@ async def test_cancelled_legacy_preview_drains_failed_registration_compensation(
         websocket_api.redirect_legacy_preview(relative_path, request_db)
     )
     try:
-        assert await asyncio.to_thread(metadata_started.wait, 2)
+        assert await asyncio.to_thread(metadata_started.wait, DB_PROGRESS_TIMEOUT)
         registration.cancel()
         await asyncio.sleep(0)
         assert not registration.done()
 
         allow_metadata_failure.set()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(registration, timeout=3)
+            await asyncio.wait_for(registration, timeout=DB_PROGRESS_TIMEOUT)
 
         check_db = _direct_db_session()
         try:
@@ -1096,15 +1429,17 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
     stage_started = threading.Event()
     allow_stage = threading.Event()
     compensation_finished = threading.Event()
-    prepared = websocket_api._PreparedTaskFileOutputs((), (), ())
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
 
-    def gated_stage(**_kwargs: Any) -> websocket_api._PreparedTaskFileOutputs:
+    def gated_stage(
+        **_kwargs: Any,
+    ) -> task_execution_service._PreparedTaskFileOutputs:
         stage_started.set()
         assert allow_stage.wait(timeout=3)
         return prepared
 
     def record_compensation(
-        actual: websocket_api._PreparedTaskFileOutputs,
+        actual: task_execution_service._PreparedTaskFileOutputs,
         *,
         metadata_committed: bool,
     ) -> None:
@@ -1113,18 +1448,18 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
         compensation_finished.set()
 
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_prepare_task_file_outputs_isolated",
         gated_stage,
     )
     monkeypatch.setattr(
-        websocket_api,
+        task_execution_service,
         "_settle_prepared_task_file_outputs",
         record_compensation,
     )
 
     staging = asyncio.create_task(
-        websocket_api._prepare_task_file_outputs_cancellation_safe(
+        task_execution_service._prepare_task_file_outputs_cancellation_safe(
             task_id=42,
             task_user_id=1,
             file_outputs=[{"path": "/slow/output.txt"}],
@@ -1145,11 +1480,16 @@ async def test_cancelled_output_staging_compensates_late_result_before_return(
 
 @pytest.mark.asyncio
 async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() -> None:
-    lease = TaskLease(task_id=42, runner_id="resume-runner", run_id="resume-run")
+    lease = TaskLease(
+        attempt_id="test-attempt",
+        task_id=42,
+        runner_id="resume-runner",
+        run_id="resume-run",
+    )
     heartbeat_stop = asyncio.Event()
     stage_started = threading.Event()
     allow_stage = threading.Event()
-    prepared = websocket_api._PreparedTaskFileOutputs((), (), ())
+    prepared = task_execution_service._PreparedTaskFileOutputs((), (), ())
 
     async def heartbeat() -> TaskLeaseHeartbeatOutcome:
         await heartbeat_stop.wait()
@@ -1176,7 +1516,9 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
         async def interrupt_reason_for_quota(self) -> None:
             return None
 
-    def gated_stage(**_kwargs: Any) -> websocket_api._PreparedTaskFileOutputs:
+    def gated_stage(
+        **_kwargs: Any,
+    ) -> task_execution_service._PreparedTaskFileOutputs:
         assert not heartbeat_stop.is_set()
         assert not heartbeat_task.done()
         stage_started.set()
@@ -1198,7 +1540,7 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
             "agent_logo_url": None,
             "final_status": TaskStatus.COMPLETED.value,
             "lease_released": True,
-            "control_event_state": {},
+            "report": SettlementReport(),
             "normalized_outputs": [],
             "output": "done",
             "late_result": False,
@@ -1216,23 +1558,27 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
 
     with (
         patch(
-            "xagent.web.api.websocket._prepare_task_file_outputs_isolated",
+            "xagent.web.services.task_execution._prepare_task_file_outputs_isolated",
             side_effect=gated_stage,
         ),
         patch(
-            "xagent.web.api.websocket._finalize_resumed_task",
+            "xagent.web.services.task_execution._finalize_resumed_task",
             side_effect=finalize,
         ),
         patch(
             "xagent.web.api.websocket.manager",
             MagicMock(broadcast_to_task=AsyncMock()),
         ),
-        patch("xagent.web.api.websocket.background_task_manager.promote_resume_task"),
-        patch("xagent.web.api.websocket.background_task_manager.cleanup_task"),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.promote_resume_task"
+        ),
+        patch(
+            "xagent.web.services.task_execution.background_task_manager.cleanup_task"
+        ),
         patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
     ):
         resume_task = asyncio.create_task(
-            websocket_api.execute_resume_background(
+            task_execution_service.execute_resume_background(
                 task_id=42,
                 agent_service=agent_service,
                 task_owner_user_id=1,

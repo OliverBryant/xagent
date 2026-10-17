@@ -33,12 +33,46 @@ from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
 from ..utils.user_scope import resolve_user_scope
 from ..web_crawler import WebCrawler
+from ..web_crawler.crawler import STOPPED_NO_ELIGIBLE_LINKS
+from ..web_crawler.url_filter import REJECTED_ROBOTS, SITE_REJECTIONS
 from .document_ingestion import run_document_ingestion
 
 if TYPE_CHECKING:
     from ..kb import KBPipelineCompatibilityFacade
 
 logger = logging.getLogger(__name__)
+
+# Reason keys are internal identifiers; this text reaches an end user. Only
+# SITE_REJECTIONS reasons are ever rendered, so this covers exactly those -
+# a reason added to that set needs a label here too.
+_REJECTION_LABELS = {
+    REJECTED_ROBOTS: "blocked by robots.txt rules",
+}
+
+
+def _blocked_crawl_explanation(
+    crawl_stats: dict, documents_created: int, pages_crawled: int
+) -> str:
+    """Say that the site refused the crawl, counting only what the site did.
+
+    Configured rejections are the operator's own scope rules; listing them in a
+    sentence that blames the site would report that filtering as a refusal.
+    """
+    rejections = crawl_stats.get("link_rejections", {})
+    refused = ", ".join(
+        f"{rejections[reason]} {_REJECTION_LABELS.get(reason, reason)}"
+        for reason in sorted(SITE_REJECTIONS)
+        if rejections.get(reason)
+    )
+    # Unreachable today - the stop reason this message explains requires a site
+    # rejection - but an empty parenthetical would read as a formatting bug.
+    cause = f" ({refused})" if refused else ""
+    return (
+        f"Only {documents_created} document(s) from {pages_crawled} page(s) "
+        f"could be imported: every link found was refused{cause}. The pages "
+        f"that were reachable have been ingested."
+    )
+
 
 FileHandlerCallback = Callable[..., Any]
 
@@ -69,14 +103,15 @@ class FileHandlerResult(TypedDict):
     Attributes:
         file_path: Path to the file for ingestion (persistent or temporary)
         file_id: Optional file_id for stable doc_id generation
-        rollback_on_failure: Optional callback to compensate file persistence
-            when the subsequent document ingestion does not succeed.
         commit_on_success: Optional callback to finalize temporary rollback
             resources once the subsequent document ingestion succeeds.
         rollback_context: Optional operation-outcome metadata describing the
             web file side effect. This is internal and does not affect public
             web ingestion result schemas.
-        file_compensation: Optional FILE-boundary compensation callback.
+        file_compensation: Optional FILE-boundary compensation callback. The
+            pipeline never deletes a persistent file_path itself; declare this
+            to undo the handler's file change (e.g. delete a fresh copy or
+            restore a refreshed file) when the page's ingestion fails.
         document_compensation: Optional DOCUMENT-boundary compensation callback.
         status_compensation: Optional STATUS-boundary compensation callback.
         snapshot_compensation: Optional SNAPSHOT-boundary compensation callback.
@@ -84,21 +119,12 @@ class FileHandlerResult(TypedDict):
 
     file_path: str
     file_id: Optional[str]
-    rollback_on_failure: NotRequired[FileHandlerCallback]
     commit_on_success: NotRequired[FileHandlerCallback]
     rollback_context: NotRequired[dict[str, object]]
     file_compensation: NotRequired[FileHandlerCallback]
     document_compensation: NotRequired[FileHandlerCallback]
     status_compensation: NotRequired[FileHandlerCallback]
     snapshot_compensation: NotRequired[FileHandlerCallback]
-
-
-class _FileHandlerRollbackError(RuntimeError):
-    def __init__(self, callback_name: str, url: str, reason: str) -> None:
-        self.callback_name = callback_name
-        self.url = url
-        self.reason = reason
-        super().__init__(f"File persistence {callback_name} failed for {url}: {reason}")
 
 
 def _callback_accepts_ingestion_result(callback: FileHandlerCallback) -> bool:
@@ -182,6 +208,22 @@ def _has_per_boundary_compensation(file_info: FileHandlerResult) -> bool:
     )
 
 
+def _log_kept_path_only_file(
+    file_info: Optional[FileHandlerResult], file_path: Path, temp_dir: str, url: str
+) -> None:
+    if not file_info or _has_per_boundary_compensation(file_info):
+        return
+    if Path(temp_dir) in file_path.parents:
+        return
+    # Log only: adding to result.warnings would change the public result.
+    logger.warning(
+        "Kept file_handler file %s after ingestion of %s failed; "
+        "declare file_compensation if it should be removed",
+        file_path,
+        url,
+    )
+
+
 def _string_or_none(value: object) -> Optional[str]:
     return value if isinstance(value, str) and value else None
 
@@ -202,39 +244,17 @@ def _run_file_handler_compensation(
     warnings: list[str],
     ingestion_result: Optional[IngestionResult] = None,
 ) -> Optional[str]:
-    if not file_info:
+    if not file_info or not _has_per_boundary_compensation(file_info):
         return None
-
-    # Per-boundary compensation takes priority over legacy rollback_on_failure.
-    has_per_boundary = _has_per_boundary_compensation(file_info)
-    if has_per_boundary:
-        return _run_per_boundary_compensation(
-            pipeline_facade=pipeline_facade,
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            warnings=warnings,
-            ingestion_result=ingestion_result,
-        )
-
-    # Legacy monolithic rollback_on_failure callback (custom callbacks only)
-    legacy_callback = cast(
-        Optional[FileHandlerCallback], file_info.get("rollback_on_failure")
+    return _run_per_boundary_compensation(
+        pipeline_facade=pipeline_facade,
+        page_operation=page_operation,
+        file_info=file_info,
+        collection=collection,
+        url=url,
+        warnings=warnings,
+        ingestion_result=ingestion_result,
     )
-    if legacy_callback is not None:
-        return _run_legacy_rollback_compensation(
-            pipeline_facade=pipeline_facade,
-            page_operation=page_operation,
-            file_info=file_info,
-            collection=collection,
-            url=url,
-            warnings=warnings,
-            legacy_callback=legacy_callback,
-            ingestion_result=ingestion_result,
-        )
-
-    return None
 
 
 def _run_per_boundary_compensation(
@@ -286,108 +306,6 @@ def _run_per_boundary_compensation(
     result = pipeline_facade.rollback_failed_ingestion_sync(request)
     warnings.extend(result.warnings)
     return result.first_error
-
-
-def _run_legacy_rollback_compensation(
-    *,
-    pipeline_facade: "KBPipelineCompatibilityFacade",
-    page_operation: Any,
-    file_info: FileHandlerResult,
-    collection: str,
-    url: str,
-    warnings: list[str],
-    legacy_callback: FileHandlerCallback,
-    ingestion_result: Optional[IngestionResult] = None,
-) -> Optional[str]:
-    """Handle legacy monolithic rollback_on_failure (custom callbacks)."""
-    rollback_context = _rollback_context_payload(file_info)
-
-    def _compensate() -> None:
-        try:
-            _run_sync_file_handler_callback(
-                legacy_callback,
-                callback_name="rollback_on_failure",
-                url=url,
-                ingestion_result=ingestion_result,
-            )
-        except Exception as cleanup_error:  # noqa: BLE001
-            raise _FileHandlerRollbackError(
-                "rollback_on_failure",
-                url,
-                str(cleanup_error),
-            ) from cleanup_error
-
-    pipeline_facade.record_web_page_file_side_effect(
-        page_operation,
-        collection=collection,
-        url=url,
-        file_path=cast(Optional[str], file_info.get("file_path")),
-        file_id=cast(Optional[str], file_info.get("file_id")),
-        reason="rollback_on_failure",
-        extra_payload=rollback_context,
-        compensation=_compensate,
-    )
-    errors = pipeline_facade.compensate_web_page_file_side_effect(page_operation)
-    if not errors:
-        return None
-
-    first_error = errors[0]
-    cleanup_reason = (
-        first_error.reason
-        if isinstance(first_error, _FileHandlerRollbackError)
-        else str(first_error)
-    )
-    message = f"File persistence rollback_on_failure failed for {url}: {cleanup_reason}"
-    logger.warning(message)
-    warnings.append(message)
-    return cleanup_reason
-
-
-def _run_legacy_persistent_file_compensation(
-    *,
-    pipeline_facade: "KBPipelineCompatibilityFacade",
-    page_operation: Any,
-    collection: str,
-    url: str,
-    copied_persistent_file: Optional[Path],
-    file_info: Optional[FileHandlerResult],
-    warnings: list[str],
-) -> Optional[str]:
-    if not copied_persistent_file or not copied_persistent_file.exists():
-        return None
-    if file_info and (
-        "rollback_on_failure" in file_info or "file_compensation" in file_info
-    ):
-        return None
-
-    def _compensate() -> None:
-        copied_persistent_file.unlink()
-
-    pipeline_facade.record_web_page_file_side_effect(
-        page_operation,
-        collection=collection,
-        url=url,
-        file_path=str(copied_persistent_file),
-        file_id=cast(Optional[str], file_info.get("file_id")) if file_info else None,
-        reason="legacy_persistent_file",
-        extra_payload={"rollback_kind": "legacy_persistent_file"},
-        compensation=_compensate,
-    )
-    errors = pipeline_facade.compensate_web_page_file_side_effect(page_operation)
-    if not errors:
-        logger.info(
-            "Cleaned up persistent file due to ingestion failure: %s",
-            copied_persistent_file,
-        )
-        return None
-
-    cleanup_reason = str(errors[0])
-    message = (
-        f"Failed to clean up persistent file {copied_persistent_file}: {cleanup_reason}"
-    )
-    logger.warning(message)
-    warnings.append(message)
-    return cleanup_reason
 
 
 def _looks_like_crawler_block(error: str) -> bool:
@@ -592,7 +510,6 @@ async def _run_web_ingestion_impl(
                     # Call file_handler if provided (for persistent storage and UploadedFile record)
                     final_file_path = temp_file
                     final_file_id = None
-                    copied_persistent_file = None
                     file_info: Optional[FileHandlerResult] = None
 
                     if file_handler:
@@ -606,6 +523,14 @@ async def _run_web_ingestion_impl(
                             if not file_info:
                                 raise ValueError(
                                     "File handler returned no file information"
+                                )
+                            # Ignoring it would silently drop the handler's
+                            # failure rollback.
+                            if "rollback_on_failure" in file_info:
+                                raise ValueError(
+                                    "rollback_on_failure is no longer supported; "
+                                    "return per-boundary callbacks such as "
+                                    "file_compensation instead"
                                 )
                             final_file_path = Path(
                                 file_info.get("file_path") or temp_file
@@ -635,13 +560,6 @@ async def _run_web_ingestion_impl(
                                         file_compensation,
                                     ),
                                 )
-
-                            # Track if we successfully copied a persistent file for cleanup
-                            if (
-                                final_file_path != temp_file
-                                and final_file_path.exists()
-                            ):
-                                copied_persistent_file = final_file_path
 
                             logger.debug(
                                 "File handler returned: path=%s, file_id=%s",
@@ -718,8 +636,6 @@ async def _run_web_ingestion_impl(
                                 warnings=warnings,
                                 ingestion_result=ingest_result,
                             )
-                            # Only clear temp file reference on success
-                            copied_persistent_file = None
                         else:
                             failed_urls[crawl_result.url] = ingest_result.message
                             msg = (
@@ -727,6 +643,9 @@ async def _run_web_ingestion_impl(
                                 f"{ingest_result.message}"
                             )
                             warnings.append(msg)
+                            _log_kept_path_only_file(
+                                file_info, final_file_path, temp_dir, crawl_result.url
+                            )
                             rollback_error = _run_file_handler_compensation(
                                 pipeline_facade=pipeline_facade,
                                 page_operation=page_operation,
@@ -736,27 +655,13 @@ async def _run_web_ingestion_impl(
                                 warnings=warnings,
                                 ingestion_result=ingest_result,
                             )
-                            legacy_cleanup_error = (
-                                _run_legacy_persistent_file_compensation(
-                                    pipeline_facade=pipeline_facade,
-                                    page_operation=page_operation,
-                                    collection=collection,
-                                    url=crawl_result.url,
-                                    copied_persistent_file=copied_persistent_file,
-                                    file_info=file_info,
-                                    warnings=warnings,
-                                )
-                            )
-                            rollback_error = rollback_error or legacy_cleanup_error
                             if rollback_error:
                                 rollback_failed_urls[crawl_result.url] = rollback_error
                             pipeline_facade.finish_web_page_operation(
                                 page_operation,
                                 status=ingest_result.status,
                                 message=ingest_result.message,
-                                side_effects_may_remain=bool(rollback_error),
                             )
-                            copied_persistent_file = None
 
                     except Exception as e:
                         logger.exception("Failed to ingest %s", crawl_result.url)
@@ -765,6 +670,9 @@ async def _run_web_ingestion_impl(
                             f"Failed to ingest {crawl_result.url}: {str(e)}"
                         )
                         warnings.append(failure_message)
+                        _log_kept_path_only_file(
+                            file_info, final_file_path, temp_dir, crawl_result.url
+                        )
 
                         rollback_error = _run_file_handler_compensation(
                             pipeline_facade=pipeline_facade,
@@ -776,26 +684,10 @@ async def _run_web_ingestion_impl(
                         )
                         if rollback_error:
                             rollback_failed_urls[crawl_result.url] = rollback_error
-
-                        # Legacy cleanup for handlers that only returned a file path.
-                        legacy_cleanup_error = _run_legacy_persistent_file_compensation(
-                            pipeline_facade=pipeline_facade,
-                            page_operation=page_operation,
-                            collection=collection,
-                            url=crawl_result.url,
-                            copied_persistent_file=copied_persistent_file,
-                            file_info=file_info,
-                            warnings=warnings,
-                        )
-                        rollback_error = rollback_error or legacy_cleanup_error
-                        if rollback_error:
-                            rollback_failed_urls[crawl_result.url] = rollback_error
-                        copied_persistent_file = None
                         pipeline_facade.finish_web_page_operation(
                             page_operation,
                             status="error",
                             message=failure_message,
-                            side_effects_may_remain=bool(rollback_error),
                         )
 
                 except Exception as e:
@@ -857,6 +749,22 @@ async def _run_web_ingestion_impl(
     if rollback_failed_urls:
         status = "error"
 
+    # A crawl can end with zero failures and still not be what the user asked
+    # for: every link the start page offered was refused by the site. Configured
+    # stops (page cap, depth, deliberate filtering) are not this case, which is
+    # why the reason comes from the crawler rather than from link counts.
+    #
+    # This deliberately does not touch `status`. The pages that landed were
+    # ingested and published, which is what "success" means to every consumer
+    # of that enum - the REST handler returns 200 and both frontend call sites
+    # treat anything else as a hard failure. The blocked crawl is a different
+    # fact about the same run, so it travels as its own flag plus a warning.
+    crawl_stats = crawler.get_statistics()
+    blocked_stop = (
+        status == "success"
+        and crawl_stats.get("stop_reason") == STOPPED_NO_ELIGIBLE_LINKS
+    )
+
     crawled_urls_list = [r.url for r in crawl_results if r.status == "success"]
 
     # Build a status-aware message. Previously this was unconditionally
@@ -901,6 +809,11 @@ async def _run_web_ingestion_impl(
                     f"{pages_crawled} pages, {len(failed_urls)} failed "
                     f"(first: {first_url} returned {first_err})"
                 )
+    elif blocked_stop:
+        message = _blocked_crawl_explanation(
+            crawl_stats, documents_created, pages_crawled
+        )
+        warnings = [*warnings, message]
     else:
         message = (
             f"Web ingestion completed: {documents_created} documents, "
@@ -909,6 +822,7 @@ async def _run_web_ingestion_impl(
 
     result = WebIngestionResult(
         status=status,
+        crawl_blocked_by_site=blocked_stop,
         collection=collection,
         total_urls_found=crawler.total_urls_found,
         pages_crawled=pages_crawled,

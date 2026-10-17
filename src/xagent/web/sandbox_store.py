@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Optional
 
 from ..sandbox import (
-    BoxliteStore,
     DockerStore,
     SandboxConfig,
     SandboxInfo,
@@ -42,6 +41,12 @@ class _DBSandboxStoreBase:
 
     sandbox_type: str
 
+    def __init__(self, *, namespace: str | None = None) -> None:
+        self._prefix = f"{namespace}::" if namespace else ""
+
+    def _storage_key(self, name: str) -> str:
+        return self._prefix + name
+
     def _get_db_session(self):  # type: ignore[no-untyped-def]
         """Get database session. Can be mocked in tests."""
         return next(get_db())
@@ -54,7 +59,7 @@ class _DBSandboxStoreBase:
                 db.query(SandboxInfoModel)
                 .filter(
                     SandboxInfoModel.sandbox_type == self.sandbox_type,
-                    SandboxInfoModel.name == name,
+                    SandboxInfoModel.name == self._storage_key(name),
                 )
                 .first()
             )
@@ -82,7 +87,7 @@ class _DBSandboxStoreBase:
                 db.query(SandboxInfoModel)
                 .filter(
                     SandboxInfoModel.sandbox_type == self.sandbox_type,
-                    SandboxInfoModel.name == name,
+                    SandboxInfoModel.name == self._storage_key(name),
                 )
                 .first()
             )
@@ -116,7 +121,7 @@ class _DBSandboxStoreBase:
                 db.query(SandboxInfoModel)
                 .filter(
                     SandboxInfoModel.sandbox_type == self.sandbox_type,
-                    SandboxInfoModel.name == name,
+                    SandboxInfoModel.name == self._storage_key(name),
                 )
                 .first()
             )
@@ -141,7 +146,7 @@ class _DBSandboxStoreBase:
         try:
             db.query(SandboxInfoModel).filter(
                 SandboxInfoModel.sandbox_type == self.sandbox_type,
-                SandboxInfoModel.name == name,
+                SandboxInfoModel.name == self._storage_key(name),
             ).delete()
             db.commit()
         except Exception as e:
@@ -169,7 +174,7 @@ class _DBSandboxStoreBase:
         config = SandboxConfig(**config_data)
 
         return SandboxInfo(
-            name=str(model.name),
+            name=str(model.name).removeprefix(self._prefix),
             state=str(model.state),
             template=template,
             config=config,
@@ -187,7 +192,7 @@ class _DBSandboxStoreBase:
 
         model = SandboxInfoModel(
             sandbox_type=self.sandbox_type,
-            name=info.name,
+            name=self._storage_key(info.name),
             state=info.state,
             template=template_json,
             config=config_json,
@@ -205,10 +210,16 @@ class _DBSandboxStoreBase:
         model.config = json.dumps(info.config.model_dump())  # type: ignore[assignment]
 
 
-class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
-    """Database-backed implementation of BoxliteStore."""
+try:
+    from ..sandbox import BoxliteStore
+except ImportError:  # boxlite is not installed on linux/arm64
+    pass
+else:
 
-    sandbox_type = SANDBOX_TYPE_BOXLITE
+    class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
+        """Database-backed implementation of BoxliteStore."""
+
+        sandbox_type = SANDBOX_TYPE_BOXLITE
 
 
 class DBDockerStore(_DBSandboxStoreBase, DockerStore):
@@ -224,7 +235,7 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
                 db.query(SandboxSnapshotModel)
                 .filter(
                     SandboxSnapshotModel.sandbox_type == SANDBOX_TYPE_DOCKER,
-                    SandboxSnapshotModel.snapshot_id == snapshot_id,
+                    SandboxSnapshotModel.snapshot_id == self._storage_key(snapshot_id),
                 )
                 .first()
             )
@@ -245,7 +256,8 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
                 db.query(SandboxSnapshotModel)
                 .filter(
                     SandboxSnapshotModel.sandbox_type == SANDBOX_TYPE_DOCKER,
-                    SandboxSnapshotModel.snapshot_id == snapshot.snapshot_id,
+                    SandboxSnapshotModel.snapshot_id
+                    == self._storage_key(snapshot.snapshot_id),
                 )
                 .first()
             )
@@ -269,7 +281,12 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
         try:
             models = (
                 db.query(SandboxSnapshotModel)
-                .filter(SandboxSnapshotModel.sandbox_type == SANDBOX_TYPE_DOCKER)
+                .filter(
+                    SandboxSnapshotModel.sandbox_type == SANDBOX_TYPE_DOCKER,
+                    SandboxSnapshotModel.snapshot_id.startswith(
+                        self._prefix, autoescape=True
+                    ),
+                )
                 .order_by(SandboxSnapshotModel.snapshot_id.asc())
                 .all()
             )
@@ -286,7 +303,7 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
         try:
             db.query(SandboxSnapshotModel).filter(
                 SandboxSnapshotModel.sandbox_type == SANDBOX_TYPE_DOCKER,
-                SandboxSnapshotModel.snapshot_id == snapshot_id,
+                SandboxSnapshotModel.snapshot_id == self._storage_key(snapshot_id),
             ).delete()
             db.commit()
         except Exception as e:
@@ -306,7 +323,7 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
             str(model.metadata_json) if model.metadata_json is not None else "{}"
         )
         return SandboxSnapshot(
-            snapshot_id=str(model.snapshot_id),
+            snapshot_id=str(model.snapshot_id).removeprefix(self._prefix),
             metadata=json.loads(metadata_str),
             created_at=model.created_at.isoformat()
             if model.created_at is not None
@@ -317,7 +334,7 @@ class DBDockerStore(_DBSandboxStoreBase, DockerStore):
         """Convert SandboxSnapshot to database model."""
         return SandboxSnapshotModel(
             sandbox_type=SANDBOX_TYPE_DOCKER,
-            snapshot_id=snapshot.snapshot_id,
+            snapshot_id=self._storage_key(snapshot.snapshot_id),
             metadata_json=json.dumps(snapshot.metadata),
             created_at=_parse_iso_datetime(snapshot.created_at),
         )

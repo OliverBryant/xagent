@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
+import type { ClarificationOnSend } from "./clarification-delivery";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 import {
   TaskRuntimeMessageMetadataExtension,
@@ -84,22 +85,32 @@ export interface ChatMessageProps {
   rawContent?: string;
   traceEvents?: TraceEvent[];
   showProcessView?: boolean;
+  // Whether an interrupted process draws its own "Interrupted" line. A caller
+  // whose turn already shows the interruption elsewhere passes false; the
+  // message row then has nothing left to draw, so only the trace renders (and
+  // nothing at all when the process view is off).
+  showInterruptedStatus?: boolean;
   isVirtual?: boolean;
   taskStatus?: string;
   processStatus?: string;
   timestamp?: number | string;
   interactions?: any[];
+  interactionRequestId?: string;
   interactionsActive?: boolean;
   showEmptyStatus?: boolean;
   onOpenExecutionPlan?: () => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
-  onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
+  onSendInteraction?: ClarificationOnSend;
   contextBadges?: Array<{
     kind: "computer_use";
     label: string;
     detail: string;
   }>;
   taskRuntimeExtensionMetadata?: TaskRuntimeMessageMetadataExtensionProps;
+  // Set by the caller on a failed assistant turn so the user can quote the
+  // task to an admin. Rendered beside the content rather than inside it: the
+  // stored failure text is replaced on reload and replayed as LLM context.
+  failureTaskId?: number | null;
 }
 
 function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
@@ -311,10 +322,12 @@ export function ChatMessage({
   // Default matches TaskConversationPanelProps: an unwired caller gets the
   // internal-page behavior; public surfaces opt out explicitly.
   showProcessView = true,
+  showInterruptedStatus = true,
   taskStatus,
   processStatus,
   timestamp,
   interactions,
+  interactionRequestId,
   interactionsActive = true,
   showEmptyStatus = true,
   onOpenExecutionPlan,
@@ -322,6 +335,7 @@ export function ChatMessage({
   onSendInteraction,
   contextBadges,
   taskRuntimeExtensionMetadata,
+  failureTaskId,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -438,17 +452,31 @@ export function ChatMessage({
     isStoppedTraceProcessStatus(resolvedProcessStatus) &&
     resolvedProcessStatus !== "completed";
 
+  // An interrupted process never draws the status indicator below, so once the
+  // caller has turned its own "Interrupted" line off, an empty message row has
+  // nothing to show, whatever showEmptyStatus or showProcessView say.
+  const hasSilencedInterruption =
+    resolvedProcessStatus === "interrupted" && !showInterruptedStatus;
+
   // A trace-only turn carries no answer text and no status line of its own, so
   // its bubble would render as a bare avatar. Drop it whether the trace above
   // was rendered (internal pages) or suppressed (embedded chat) — keying this
   // off the events themselves rather than off shouldShowProcess. Stopped
   // unanswered turns are the exception once the trace is hidden (see above).
+  // An interrupted process is another exception, unless the caller has turned
+  // its own "Interrupted" line off: that line is the message's content.
   const isProcessOnlyMessage =
     hasTraceEvents &&
     !isUser &&
     !content &&
-    showEmptyStatus === false &&
-    (showProcessView || !isStoppedWithoutAnswer);
+    (
+      hasSilencedInterruption ||
+      (
+        resolvedProcessStatus !== "interrupted" &&
+        showEmptyStatus === false &&
+        (showProcessView || !isStoppedWithoutAnswer)
+      )
+    );
 
   // The trace carries the backend's raw error string (a Python exception, more
   // often than not). With the trace hidden the failure line must not become its
@@ -484,9 +512,17 @@ export function ChatMessage({
     ? serializeFilesDisabledPresentation(copyableContent)
     : copyableContent;
 
+  const failureReference =
+    !isUser && typeof failureTaskId === "number" && failureTaskId > 0
+      ? t("common.errors.taskIdReference", { id: failureTaskId })
+      : "";
+  const clipboardContent = displayCopyableContent && failureReference
+    ? `${displayCopyableContent}\n${failureReference}`
+    : displayCopyableContent;
+
   const handleCopy = () => {
-    if (displayCopyableContent) {
-      navigator.clipboard.writeText(displayCopyableContent);
+    if (clipboardContent) {
+      navigator.clipboard.writeText(clipboardContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
@@ -562,9 +598,17 @@ export function ChatMessage({
               ) : (
                 // A past paused/waiting turn has showEmptyStatus=false, but with
                 // the trace hidden its status line is all that marks the turn.
-                !isUser && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
+                !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
                   <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
                 )
+              )}
+              {failureReference && (
+                <div
+                  className="mt-1 text-xs text-muted-foreground select-all"
+                  data-testid="task-failure-reference"
+                >
+                  {failureReference}
+                </div>
               )}
               {isUser && contextBadges && contextBadges.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">
@@ -592,11 +636,15 @@ export function ChatMessage({
                 <div className="mt-4 border-t pt-4">
                   <ClarificationForm
                     interactions={interactions}
+                    requestId={interactionRequestId}
                     active={interactionsActive}
                     filesDisabled={filesDisabled}
                     onSend={onSendInteraction}
                   />
                 </div>
+              )}
+              {resolvedProcessStatus === "interrupted" && showInterruptedStatus && (
+                <div className="py-3 text-sm text-muted-foreground">{t("agent.layout.status.interrupted")}</div>
               )}
             </div>
           </div>

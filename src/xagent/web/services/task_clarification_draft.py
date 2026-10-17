@@ -13,16 +13,17 @@ row? The answer is one of three outcomes, never folded into a boolean:
   (``request_payload``, ``request_idempotency_key``, ``expires_at``).
 * :class:`NotApplicable` -- nothing durable should be written this round,
   but nothing failed either: either this run never produced a clarification
-  in the first place, or a waiting run's draft could not be turned into a
-  publishable payload (no resume anchor, or the payload could not be shaped
-  within the size and character limits below). The caller's own settlement
-  proceeds exactly as it would have before this module existed.
-* :class:`FailClosed` -- carries one of five reason strings that split into
-  two different consequences, not one. Two of them (from the guard that
-  pairs waiting status against draft presence) do not discard the round at
-  all: no structured row is written, but the finalizer's existing path for
-  that status proceeds unchanged. The other three (an unfenced lease, a
-  task row no longer owned by the lease that produced this result, or an
+  in the first place, or the waiting turn is the host's MCP approval prompt
+  rather than a question the agent asked, or a waiting run's draft could not
+  be turned into a publishable payload (no resume anchor, or the payload
+  could not be shaped within the size and character limits below). The
+  caller's own settlement proceeds exactly as it would have before this
+  module existed.
+* :class:`FailClosed` -- carries one of seven reason strings that split into
+  two different consequences, not one. Four of them do not discard the
+  round at all: no structured row is written, but the finalizer's existing
+  path for that status proceeds unchanged. The other three (an unfenced
+  lease, a task row no longer owned by the lease that produced this result, or an
   attempt that is no longer current) do mean the caller must discard this
   round's settlement wholesale, the same way it already discards a late,
   no-longer-owned result. See :class:`FailClosed` itself for which reason
@@ -64,6 +65,13 @@ unread today -- removing them now would trade the free "add an optional
 field" path above for a version bump later, to add back exactly what was
 just deleted.
 
+The payload's ``event_id`` is also intentionally outside the v1 question-shape
+readers. It is correlation metadata for the already-published question and the
+authoritative staging identity: the publication path passes the same value to
+``stage()`` separately as ``request_idempotency_key``. Neither
+:func:`parse_clarification_payload` nor the compatibility reader should add an
+``event_id`` field merely to consume metadata that staging already owns.
+
 An application-layer invariant worth stating plainly: a task can have at
 most one *active* interaction row at a time (the database enforces this
 with a unique constraint on the active slot). Nothing in this module
@@ -85,7 +93,6 @@ is the caller's obligation, not this module's.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -93,6 +100,10 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Mapping
 
 from ...core.agent.clarification import ClarificationDraft
+from ...core.agent.pattern.react.react import normalize_interaction_text
+from ...core.tools.adapters.vibe.mcp_approval_gate import (
+    is_gate_issued_interaction_id,
+)
 from ..models.task import Task
 from .ops_signals import (
     CLARIFICATION_DRAFT_MISSING,
@@ -100,6 +111,7 @@ from .ops_signals import (
     clear_degradation,
     register_degradation,
 )
+from .task_command_transport import COMMAND_ID_PATTERN
 from .task_interaction_staging import InteractionAnchor
 from .task_lease_service import (
     TaskLease,
@@ -110,11 +122,21 @@ from .task_lease_service import (
 
 logger = logging.getLogger(__name__)
 
-# Deployment policy, not an invariant: this only bounds how long an
+# The TTL the publication path actually uses: a published row's
+# ``expires_at`` is this added to the moment the round is resolved.
+# Deployment policy, not an invariant -- it only bounds how long an
 # unanswered row sits before a reclaim job retires it. The read surface
 # does not consult ``expires_at`` at all, so a longer-lived row is still
 # shown to whoever is waiting on it; widen or narrow this once real
 # publication volume gives a basis for the number, not before.
+#
+# Distinct from ``_MIN_INTERACTION_TTL_SECONDS`` /
+# ``_MAX_INTERACTION_TTL_SECONDS`` (``task_interaction_service.py``),
+# which are not a TTL at all but the interval a caller's own
+# ``ttl_seconds`` override has to fall inside. The two are deliberately
+# not unified -- one is the value this path publishes with, the other the
+# range a caller may ask for. The only relationship that has to hold
+# between them is that this value falls inside that range.
 CLARIFICATION_REQUEST_TTL = timedelta(hours=24)
 
 # The character domain a payload's free-text leaves may contain, kept
@@ -188,10 +210,14 @@ def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
 # and :class:`FailClosed`'s own docstrings. Both are ``str`` at runtime --
 # ``Literal`` only narrows what a type checker accepts, so a caller reading
 # ``resolution.fail_closed_reason == "attempt_mismatch"`` needs no change.
-NotApplicableReason = Literal["no_anchor", "payload_too_large", "empty_question"]
+NotApplicableReason = Literal[
+    "host_approval_prompt", "no_anchor", "payload_too_large", "empty_question"
+]
 FailClosedReason = Literal[
     "missing_draft",
     "draft_status_mismatch",
+    "missing_event_id",
+    "invalid_event_id",
     "unfenced_lease",
     "ownership_changed",
     "attempt_mismatch",
@@ -217,10 +243,15 @@ class NotApplicable:
     ``reason`` is ``None`` for the ordinary case -- this finalization was
     never a waiting-for-user turn with a draft attached, so publication
     simply does not apply, and the caller's settlement proceeds exactly as
-    it would without this module. ``reason`` is one of ``"no_anchor"``,
-    ``"payload_too_large"``, or ``"empty_question"`` when a waiting turn's
-    draft existed but could not be shaped into a publishable payload; each
-    of those is a degrade, not a failure -- the run is not discarded.
+    it would without this module. ``reason`` is ``"host_approval_prompt"``
+    when the waiting turn is the host's MCP approval prompt -- a request to
+    confirm a tool call, not a question the agent asked -- which is never
+    published as a structured interaction; that is not a shaping failure,
+    and the run is not discarded either. ``reason`` is one of
+    ``"no_anchor"``, ``"payload_too_large"``, or ``"empty_question"`` when a
+    waiting turn's draft existed but could not be shaped into a publishable
+    payload; each of those is a degrade, not a failure -- the run is not
+    discarded.
     """
 
     reason: NotApplicableReason | None
@@ -231,13 +262,13 @@ class NotApplicable:
 class FailClosed:
     """No structured row is published this round. What the caller must do
     about the *round itself* depends on which guard produced ``reason`` --
-    the five values split into two different consequences, not one.
+    the seven values split into two different consequences, not one.
 
-    ``"missing_draft"`` and ``"draft_status_mismatch"`` come from guard 1
-    (the waiting-status/draft-presence pairing) and do not discard the
-    round: no structured row is written and a stray draft is dropped, but
-    the finalizer's existing path for that status proceeds exactly as it
-    already does today.
+    ``"missing_draft"``, ``"draft_status_mismatch"``, and
+    the two event-identity failures (``"missing_event_id"`` and
+    ``"invalid_event_id"``) do not discard the round: no structured row is
+    written and a stray or unidentified draft is dropped, but the finalizer's
+    existing path for that status proceeds exactly as it already does today.
 
     ``"unfenced_lease"``, ``"ownership_changed"``, and ``"attempt_mismatch"``
     come from guards 2 through 4 and mean the opposite: this round's
@@ -257,18 +288,18 @@ ClarificationResolution = Publishable | NotApplicable | FailClosed
 
 
 def clarification_idempotency_key(draft: ClarificationDraft) -> str:
-    """Derive a ``stage()`` idempotency key from the draft's content.
+    """Reuse the question event identity as the ``stage()`` idempotency key.
 
-    Reads only ``turn_marker`` -- never ``message`` or ``interactions`` --
-    so that truncating or otherwise reshaping the payload in
-    :func:`build_clarification_payload` can never change the key a re-entrant
-    resume of the same turn produces. A key that moved with the payload
-    would turn a replay that should cost nothing (the active row already
-    matches) into a fresh request every time the payload's shape changed.
+    The runtime generates this identity before publishing the question and
+    carries it through the waiting checkpoint. Reusing it here makes the
+    outbound TraceEvent, checkpoint draft, and durable interaction row name
+    the same question occurrence. Payload truncation or reshaping cannot
+    move the key because none of the payload content participates in it.
     """
 
-    digest = hashlib.sha256(draft.turn_marker.encode("utf-8")).hexdigest()[:32]
-    return f"clarification.{digest}"
+    if not isinstance(draft.event_id, str):
+        raise TypeError("clarification event identity must be validated first")
+    return draft.event_id
 
 
 def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
@@ -279,6 +310,23 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     produce a different truncated length depending on how many control
     characters a truncated tail happened to contain -- the same input must
     always truncate to the same length.
+
+    After control-character filtering, each interaction's ``field`` goes
+    through ``normalize_interaction_text`` (``react.py``), the trim function
+    the write-side rules (``validate_v1_write_payload``) compare a field
+    against, so a control character removed next to an edge space cannot
+    leave that space behind for the write side to refuse. That covers each
+    field on its own, not uniqueness across fields: two fields that differ
+    only by a control character, such as ``"\x07a"`` and ``"a"``, both come
+    out as ``"a"``, and the write side refuses the pair as
+    ``field_duplicate``. ``message`` is
+    not trimmed: the write side only refuses a message that is blank under
+    that same function, and leading indentation or newlines (a code block,
+    for instance) are part of what the user should see. The blank judgment
+    itself is made by :func:`resolve_publishable_clarification`. Option
+    ``label`` / ``value``, ``message_type`` and ``requests`` are not
+    normalized either: trimming option text would change option values that
+    are valid today.
 
     Every step here degrades rather than raises: a control character is
     dropped silently (it was never visible to begin with), an over-length
@@ -347,6 +395,13 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         message_truncated = True
 
     interactions_cleaned = [_clean_leaves(dict(item)) for item in draft.interactions]
+    # Only the ``field`` key: ``_clean_leaves`` cannot see key names, and
+    # option ``label`` / ``value`` keep their edge whitespace on purpose.
+    # A non-string ``field`` is left as is for the v1 parser to refuse.
+    for item in interactions_cleaned:
+        field_value = item.get("field")
+        if isinstance(field_value, str):
+            item["field"] = normalize_interaction_text(field_value)
     interactions_dropped = False
     interactions_payload: list[Any] = interactions_cleaned
     if _serialized_byte_length(interactions_cleaned) > _INTERACTIONS_MAX_BYTES:
@@ -354,6 +409,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         interactions_dropped = True
 
     payload: dict[str, Any] = {
+        "event_id": draft.event_id,
         "message": question,
         "interactions": interactions_payload,
         "message_type": _strip_control_characters(draft.message_type),
@@ -391,14 +447,13 @@ def parse_clarification_payload(
     ``interactions`` comes back ``None``, not ``[]``, whenever the payload
     carries no interaction items. ``get_latest_waiting_question`` itself is
     not this consistent: it returns ``None`` for a persisted row whose
-    ``interactions`` column is ``NULL`` (the shape a ``send_message``-
-    sourced draft always produces, since that source's payload never has
-    any interactions to carry), but it returns ``[]`` for a row whose
-    column holds an actual empty list -- the shape an empty-form
-    ``ask_user_question`` call produces (a legal call: ``ask_user_question``
-    is classified by whether its request carries an ``interactions`` key at
-    all, not by whether that key's value is non-empty; see
-    ``draft_from_waiting_request``). That ``NULL``-vs-``[]`` split on the
+    ``interactions`` column is ``NULL`` but ``[]`` for a row whose column
+    holds an actual empty list. The ``NULL`` side no longer has a live
+    producer: every suspending ReAct path publishes at least one answerable
+    field, so only a run resuming a checkpoint written before that -- whose
+    stored request has no ``interactions`` key -- still reaches it. The
+    ``[]`` side does: an over-size form is dropped to ``[]`` above.
+    That ``NULL``-vs-``[]`` split on the
     legacy side is a known, un-reconciled divergence, not something this
     function reproduces: every empty case collapses to ``None`` here,
     deliberately, so a caller checking "did this turn have interactions"
@@ -455,14 +510,8 @@ def resolve_publishable_clarification(
     3. ``task.runner_id == lease.runner_id and task.run_id == lease.run_id``
        -- the task row must still be owned by the lease that produced the
        result.
-    4. ``lease.attempt_id is None or task.lease_attempt_id == lease.attempt_id``
-       -- ``None`` means the lease cannot prove attempt identity at all and
-       must be treated as "skip this check", never as "matches" (the same
-       reading ``interaction_handoff`` itself uses for the identical
-       sentinel). A concrete mismatch means a later attempt has already
-       claimed the row, and this settlement must be discarded wholesale
-       rather than degrade -- an attempt that is no longer current has no
-       business writing anything at all.
+    4. ``lease.attempt_id is not None and task.lease_attempt_id == lease.attempt_id``
+       -- a missing or superseded acquisition cannot publish a clarification.
 
        Guards 2 through 4 evaluate ``lease_is_fenced``,
        ``task_row_matches_lease_owner`` and ``task_row_matches_lease_attempt``
@@ -470,12 +519,37 @@ def resolve_publishable_clarification(
        interaction handoff's own re-check so the two cannot drift; the
        fail-closed classification each one produces here is this function's
        alone.
-    5. ``anchor is not None`` -- no resume anchor means this run's most
+    5. The draft is not the host's MCP approval prompt: a ``tool_waiting``
+       draft where *any* item in ``draft.requests`` carries an
+       ``interaction_id`` in the MCP approval gate's id format is
+       ``NotApplicable("host_approval_prompt")``. Any item, not all: a
+       multi-tool draft is published as a single row, so publishing it would
+       hand that approval to the structured-answer path. The other tools'
+       questions in such a mixed draft are therefore not published as a
+       structured interaction either; they stay on the legacy transcript
+       like every other ``NotApplicable`` outcome, and an info-level log
+       records that the mix happened. Only
+       ``tool_waiting`` drafts are checked -- ``ask_user_question`` and
+       ``send_message`` items carry a model-produced tool call id, which is
+       never excluded even if it happens to look like a gate id. This runs
+       after guards 2 through 4, because a fence failure must still discard
+       the round, and before the anchor check, so an approval wait is
+       neither reported as ``no_anchor`` nor shaped into a payload.
+       Recognising the gate's id format belongs to the gate module
+       (``is_gate_issued_interaction_id``); this function does not parse
+       the id itself. No degradation signal is registered.
+    6. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
-    5b. The payload built from the draft fits the character domain and size
+    7. ``draft.event_id`` is a non-empty string in the downstream command-ID
+       domain -- a question without the identity allocated before publication,
+       or with a restored identity that staging would normalize or reject,
+       cannot safely become a native interaction row. This fails closed for
+       native publication without discarding the round.
+    8. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
-        (empty after filtering, or reduced to only whitespace, or still
+        (empty after filtering, or reduced to only characters
+        ``normalize_interaction_text`` trims, or still
         oversized after truncation), that also degrades rather than fails.
         This check runs last because it is the only one that requires
         building the payload first.
@@ -560,12 +634,49 @@ def resolve_publishable_clarification(
     if not task_row_matches_lease_attempt(task, lease):
         return FailClosed("attempt_mismatch")
 
+    if draft.source == "tool_waiting":
+        gated_count = sum(
+            1
+            for item in draft.requests
+            if is_gate_issued_interaction_id(item.interaction_id)
+        )
+        if gated_count:
+            if gated_count < len(draft.requests):
+                logger.info(
+                    "an approval prompt shares its waiting turn with another "
+                    "tool's question; neither is published as a structured "
+                    "interaction",
+                    extra={
+                        "task_id": task.id,
+                        "run_id": lease.run_id,
+                        "gated_request_count": gated_count,
+                        "request_count": len(draft.requests),
+                    },
+                )
+            return NotApplicable("host_approval_prompt")
+
     if anchor is None:
         return NotApplicable("no_anchor")
 
+    if draft.event_id == "":
+        logger.warning(
+            "a clarification draft had no question event identity",
+            extra={"task_id": task.id, "run_id": lease.run_id},
+        )
+        return FailClosed("missing_event_id")
+
+    if (
+        not isinstance(draft.event_id, str)
+        or COMMAND_ID_PATTERN.fullmatch(draft.event_id) is None
+    ):
+        return FailClosed("invalid_event_id")
+
     payload = build_clarification_payload(draft)
 
-    if not payload["message"].strip():
+    # Judged with the write side's own trim function, not ``str.strip()``:
+    # the payload keeps the message's edge whitespace, and ``str.strip()``
+    # keeps a U+FEFF that the write side would refuse as ``message_blank``.
+    if not normalize_interaction_text(payload["message"]):
         return NotApplicable("empty_question")
 
     if _serialized_byte_length(payload) > _TOTAL_PAYLOAD_MAX_BYTES:

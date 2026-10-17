@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -11,7 +12,11 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionStepResult,
     WebIngestionResult,
 )
-from xagent.core.tools.core.RAG_tools.kb import KBApiOperationResult
+from xagent.core.tools.core.RAG_tools.kb import (
+    KBApiCompatibilityFacade,
+    KBApiFailedIngestCleanupDecision,
+    KBApiOperationResult,
+)
 from xagent.web.api import kb as kb_module
 from xagent.web.models.user import User
 
@@ -45,14 +50,10 @@ class _Facade:
         successful_documents: int | None = None,
     ) -> Any:
         self.single_cleanup_inputs.append((api_result, successful_documents))
-        return type(
-            "Decision",
-            (),
-            {
-                "successful_documents": 3,
-                "side_effects_may_remain": api_result.rollback_complete is False,
-            },
-        )()
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=3,
+            side_effects_may_remain=api_result.rollback_complete is False,
+        )
 
     def failed_batch_ingest_cleanup_decision(
         self,
@@ -61,14 +62,10 @@ class _Facade:
         successful_documents: int | None = None,
     ) -> Any:
         self.batch_cleanup_inputs.append((api_results, successful_documents))
-        return type(
-            "Decision",
-            (),
-            {
-                "successful_documents": 5,
-                "side_effects_may_remain": True,
-            },
-        )()
+        return KBApiFailedIngestCleanupDecision(
+            successful_documents=5,
+            side_effects_may_remain=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -115,8 +112,10 @@ async def test_api_failed_ingest_config_cleanup_uses_api_outcome_decision(
             "collection_name": "demo",
             "user": user,
             "context": "ingest",
-            "successful_documents": 3,
-            "side_effects_may_remain": True,
+            "decision": KBApiFailedIngestCleanupDecision(
+                successful_documents=3,
+                side_effects_may_remain=True,
+            ),
         }
     ]
 
@@ -160,8 +159,10 @@ async def test_api_failed_batch_ingest_config_cleanup_uses_api_outcome_decision(
             "collection_name": "demo",
             "user": user,
             "context": "ingest_cloud",
-            "successful_documents": 5,
-            "side_effects_may_remain": True,
+            "decision": KBApiFailedIngestCleanupDecision(
+                successful_documents=5,
+                side_effects_may_remain=True,
+            ),
         }
     ]
 
@@ -243,13 +244,12 @@ def test_background_web_cleanup_keeps_early_exception_fallback(
         db,
         payload,
         context="background web ingest",
-        successful_documents=0,
     )
     api_helper.assert_not_called()
 
 
 def _records_lookup(records: Any):
-    """Stub for kb.list_document_records driving failure-time decisions."""
+    """Stub for the facade's list_document_records driving failure-time decisions."""
 
     def _lookup(**kwargs: Any) -> Any:
         if isinstance(records, Exception):
@@ -271,15 +271,14 @@ def _records_lookup(records: Any):
     ],
 )
 def test_collection_holds_documents_reads_at_decision_time(
-    monkeypatch: pytest.MonkeyPatch,
     records: Any,
     on_error: bool,
     expected: bool,
 ) -> None:
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup(records))
+    facade = _facade_with(list_document_records=_records_lookup(records))
 
     assert (
-        kb_module._collection_holds_documents(
+        facade.collection_holds_documents(
             collection_name="shared-kb",
             user_id=3,
             context="test",
@@ -299,7 +298,6 @@ def test_collection_holds_documents_reads_at_decision_time(
 )
 @pytest.mark.asyncio
 async def test_collection_config_exists_reads_at_decision_time(
-    monkeypatch: pytest.MonkeyPatch,
     stored_config: Any,
     expected: bool,
 ) -> None:
@@ -308,16 +306,10 @@ async def test_collection_config_exists_reads_at_decision_time(
             raise stored_config
         return stored_config
 
-    monkeypatch.setattr(
-        kb_module,
-        "_get_api_compatibility_facade",
-        lambda: type(
-            "F", (), {"get_collection_config": staticmethod(_get_collection_config)}
-        )(),
-    )
+    facade = _facade_with(get_collection_config=_get_collection_config)
 
     assert (
-        await kb_module._collection_config_exists(
+        await facade._collection_config_exists(
             collection_name="shared-kb",
             user_id=3,
             context="test",
@@ -383,6 +375,11 @@ async def test_rollback_keeps_collection_whose_config_a_sibling_published(
     monkeypatch.setattr(kb_module, "delete_collection", delete_collection)
     monkeypatch.setattr(kb_module, "_restore_ingest_file_backup", MagicMock())
     monkeypatch.setattr(kb_module, "clear_ingestion_status", MagicMock())
+    monkeypatch.setattr(
+        kb_module,
+        "delete_document",
+        MagicMock(return_value=SimpleNamespace(status="success")),
+    )
 
     async def _published(**kwargs: Any) -> str:
         return '{"chunk_size": 512}'
@@ -390,7 +387,7 @@ async def test_rollback_keeps_collection_whose_config_a_sibling_published(
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
-        lambda: type("F", (), {"get_collection_config": staticmethod(_published)})(),
+        lambda: _facade_with(get_collection_config=_published),
     )
 
     user = User()
@@ -403,7 +400,14 @@ async def test_rollback_keeps_collection_whose_config_a_sibling_published(
         db=MagicMock(),
         user=user,
         collection_name="shared-kb",
-        result=IngestionResult(status="error", message="failed", doc_id="my-doc"),
+        result=IngestionResult(
+            status="error",
+            message="failed",
+            doc_id="my-doc",
+            completed_steps=[
+                {"name": "register_document", "metadata": {"created": True}}
+            ],
+        ),
         file_path=Path("/tmp/does-not-matter.pdf"),
         file_record=file_record,
         collection_existed_before=False,
@@ -422,14 +426,12 @@ async def test_cleanup_keeps_metadata_when_the_collection_holds_documents(
     """The stamped flag is stale; a config-only ghost holds no documents."""
     delete_metadata = AsyncMock()
     monkeypatch.setattr(
-        kb_module, "list_document_records", _records_lookup([{"file_id": "sibling"}])
-    )
-    monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
-        lambda: type(
-            "F", (), {"delete_collection_metadata": staticmethod(delete_metadata)}
-        )(),
+        lambda: _facade_with(
+            list_document_records=_records_lookup([{"file_id": "sibling"}]),
+            delete_collection_metadata=delete_metadata,
+        ),
     )
 
     user = User()
@@ -450,13 +452,13 @@ async def test_cleanup_removes_a_config_only_ghost(
 ) -> None:
     """A collection with no documents is the ghost this cleanup exists for."""
     delete_metadata = AsyncMock(return_value={"config_rows": 1})
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup([]))
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
-        lambda: type(
-            "F", (), {"delete_collection_metadata": staticmethod(delete_metadata)}
-        )(),
+        lambda: _facade_with(
+            list_document_records=_records_lookup([]),
+            delete_collection_metadata=delete_metadata,
+        ),
     )
 
     user = User()
@@ -674,9 +676,6 @@ async def test_documents_left_by_an_incomplete_rollback_are_published(
     its previous import saved.
     """
     save = AsyncMock()
-    monkeypatch.setattr(
-        kb_module, "list_document_records", _records_lookup([{"file_id": "leftover"}])
-    )
 
     async def _no_existing_config(**kwargs: Any) -> None:
         return None
@@ -684,14 +683,11 @@ async def test_documents_left_by_an_incomplete_rollback_are_published(
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
-        lambda: type(
-            "F",
-            (),
-            {
-                "save_collection_config": staticmethod(save),
-                "get_collection_config": staticmethod(_no_existing_config),
-            },
-        )(),
+        lambda: _facade_with(
+            list_document_records=_records_lookup([{"file_id": "leftover"}]),
+            save_collection_config=save,
+            get_collection_config=_no_existing_config,
+        ),
     )
 
     user = User()
@@ -749,7 +745,10 @@ def test_produced_documents_is_the_shared_publish_predicate(
 
 
 def _facade_with(**attrs: Any) -> Any:
-    return type("F", (), {k: staticmethod(v) for k, v in attrs.items()})()
+    """The real facade decisions over the stubbed store calls in `attrs`."""
+    return type(
+        "F", (KBApiCompatibilityFacade,), {k: staticmethod(v) for k, v in attrs.items()}
+    )()
 
 
 @pytest.mark.asyncio
@@ -757,12 +756,15 @@ async def test_metadata_cleanup_deletes_with_the_scope_it_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An admin-scoped delete would wipe a row another tenant owns by name."""
+    list_records = MagicMock(return_value=[])
     delete_metadata = AsyncMock(return_value={"config_rows": 1})
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup([]))
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
-        lambda: _facade_with(delete_collection_metadata=delete_metadata),
+        lambda: _facade_with(
+            list_document_records=list_records,
+            delete_collection_metadata=delete_metadata,
+        ),
     )
 
     user = User()
@@ -774,7 +776,15 @@ async def test_metadata_cleanup_deletes_with_the_scope_it_read(
         user=user,
     )
 
-    assert delete_metadata.await_args.kwargs["is_admin"] is False
+    list_records.assert_called_once_with(
+        collection_name="shared-kb", user_id=5, is_admin=False, max_results=1
+    )
+    delete_metadata.assert_awaited_once_with(
+        collection_name="shared-kb",
+        user_id=5,
+        is_admin=False,
+        delete_orphaned_metadata=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -785,13 +795,11 @@ async def test_publish_does_not_guess_when_the_store_read_fails(
     save = AsyncMock()
     monkeypatch.setattr(
         kb_module,
-        "list_document_records",
-        _records_lookup(RuntimeError("vector store down")),
-    )
-    monkeypatch.setattr(
-        kb_module,
         "_get_api_compatibility_facade",
-        lambda: _facade_with(save_collection_config=save),
+        lambda: _facade_with(
+            list_document_records=_records_lookup(RuntimeError("vector store down")),
+            save_collection_config=save,
+        ),
     )
 
     user = User()
@@ -818,13 +826,11 @@ async def test_cleanup_does_not_delete_when_the_store_read_fails(
     delete_metadata = AsyncMock()
     monkeypatch.setattr(
         kb_module,
-        "list_document_records",
-        _records_lookup(RuntimeError("vector store down")),
-    )
-    monkeypatch.setattr(
-        kb_module,
         "_get_api_compatibility_facade",
-        lambda: _facade_with(delete_collection_metadata=delete_metadata),
+        lambda: _facade_with(
+            list_document_records=_records_lookup(RuntimeError("vector store down")),
+            delete_collection_metadata=delete_metadata,
+        ),
     )
 
     user = User()
@@ -840,65 +846,85 @@ async def test_cleanup_does_not_delete_when_the_store_read_fails(
 
 
 @pytest.mark.parametrize(
-    ("existed_before", "other_document", "config", "may_delete"),
+    ("existed_before", "records", "register_created", "config", "reads", "may_delete"),
     [
-        (False, False, None, True),
-        # a sibling landed a document, or published the config
-        (False, True, None, False),
-        (False, False, "{}", False),
-        (True, False, None, False),
+        (False, [], True, None, True, True),
+        (False, [{"doc_id": "doc-1", "file_id": "f-1"}], True, None, True, True),
+        # a sibling landed a document (same-path ingests share a file_id), or
+        # published the config
+        (False, [{"doc_id": "other", "file_id": "f-1"}], True, None, False, False),
+        (
+            False,
+            [SimpleNamespace(doc_id="other", file_id="f-2")],
+            True,
+            None,
+            False,
+            False,
+        ),
+        (
+            False,
+            [
+                {"doc_id": "doc-1", "file_id": "f-1"},
+                {"doc_id": "other", "file_id": "f-1"},
+            ],
+            True,
+            None,
+            False,
+            False,
+        ),
+        (False, [], True, "{}", True, False),
+        (True, [], True, None, False, False),
+        # a run that holds no document of its own counts every record
+        (False, [{"doc_id": "doc-1", "file_id": "f-1"}], False, None, False, False),
     ],
 )
 @pytest.mark.asyncio
 async def test_rollback_may_delete_collection_reads_live_state(
-    monkeypatch: pytest.MonkeyPatch,
     existed_before: bool,
-    other_document: bool,
+    records: list[Any],
+    register_created: bool,
     config: Any,
+    reads: bool,
     may_delete: bool,
 ) -> None:
-    async def _get_collection_config(**kwargs: Any) -> Any:
-        return config
-
-    monkeypatch.setattr(
-        kb_module,
-        "_get_api_compatibility_facade",
-        lambda: _facade_with(get_collection_config=_get_collection_config),
-    )
+    get_config = AsyncMock(return_value=config)
+    facade = _facade_with(get_collection_config=get_config)
 
     assert (
-        await kb_module._rollback_may_delete_collection(
+        await facade.failed_ingest_may_delete_collection(
             collection_name="kb",
             user_id=5,
             collection_existed_before=existed_before,
-            other_document_present=other_document,
+            collection_records=records,
+            register_created=register_created,
+            doc_id="doc-1",
             context="test",
         )
         is may_delete
     )
+    if reads:
+        get_config.assert_awaited_once_with(collection="kb", user_id=5, is_admin=False)
+    else:
+        get_config.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_rollback_keeps_the_collection_when_the_config_read_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_rollback_keeps_the_collection_when_the_config_read_fails() -> None:
     """Unknown state must not authorize deleting a whole collection."""
 
     async def _get_collection_config(**kwargs: Any) -> Any:
         raise RuntimeError("metadata store down")
 
-    monkeypatch.setattr(
-        kb_module,
-        "_get_api_compatibility_facade",
-        lambda: _facade_with(get_collection_config=_get_collection_config),
-    )
+    facade = _facade_with(get_collection_config=_get_collection_config)
 
     assert (
-        await kb_module._rollback_may_delete_collection(
+        await facade.failed_ingest_may_delete_collection(
             collection_name="kb",
             user_id=5,
             collection_existed_before=False,
-            other_document_present=False,
+            collection_records=[],
+            register_created=False,
+            doc_id=None,
             context="test",
         )
         is False
@@ -970,7 +996,6 @@ async def test_unreadable_config_does_not_overwrite_an_existing_collection(
     async def _unreadable(**kwargs: Any) -> Any:
         raise RuntimeError("config store down")
 
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup([{"d": 1}]))
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
@@ -1005,7 +1030,6 @@ async def test_unreadable_config_still_publishes_a_new_collection(
     async def _unreadable(**kwargs: Any) -> Any:
         raise RuntimeError("config store down")
 
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup([{"d": 1}]))
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
@@ -1087,7 +1111,6 @@ async def test_config_save_failure_advice_matches_what_the_user_can_do(
     async def _no_existing_config(**kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr(kb_module, "list_document_records", _records_lookup([{"d": 1}]))
     monkeypatch.setattr(
         kb_module,
         "_get_api_compatibility_facade",
@@ -1112,3 +1135,75 @@ async def test_config_save_failure_advice_matches_what_the_user_can_do(
         )
 
     assert expected in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_failed_ingest_config_cleanup_follows_the_cleanup_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleaned: list[str] = []
+
+    async def fake_cleanup(*, collection_name: str, user: Any) -> None:
+        cleaned.append(collection_name)
+
+    monkeypatch.setattr(
+        kb_module, "_cleanup_failed_new_collection_metadata", fake_cleanup
+    )
+    user = User()
+    user.id = 3
+
+    await kb_module._cleanup_collection_metadata_after_failed_ingest(
+        collection_existed_before=False,
+        collection_name="demo",
+        user=user,
+        context="ingest",
+        decision=SimpleNamespace(  # type: ignore[arg-type]
+            keeps_new_collection_metadata=False,
+            successful_documents=5,
+            side_effects_may_remain=True,
+        ),
+    )
+
+    assert cleaned == ["demo"]
+
+
+@pytest.mark.asyncio
+async def test_failed_ingest_config_cleanup_warns_when_side_effects_may_remain(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cleaned: list[str] = []
+
+    async def fake_cleanup(*, collection_name: str, user: Any) -> None:
+        cleaned.append(collection_name)
+
+    monkeypatch.setattr(
+        kb_module, "_cleanup_failed_new_collection_metadata", fake_cleanup
+    )
+    caplog.set_level("WARNING", logger="xagent.web.api.kb")
+    user = User()
+    user.id = 3
+
+    await kb_module._cleanup_collection_metadata_after_failed_ingest(
+        collection_existed_before=False,
+        collection_name="demo",
+        user=user,
+        context="ingest",
+        decision=KBApiFailedIngestCleanupDecision(
+            successful_documents=0,
+            side_effects_may_remain=True,
+        ),
+    )
+
+    assert cleaned == []
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "xagent.web.api.kb"
+    ] == [
+        (
+            "WARNING",
+            "Skipping failed-ingest collection metadata cleanup for demo/user_3 "
+            "during ingest because rollback side effects may remain",
+        )
+    ]

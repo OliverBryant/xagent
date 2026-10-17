@@ -1,5 +1,6 @@
 """Gemini LLM implementation using official Google Generative AI SDK."""
 
+import asyncio
 import json
 import logging
 import os
@@ -10,12 +11,16 @@ from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors
 
 from ....utils.security import redact_sensitive_text
+from ...providers import is_placeholder_api_key
+from ..error import is_context_length_error
 from ..exceptions import (
+    LLMContextLengthError,
     LLMEmptyContentError,
     LLMInvalidResponseError,
     LLMRetryableError,
     LLMTimeoutError,
 )
+from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -78,21 +83,89 @@ def _flatten_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _sanitize_schema_for_gemini(schema: Any) -> Any:
-    """Remove JSON Schema keywords that Gemini function declarations reject."""
+    """Normalize JSON Schema fragments accepted by Gemini function declarations."""
     unsupported_keys = {
         # Pydantic/JSON Schema uses this for closed objects or dict value schemas.
         # google-genai converts it to additional_properties, which Gemini rejects
         # in function declaration schemas.
         "additionalProperties",
         "additional_properties",
+        "const",
+        "allOf",
     }
 
     if isinstance(schema, dict):
-        return {
-            key: _sanitize_schema_for_gemini(value)
-            for key, value in schema.items()
-            if key not in unsupported_keys
-        }
+        sanitized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in unsupported_keys:
+                continue
+            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+                if isinstance(value, dict):
+                    sanitized[key] = {
+                        name: _sanitize_schema_for_gemini(child)
+                        for name, child in value.items()
+                    }
+                else:
+                    sanitized[key] = value
+            else:
+                sanitized[key] = _sanitize_schema_for_gemini(value)
+        # Gemini's Schema model accepts one type string and string enum
+        # members. JSON Schema permits a type list and arbitrary JSON enum
+        # values, so normalize or drop those provider-incompatible forms.
+        schema_type = sanitized.get("type")
+        if isinstance(schema_type, list):
+            valid_types = list(
+                dict.fromkeys(
+                    item
+                    for item in schema_type
+                    if isinstance(item, str)
+                    and item
+                    in {
+                        "array",
+                        "boolean",
+                        "integer",
+                        "null",
+                        "number",
+                        "object",
+                        "string",
+                    }
+                )
+            )
+            if len(valid_types) == 1:
+                sanitized["type"] = valid_types[0]
+            elif "null" in valid_types and len(valid_types) == 2:
+                non_null_type = next(item for item in valid_types if item != "null")
+                sanitized["type"] = non_null_type
+                sanitized["nullable"] = True
+            elif valid_types:
+                sanitized.pop("type", None)
+                existing_any_of = sanitized.get("anyOf")
+                type_options = [{"type": item} for item in valid_types]
+                if isinstance(existing_any_of, list):
+                    type_options.extend(existing_any_of)
+                sanitized["anyOf"] = type_options
+            else:
+                sanitized.pop("type", None)
+        enum = sanitized.get("enum")
+        if isinstance(enum, list):
+            string_members = [item for item in enum if isinstance(item, str)]
+            has_null = any(item is None for item in enum)
+            if string_members and len(string_members) + int(has_null) == len(enum):
+                sanitized["enum"] = string_members
+                if has_null:
+                    sanitized["nullable"] = True
+            else:
+                sanitized.pop("enum", None)
+        else:
+            sanitized.pop("enum", None)
+        one_of = sanitized.pop("oneOf", None)
+        if isinstance(one_of, list):
+            existing_any_of = sanitized.get("anyOf")
+            if isinstance(existing_any_of, list):
+                sanitized["anyOf"] = existing_any_of + one_of
+            else:
+                sanitized["anyOf"] = one_of
+        return sanitized
     if isinstance(schema, list):
         return [_sanitize_schema_for_gemini(item) for item in schema]
     return schema
@@ -112,6 +185,17 @@ def _compact_repr(value: Any, limit: int = 500) -> str:
     except Exception:
         text = f"<unrepresentable {type(value).__name__}>"
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream after a deadline expired, best effort."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        await close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing aborted Gemini stream failed (%s)", type(exc).__name__)
 
 
 def _gemini_candidate_diagnostics(candidate: Any) -> Dict[str, Any]:
@@ -308,6 +392,12 @@ class GeminiLLM(BaseLLM):
         self, messages: List[Dict[str, Any]]
     ) -> tuple[Optional[str], List[Dict[str, Any]]]:
         """Convert OpenAI format messages to Gemini format."""
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field, never a
+        # ``dict(msg)`` copy, so an internal marker like
+        # ``_xagent_provider_state`` on the input is never read and cannot
+        # leak into the Gemini request. Switching any branch here to copy
+        # ``msg`` wholesale would reopen that leak.
         gemini_messages = []
         system_instruction = None
 
@@ -649,6 +739,9 @@ class GeminiLLM(BaseLLM):
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
 
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
+
             error_text = str(e)
             error_text_lower = error_text.lower()
 
@@ -688,12 +781,6 @@ class GeminiLLM(BaseLLM):
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
         """Stream chat completion using official Google Generative AI SDK."""
-        import time
-
-        first_token = True
-        last_token_time = None
-        start_time = time.time()
-
         current_content = ""
         usage_received = False
 
@@ -765,8 +852,31 @@ class GeminiLLM(BaseLLM):
             if merged_config:
                 api_params["config"] = types.GenerateContentConfig(**merged_config)
 
-            response_stream = await self._client.aio.models.generate_content_stream(
-                **api_params
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent, and without a configured ``base_url`` the SDK
+            # client has no HTTP timeout to bound it either (#3058). With tools
+            # (AFC is disabled in ``_build_gemini_tool_config``) the SDK sends
+            # the request and waits for the response headers inside
+            # ``generate_content_stream(...)``; without tools it sends the
+            # request on the first read. The first-token deadline bounds both.
+            loop = asyncio.get_running_loop()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            opened_at = loop.time()
+            first_token_deadline = opened_at + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
+            response_stream = await await_before_deadline(
+                self._client.aio.models.generate_content_stream(**api_params),
+                deadline=first_token_deadline,
+                timeout_message=first_token_message,
             )
 
             # Check if response_stream is None
@@ -776,31 +886,39 @@ class GeminiLLM(BaseLLM):
             candidate_diagnostics: List[Dict[str, Any]] = []
             partial_call_diagnostics: List[Dict[str, Any]] = []
             emitted_content_or_tool = False
+            emitted_tool_call = False
+            last_candidate_finish_reason: Any = None
             tool_call_index = 0
 
             # Process streaming response (async iteration)
-            async for chunk in response_stream:
-                current_time = time.time()
-
-                if first_token:
-                    elapsed = current_time - start_time
-                    if elapsed > self.timeout_config.first_token_timeout:
-                        raise LLMTimeoutError(
-                            f"First token timeout: {elapsed:.2f}s > "
-                            f"{self.timeout_config.first_token_timeout}s"
-                        )
-                    first_token = False
-                    logger.debug(f"First token received after {elapsed:.2f}s")
-
-                if last_token_time is not None:
-                    interval = current_time - last_token_time
-                    if interval > self.timeout_config.token_interval_timeout:
-                        raise LLMTimeoutError(
-                            f"Token interval timeout: {interval:.2f}s > "
-                            f"{self.timeout_config.token_interval_timeout}s"
-                        )
-
-                last_token_time = current_time
+            chunks = aiter(response_stream)
+            first_chunk = True
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_chunk:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                try:
+                    chunk = await await_before_deadline(
+                        anext(chunks),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(response_stream)
+                    raise
+                if first_chunk:
+                    first_chunk = False
+                    logger.debug(
+                        "First token received after %.2fs", loop.time() - opened_at
+                    )
 
                 # Check for usage metadata
                 if (
@@ -848,6 +966,7 @@ class GeminiLLM(BaseLLM):
                     continue
 
                 candidate = chunk.candidates[0]
+                last_candidate_finish_reason = getattr(candidate, "finish_reason", None)
                 diagnostics = _gemini_candidate_diagnostics(candidate)
                 if diagnostics:
                     candidate_diagnostics.append(diagnostics)
@@ -878,6 +997,7 @@ class GeminiLLM(BaseLLM):
                             continue
 
                         emitted_content_or_tool = True
+                        emitted_tool_call = True
                         yield StreamChunk(
                             type=ChunkType.TOOL_CALL,
                             tool_calls=[
@@ -925,10 +1045,28 @@ class GeminiLLM(BaseLLM):
                 )
                 return
 
-            # Yield end chunk
+            # Yield end chunk. Gemini reports STOP on the final chunk even for
+            # function-call turns, so tool calls are detected from what the
+            # stream actually emitted rather than trusted from the last
+            # candidate. MAX_TOKENS maps to the OpenAI-style "length" value
+            # this adapter already uses elsewhere (#2790 tracks the wider
+            # finish-reason vocabulary question).
+            end_finish_reason = "stop"
+            if emitted_tool_call:
+                end_finish_reason = "tool_calls"
+            else:
+                reason_value = getattr(
+                    last_candidate_finish_reason, "name", last_candidate_finish_reason
+                )
+                if (
+                    isinstance(reason_value, str)
+                    and reason_value.upper() == "MAX_TOKENS"
+                ):
+                    end_finish_reason = "length"
+
             yield StreamChunk(
                 type=ChunkType.END,
-                finish_reason="stop",
+                finish_reason=end_finish_reason,
                 raw=None,
             )
 
@@ -938,6 +1076,9 @@ class GeminiLLM(BaseLLM):
             logger.error(
                 "Gemini SDK streaming error: %s", redact_sensitive_text(str(e))
             )
+
+            if is_context_length_error(e):
+                raise LLMContextLengthError(str(e)) from e
 
             error_text = str(e)
             error_text_lower = error_text.lower()
@@ -993,7 +1134,7 @@ class GeminiLLM(BaseLLM):
 
     @staticmethod
     async def list_available_models(
-        api_key: str, base_url: Optional[str] = None
+        api_key: str, base_url: Optional[str] = None, *, raise_on_error: bool = False
     ) -> List[Dict[str, Any]]:
         """Fetch available models from Google Gemini API using SDK.
 
@@ -1002,6 +1143,14 @@ class GeminiLLM(BaseLLM):
             base_url: Base URL for the API (optional).
                 - If not provided, uses official Google Generative AI API
                 - If provided, uses the specified endpoint (e.g., proxy or custom service)
+            raise_on_error: Raise read failures instead of answering them
+                with an empty list; a rejected key (HTTP 401/403, or 400
+                ``API_KEY_INVALID``) is raised as ``ValueError``. A missing
+                or placeholder key is refused with ``ValueError`` before any
+                request, since ``genai.Client`` would replace a missing key
+                with ``GOOGLE_API_KEY``/``GEMINI_API_KEY``. Without this
+                option every failure, a rejected key included, returns an
+                empty list.
 
         Returns:
             List of available Gemini models with their information
@@ -1015,6 +1164,8 @@ class GeminiLLM(BaseLLM):
             ...     base_url="https://my-proxy.com/v1beta"
             ... )
         """
+        if raise_on_error and is_placeholder_api_key(api_key):
+            raise ValueError("An explicit, non-placeholder api_key is required")
         try:
             # Prepare HTTP options for custom base URL if configured
             http_options = None
@@ -1055,6 +1206,14 @@ class GeminiLLM(BaseLLM):
 
         except Exception as e:
             logger.error(f"Failed to fetch Gemini models: {e}")
+            if raise_on_error:
+                if isinstance(e, genai_errors.ClientError) and (
+                    e.code in (401, 403)
+                    # A wrong or expired key is a 400 with reason API_KEY_INVALID.
+                    or (e.code == 400 and "API_KEY_INVALID" in str(e.details))
+                ):
+                    raise ValueError("Gemini rejected the API key") from e
+                raise
             return []
 
     async def close(self) -> None:

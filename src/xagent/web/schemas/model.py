@@ -1,7 +1,9 @@
 from datetime import datetime
-from typing import Any, List, Optional, Set
+from typing import Any, List, Literal, Optional, Set
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from xagent.core.model.model import MODEL_ID_MAX_LENGTH, MODEL_NAME_MAX_LENGTH
 
 
 def _strip_whitespace(v: Any) -> Any:
@@ -116,12 +118,14 @@ def _validate_abilities_for_category(abilities: List[str], category: str) -> Lis
 class ModelCreate(BaseModel):
     """Model creation request schema"""
 
-    model_id: str
+    model_id: str = Field(max_length=MODEL_ID_MAX_LENGTH)
     category: str = "llm"
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Literal["api_key", "credentials_chain"] = "api_key"
     temperature: Optional[float] = None
     context_window: Optional[int] = None  # LLM total context window in tokens
     dimension: Optional[int] = None
@@ -137,7 +141,9 @@ class ModelCreate(BaseModel):
     format: Optional[str] = None  # TTS audio format (e.g., 'mp3', 'wav', 'pcm')
     sample_rate: Optional[int] = None  # TTS sample rate in Hz (e.g., 24000, 48000)
 
-    @field_validator("model_id", "model_name", "base_url", "api_key", mode="before")
+    @field_validator(
+        "model_id", "model_name", "base_url", "api_key", "bedrock_region", mode="before"
+    )
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)
@@ -160,9 +166,11 @@ class ModelUpdate(BaseModel):
 
     category: Optional[str] = None
     model_provider: Optional[str] = None
-    model_name: Optional[str] = None
+    model_name: Optional[str] = Field(default=None, max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
     temperature: Optional[float] = None
     context_window: Optional[int] = None  # LLM total context window in tokens
     dimension: Optional[int] = None
@@ -175,7 +183,9 @@ class ModelUpdate(BaseModel):
     format: Optional[str] = None  # TTS audio format (e.g., 'mp3', 'wav', 'pcm')
     sample_rate: Optional[int] = None  # TTS sample rate in Hz (e.g., 24000, 48000)
 
-    @field_validator("model_name", "base_url", "api_key", mode="before")
+    @field_validator(
+        "model_name", "base_url", "api_key", "bedrock_region", mode="before"
+    )
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)
@@ -204,8 +214,10 @@ class ModelResponse(BaseModel):
     model_id: str
     category: str
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     base_url: Optional[str]
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
     dimension: Optional[int]
@@ -252,9 +264,11 @@ class ModelConnectionTestRequest(BaseModel):
     """Request schema for testing an unsaved model connection"""
 
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Literal["api_key", "credentials_chain"] = "api_key"
     category: str = "llm"
     temperature: Optional[float] = None
     dimension: Optional[int] = None
@@ -262,7 +276,9 @@ class ModelConnectionTestRequest(BaseModel):
     top_n: Optional[int] = None
     instruct: Optional[str] = None
 
-    @field_validator("model_name", "base_url", "api_key", mode="before")
+    @field_validator(
+        "model_name", "base_url", "api_key", "bedrock_region", mode="before"
+    )
     @classmethod
     def strip_string_fields(cls, v: Any) -> Any:
         return _strip_whitespace(v)
@@ -356,8 +372,10 @@ class ModelWithAccessInfo(BaseModel):
     model_id: str
     category: str
     model_provider: str
-    model_name: str
+    model_name: str = Field(max_length=MODEL_NAME_MAX_LENGTH)
     base_url: Optional[str]
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
     dimension: Optional[int]
@@ -384,6 +402,73 @@ class ModelWithAccessInfo(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class AutoModelCandidateUpdate(BaseModel):
+    """Bind one saved model to the matching xrouter profile."""
+
+    target_model_id: int
+    routing_model_id: str
+
+    @field_validator("routing_model_id", mode="before")
+    @classmethod
+    def strip_routing_model_id(cls, v: Any) -> Any:
+        return _strip_whitespace(v)
+
+
+class AutoModelConfigUpdate(BaseModel):
+    """Create or replace the current user's Auto model configuration."""
+
+    strategy: Literal["balanced", "quality", "cost"] = Field(
+        default="balanced",
+        deprecated=True,
+        description="Deprecated compatibility field; Auto always uses xrouter auto.",
+    )
+    fallback_model_id: Optional[int] = None
+    set_as_default: Optional[bool] = None
+    candidates: List[AutoModelCandidateUpdate]
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> "AutoModelConfigUpdate":
+        if not self.candidates:
+            raise ValueError("Auto needs at least one candidate model")
+
+        target_ids = [candidate.target_model_id for candidate in self.candidates]
+        routing_ids = [candidate.routing_model_id for candidate in self.candidates]
+        if any(not routing_id for routing_id in routing_ids):
+            raise ValueError("routing_model_id must not be empty")
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("Each saved model can only appear once")
+        if len(routing_ids) != len(set(routing_ids)):
+            raise ValueError("Each routing profile can only appear once")
+        if (
+            self.fallback_model_id is not None
+            and self.fallback_model_id not in target_ids
+        ):
+            raise ValueError("The fallback model must be one of the candidates")
+        return self
+
+
+class AutoModelCandidateResponse(BaseModel):
+    routing_model_id: str
+    target_model_id: int
+    target_model: ModelWithAccessInfo
+
+
+class AutoModelConfigResponse(BaseModel):
+    configured: bool
+    strategy: Literal["balanced"] = "balanced"
+    fallback_model_id: Optional[int] = None
+    auto_model: Optional[ModelWithAccessInfo] = None
+    candidates: List[AutoModelCandidateResponse] = Field(default_factory=list)
+
+
+class RouterProfileResponse(BaseModel):
+    id: str
+    provider: Optional[str] = None
+    aliases: List[str] = Field(default_factory=list)
+    input_modalities: List[str] = Field(default_factory=list)
+    context_window: Optional[int] = None
 
 
 class FetchProviderModelsRequest(BaseModel):

@@ -3,9 +3,9 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
-from .trace import TraceAction, TraceCategory, TraceEventType, TraceScope
+from .trace import TraceAction, TraceCategory, TraceEventType, Tracer, TraceScope
 
 CHECKPOINT_TYPE = "agent_execution_checkpoint"
 LEGACY_CHECKPOINT_TYPES = frozenset({"agent_v2_execution_checkpoint"})
@@ -40,8 +40,28 @@ def checkpoint_execution_id(data: dict[str, Any]) -> str:
     )
 
 
+def supports_kwarg(method: Any, name: str) -> bool:
+    """Whether ``method`` accepts ``name`` as a keyword argument.
+
+    Used to decide whether a duck-typed tracer can be asked for persisted
+    delivery before it is treated as a durable checkpoint writer.
+    """
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    return name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 class CheckpointPersistenceError(RuntimeError):
     """Raised when a checkpoint cannot be durably persisted."""
+
+
+class ExecutionEventPersistenceError(CheckpointPersistenceError):
+    """An execution fact failed to commit; apply the checkpoint abort policy."""
 
 
 class CheckpointReadError(RuntimeError):
@@ -56,12 +76,24 @@ class CheckpointReadError(RuntimeError):
 
 
 class CheckpointUnavailableError(CheckpointReadError):
-    """Raised when a checkpoint read could not be completed.
+    """Raised when a checkpoint read did not produce an answer the reader
+    can vouch for.
 
-    Covers infrastructure failures only: session checkout, query
-    execution, and generic per-row decode errors such as a failed blob
-    prefetch. Rows that decode as permanently unreadable are classified
-    by the corrupt error once the matching set is exhausted.
+    Covers causes including infrastructure failure (session checkout,
+    query execution, and generic per-row decode errors such as a failed
+    blob prefetch) and a read whose partition decision was invalidated
+    before it produced a result (see the root-checkpoint read path's
+    re-probe at its own boundary). Rows that decode as permanently
+    unreadable are classified by the corrupt error instead, once the
+    matching set is exhausted.
+    """
+
+
+class UnknownToolEffectError(CheckpointReadError):
+    """A persisted attempt has no confirmed external outcome; do not replay it.
+
+    Unlike a transient read failure, retrying this checkpoint cannot establish
+    whether the tool performed its side effect before interruption.
     """
 
 
@@ -98,6 +130,30 @@ class CheckpointAccessRefusedError(CheckpointReadError):
         self.reason = reason
 
 
+def exposes_checkpoint_reader(reader: Any) -> bool:
+    """Whether ``reader`` has a checkpoint read method (it may still read nothing)."""
+    return any(
+        callable(getattr(reader, name, None)) for name in CHECKPOINT_READER_METHODS
+    )
+
+
+def can_read_checkpoints(reader: Any) -> bool:
+    """Whether a read through ``reader`` reaches a backend that can answer.
+
+    ``Tracer`` always exposes ``load_latest_checkpoint`` and returns ``None``
+    when no handler reads, so its handlers decide. An empty result from a
+    stack without one proves nothing about what was written.
+    """
+    while isinstance(reader, TraceCheckpointStore):
+        reader = reader.tracer
+    if isinstance(reader, Tracer):
+        return any(
+            callable(getattr(handler, "load_latest_checkpoint", None))
+            for handler in reader.handlers
+        )
+    return exposes_checkpoint_reader(reader)
+
+
 async def read_latest_checkpoint_payload(
     reader: Any,
     execution_id: str,
@@ -122,6 +178,110 @@ async def read_latest_checkpoint_payload(
     return None
 
 
+def _count(value: Any) -> int:
+    return len(value) if isinstance(value, (list, dict)) else 0
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(int(value), 0)
+
+
+def _message_count(context: Any) -> int:
+    return _count(context.get("messages")) if isinstance(context, dict) else 0
+
+
+def _accumulate_pattern_progress(state: Any, totals: dict[str, int]) -> None:
+    """Add one pattern state's progress counters into ``totals``.
+
+    Shapes are read by key rather than by pattern class so nested states
+    (an Auto child, a DAG step's ReAct) are walked the same way as top-level
+    ones, and a state missing a key simply contributes nothing.
+    """
+    if not isinstance(state, dict):
+        return
+
+    # ReAct: the iteration only advances once a turn's LLM response has been
+    # handled, and every executed tool call adds one ledger entry.
+    totals["iterations"] += _non_negative_int(state.get("current_iteration"))
+    totals["tool_calls"] += _count(state.get("tool_ledger"))
+
+    # DAG: a generated plan, each completed step, and the step-level ReAct
+    # states and contexts of steps still in flight.
+    plan = state.get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    if isinstance(steps, list):
+        totals["plan_steps"] += len(steps)
+        totals["completed_steps"] += sum(
+            1
+            for step in steps
+            if isinstance(step, dict) and step.get("status") == "completed"
+        )
+    raw_step_states = state.get("active_step_pattern_states")
+    step_states = dict(raw_step_states) if isinstance(raw_step_states, dict) else {}
+    raw_step_contexts = state.get("active_step_contexts")
+    step_contexts = (
+        dict(raw_step_contexts) if isinstance(raw_step_contexts, dict) else {}
+    )
+    # The singular fields are the legacy form of one entry of the dicts above;
+    # ``DAGPattern.load_state`` merges them with ``setdefault``, and so does
+    # this, so the same step is never counted twice.
+    active_step_id = state.get("active_step_id")
+    if isinstance(active_step_id, str) and active_step_id:
+        if state.get("active_step_pattern_state"):
+            step_states.setdefault(
+                active_step_id, state.get("active_step_pattern_state")
+            )
+        if state.get("active_step_context"):
+            step_contexts.setdefault(active_step_id, state.get("active_step_context"))
+    for step_state in step_states.values():
+        _accumulate_pattern_progress(step_state, totals)
+    for step_context in step_contexts.values():
+        totals["messages"] += _message_count(step_context)
+
+    # Auto: the selected child's state is carried inside the parent's.
+    _accumulate_pattern_progress(state.get("react_state"), totals)
+    _accumulate_pattern_progress(state.get("dag_state"), totals)
+
+
+def checkpoint_progress_marker(checkpoint: dict[str, Any] | None) -> str:
+    """Fingerprint how far a checkpoint's run has actually got.
+
+    Two checkpoints share a marker when they record the same position, even
+    if different runs wrote them: a resumed run rewrites ``before_llm`` at the
+    iteration it resumed from, and that rewrite must not read as progress. So
+    the marker is built only from counters that move when work is done, never
+    from labels, statuses, timestamps, ids or metadata:
+
+    * ``m`` -- messages in the root context plus in-flight DAG step contexts;
+    * ``i`` -- ReAct ``current_iteration``, summed over every ReAct state;
+    * ``t`` -- entries in every ReAct ``tool_ledger``;
+    * ``p`` -- steps in the DAG plan (generating a plan is progress);
+    * ``s`` -- DAG plan steps with status ``completed``.
+
+    Nested states (Auto's ``react_state``/``dag_state`` and DAG step ReAct
+    states) are summed into the same counters. Compare markers for equality
+    only: context compaction shrinks ``m``, and it still follows an LLM call.
+    Missing or malformed fields count as zero, so a legacy or partial
+    checkpoint yields a marker instead of raising.
+    """
+    totals = {
+        "messages": 0,
+        "iterations": 0,
+        "tool_calls": 0,
+        "plan_steps": 0,
+        "completed_steps": 0,
+    }
+    if isinstance(checkpoint, dict):
+        totals["messages"] += _message_count(checkpoint.get("context"))
+        _accumulate_pattern_progress(checkpoint.get("pattern_state"), totals)
+    return (
+        f"m{totals['messages']}:i{totals['iterations']}:t{totals['tool_calls']}"
+        f":p{totals['plan_steps']}:s{totals['completed_steps']}"
+    )
+
+
 @dataclass
 class TraceCheckpointStore:
     """Durable checkpoint adapter backed by the tracer event pipeline.
@@ -133,6 +293,18 @@ class TraceCheckpointStore:
 
     tracer: Any
     require_persisted: bool = True
+
+    @property
+    def records_execution_events(self) -> bool:
+        return getattr(self.tracer, "records_execution_events", False) is True
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return cast(
+            dict[str, Any] | None,
+            await self.tracer.load_committed_tool_outcome(tool_call),
+        )
 
     async def checkpoint(self, **payload: Any) -> str | None:
         return await self.save(payload)
@@ -154,7 +326,21 @@ class TraceCheckpointStore:
         execution_id = self._execution_id(payload)
         event_payload = self._event_payload(payload, execution_id=execution_id)
 
-        event_id = await self._call_checkpoint_writer(payload, event_payload)
+        # Normalize ordinary writer failures at the persistence boundary so
+        # callers can tell "the checkpoint is not durable" apart from "the
+        # step itself failed". ``CheckpointPersistenceError`` passes through
+        # unchanged, and ``BaseException`` (cancellation, ``SystemExit``,
+        # ``KeyboardInterrupt``) is deliberately not caught: those carry
+        # control-flow meaning that must not be downgraded to a persistence
+        # failure.
+        try:
+            event_id = await self._call_checkpoint_writer(payload, event_payload)
+        except CheckpointPersistenceError:
+            raise
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "Checkpoint writer failed before persistence was confirmed."
+            ) from exc
         if event_id is None:
             raise CheckpointPersistenceError(
                 "Tracer does not expose a durable checkpoint write API."
@@ -165,6 +351,8 @@ class TraceCheckpointStore:
         self,
         execution_id: str,
     ) -> dict[str, Any] | None:
+        if not exposes_checkpoint_reader(self.tracer):
+            raise CheckpointUnavailableError("Checkpoint store has no readable backend")
         payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
         return self._unwrap_checkpoint_payload(payload)
 
@@ -194,13 +382,38 @@ class TraceCheckpointStore:
 
         trace_event = getattr(self.tracer, "trace_event", None)
         if callable(trace_event):
-            if self.require_persisted and not self._supports_kwarg(
+            if self.require_persisted and not supports_kwarg(
                 trace_event,
                 "require_persisted",
             ):
                 raise CheckpointPersistenceError(
                     "Tracer.trace_event() cannot guarantee checkpoint persistence."
                 )
+            if self.require_persisted and isinstance(self.tracer, Tracer):
+                # ``Tracer.trace_event(require_persisted=True)`` only proves
+                # every handler currently attached to this ``Tracer``
+                # dispatched without raising, and that at least one handler
+                # is registered -- it does not prove any of them can durably
+                # store this checkpoint and later answer a read for it. A
+                # ``Tracer`` wired with only observational handlers (for
+                # example ``ConsoleTraceHandler``) would otherwise "succeed"
+                # here and still lose the checkpoint on a cold resume, since
+                # no handler is capable of ``load_latest_checkpoint``. This
+                # check is scoped to genuine ``Tracer`` instances: a
+                # duck-typed writer that implements its own
+                # ``trace_event(require_persisted=...)`` (with no
+                # ``.handlers`` list to inspect) already made its own
+                # persistence promise via the kwarg check above, and is
+                # trusted at face value as before.
+                if not any(
+                    callable(getattr(handler, "load_latest_checkpoint", None))
+                    for handler in self.tracer.handlers
+                ):
+                    raise CheckpointPersistenceError(
+                        "Tracer has no checkpoint-reading handler attached; "
+                        "its trace_event(require_persisted=True) acknowledgement "
+                        "cannot be trusted as a durable checkpoint write."
+                    )
             result = trace_event(
                 self._checkpoint_trace_event_type(trace_event),
                 task_id=event_payload["root_execution_id"],
@@ -279,16 +492,6 @@ class TraceCheckpointStore:
                 "Checkpoint payload is missing execution_id."
             )
         return str(execution_id)
-
-    def _supports_kwarg(self, method: Any, name: str) -> bool:
-        try:
-            signature = inspect.signature(method)
-        except (TypeError, ValueError):
-            return False
-        return name in signature.parameters or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
 
     def _checkpoint_trace_event_type(self, trace_event: Any) -> Any:
         del trace_event

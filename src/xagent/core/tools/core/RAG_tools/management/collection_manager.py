@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from ..kb import (
         CollectionConfigSnapshot,
         CollectionRollbackMaintenanceResult,
+        KBCoordinator,
         KBMaintenanceCompatibilityFacade,
     )
 
@@ -1190,7 +1191,10 @@ async def rebuild_collection_stats(
 
 async def _rebuild_collection_stats_impl(
     collection_name: str,
+    coordinator: "KBCoordinator | None" = None,
 ) -> Optional["CollectionInfo"]:
+    from .collections import _resolve_coordinator
+
     try:
         existing_info: Optional[
             CollectionInfo
@@ -1202,7 +1206,7 @@ async def _rebuild_collection_stats_impl(
     # aggregate_collection_stats is a synchronous LanceDB scan: keep it off the
     # event loop so it cannot stall every other coroutine in the process.
     stats_by_collection = await asyncio.to_thread(
-        get_vector_index_store().aggregate_collection_stats,
+        _resolve_coordinator(coordinator).aggregate_collection_stats_sync,
         user_id=None,
         is_admin=True,
     )
@@ -1258,8 +1262,9 @@ def rebuild_collection_stats_sync(
 
 def _rebuild_collection_stats_sync_impl(
     collection_name: str,
+    coordinator: "KBCoordinator | None" = None,
 ) -> Optional["CollectionInfo"]:
-    return _sync_wrapper(_rebuild_collection_stats_impl)(collection_name)
+    return _sync_wrapper(_rebuild_collection_stats_impl)(collection_name, coordinator)
 
 
 def resolve_effective_embedding_model_sync(
@@ -1413,12 +1418,16 @@ async def rebuild_collection_metadata() -> None:
     await _get_maintenance_compatibility_facade().rebuild_collection_metadata()
 
 
+_ENGINE_COUNTS = ("documents", "parses", "chunks", "embeddings")
+
+
 async def _rebuild_collection_metadata_impl() -> None:
     """Implementation for rebuild_collection_metadata."""
+    from ..kb.collection_handle import ledger_holds_vectors
     from . import collections
+    from .collections import _resolve_coordinator
 
     # Get all existing collections (use is_admin=True to bypass user filtering)
-    # force_realtime=True to avoid reading stale metadata cache.
     result = await collections.list_collections(is_admin=True, force_realtime=True)
 
     if result.status != "success":
@@ -1428,10 +1437,20 @@ async def _rebuild_collection_metadata_impl() -> None:
     if not result.collections:
         return
 
+    # Unreported collections have unknown counts: a stored row with vectors is
+    # left as is, one without keeps its counts and the normal binding rule.
+    engine_stats = await asyncio.to_thread(
+        _resolve_coordinator(None).aggregate_collection_stats_sync,
+        user_id=None,
+        is_admin=True,
+    )
+
     # Get connection and find embeddings tables
     vector_store = get_vector_index_store()
-    table_names = vector_store.list_table_names()
-    embeddings_tables = [t for t in table_names if t.startswith("embeddings_")]
+    embeddings_tables: list[str] = []
+    if ledger_holds_vectors():
+        table_names = vector_store.list_table_names()
+        embeddings_tables = [t for t in table_names if t.startswith("embeddings_")]
 
     # Build lookup from legacy/new table tags to Hub model IDs.
     hub_tag_to_id: dict[str, tuple[str, Optional[int]]] = {}
@@ -1477,7 +1496,35 @@ async def _rebuild_collection_metadata_impl() -> None:
             embedding_model_id = None
             embedding_dimension = None
 
-            if collection.embeddings > 0:
+            engine = engine_stats.get(collection.name)
+            if engine is not None:
+                # Counts and the reported decision come from this one read.
+                collection = collection.model_copy(
+                    update={
+                        **{k: engine.get(k, 0) for k in _ENGINE_COUNTS},
+                        "processed_documents": engine.get("parses", 0),
+                    }
+                )
+            else:
+                try:
+                    stored = await get_metadata_store().get_collection(collection.name)
+                except Exception as e:  # noqa: BLE001 - unknown state, keep the row
+                    # A corrupt row raises pydantic's ValidationError, also a ValueError.
+                    if not (isinstance(e, ValueError) and "not found" in str(e)):
+                        logger.warning(
+                            "Skipping rebuild of '%s': cannot read its row: %s",
+                            collection.name,
+                            e,
+                        )
+                        continue
+                    stored = None
+                if stored is not None:
+                    if stored.embeddings > 0:
+                        continue
+                    collection = stored
+
+            # Redundant at run time; a direct gate the bypass guard can see.
+            if collection.embeddings > 0 and ledger_holds_vectors():
                 # Find which embeddings table has data for this collection
                 for table_name in embeddings_tables:
                     # Use abstraction layer to count rows
@@ -1504,12 +1551,17 @@ async def _rebuild_collection_metadata_impl() -> None:
 
                         break
 
-            # Update collection with embedding info
-            updated_collection = collection.model_copy(
-                update={
-                    "embedding_model_id": embedding_model_id,
-                    "embedding_dimension": embedding_dimension,
-                }
+            # Vectors the engine counts but no embeddings_* table holds: keep the
+            # stored model. Zero vectors still clear it so the KB can be rebound.
+            updated_collection = (
+                collection
+                if collection.embeddings > 0 and embedding_model_id is None
+                else collection.model_copy(
+                    update={
+                        "embedding_model_id": embedding_model_id,
+                        "embedding_dimension": embedding_dimension,
+                    }
+                )
             )
 
             # Use the async save_collection method through sync wrapper

@@ -221,17 +221,26 @@ def test_build_preview_splits_importable_and_archived(openclaw_home: Path) -> No
 
 @pytest.fixture
 def db_session() -> Iterator[object]:
+    from xagent.web.models import database
     from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 
+    previous = database._SessionLocal, database._engine
     temp_dir = tempfile.mkdtemp()
     db_url = f"sqlite:///{os.path.join(temp_dir, 'test.db')}"
-    init_db(db_url=db_url)
-    session = get_session_local()()
     try:
-        yield session
+        init_db(db_url=db_url)
+        engine = get_engine()
+        session = get_session_local()()
+        try:
+            yield session
+        finally:
+            session.close()
+            Base.metadata.drop_all(bind=engine)
     finally:
-        session.close()
-        Base.metadata.drop_all(bind=get_engine())
+        engine = database._engine
+        database._SessionLocal, database._engine = previous
+        if engine is not None and engine is not previous[1]:
+            engine.dispose()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -248,6 +257,37 @@ def _make_user(db) -> object:
     db.commit()
     db.refresh(user)
     return user
+
+
+def test_database_teardown_preserves_standalone_document_registration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from xagent.core.tools.core.RAG_tools.file.register_document import (
+        register_document,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+        LanceDBVectorIndexStore,
+    )
+    from xagent.web.models import database
+
+    monkeypatch.setattr(database, "_SessionLocal", None)
+    monkeypatch.setattr(database, "_engine", None)
+    lifecycle = db_session.__wrapped__()
+    try:
+        next(lifecycle)
+    finally:
+        lifecycle.close()
+
+    source = tmp_path / "standalone.txt"
+    source.write_text("A source independent of the temporary Web database.")
+    result = register_document(
+        collection="standalone", source_path=str(source), file_id="standalone-file"
+    )
+    assert result["created"] is True
+    records = LanceDBVectorIndexStore().list_document_records_by_file_ids(
+        ["standalone-file"]
+    )
+    assert [row.doc_id for row in records] == [result["doc_id"]]
 
 
 def test_loader_imports_agent_skills_and_interval_schedule(
@@ -690,9 +730,7 @@ def test_cli_run_imports_end_to_end(
     user_id = int(user.id)
     # Point the CLI at the already-initialized test database.
     monkeypatch.setattr("xagent.web.models.database.init_db", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: lambda: db_session
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", lambda: db_session)
     args = argparse.Namespace(
         source="hermes",
         source_dir=hermes_home,
@@ -734,3 +772,66 @@ def test_dry_run_never_initializes_the_db(
     assert cli.run(args) == 0
     out = capsys.readouterr().out
     assert "dry-run: no changes made." in out
+
+
+def test_loader_reports_skills_refused_by_the_shared_validation_gate(
+    db_session,
+) -> None:
+    """A bundle the archive layer refuses becomes a report error, not a crash.
+
+    ``_write_skill`` delegates to Skill Hub's ``_write_personal_skill``, so the
+    validation added to that shared boundary — blank ``SKILL.md``, duplicate
+    canonical paths, over-long paths, unparsable bundles — now governs
+    migration too. That is intended, but it changes what an import does with a
+    bundle the source platform happily held, so the per-skill error path needs
+    to hold: one bad skill is reported and skipped, and the good ones around it
+    still import.
+    """
+    from xagent.web.models.skill import UserSkill
+
+    user = _make_user(db_session)
+    good = SkillItem(
+        name="keeper",
+        files={"SKILL.md": b"---\ndescription: fine\n---\n# Keeper\n"},
+        source_path="/src/keeper",
+    )
+    blank = SkillItem(
+        name="blank-one",
+        files={"SKILL.md": b"   \n\t"},
+        source_path="/src/blank-one",
+    )
+    unparsable = SkillItem(
+        name="bad-template",
+        files={
+            "SKILL.md": b"---\ndescription: fine\n---\n# Bad\n",
+            "template.md": b"\xff\xfe not utf-8",
+        },
+        source_path="/src/bad-template",
+    )
+    # Ordered so a valid skill follows both rejections. With the good one
+    # first, the only successful write precedes every failure and the test
+    # cannot fail if a rejection left the session unusable for what comes
+    # after it -- which is the half that actually needs guarding.
+    trailing = SkillItem(
+        name="after-the-failures",
+        files={"SKILL.md": b"---\ndescription: fine\n---\n# After\n"},
+        source_path="/src/after-the-failures",
+    )
+    bundle = MigrationBundle(
+        source="openclaw",
+        source_root="/src",
+        skills=[good, blank, unparsable, trailing],
+    )
+
+    report = MigrationLoader(db_session, user=user).load(bundle)
+
+    assert report.skills_imported == ["keeper", "after-the-failures"]
+    stored = db_session.query(UserSkill).filter(UserSkill.user_id == user.id).all()
+    assert {s.name for s in stored} == {"keeper", "after-the-failures"}
+
+    errors = "\n".join(report.errors)
+    assert "blank-one" in errors
+    assert "bad-template" in errors
+    # The rejection reason has to survive into the operator-facing report.
+    assert "empty" in errors.lower()
+    assert "template.md" in errors

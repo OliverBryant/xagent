@@ -174,7 +174,7 @@ def test_oauth_landing_rejects_non_oauth_app():
     with pytest.raises(AppNotOAuthError, match="not an OAuth app"):
         _ensure_user_mcp_server(
             None,
-            "1",
+            1,
             {"id": "google-maps", "name": "Google Maps", "auth_type": "api_key"},
         )
 
@@ -215,7 +215,7 @@ def test_builtin_runtime_view_overlays_stale_execution_fields(catalog_db):
     assert app["name"] == "Gmail"
     assert app["transport"] == "oauth"
     assert app["provider"] == "google"
-    assert app["oauth_scopes"] == ["https://www.googleapis.com/auth/gmail.modify"]
+    assert app["oauth_scopes"] == []
     assert app["launch_config"] == {
         "command": "python",
         "args": ["-m", "xagent.web.tools.mcp.gmail"],

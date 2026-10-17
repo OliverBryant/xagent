@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timedelta
 from threading import Barrier, Event, get_ident
@@ -17,12 +18,20 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT, eventually
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    assert_pool_checkout_off_loop,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
+from tests.web.services.task_lease_shared import (
+    live_task_lease as live_task_lease_fixture,
+)
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
-from xagent.web.api.websocket import (
-    _load_command_message_delivery_status,
-    execute_durable_task_command,
-)
 from xagent.web.models import database as database_module
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
@@ -34,13 +43,19 @@ from xagent.web.models.database import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
+from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_command_transport as task_command_transport_module
+from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services.task_command_execution import (
+    _load_command_message_delivery_status,
+    execute_durable_task_command,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
     COMMAND_PENDING,
-    DISPATCHER_IDLE_SECONDS,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
     ClaimedTaskCommand,
@@ -60,6 +75,7 @@ from xagent.web.services.task_command_transport import (
     fail_task_command,
     finish_task_command,
     load_task_command,
+    max_command_defers,
     notify_task_command_dispatcher,
     renew_task_command_claim,
     retry_failed_task_command,
@@ -67,7 +83,10 @@ from xagent.web.services.task_command_transport import (
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
     task_has_live_foreign_runner,
+    task_has_live_runner,
 )
+
+live_task_lease = live_task_lease_fixture
 
 
 @pytest.fixture()
@@ -115,8 +134,7 @@ def low_timeout_sqlite_engine(tmp_path):
         f"sqlite:///{tmp_path / 'task-command-lock-path.db'}",
         connect_args={"check_same_thread": False},
     )
-    # Long enough to stay clear of thread-scheduling jitter under a loaded
-    # test run, short enough to keep the lock-path tests well under 2s.
+    # Keep SQLite lock waits short without asserting wall-clock performance.
     apply_sqlite_concurrency_pragmas(engine, busy_timeout_ms=200)
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -222,6 +240,46 @@ def test_enqueue_is_committed_and_idempotent(db_session) -> None:
     assert duplicate.payload_matches is True
     assert conflict.payload_matches is False
     assert db_session.query(TaskExecutionCommand).count() == 1
+
+
+def test_reused_actor_id_does_not_match_a_legacy_command(db_session) -> None:
+    user, task = _create_running_task(db_session)
+    actor_id = int(user.id)
+    task_id = int(task.id)
+    legacy = TaskExecutionCommand(
+        task_id=task_id,
+        actor_user_id=actor_id,
+        actor_subject=f"legacy-user-id:{actor_id}",
+        command_id="legacy-actor-idempotency",
+        kind=TaskCommandKind.PAUSE.value,
+        payload={"type": "pause_task"},
+    )
+    db_session.add(legacy)
+    db_session.commit()
+    assert user.actor_subject != legacy.actor_subject
+
+    duplicate = stage_task_command(
+        db_session,
+        task_id=task_id,
+        actor_user_id=actor_id,
+        command_id=legacy.command_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    classification = classify_task_command_conflict(
+        db_session,
+        task_id=task_id,
+        command_id=legacy.command_id,
+        actor_user_id=actor_id,
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+
+    assert duplicate.created is False
+    assert duplicate.payload_matches is False
+    assert classification.kind is TaskCommandConflictKind.RACED_DUPLICATE
+    assert classification.raced is not None
+    assert classification.raced.payload_matches is False
 
 
 def test_live_run_command_stays_with_owner_until_task_lease_expires(
@@ -371,6 +429,12 @@ def test_stale_attempt_cannot_mutate_reclaimed_command(db_session) -> None:
     assert row.status == "processing"
     assert row.claimed_by == "runner-a"
     assert row.attempt_count == second.attempt_count
+    assert (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+        .count()
+        == 0
+    )
 
 
 def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
@@ -378,11 +442,14 @@ def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
 
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is True
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-a") is False
+    assert task_has_live_runner(int(task.id), expected_run_id="run-1") is True
+    assert task_has_live_runner(int(task.id), expected_run_id="run-2") is False
 
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
 
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is False
+    assert task_has_live_runner(int(task.id), expected_run_id="run-1") is False
 
 
 @pytest.mark.asyncio
@@ -437,24 +504,75 @@ async def test_cancel_command_defers_on_a_live_foreign_owner(db_session) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [TaskCommandKind.PAUSE, TaskCommandKind.RESUME])
-async def test_control_command_defers_on_a_live_foreign_owner(
-    db_session,
-    kind: TaskCommandKind,
-) -> None:
+async def test_pause_command_defers_on_a_live_foreign_owner(db_session) -> None:
     user, task = _create_running_task(db_session)
     command = ClaimedTaskCommand(
         id=1,
         task_id=int(task.id),
         actor_user_id=int(user.id),
-        command_id=f"misrouted-{kind.value}",
-        kind=kind,
-        payload={"type": f"{kind.value}_task"},
+        command_id="misrouted-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
         target_run_id=None,
         attempt_count=1,
     )
 
     with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_when_the_target_run_has_a_live_foreign_owner(
+    db_session,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.control_state = "running"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="idempotent-foreign-resume",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    result = await execute_durable_task_command(command)
+
+    assert result is not None
+    assert result["resume_outcome"] == "already_in_progress"
+
+
+@pytest.mark.asyncio
+async def test_resume_defers_when_a_settling_turn_still_holds_a_foreign_lease(
+    db_session,
+) -> None:
+    """RESUME still defers for a foreign lease in a state it cannot classify.
+
+    The idempotency evidence only settles RUNNING rows. A turn that has
+    committed WAITING_FOR_USER but whose lease columns have not been cleared
+    yet is not evidence that anything is resuming, so the command must defer
+    rather than schedule into the previous owner's live lease.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.status = TaskStatus.WAITING_FOR_USER
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="resume-into-foreign-lease",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandDeferred):
         await execute_durable_task_command(command)
 
 
@@ -476,7 +594,7 @@ async def test_cancel_command_does_not_require_persisted_actor(db_session) -> No
     )
 
     with (
-        patch.object(websocket_api, "_load_command_actor") as load_actor,
+        patch.object(command_execution_service, "_load_command_actor") as load_actor,
         pytest.raises(ValueError, match="Agent ID is missing"),
     ):
         await execute_durable_task_command(command)
@@ -603,7 +721,7 @@ async def test_final_command_deferral_is_broadcast(db_session) -> None:
         payload={"agent_id": 1},
         target_run_id=None,
         attempt_count=1,
-        defer_count=MAX_COMMAND_DEFERS - 1,
+        defer_count=max_command_defers() - 1,
     )
 
     with patch.object(
@@ -808,7 +926,7 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     )
     row = db_session.get(TaskExecutionCommand, message.command_id)
     assert row is not None
-    row.defer_count = MAX_COMMAND_DEFERS - 1
+    row.defer_count = max_command_defers() - 1
     db_session.commit()
 
     async def defer(_command):
@@ -820,7 +938,14 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row is not None
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
-    assert row.defer_count == MAX_COMMAND_DEFERS
+    assert row.defer_count == max_command_defers()
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == message.command_id)
+        .one()
+    )
+    assert event.outcome == COMMAND_FAILED
+    assert event.outcome_version == row.attempt_count
 
     cancel_claim = claim_task_command(db_session)
     assert cancel_claim is not None
@@ -870,7 +995,7 @@ def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
     assert row is not None
     row.status = COMMAND_FAILED
     row.failure_count = MAX_COMMAND_FAILURES
-    row.defer_count = MAX_COMMAND_DEFERS
+    row.defer_count = max_command_defers()
     row.error = "temporary cancellation failure"
     row.completed_at = datetime.utcnow()
     db_session.commit()
@@ -893,6 +1018,7 @@ def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
 
 @pytest.mark.asyncio
 async def test_recovery_dispatches_committed_message_across_run_rotation(
+    live_task_lease,
     db_session,
 ) -> None:
     user, task = _create_running_task(db_session)
@@ -930,35 +1056,56 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     task.run_id = "run-2"
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
+    live_task_lease(db_session, task)
 
     runtime_agent = MagicMock()
     runtime_agent.supports_live_control.return_value = True
-    runtime_agent.post_user_message = AsyncMock(return_value=True)
+    runtime_agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     runtime_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )
-    resume = AsyncMock()
+    allow_resume_to_finish = asyncio.Event()
+
+    async def hold_resume(*args, **kwargs) -> None:
+        await allow_resume_to_finish.wait()
+
+    resume = AsyncMock(side_effect=hold_resume)
+    resume_task = None
 
     with (
         patch(
-            "xagent.web.api.chat.get_agent_manager",
+            "xagent.web.services.agent_service_manager.get_agent_manager",
             return_value=runtime_manager,
         ),
-        patch.object(websocket_api, "execute_resume_background", new=resume),
+        patch.object(task_execution_service, "execute_resume_background", new=resume),
     ):
-        assert await dispatch_one_task_command(
-            execute_durable_task_command,
-            command_db_id=enqueued.command_id,
-        )
-        resume_task = websocket_api.background_task_manager.resume_tasks.get(
-            int(task.id)
-        )
-        assert resume_task is not None
-        await resume_task
-        websocket_api.background_task_manager.cleanup_task(
-            int(task.id),
-            expected_task=resume_task,
-        )
+        try:
+            assert await dispatch_one_task_command(
+                execute_durable_task_command,
+                command_db_id=enqueued.command_id,
+            )
+            # A completed mock can already have been unregistered by the time
+            # command dispatch returns. Hold execution to inspect live ownership.
+            resume_task = (
+                task_execution_service.background_task_manager.resume_tasks.get(
+                    int(task.id)
+                )
+            )
+            assert resume_task is not None
+            assert not resume_task.done()
+        finally:
+            allow_resume_to_finish.set()
+            if resume_task is not None:
+                await asyncio.wait_for(resume_task, timeout=1)
+
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.resume_tasks
+    )
+    assert (
+        int(task.id) not in task_execution_service.background_task_manager.running_tasks
+    )
 
     db_session.expire_all()
     messages = (
@@ -972,6 +1119,12 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
     assert command is not None
     assert command.status == COMMAND_COMPLETED
     assert task.run_id == "run-2"
+    assert (
+        runtime_manager.get_agent_for_task.await_args.kwargs[
+            "connector_runtime_turn_id"
+        ]
+        == "committed-turn"
+    )
     runtime_agent.post_user_message.assert_awaited_once()
     assert runtime_agent.post_user_message.await_args.kwargs["turn_id"] == (
         "committed-turn"
@@ -1003,17 +1156,17 @@ async def test_dispatcher_recovers_command_that_predates_worker_start(
         applied.set()
         return None
 
+    def completed() -> bool:
+        db_session.expire_all()
+        stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+        return stored is not None and stored.status == COMMAND_COMPLETED
+
     start_task_command_dispatcher(execute)
     try:
-        await asyncio.wait_for(applied.wait(), timeout=2)
-        for _ in range(100):
-            db_session.expire_all()
-            stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
-            if stored is not None and stored.status == COMMAND_COMPLETED:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("dispatcher did not complete recovered command")
+        # Anti-hang bounds: the claim and completion each wait on a real
+        # SQLite commit, which a loaded CI runner can stall for seconds.
+        await asyncio.wait_for(applied.wait(), timeout=DB_PROGRESS_TIMEOUT)
+        await eventually(completed)
     finally:
         await stop_task_command_dispatcher()
     db_session.expire_all()
@@ -1163,7 +1316,7 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
         session_threads.append(get_ident())
         return SessionLocal()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
 
     held_connection = engine.connect()
     loop_thread = get_ident()
@@ -1179,20 +1332,28 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
     async def execute(command: ClaimedTaskCommand) -> None:
         assert isinstance(command, ClaimedTaskCommand)
 
-    ticker_task = asyncio.create_task(ticker())
-    dispatch_task = asyncio.create_task(
-        dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
-    )
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 3, "command claim QueuePool checkout blocked the event loop"
-        assert not dispatch_task.done()
-    finally:
-        held_connection.close()
-        ticker_stop.set()
-        await ticker_task
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        dispatch_task = asyncio.create_task(
+            dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
+        )
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS, (
+                "command claim QueuePool checkout blocked the event loop"
+            )
+            assert not dispatch_task.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            ticker_stop.set()
+            await asyncio.wait_for(
+                asyncio.gather(dispatch_task, ticker_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
 
-    assert await asyncio.wait_for(dispatch_task, timeout=1)
+    assert dispatch_task.result()
     assert session_threads
     assert session_threads[0] != loop_thread
 
@@ -1220,16 +1381,9 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
         )
         task_id = int(task.id)
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     def checkout_from_exhausted_pool() -> None:
         with SessionLocal() as db:
@@ -1237,27 +1391,24 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
 
     async def execute(_command: ClaimedTaskCommand) -> None:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         await asyncio.to_thread(checkout_from_exhausted_pool)
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "command handler QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)
@@ -1380,40 +1531,30 @@ async def test_real_final_disposition_pool_timeout_stays_off_event_loop(
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
-    ticker_stop = asyncio.Event()
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while not ticker_stop.is_set():
-            ticks += 1
-            await asyncio.sleep(0.01)
+    checkout_probe = ExitStack()
 
     async def execute(_command: ClaimedTaskCommand) -> dict[str, bool]:
         held_connections.append(engine.connect())
+        checkout_probe.enter_context(assert_pool_checkout_off_loop(engine))
         return {"ok": True}
 
     caplog.set_level(
         logging.ERROR,
         logger="xagent.web.services.task_command_transport",
     )
-    ticker_task = asyncio.create_task(ticker())
     try:
         assert await dispatch_one_task_command(
             execute,
             command_db_id=enqueued.command_id,
         )
-        assert ticks >= 10, (
-            "final disposition QueuePool timeout blocked the event loop; "
-            f"ticker advanced only {ticks} times"
-        )
     finally:
-        ticker_stop.set()
-        await ticker_task
-        for connection in held_connections:
-            connection.close()
+        try:
+            checkout_probe.close()
+        finally:
+            for connection in held_connections:
+                connection.close()
 
     with SessionLocal() as verify_db:
         stored = verify_db.get(TaskExecutionCommand, enqueued.command_id)
@@ -1551,15 +1692,288 @@ async def test_dispatcher_worker_isolates_one_command_error(
         )
     )
     try:
-        await asyncio.wait_for(recovered.wait(), timeout=0.25)
+        await asyncio.wait_for(recovered.wait(), timeout=GUARD_TIMEOUT)
     finally:
         worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
     with pytest.raises(asyncio.CancelledError):
-        await worker
+        worker.result()
     assert calls >= 2
     assert "component=task-command-dispatcher" in caplog.text
     assert "single command failure" in caplog.text
+
+
+def test_dispatcher_failure_backoff_grows_exponentially_to_cap(monkeypatch) -> None:
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.5)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_BACKOFF_MAX_SECONDS", 30.0
+    )
+
+    delays = [
+        task_command_transport_module._dispatcher_failure_backoff_seconds(failures)
+        # 2000 is past 1025, where an unclamped float(1 << exponent) overflows.
+        for failures in (1, 2, 3, 4, 5, 6, 7, 8, 2000)
+    ]
+
+    assert delays == [0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_backs_off_and_rate_limits_failure_logs(
+    monkeypatch,
+    caplog,
+) -> None:
+    """Repeated claim failures back off, log once per interval, and reset."""
+
+    # fail x3, idle success, fail x1, idle success (stop).
+    script = [True, True, True, False, True, False]
+    finished = asyncio.Event()
+    calls = 0
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal calls
+        del command_db_id
+        if calls >= len(script):
+            return False
+        step = script[calls]
+        calls += 1
+        if calls == len(script):
+            finished.set()
+        if step:
+            raise RuntimeError("database unreachable")
+        return False
+
+    backoff_requests: list[int] = []
+
+    def record_backoff(consecutive_failures: int) -> float:
+        backoff_requests.append(consecutive_failures)
+        return 0.001
+
+    monkeypatch.setattr(
+        task_command_transport_module, "dispatch_one_task_command", dispatch
+    )
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_dispatcher_failure_backoff_seconds",
+        record_backoff,
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
+    )
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.001)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS", 3600.0
+    )
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_command_transport")
+
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=GUARD_TIMEOUT)
+        # Let the final idle claim's bookkeeping run before cancelling.
+        await asyncio.sleep(0.01)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert backoff_requests == [1, 2, 3, 1]
+    failure_logs = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "command dispatch failed" in record.getMessage()
+    ]
+    # The first failure of each outage is logged; repeats inside the interval
+    # are suppressed, and recovery re-arms logging for the next outage.
+    assert len(failure_logs) == 2
+    assert "consecutive_failures=1" in failure_logs[0].getMessage()
+    assert "consecutive_failures=1" in failure_logs[1].getMessage()
+    recovered = [
+        record.getMessage()
+        for record in caplog.records
+        if "dispatch recovered after" in record.getMessage()
+    ]
+    assert recovered == [
+        "component=task-command-dispatcher dispatch recovered after "
+        "3 consecutive failure(s)",
+        "component=task-command-dispatcher dispatch recovered after "
+        "1 consecutive failure(s)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_logs_suppressed_count_after_interval(
+    monkeypatch,
+    caplog,
+) -> None:
+    """Once the log interval elapses, the next failure reports what was suppressed."""
+
+    finished = asyncio.Event()
+    calls = 0
+    clock = [1000.0]
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal calls
+        del command_db_id
+        calls += 1
+        if calls == 4:
+            # Simulate the log interval elapsing before the fourth failure.
+            clock[0] += 61.0
+        if calls >= 5:
+            finished.set()
+            return False
+        raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr(
+        task_command_transport_module, "dispatch_one_task_command", dispatch
+    )
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_dispatcher_failure_backoff_seconds",
+        lambda _failures: 0.001,
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_clock", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
+    )
+    monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.001)
+    monkeypatch.setattr(
+        task_command_transport_module, "DISPATCHER_FAILURE_LOG_INTERVAL_SECONDS", 60.0
+    )
+    caplog.set_level(logging.ERROR, logger="xagent.web.services.task_command_transport")
+
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=GUARD_TIMEOUT)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    failure_logs = [
+        record.getMessage()
+        for record in caplog.records
+        if "command dispatch failed" in record.getMessage()
+    ]
+    assert len(failure_logs) == 2
+    assert "consecutive_failures=1 suppressed_since_last_log=0" in failure_logs[0]
+    assert "consecutive_failures=4 suppressed_since_last_log=2" in failure_logs[1]
+
+
+def _dispatch_diagnostics(db_session, dispatch_task, command_db_id) -> str:
+    """Temporary CI diagnostics: why finish_task_command was never reached."""
+    import io
+
+    from xagent.config import (
+        get_shared_task_execution_enabled,
+        get_task_execution_role,
+        get_worker_count,
+    )
+
+    try:  # Added on main by the shared-worker admission change.
+        from xagent.web.models.task_admission import TaskAdmissionTicket
+        from xagent.web.services import task_execution_admission
+    except ImportError:
+        TaskAdmissionTicket = None
+        task_execution_admission = None
+    from xagent.web.services.task_execution_host import consumes_task_commands
+    from xagent.web.services.task_lease_service import get_runner_id
+
+    lines = [f"dispatch done={dispatch_task.done()}"]
+    if dispatch_task.done():
+        if dispatch_task.cancelled():
+            lines.append("dispatch cancelled")
+        elif dispatch_task.exception() is not None:
+            lines.append(f"dispatch exception={dispatch_task.exception()!r}")
+        else:
+            lines.append(f"dispatch result={dispatch_task.result()!r}")
+    else:
+        stack = io.StringIO()
+        dispatch_task.print_stack(file=stack)
+        lines.append(f"dispatch stack=\n{stack.getvalue()}")
+    lines.append(
+        "shared_enabled={} role={} worker_count={} consumes={} runner_id={}".format(
+            get_shared_task_execution_enabled(),
+            get_task_execution_role(),
+            get_worker_count(),
+            consumes_task_commands(),
+            get_runner_id(),
+        )
+    )
+    lines.append(
+        "admission_hook={!r}".format(
+            getattr(task_execution_admission, "_hook", "<no admission module>")
+        )
+    )
+    lines.append(
+        "env="
+        + repr(
+            {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("XAGENT_")
+                and any(
+                    part in key
+                    for part in ("SHARED", "ROLE", "WORKER", "RUNNER", "LEASE")
+                )
+            }
+        )
+    )
+    db_session.expire_all()
+    command = db_session.get(TaskExecutionCommand, command_db_id)
+    if command is None:
+        lines.append("command row missing")
+    else:
+        lines.append(
+            "command status={} kind={} attempts={} claimed_by={} "
+            "claim_expires_at={} retry_available_at={}".format(
+                command.status,
+                command.kind,
+                command.attempt_count,
+                command.claimed_by,
+                command.claim_expires_at,
+                command.retry_available_at,
+            )
+        )
+        task_row = db_session.get(Task, command.task_id)
+        lines.append(
+            "task status={} runner_id={} run_id={} lease_attempt_id={} "
+            "lease_expires_at={}".format(
+                task_row.status,
+                task_row.runner_id,
+                task_row.run_id,
+                task_row.lease_attempt_id,
+                task_row.lease_expires_at,
+            )
+        )
+        if TaskAdmissionTicket is not None:
+            tickets = (
+                db_session.query(TaskAdmissionTicket)
+                .filter(TaskAdmissionTicket.command_id == command_db_id)
+                .count()
+            )
+            lines.append(f"admission tickets={tickets}")
+        lines.append(
+            "commands on task: "
+            + repr(
+                [
+                    (row.id, row.kind, row.status)
+                    for row in db_session.query(TaskExecutionCommand)
+                    .filter(TaskExecutionCommand.task_id == command.task_id)
+                    .all()
+                ]
+            )
+        )
+    return "finish_task_command not reached within 1s\n" + "\n".join(lines)
 
 
 @pytest.mark.asyncio
@@ -1585,7 +1999,7 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
 
     def blocking_finish(*_args, **_kwargs) -> bool:
         finish_started.set()
-        assert allow_finish.wait(timeout=2)
+        assert allow_finish.wait(timeout=DB_PROGRESS_TIMEOUT)
         finish_completed.set()
         return True
 
@@ -1600,7 +2014,16 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
     dispatch_task = asyncio.create_task(
         dispatch_one_task_command(execute, command_db_id=enqueued.command_id)
     )
-    await asyncio.wait_for(asyncio.to_thread(finish_started.wait, 1), timeout=1)
+    try:
+        # The claim before this point commits through SQLite; bound only a hang.
+        await asyncio.wait_for(
+            asyncio.to_thread(finish_started.wait, DB_PROGRESS_TIMEOUT),
+            timeout=DB_PROGRESS_TIMEOUT,
+        )
+    except TimeoutError:
+        pytest.fail(
+            _dispatch_diagnostics(db_session, dispatch_task, enqueued.command_id)
+        )
     dispatch_task.cancel()
     try:
         await asyncio.sleep(0.02)
@@ -1609,7 +2032,7 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
         allow_finish.set()
 
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(dispatch_task, timeout=1)
+        await asyncio.wait_for(dispatch_task, timeout=DB_PROGRESS_TIMEOUT)
     assert finish_completed.is_set()
 
 
@@ -1862,7 +2285,9 @@ async def test_claim_heartbeat_survives_transient_database_error(
         renew,
     )
 
-    await asyncio.wait_for(_claim_heartbeat(7, "runner-a", 3, stop_event), timeout=0.2)
+    await asyncio.wait_for(
+        _claim_heartbeat(7, "runner-a", 3, stop_event), timeout=GUARD_TIMEOUT
+    )
 
     assert attempts == 2
 
@@ -1871,6 +2296,20 @@ async def test_claim_heartbeat_survives_transient_database_error(
 async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) -> None:
     second_claim = asyncio.Event()
     calls = 0
+    notification_delivered = asyncio.Event()
+    wakeup_at_empty_claim = []
+
+    class ObservedWakeup(asyncio.Event):
+        def set(self):
+            super().set()
+            notification_delivered.set()
+
+        async def wait(self):
+            if calls == 1:
+                wakeup_at_empty_claim.append(self.is_set())
+            return await super().wait()
+
+    wakeup = ObservedWakeup()
 
     async def fake_dispatch(_executor, *, command_db_id=None) -> bool:
         nonlocal calls
@@ -1878,6 +2317,8 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         calls += 1
         if calls == 1:
             notify_task_command_dispatcher()
+            # Deliver the notification while the first claim is still in flight.
+            await notification_delivered.wait()
             return False
         second_claim.set()
         return False
@@ -1887,13 +2328,27 @@ async def test_dispatcher_does_not_erase_wakeup_during_empty_claim(monkeypatch) 
         fake_dispatch,
     )
 
-    start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    monkeypatch.setattr(task_command_transport_module, "_dispatcher_wakeup", wakeup)
+    monkeypatch.setattr(
+        task_command_transport_module, "_dispatcher_loop", asyncio.get_running_loop()
+    )
+    # One worker must observe the notification; a sibling or the periodic poll
+    # must not make a lost wakeup look like success.
+    worker = asyncio.create_task(
+        task_command_transport_module._run_task_command_dispatcher_worker(
+            lambda _command: asyncio.sleep(0)
+        )
+    )
     try:
-        await asyncio.wait_for(second_claim.wait(), timeout=0.25)
+        await asyncio.wait_for(second_claim.wait(), timeout=GUARD_TIMEOUT)
     finally:
-        await stop_task_command_dispatcher()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
+    with pytest.raises(asyncio.CancelledError):
+        worker.result()
     assert calls >= 2
+    assert wakeup_at_empty_claim == [True]
 
 
 @pytest.mark.asyncio
@@ -1981,7 +2436,7 @@ def test_websocket_enqueue_returns_none_when_the_task_vanishes_mid_enqueue(
     assert result is None
 
 
-def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
+def test_websocket_enqueue_rejects_missing_task_with_client_visible_wording(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1996,7 +2451,11 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
 
     monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
 
-    with pytest.raises(TaskCommandTaskMissing):
+    # The rejection is re-raised as ClientVisibleValidationError at this
+    # boundary (still a ValueError, so pause/resume reject it the same way)
+    # so the redaction chokepoint keeps "not found" wording on this race
+    # instead of flattening it to the generic string (#1514 round 5).
+    with pytest.raises(ValueError) as raised:
         websocket_api._enqueue_websocket_task_command_sync(
             task_id=task_id,
             actor_user_id=int(user.id),
@@ -2006,6 +2465,8 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
             payload={"type": "pause_task"},
             allow_missing_task=False,
         )
+    assert isinstance(raised.value, task_execution_service.ClientVisibleValidationError)
+    assert str(raised.value) == f"Task {task_id} not found"
 
 
 def test_task_foreign_key_violation_is_reported_as_a_missing_task(
@@ -2575,9 +3036,9 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
     """A staged id must not be dispatchable before its owning transaction
     commits -- the dispatcher claims through its own isolated session, which
     cannot see an uncommitted row. Once the owner commits without notifying,
-    durable polling converges on it within one idle cycle. The target task
-    has no earlier in-flight command, so unfinished-earlier-command ordering
-    cannot also explain the delay."""
+    durable polling eventually converges on it. The target task has no earlier
+    in-flight command, so unfinished-earlier-command ordering cannot also
+    explain the delay."""
 
     user, task = _create_running_task(db_session)
     task.runner_id = None
@@ -2612,11 +3073,13 @@ async def test_dispatch_with_staged_id_before_commit_is_noop_and_converges_after
 
     start_task_command_dispatcher(execute_after_commit)
     try:
-        await asyncio.wait_for(applied.wait(), timeout=DISPATCHER_IDLE_SECONDS + 1.5)
+        # Detect a stuck dispatcher without timing shared-runner scheduling.
+        await asyncio.wait_for(applied.wait(), timeout=GUARD_TIMEOUT)
     finally:
         await stop_task_command_dispatcher()
 
 
+@pytest.mark.timeout(30)
 def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     low_timeout_sqlite_engine,
 ) -> None:
@@ -2625,7 +3088,8 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
     transaction -- far longer than the microseconds an insert that committed
     itself holds it for. SQLite's writer lock is database-wide, so a concurrent claim
     of a different, already-committed command must still wait out
-    busy_timeout and fail with OperationalError rather than hang."""
+    busy_timeout and fail with OperationalError. Once the owner commits,
+    the same command must be claimable."""
 
     engine, SessionLocal = low_timeout_sqlite_engine
     with SessionLocal() as setup_db:
@@ -2654,18 +3118,25 @@ def test_owner_holding_a_flushed_command_blocks_a_concurrent_claim(
             payload={"agent_id": 1},
         )
         # Deliberately not committed yet -- this is the window under test.
-        started = time.monotonic()
         with SessionLocal() as claimant_db:
-            with pytest.raises(OperationalError):
+            with pytest.raises(OperationalError, match="database is locked"):
                 claim_task_command(
                     claimant_db,
                     runner_id="lock-path-claimant",
                     command_db_id=claimable.command_id,
                 )
-        elapsed = time.monotonic() - started
         owner_db.commit()
 
-    assert elapsed < 2.0
+    with SessionLocal() as claimant_db:
+        claimed = claim_task_command(
+            claimant_db,
+            runner_id="lock-path-claimant",
+            command_db_id=claimable.command_id,
+        )
+
+    assert claimed is not None
+    assert claimed.id == claimable.command_id
+    assert claimed.attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -2695,7 +3166,7 @@ async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_re
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.01)
     monkeypatch.setattr(
         task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
@@ -2783,3 +3254,556 @@ def test_enqueue_notifies_only_after_commit(db_session, monkeypatch) -> None:
     )
 
     assert order == ["commit", "notify"]
+
+
+def test_defer_budget_is_coupled_to_the_lease_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defer budget must outlast the configured lease TTL with margin.
+
+    A deferral's canonical wait is an unreleased task lease, which clears
+    within one TTL; a fixed budget silently smaller than a raised
+    ``XAGENT_TASK_LEASE_TTL_SECONDS`` turned every long park into a terminal
+    failure for an already-accepted command (xorbitsai/xagent-saas#952 B3).
+    """
+
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "300")
+    assert max_command_defers() == 600
+
+    # The historical constant stays as the floor for short TTLs.
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "10")
+    assert max_command_defers() == MAX_COMMAND_DEFERS
+
+    # The default (no env var) doubles the historical constant.
+    monkeypatch.delenv("XAGENT_TASK_LEASE_TTL_SECONDS", raising=False)
+    assert max_command_defers() == 120
+
+    # An invalid value falls back to the default TTL, not the floor.
+    monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "not-a-number")
+    assert max_command_defers() == 120
+
+
+def test_duplicate_command_cannot_replace_persisted_reply_origin(db_session):
+    user, task = _create_running_task(db_session)
+    arguments = dict(
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="routed-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    original = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-a", reply_origin="socket-a"
+    )
+    duplicate = enqueue_task_command(
+        db_session, **arguments, reply_host_id="web-b", reply_origin="socket-b"
+    )
+    assert original.created
+    assert not duplicate.created
+    assert duplicate.payload_matches
+    db_session.expire_all()
+    row = (
+        db_session.query(TaskExecutionCommand)
+        .filter_by(command_id="routed-pause")
+        .one()
+    )
+    assert (row.reply_host_id, row.reply_origin) == ("web-a", "socket-a")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait_style", ["shield", "wait_for_previous"])
+async def test_dispatcher_worker_survives_cancellation_not_aimed_at_it(
+    monkeypatch, caplog, wait_style
+) -> None:
+    """A cancel raised inside dispatch must not end loops nobody cancelled."""
+
+    transport = task_command_transport_module
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 0.01)
+    foreign: asyncio.Task | None = None
+    hit_worker: asyncio.Task | None = None
+    hit_calls = 0
+    manager = task_execution_service.BackgroundTaskManager()
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        nonlocal foreign, hit_worker, hit_calls
+        if hit_worker is None:
+            hit_worker = asyncio.current_task()
+            foreign = asyncio.create_task(asyncio.Event().wait())
+            if wait_style == "shield":
+                await asyncio.shield(foreign)
+            else:
+                manager.running_tasks[1] = foreign
+                await manager.wait_for_previous(1)
+        elif asyncio.current_task() is hit_worker:
+            hit_calls += 1
+        return False
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch)
+    caplog.set_level(logging.ERROR, logger=transport.__name__)
+    dispatcher = start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    assert dispatcher is not None
+    try:
+        await eventually(lambda: foreign is not None)
+        foreign.cancel()
+        # The very loop that took the cancellation must dispatch again; other
+        # loops running meanwhile cannot satisfy this.
+        await eventually(lambda: hit_calls > 0)
+        assert hit_worker is not None and not hit_worker.done()
+        assert not dispatcher.done()
+        aimed = [
+            r for r in caplog.records if "not aimed at this worker" in r.getMessage()
+        ]
+        assert len(aimed) == 1
+    finally:
+        await stop_task_command_dispatcher()
+    assert dispatcher.done()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_worker_exits_when_it_is_cancelled(monkeypatch) -> None:
+    """Cancelling the worker itself ends it even while its wakeup is still live."""
+
+    transport = task_command_transport_module
+    parked = asyncio.Event()
+
+    async def dispatch(_executor, *, command_db_id=None) -> bool:
+        parked.set()
+        await asyncio.Event().wait()
+        return False
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch)
+    monkeypatch.setattr(transport, "_dispatcher_wakeup", asyncio.Event())
+    worker = asyncio.create_task(
+        transport._run_task_command_dispatcher_worker(lambda _command: asyncio.sleep(0))
+    )
+    try:
+        await asyncio.wait_for(parked.wait(), DB_PROGRESS_TIMEOUT)
+        worker.cancel()
+        await asyncio.wait({worker}, timeout=DB_PROGRESS_TIMEOUT)
+        assert worker.cancelled()
+    finally:
+        if not worker.done():
+            # Let a loop that wrongly survived its own cancel return.
+            monkeypatch.setattr(transport, "_dispatcher_wakeup", None)
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+
+class _Boom(BaseException):
+    """An exit that is neither a cancellation nor an ordinary exception."""
+
+
+async def _wait_forever(_executor) -> None:
+    await asyncio.Event().wait()
+
+
+@pytest.fixture
+async def fake_dispatcher(monkeypatch):
+    transport = task_command_transport_module
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    monkeypatch.setattr(transport, "run_task_command_dispatcher", _wait_forever)
+    yield transport
+    await stop_task_command_dispatcher()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("external_cancel", "ended by a cancellation outside"),
+        ("base_exception", "exited unexpectedly"),
+        ("returns", "returned while still registered"),
+        ("explicit_stop", None),
+    ],
+)
+async def test_dispatcher_exit_callback_reports_only_unregistered_exits(
+    fake_dispatcher, monkeypatch, caplog, scenario, expected
+) -> None:
+    async def raises(_executor) -> None:
+        raise _Boom
+
+    async def returns(_executor) -> None:
+        return None
+
+    if scenario == "base_exception":
+        monkeypatch.setattr(fake_dispatcher, "run_task_command_dispatcher", raises)
+    elif scenario == "returns":
+        monkeypatch.setattr(fake_dispatcher, "run_task_command_dispatcher", returns)
+    caplog.set_level(logging.CRITICAL, logger=fake_dispatcher.__name__)
+    dispatcher = start_task_command_dispatcher(lambda _command: asyncio.sleep(0))
+    assert dispatcher is not None
+    await asyncio.sleep(0)
+    if scenario == "external_cancel":
+        dispatcher.cancel()
+    elif scenario == "explicit_stop":
+        await stop_task_command_dispatcher()
+    await asyncio.gather(dispatcher, return_exceptions=True)
+    await asyncio.sleep(0)
+    critical = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    if expected is None:
+        assert critical == []
+    else:
+        assert len(critical) == 1
+        assert expected in critical[0].getMessage()
+        if scenario in ("external_cancel", "base_exception"):
+            assert critical[0].exc_info is not None
+
+
+async def _restart_after(transport, dispatcher) -> None:
+    await eventually(
+        lambda: transport._dispatcher_task is not dispatcher
+        and transport._dispatcher_task is not None
+        and not transport._dispatcher_task.done()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "stop_first",
+        "stop_with_dispatcher_ending",
+        "one_restart",
+        "restart_limit",
+        "exits_spaced_beyond_window",
+        "no_dispatcher_none",
+        "no_dispatcher_done",
+        "no_dispatcher_foreign_loop",
+        "supervisor_cancelled",
+        "explicit_stop",
+    ],
+)
+async def test_supervise_task_command_dispatcher(
+    fake_dispatcher, monkeypatch, caplog, scenario
+) -> None:
+    transport = fake_dispatcher
+    caplog.set_level(logging.INFO, logger=transport.__name__)
+    executor = lambda _command: asyncio.sleep(0)  # noqa: E731
+    stop = asyncio.Event()
+    foreign_loop = None
+    if scenario == "no_dispatcher_none":
+        assert transport._dispatcher_task is None
+    elif scenario == "no_dispatcher_foreign_loop":
+        foreign_loop = asyncio.new_event_loop()
+        # Only the loop it belongs to and its done state matter to the supervisor.
+        foreign = foreign_loop.create_future()
+        monkeypatch.setattr(transport, "_dispatcher_task", foreign)
+    else:
+        start_task_command_dispatcher(executor)
+        if scenario == "no_dispatcher_done":
+            dispatcher = transport._dispatcher_task
+            dispatcher.cancel()
+            await asyncio.gather(dispatcher, return_exceptions=True)
+    if scenario == "exits_spaced_beyond_window":
+        monkeypatch.setattr(transport, "DISPATCHER_RESTART_WINDOW_SECONDS", 0.05)
+    registered = transport._dispatcher_task
+    supervisor = asyncio.create_task(
+        transport.supervise_task_command_dispatcher(executor, stop)
+    )
+    errors = lambda: [r for r in caplog.records if r.levelno >= logging.ERROR]  # noqa: E731
+    await asyncio.sleep(0)  # let the supervisor start watching
+    try:
+        if scenario == "stop_first":
+            stop.set()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+            assert not registered.done()
+            assert errors() == []
+        elif scenario == "stop_with_dispatcher_ending":
+            stop.set()
+            registered.cancel()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+            await asyncio.sleep(0)
+            assert [r for r in errors() if r.levelno == logging.ERROR] == []
+            assert not any("restarting" in r.getMessage() for r in caplog.records)
+        elif scenario == "one_restart":
+            registered.cancel()
+            await _restart_after(transport, registered)
+            records = caplog.records
+            critical = next(i for i, r in enumerate(records) if r.levelno == 50)
+            restart = next(
+                i for i, r in enumerate(records) if "restart 1 of 3" in r.getMessage()
+            )
+            assert critical < restart
+            stop.set()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+        elif scenario == "restart_limit":
+            for _ in range(transport.DISPATCHER_RESTART_LIMIT):
+                current = transport._dispatcher_task
+                current.cancel()
+                await _restart_after(transport, current)
+            transport._dispatcher_task.cancel()
+            with pytest.raises(RuntimeError, match="4 times within 600 seconds"):
+                await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+            restarts = [
+                r for r in caplog.records if "restarting dispatcher" in r.getMessage()
+            ]
+            assert len(restarts) == transport.DISPATCHER_RESTART_LIMIT
+        elif scenario == "exits_spaced_beyond_window":
+            for _ in range(transport.DISPATCHER_RESTART_LIMIT + 1):
+                current = transport._dispatcher_task
+                current.cancel()
+                await _restart_after(transport, current)
+                await asyncio.sleep(0.1)
+            assert not supervisor.done()
+            stop.set()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+        elif scenario.startswith("no_dispatcher"):
+            await eventually(
+                lambda: any(
+                    "no running dispatcher to supervise" in r.getMessage()
+                    for r in caplog.records
+                )
+            )
+            assert [r for r in errors() if r.levelno == logging.ERROR] == []
+            assert not supervisor.done()
+            stop.set()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+            assert transport._dispatcher_task is registered
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+        elif scenario == "supervisor_cancelled":
+            supervisor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await supervisor
+            assert not registered.done()
+            await asyncio.sleep(0)
+            # The supervisor's internal stop.wait() task must be reclaimed.
+            assert not [
+                t
+                for t in asyncio.all_tasks()
+                if t.get_coro().__qualname__ == "Event.wait"
+            ]
+        else:
+            await stop_task_command_dispatcher()
+            await eventually(
+                lambda: any(
+                    "stopped explicitly" in r.getMessage() for r in caplog.records
+                )
+            )
+            assert transport._dispatcher_task is None
+            assert errors() == []
+            assert not supervisor.done()
+            stop.set()
+            await asyncio.wait_for(supervisor, DB_PROGRESS_TIMEOUT)
+    finally:
+        stop.set()
+        supervisor.cancel()
+        await asyncio.gather(supervisor, return_exceptions=True)
+        if foreign_loop is not None:
+            foreign.cancel()
+            foreign_loop.close()
+
+
+@pytest.fixture()
+def shared_dispatch_db(db_session, monkeypatch):
+    """Shared execution enabled, with tasks that any runner may claim from."""
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_command_transport_module, "get_runner_id", lambda: "me")
+    return db_session
+
+
+def _unowned_task(db, user_id: int, title: str) -> Task:
+    task = Task(
+        user_id=user_id,
+        title=title,
+        description=title,
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        run_id=None,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _insert_command(db, task_id: int, kind: TaskCommandKind, identity: str) -> int:
+    row = TaskExecutionCommand(
+        task_id=task_id, command_id=identity, kind=kind.value, payload={}
+    )
+    db.add(row)
+    db.commit()
+    return int(row.id)
+
+
+def _claim_candidate() -> tuple[int, int, TaskCommandKind] | None:
+    return task_command_transport_module._find_command_candidate(None)
+
+
+def test_reply_first_claim_order_prefers_a_newer_reply_over_an_older_start(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    second_task = _unowned_task(db, int(user.id), "second")
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    older_start = _insert_command(
+        db, int(first_task.id), TaskCommandKind.START, "start-a"
+    )
+    newer_reply = _insert_command(
+        db, int(second_task.id), TaskCommandKind.RESUME_INPUT, "reply-b"
+    )
+    assert older_start < newer_reply
+
+    assert _claim_candidate() == (
+        newer_reply,
+        int(second_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+def test_reply_first_claim_order_keeps_a_tasks_start_ahead_of_its_own_reply(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    start = _insert_command(db, int(task.id), TaskCommandKind.START, "start-same")
+    _insert_command(db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-same")
+
+    assert _claim_candidate() == (start, int(task.id), TaskCommandKind.START)
+
+
+@pytest.mark.parametrize(
+    "kind", [TaskCommandKind.START, TaskCommandKind.RESUME_INPUT], ids=lambda k: k.value
+)
+def test_reply_first_claim_order_takes_the_older_of_two_commands_of_one_kind(
+    shared_dispatch_db, kind: TaskCommandKind
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    second_task = _unowned_task(db, int(user.id), "second")
+    older = _insert_command(db, int(first_task.id), kind, f"{kind.value}-1")
+    _insert_command(db, int(second_task.id), kind, f"{kind.value}-2")
+
+    assert _claim_candidate() == (older, int(first_task.id), kind)
+
+
+@pytest.mark.parametrize(
+    "kind", [TaskCommandKind.CANCEL, TaskCommandKind.PAUSE], ids=lambda k: k.value
+)
+def test_reply_first_claim_order_puts_a_reply_ahead_of_an_older_control_command(
+    shared_dispatch_db, kind: TaskCommandKind
+) -> None:
+    db = shared_dispatch_db
+    user, control_task = _create_running_task(db)
+    control_task.runner_id = None
+    control_task.lease_expires_at = None
+    db.commit()
+    reply_task = _unowned_task(db, int(user.id), "reply")
+    older_control = _insert_command(
+        db, int(control_task.id), kind, f"{kind.value}-older"
+    )
+    newer_reply = _insert_command(
+        db, int(reply_task.id), TaskCommandKind.RESUME_INPUT, "reply-newer"
+    )
+    assert older_control < newer_reply
+
+    assert _claim_candidate() == (
+        newer_reply,
+        int(reply_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+@pytest.mark.parametrize("reply_task_is_active", [False, True])
+def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed(
+    shared_dispatch_db, reply_task_is_active: bool
+) -> None:
+    from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
+
+    db = shared_dispatch_db
+    user, start_task = _create_running_task(db)
+    start_task.runner_id = None
+    start_task.lease_expires_at = None
+    db.commit()
+    reply_task = _unowned_task(db, int(user.id), "waiting")
+    older_start = _insert_command(
+        db, int(start_task.id), TaskCommandKind.START, "start-active"
+    )
+    _insert_command(db, int(reply_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+    active = {int(start_task.id)} | (
+        {int(reply_task.id)} if reply_task_is_active else set()
+    )
+    closed = DispatchCapSnapshot(len(active), frozenset(active))
+
+    assert task_command_transport_module._find_command_candidate(None, (), closed) == (
+        older_start,
+        int(start_task.id),
+        TaskCommandKind.START,
+    )
+
+
+def test_reply_first_claim_order_falls_back_past_a_reply_on_a_busy_task(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, start_task = _create_running_task(db)
+    start_task.runner_id = None
+    start_task.lease_expires_at = None
+    db.commit()
+    busy_task = _unowned_task(db, int(user.id), "busy")
+    start = _insert_command(db, int(start_task.id), TaskCommandKind.START, "start")
+    _insert_command(db, int(busy_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+
+    assert task_command_transport_module._find_command_candidate(
+        None, (int(busy_task.id),)
+    ) == (start, int(start_task.id), TaskCommandKind.START)
+
+
+def test_reply_first_claim_order_falls_back_past_a_reply_under_an_expired_foreign_owner(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, foreign_task = _create_running_task(db)
+    foreign_task.runner_id = "someone-else"
+    foreign_task.lease_expires_at = datetime.utcnow() - timedelta(minutes=1)
+    db.commit()
+    start_task = _unowned_task(db, int(user.id), "start")
+    start = _insert_command(db, int(start_task.id), TaskCommandKind.START, "start")
+    _insert_command(db, int(foreign_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+
+    assert _claim_candidate() == (start, int(start_task.id), TaskCommandKind.START)
+
+
+def test_find_command_candidate_with_an_explicit_id_skips_the_reply_lookup(
+    shared_dispatch_db,
+) -> None:
+    from sqlalchemy import event
+
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    reply = _insert_command(
+        db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-explicit"
+    )
+    parameters: list[tuple[object, ...]] = []
+
+    def record(_conn, _cursor, statement, params, *_args) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            parameters.append(tuple(params))
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        found = task_command_transport_module._find_command_candidate(reply)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert found == (reply, int(task.id), TaskCommandKind.RESUME_INPUT)
+    # One statement, and the reply-only kind filter is not among its values.
+    assert len(parameters) == 1
+    assert TaskCommandKind.RESUME_INPUT.value not in parameters[0]

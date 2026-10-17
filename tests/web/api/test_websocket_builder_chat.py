@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import WebSocketDisconnect
 
+from xagent.core.agent.budget import ExecutionBudgetPolicy
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     handle_builder_chat,
@@ -15,6 +16,8 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.user import User
 from xagent.web.services.builder_chat_runtime import BuilderChatRuntimeInputs
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 
 
 @pytest.mark.asyncio
@@ -196,9 +199,29 @@ async def test_handle_builder_chat_basic() -> None:
         # extra pattern-selection tool calls.
         assert MockAgentService.called
         call_kwargs = MockAgentService.call_args[1]
+        with patch(
+            "xagent.web.services.execution_budget.resolve_execution_budget_policy",
+            new_callable=AsyncMock,
+            return_value=ExecutionBudgetPolicy(max_tokens=123),
+        ) as resolve_budget:
+            assert (await call_kwargs["budget_policy_provider"]()).max_tokens == 123
+        request = resolve_budget.await_args.args[0]
+        assert request.user_id == 1
+        assert request.task_id == mock_websocket.state.builder_task_id
+        assert request.scope is None
         assert call_kwargs["pattern"] == "react"
         assert call_kwargs["name"] == "builder_chat_agent"
         assert call_kwargs["compact_llm"] is mock_compact_llm
+        # After #2219 the builder chat is the only place the knowledge-base
+        # authoring tools are mounted, so pin the wiring here rather than
+        # only the tool classes.
+        mounted_tool_names = {
+            getattr(tool, "name", None) for tool in call_kwargs["tools"]
+        }
+        assert {
+            "create_knowledge_base_from_file",
+            "create_knowledge_base_from_url",
+        } <= mounted_tool_names
         mock_agent_service.set_allowed_skills.assert_called_once_with(["agent-builder"])
         mock_agent_service.set_recovered_skill_context.assert_called_once()
         mock_agent_service.set_outbound_message_handler.assert_called_once()
@@ -375,6 +398,166 @@ async def test_handle_builder_chat_waiting_for_user_sends_chat_response() -> Non
 
 
 @pytest.mark.asyncio
+async def test_handle_builder_chat_applies_voice_preference() -> None:
+    """The builder chat's own meta-assistant must honor the user's onboarding
+    voice preference the same way a saved agent's real conversation does
+    (see apply_user_voice's call sites in chat.py) - before this fix, only
+    agents the user created got voice injection, not this platform-owned
+    assistant itself."""
+    mock_websocket = AsyncMock()
+    mock_user = SimpleNamespace(id=1, is_admin=False, voice="concise")
+
+    message_data = {
+        "messages": [{"role": "user", "content": "Create an agent"}],
+        "models": {"general": 1},
+        "selectedSkills": [],
+        "selectedKbs": [],
+        "tool_categories": [],
+        "executionMode": "balanced",
+    }
+
+    mock_llm = AsyncMock()
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(),
+            llm=mock_llm,
+            compact_llm=None,
+        )
+    )
+
+    with (
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
+        patch("xagent.core.agent.service.AgentService") as MockAgentService,
+        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+    ):
+        mock_agent_service = MockAgentService.return_value
+        mock_agent_service.execute_task = AsyncMock(
+            return_value={"output": "Agent created successfully", "status": "completed"}
+        )
+
+        mock_websocket.state = MagicMock()
+        mock_websocket.state.builder_memory = MagicMock()
+        del mock_websocket.state.builder_task_id
+        del mock_websocket.state.builder_agent_service
+
+        await handle_builder_chat(mock_websocket, message_data, mock_user)
+
+    execution_context = mock_agent_service.execute_task.await_args.kwargs["context"]
+    system_prompt = execution_context["system_prompt"]
+    assert "\n\n## OUTPUT VOICE\n" in system_prompt
+    assert "As short as possible" in system_prompt
+    # The voice tone must not bleed into create_agent/update_agent's
+    # persisted name/description/instructions arguments - apply_user_voice
+    # (apply_output_voice under the hood) always pairs the tone with this
+    # scoping caveat, so this call site doesn't need its own.
+    assert "persisted as configuration" in system_prompt
+    assert "final natural-language reply" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_builder_chat_without_voice_leaves_prompt_unchanged() -> None:
+    """No voice preference means apply_user_voice is a no-op - no OUTPUT
+    VOICE section, and no scoping caveat riding along with a tone that
+    was never applied."""
+    mock_websocket = AsyncMock()
+    mock_user = SimpleNamespace(id=1, is_admin=False, voice=None)
+
+    message_data = {
+        "messages": [{"role": "user", "content": "Create an agent"}],
+        "models": {"general": 1},
+        "selectedSkills": [],
+        "selectedKbs": [],
+        "tool_categories": [],
+        "executionMode": "balanced",
+    }
+
+    mock_llm = AsyncMock()
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(),
+            llm=mock_llm,
+            compact_llm=None,
+        )
+    )
+
+    with (
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
+        patch("xagent.core.agent.service.AgentService") as MockAgentService,
+        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+    ):
+        mock_agent_service = MockAgentService.return_value
+        mock_agent_service.execute_task = AsyncMock(
+            return_value={"output": "Agent created successfully", "status": "completed"}
+        )
+
+        mock_websocket.state = MagicMock()
+        mock_websocket.state.builder_memory = MagicMock()
+        del mock_websocket.state.builder_task_id
+        del mock_websocket.state.builder_agent_service
+
+        await handle_builder_chat(mock_websocket, message_data, mock_user)
+
+    execution_context = mock_agent_service.execute_task.await_args.kwargs["context"]
+    system_prompt = execution_context["system_prompt"]
+    assert "## OUTPUT VOICE" not in system_prompt
+    assert "persisted as configuration" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_handle_builder_chat_hides_connectors_from_current_config() -> None:
+    mock_websocket = AsyncMock()
+    message_data = {
+        "messages": [{"role": "user", "content": "Add web search"}],
+        "models": {"general": 1},
+        "tool_categories": ["file", "mcp", "mcp:github"],
+    }
+    runtime_loader = AsyncMock(
+        return_value=BuilderChatRuntimeInputs(
+            authorized_file_ids=(), llm=AsyncMock(), compact_llm=None
+        )
+    )
+
+    with (
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            runtime_loader,
+        ),
+        patch("xagent.web.api.websocket.get_session_local", return_value=MagicMock()),
+        patch("xagent.core.agent.service.AgentService") as MockAgentService,
+        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+    ):
+        mock_agent_service = MockAgentService.return_value
+        mock_agent_service.execute_task = AsyncMock(
+            return_value={"output": "done", "status": "completed"}
+        )
+        mock_websocket.state = MagicMock()
+        del mock_websocket.state.builder_task_id
+        del mock_websocket.state.builder_agent_service
+
+        await handle_builder_chat(
+            mock_websocket,
+            message_data,
+            SimpleNamespace(id=1, is_admin=False, voice=None),
+        )
+
+    system_prompt = mock_agent_service.execute_task.await_args.kwargs["context"][
+        "system_prompt"
+    ]
+    assert "'tool_categories': ['file']" in system_prompt
+
+
+@pytest.mark.asyncio
 async def test_handle_builder_chat_no_llm() -> None:
     """
     Test that handle_builder_chat handles missing LLM gracefully.
@@ -415,6 +598,23 @@ async def test_handle_builder_chat_no_llm() -> None:
         sent_data = json.loads(mock_websocket.send_text.call_args[0][0])
         assert sent_data["type"] == "error"
         assert "No LLM configured" in sent_data["message"]
+
+
+@pytest.mark.asyncio
+async def test_builder_auto_unavailable_has_safe_message_and_code():
+    websocket = AsyncMock()
+    user = SimpleNamespace(id=1, is_admin=False)
+    with patch(
+        "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+        AsyncMock(side_effect=AutoModelUnavailableError("private model details")),
+    ):
+        await handle_builder_chat(websocket, {"message": "Create an agent"}, user)
+    payload = json.loads(websocket.send_text.call_args.args[0])
+    assert payload == {
+        "type": "error",
+        "message": CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
+        "error_code": "auto_model_unavailable",
+    }
 
 
 if __name__ == "__main__":

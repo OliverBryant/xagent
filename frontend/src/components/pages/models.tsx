@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useMemo, ReactNode } from "react"
+import React, { useState, useEffect, useMemo, ReactNode } from "react"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/ui/page-header"
@@ -28,6 +28,8 @@ import { useI18n } from "@/contexts/i18n-context"
 import { ModelManagementDialog } from "./model-management-dialog"
 import { toast } from "@/components/ui/sonner"
 import { getProviderDisplayCapabilities } from "./model-display-capabilities"
+import { AutoModelConfigCard } from "./auto-model-config-card"
+import type { BedrockAuthMode, ModelFormData } from "@/lib/model-provider-settings"
 
 const MODEL_TABS = ["llm", "embedding", "rerank", "image", "video", "audio"] as const
 const DEFAULT_MODEL_TAB = "llm"
@@ -66,7 +68,12 @@ export function generateModelId(modelName: string, modelProvider: string, userId
   const suffix = randomHex8()
   // Fallback to 'user' if ID is missing to prevent "undefined" in string
   const uid = userId || 'unknown'
-  return `${modelName}-${modelProvider}-${uid}-${suffix}`
+  const arnResourceName = modelName.includes("/")
+    ? modelName.slice(modelName.lastIndexOf("/") + 1)
+    : modelName
+  const randomSuffix = `-${suffix}`
+  const readableIdentity = `${arnResourceName}-${modelProvider}-${uid}`
+  return `${readableIdentity.slice(0, 100 - randomSuffix.length)}${randomSuffix}`
 }
 
 // Interfaces from models-1.tsx
@@ -77,6 +84,8 @@ export interface Model {
   model_provider: string
   model_name: string
   base_url?: string
+  bedrock_region?: string
+  bedrock_auth_mode?: BedrockAuthMode
   temperature?: number
   context_window?: number
   dimension?: number
@@ -91,20 +100,7 @@ export interface Model {
   is_shared: boolean
 }
 
-export interface ModelCreate {
-  model_id: string
-  category: string
-  model_provider: string
-  model_name: string
-  api_key: string
-  base_url?: string
-  temperature?: number
-  context_window?: number
-  dimension?: number
-  abilities?: string[]
-  share_with_users?: boolean
-  default_config_types?: string[]
-}
+export type ModelCreate = ModelFormData
 
 // Provider Config from models.tsx
 export interface ProviderConfig {
@@ -186,6 +182,9 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   claude: {
     icon: <img src="/claude.svg" alt="Claude" className="w-6 h-6" />,
     defaultBaseUrl: "https://api.anthropic.com/v1",
+  },
+  bedrock: {
+    icon: <Box className="w-6 h-6 text-orange-500" />,
   },
   xinference: {
     icon: <img src="/xagent_logo.png" alt="Xinference" className="w-6 h-6" />,
@@ -292,7 +291,7 @@ export function ModelsPage() {
           defaultBaseUrl: p.default_base_url || localConfig.defaultBaseUrl,
           categoryBaseUrls: localConfig.categoryBaseUrls,
           category: p.category || ["llm"],
-          requires_base_url: p.requires_base_url
+          requires_base_url: p.requires_base_url,
         }
       })
       setProviders(mergedProviders)
@@ -364,18 +363,21 @@ export function ModelsPage() {
   }
 
   const modelCounts = useMemo(() => {
+    const concreteModels = models.filter(m => m.model_provider.toLowerCase() !== 'router')
     return {
-      llm: models.filter(m => m.category === 'llm').length,
-      embedding: models.filter(m => m.category === 'embedding').length,
-      rerank: models.filter(m => m.category === 'rerank').length,
-      image: models.filter(m => m.category === 'image').length,
-      video: models.filter(m => m.category === 'video').length,
-      audio: models.filter(m => AUDIO_MODEL_CATEGORIES.has(m.category)).length
+      llm: concreteModels.filter(m => m.category === 'llm').length,
+      embedding: concreteModels.filter(m => m.category === 'embedding').length,
+      rerank: concreteModels.filter(m => m.category === 'rerank').length,
+      image: concreteModels.filter(m => m.category === 'image').length,
+      video: concreteModels.filter(m => m.category === 'video').length,
+      audio: concreteModels.filter(m => AUDIO_MODEL_CATEGORIES.has(m.category)).length
     }
   }, [models])
 
   const filteredModels = useMemo(() => {
-    return models.filter(m => modelMatchesTab(m.category, activeTab))
+    return models.filter(m =>
+      m.model_provider.toLowerCase() !== 'router' && modelMatchesTab(m.category, activeTab)
+    )
   }, [models, activeTab])
 
   const enabledProviders = useMemo(() => {
@@ -507,6 +509,14 @@ export function ModelsPage() {
             </TabsTrigger>
           </TabsList>
         </Tabs>
+
+        {activeTab === "llm" && (
+          <AutoModelConfigCard
+            models={models}
+            generalDefault={defaultModels.general}
+            onSuccess={handleDialogSuccess}
+          />
+        )}
 
         {/* Enabled Models */}
         {Object.keys(enabledProviders).length > 0 && (

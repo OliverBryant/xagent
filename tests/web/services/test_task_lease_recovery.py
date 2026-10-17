@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
@@ -16,6 +17,7 @@ from tests.shared.db_teardown import drop_all_tables
 from tests.web.services.checkpoint_anchor_shared import build_upgraded_sqlite_engine
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
 from xagent.web.models.agent import Agent
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import (
     get_db,
     get_engine,
@@ -23,6 +25,8 @@ from xagent.web.models.database import (
     init_db,
 )
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_auto_recovery import TaskAutoRecovery
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerRun,
@@ -32,6 +36,20 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_lease_recovery, task_lease_service
+from xagent.web.services.chat_history_service import (
+    DELIVERY_COMPLETED,
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    DELIVERY_OUTCOME_UNKNOWN,
+    DELIVERY_PENDING,
+)
+from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    COMMAND_PENDING,
+    COMMAND_PROCESSING,
+    TaskCommandKind,
+)
 from xagent.web.services.task_lease_recovery import (
     TASK_LEASE_EXPIRED_ERROR,
     TASK_LEASE_PAUSED_TRIGGER_ERROR,
@@ -45,7 +63,7 @@ from xagent.web.services.task_lease_service import (
     CheckpointRecoveryVerdict,
     TaskLeaseRecoveryCandidate,
     get_expired_task_lease_candidates,
-    resolve_checkpoint_recovery,
+    resolve_checkpoint_recovery_with_data,
     utc_now,
 )
 
@@ -133,7 +151,7 @@ def _recover_expired_task(db, task: Task) -> TaskStatus | None:
 
 
 def _candidate_for_task(task: Task) -> TaskLeaseRecoveryCandidate:
-    """Build the recovery candidate snapshot resolve_checkpoint_recovery
+    """Build the recovery candidate snapshot resolve_checkpoint_recovery_with_data
     consumes, directly from a task's current column values -- for tests
     that exercise checkpoint pointer resolution without going through the
     full expired-lease scan query.
@@ -143,6 +161,7 @@ def _candidate_for_task(task: Task) -> TaskLeaseRecoveryCandidate:
         runner_id=task.runner_id,
         run_id=task.run_id,
         lease_expires_at=task.lease_expires_at,
+        attempt_id=task.lease_attempt_id,
         state_version=int(task.state_version or 0),
         last_checkpoint_event_id=task.last_checkpoint_event_id,
         last_checkpoint_trace_event_id=task.last_checkpoint_trace_event_id,
@@ -216,9 +235,11 @@ def _attach_workforce_and_trigger(db, *, task: Task, user: User) -> tuple:
     return workforce_run, trigger_run
 
 
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
 def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
-    db_session,
+    db_session, monkeypatch: pytest.MonkeyPatch, auto_resume: str
 ) -> None:
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", auto_resume)
     user = _create_user(db_session, suffix="checkpoint")
     task = _create_expired_task(
         db_session,
@@ -246,9 +267,18 @@ def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
     assert task.error_message is None
     assert workforce_run.status == "paused"
     assert workforce_run.completed_at is None
-    assert trigger_run.status == TriggerRunStatus.FAILED.value
-    assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
-    assert trigger_run.finished_at is not None
+    if auto_resume == "true":
+        # Automatic resume is scheduled: the resumed run settles the
+        # TriggerRun.
+        assert trigger_run.status == TriggerRunStatus.RUNNING.value
+        assert trigger_run.error_message is None
+        assert trigger_run.finished_at is None
+        recovery = db_session.get(TaskAutoRecovery, task.id)
+        assert (recovery.state, recovery.reason) == ("scheduled", "lease_expired")
+    else:
+        assert trigger_run.status == TriggerRunStatus.FAILED.value
+        assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
+        assert trigger_run.finished_at is not None
 
 
 def test_expired_lease_without_checkpoint_fails_and_clears_stale_output(
@@ -378,7 +408,7 @@ def test_pk_anchor_resolves_without_a_usable_legacy_pointer(db_session) -> None:
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
@@ -391,6 +421,13 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
     that exact row, not a cue to go search other rows -- even when the
     legacy event_id column names a different, genuinely valid checkpoint
     that a legacy-only scan would have accepted.
+
+    One shape is deliberately excluded and is not this test's subject: a row
+    whose *only* failed condition is the run partition, and only because the
+    field is absent, is a pre-existing row rather than a failed validation,
+    and does defer to the legacy scan (see
+    test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan). This
+    test's row fails on ``build_id``, which no reclassification covers.
     """
     user = _create_user(db_session, suffix="pk-no-fallback")
     task = _create_expired_task(
@@ -429,10 +466,263 @@ def test_pk_anchor_validation_failure_does_not_fall_back_to_the_legacy_scan(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
+def test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan(
+    db_session, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pointer row whose only failed condition is an *absent* run-partition
+    field is a pre-existing row -- the shape the 20260804 backfill produces
+    from a trace_events row written before that field existed -- not a
+    mismatched one. It defers to the legacy event_id scan the same way a
+    dangling pointer does, instead of failing the candidate on the spot.
+
+    The legacy pointer here names a different, genuinely valid checkpoint, so
+    the deferral has somewhere to land and the candidate recovers. That is
+    what separates this cell from
+    test_recovery_rejects_checkpoint_without_current_run_provenance[None],
+    where both pointers name the same field-less row and the deferral
+    correctly still ends in FAILED.
+    """
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_lease_service")
+    user = _create_user(db_session, suffix="pk-absent-partition")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-absent-partition",
+    )
+    pre_existing_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="pk-absent-partition-preexisting",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD at all -- absent, not wrong.
+        },
+    )
+    valid_legacy_row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-absent-partition-valid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add_all([pre_existing_anchor, valid_legacy_row])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = pre_existing_anchor.id
+    task.last_checkpoint_event_id = valid_legacy_row.event_id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
+    # resolve_checkpoint_recovery_with_data is pure and was just called directly above
+    # to check the verdict; clear its log line so the assertion below pins
+    # the recovery path's own call, not a second echo of the first.
+    caplog.clear()
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
+
+    infos = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO
+        and r.name == "xagent.web.services.task_lease_service"
+    ]
+    assert len(infos) == 1, caplog.records
+    assert infos[0].msg == (
+        "Task %s's checkpoint pointer %s is missing its "
+        "run-partition field; deferring to the legacy event_id scan "
+        "rather than treating the row as a mismatch"
+    )
+
+
+def test_pk_anchor_wrong_run_partition_still_fails_without_a_legacy_retry(
+    db_session,
+) -> None:
+    """The reclassification above requires the run-partition field to be
+    *absent*. A field that is present and holds another run's id is a real
+    mismatch: it fails the candidate on the spot and never reaches the legacy
+    scan, even when the legacy pointer names a genuinely valid checkpoint
+    that scan would have accepted.
+    """
+    user = _create_user(db_session, suffix="pk-wrong-partition")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-wrong-partition",
+    )
+    mismatched_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-partition-mismatched",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: "some-other-run",
+        },
+    )
+    valid_legacy_row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-partition-valid",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+        },
+    )
+    db_session.add_all([mismatched_anchor, valid_legacy_row])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = mismatched_anchor.id
+    task.last_checkpoint_event_id = valid_legacy_row.event_id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+
+def test_pk_anchor_no_run_id_candidate_fails_closed_before_the_shared_predicate(
+    db_session,
+) -> None:
+    """A candidate with no run_id (a run claim that never wrote provenance)
+    fails closed before the shared predicate is even consulted. The shared
+    predicate treats a null run_id as a legitimate partition, matched by a
+    row whose own run field is also absent -- but that answer belongs to the
+    root-checkpoint read path the predicate was written for, not to lease
+    recovery, which cannot prove an exact pointer belongs to the expired run
+    without provenance. This is the guard the read path's shared predicate
+    delegates back to its callers; this test pins that lease recovery
+    actually applies it.
+    """
+    user = _create_user(db_session, suffix="pk-no-run-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-no-run-id",
+    )
+    task.run_id = None
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-no-run-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD -- matches a null run_id under the
+            # shared predicate's own rule, which is exactly why this
+            # candidate must fail closed before reaching it.
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def test_pk_anchor_execution_identity_mismatch_is_not_recoverable(
+    db_session,
+) -> None:
+    """The shared predicate's execution-identity condition is evaluated for
+    lease recovery too, with execution_id set to str(candidate.task_id) --
+    web's execution id is the task id, the same value the other two
+    by-primary-key callers pass. A row whose payload carries a different
+    execution_id fails that condition and is not recoverable, proving the
+    sixth condition is actually wired up rather than silently skipped."""
+    user = _create_user(db_session, suffix="pk-wrong-execution-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-wrong-execution-id",
+    )
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-wrong-execution-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            "execution_id": "not-this-task-id",
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+        is CheckpointRecoveryVerdict.NOT_RECOVERABLE
+    )
+
+
+def test_pk_anchor_execution_identity_match_is_recoverable(db_session) -> None:
+    """The positive side of the identity check above: a row whose payload
+    carries the *correct* execution_id -- str(task.id), matching what
+    _candidate_row_failures passes -- is recoverable.
+
+    This is not redundant with the happy-path checkpoints built by
+    _create_expired_task, which never set an execution_id field at all;
+    checkpoint_execution_id then reads as empty and the identity condition
+    is vacuously satisfied regardless of what value is passed in. Only a
+    row that actually carries the right id proves the right id is the one
+    being passed, rather than merely that nothing is being compared.
+    """
+    user = _create_user(db_session, suffix="pk-right-execution-id")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="pk-right-execution-id",
+    )
+    row = TraceEvent(
+        task_id=task.id,
+        event_id="pk-right-execution-id-row",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            "execution_id": str(task.id),
+        },
+    )
+    db_session.add(row)
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = row.id
+    db_session.commit()
+
+    candidate = _candidate_for_task(task)
+    assert (
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+        is CheckpointRecoveryVerdict.RECOVERABLE
+    )
 
 
 _RECOVERY_SINGLE_FAULT_FIELDS = [
@@ -517,7 +807,7 @@ def test_pk_anchor_single_fault_is_not_recoverable(db_session, field: str) -> No
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.NOT_RECOVERABLE
     )
     assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
@@ -575,7 +865,7 @@ def test_dangling_pk_pointer_falls_back_to_the_legacy_scan(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(session, candidate)
+        resolve_checkpoint_recovery_with_data(session, candidate).verdict
         is CheckpointRecoveryVerdict.RECOVERABLE
     )
 
@@ -614,7 +904,7 @@ def test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep(
 
     candidate = _candidate_for_task(task)
     assert (
-        resolve_checkpoint_recovery(db_session, candidate)
+        resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
         is CheckpointRecoveryVerdict.INDETERMINATE
     )
     assert _recover_expired_task(db_session, task) is None
@@ -673,10 +963,109 @@ def test_ambiguous_legacy_checkpoint_registers_a_degradation_signal(
     try:
         candidate = _candidate_for_task(task)
         assert (
-            resolve_checkpoint_recovery(db_session, candidate)
+            resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
             is CheckpointRecoveryVerdict.INDETERMINATE
         )
         assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+    finally:
+        clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+
+
+def test_pk_anchor_missing_run_partition_then_ambiguous_legacy_id_is_indeterminate(
+    db_session,
+) -> None:
+    """The two deferral conditions meeting at once: a pointer row missing only
+    its run-partition field defers to the legacy scan, and that scan finds the
+    legacy event_id on more than one row.
+
+    Pinned because it is a change of kind, not of degree. Before the pointer
+    row was reclassified, a field-less pointer row resolved NOT_RECOVERABLE on
+    the spot and the task was failed once. The same candidate now reaches the
+    legacy scan's ambiguity branch, so the verdict is INDETERMINATE: the task
+    and its lease are left untouched and every later sweep selects the
+    candidate again, with no terminal exit of its own. Leaving it untouched is
+    deliberate -- an ambiguity a later sweep may resolve must not fail a
+    readable checkpoint -- but the repetition is unbounded, which is why the
+    degradation signal asserted below has to fire. Whether an INDETERMINATE
+    candidate should reach a terminal state after a bounded number of sweeps
+    is #2118, not decided here.
+
+    Both conditions are needed to reach this path. Either alone is already
+    covered: test_pk_anchor_missing_run_partition_defers_to_the_legacy_scan
+    has the deferral landing on a valid row, and
+    test_ambiguous_legacy_checkpoint_skips_the_candidate_for_the_next_sweep
+    reaches the ambiguity through a pointer that was never set.
+    """
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
+        active_degradations,
+        clear_degradation,
+    )
+
+    user = _create_user(db_session, suffix="absent-partition-ambiguous")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix="absent-partition-ambiguous",
+    )
+    legacy_event_id = "absent-partition-ambiguous-legacy"
+    pre_existing_anchor = TraceEvent(
+        task_id=task.id,
+        event_id="absent-partition-ambiguous-preexisting",
+        event_type="system_update_general",
+        timestamp=utc_now(),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "snapshot": {"type": "checkpoint"},
+            # No TASK_RUN_ID_TRACE_FIELD at all -- absent, not wrong, so the
+            # pointer defers instead of failing the candidate on the spot.
+        },
+    )
+    duplicate_legacy_rows = [
+        TraceEvent(
+            task_id=task.id,
+            event_id=legacy_event_id,
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: task.run_id,
+            },
+        )
+        for _ in range(2)
+    ]
+    db_session.add_all([pre_existing_anchor, *duplicate_legacy_rows])
+    db_session.flush()
+    task.last_checkpoint_trace_event_id = pre_existing_anchor.id
+    task.last_checkpoint_event_id = legacy_event_id
+    db_session.commit()
+
+    clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
+    try:
+        candidate = _candidate_for_task(task)
+        assert (
+            resolve_checkpoint_recovery_with_data(db_session, candidate).verdict
+            is CheckpointRecoveryVerdict.INDETERMINATE
+        )
+        assert CHECKPOINT_LEGACY_POINTER_AMBIGUOUS in active_degradations()
+
+        assert _recover_expired_task(db_session, task) is None
+
+        db_session.expire_all()
+        persisted = db_session.get(Task, int(task.id))
+        assert persisted.status == TaskStatus.RUNNING
+        assert persisted.runner_id is not None
+        assert persisted.lease_expires_at is not None
+
+        # No terminal exit: the candidate is still on the expired-lease scan,
+        # so the next sweep resolves the same two conditions the same way.
+        rescanned = get_expired_task_lease_candidates(
+            db_session,
+            cutoff=utc_now(),
+            limit=10,
+        )
+        assert any(c.task_id == int(task.id) for c in rescanned)
     finally:
         clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
 
@@ -1080,10 +1469,7 @@ def test_postgresql_batch_does_not_count_a_failed_candidate_transaction(
         "get_next_expired_task_lease_candidate_for_update",
         select_next_candidate,
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: TestSessionLocal,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", TestSessionLocal)
 
     batch = (
         task_lease_recovery._recover_expired_task_leases_batch_with_postgresql_locks(
@@ -1261,3 +1647,309 @@ async def test_recovery_loop_survives_pool_timeout_and_waits_for_next_tick(
 
     assert calls == 2
     assert sleeps == [11]
+
+
+# --- Orphaned pending delivery reconciliation (lease recovery owns it) ---
+
+
+def _add_user_row(
+    db,
+    task: Task,
+    *,
+    turn_id: str | None,
+    status: str = DELIVERY_PENDING,
+    role: str = "user",
+    created_at: datetime | None = None,
+) -> int:
+    row = TaskChatMessage(
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+        role=role,
+        message_type="user_message" if role == "user" else "assistant_message",
+        content=f"message {turn_id}",
+        turn_id=turn_id,
+        delivery_status=status,
+    )
+    if created_at is not None:
+        row.created_at = created_at
+    db.add(row)
+    db.commit()
+    return int(row.id)
+
+
+def _add_command(db, task: Task, *, command_id: str, status: str) -> None:
+    db.add(
+        TaskExecutionCommand(
+            task_id=int(task.id),
+            command_id=command_id,
+            kind=TaskCommandKind.MESSAGE.value,
+            payload={"message": "m", "client_message_id": command_id},
+            status=status,
+        )
+    )
+    db.commit()
+
+
+def _delivery_status(db, row_id: int) -> str | None:
+    db.expire_all()
+    row = db.get(TaskChatMessage, row_id)
+    assert row is not None
+    return row.delivery_status
+
+
+@pytest.mark.parametrize(
+    ("with_checkpoint", "verdict"),
+    [(True, TaskStatus.PAUSED), (False, TaskStatus.FAILED)],
+)
+def test_lease_recovery_dispatches_orphaned_pending_rows(
+    db_session,
+    with_checkpoint: bool,
+    verdict: TaskStatus,
+) -> None:
+    user = _create_user(db_session, suffix=f"orphan-{verdict.value}")
+    task = _create_expired_task(
+        db_session,
+        user_id=int(user.id),
+        suffix=f"orphan-{verdict.value}",
+        with_checkpoint=with_checkpoint,
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    no_turn = _add_user_row(db_session, task, turn_id=None)
+    settled = _add_user_row(
+        db_session, task, turn_id="settled-turn", status=DELIVERY_FAILED
+    )
+
+    assert _recover_expired_task(db_session, task) == verdict
+
+    # No grace period: the expired run can no longer settle its own rows.
+    assert _delivery_status(db_session, orphan) == DELIVERY_DISPATCHED
+    assert _delivery_status(db_session, no_turn) == DELIVERY_PENDING
+    assert _delivery_status(db_session, settled) == DELIVERY_FAILED
+
+
+@pytest.mark.parametrize(
+    ("command_id", "command_status"),
+    [
+        ("orphan-turn", COMMAND_PENDING),
+        ("orphan-turn", COMMAND_PROCESSING),
+        ("other-command", COMMAND_PENDING),
+        ("other-command", COMMAND_PROCESSING),
+        # A same-id MESSAGE that failed told its sender "not accepted".
+        ("orphan-turn", COMMAND_FAILED),
+    ],
+)
+def test_lease_recovery_leaves_rows_an_unfinished_or_failed_command_owns(
+    db_session,
+    command_id: str,
+    command_status: str,
+) -> None:
+    suffix = f"owned-{command_id}-{command_status}"
+    user = _create_user(db_session, suffix=suffix)
+    task = _create_expired_task(db_session, user_id=int(user.id), suffix=suffix)
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    _add_command(db_session, task, command_id=command_id, status=command_status)
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_PENDING
+
+
+def test_lease_recovery_ignores_settled_commands(db_session) -> None:
+    user = _create_user(db_session, suffix="completed-other")
+    task = _create_expired_task(
+        db_session, user_id=int(user.id), suffix="completed-other"
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    _add_command(db_session, task, command_id="orphan-turn", status=COMMAND_COMPLETED)
+    _add_command(db_session, task, command_id="other-command", status=COMMAND_FAILED)
+
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_DISPATCHED
+
+
+def test_fenced_recovery_candidate_writes_no_delivery_state(db_session) -> None:
+    user = _create_user(db_session, suffix="fenced-orphan")
+    task = _create_expired_task(
+        db_session, user_id=int(user.id), suffix="fenced-orphan"
+    )
+    orphan = _add_user_row(db_session, task, turn_id="orphan-turn")
+    candidate = get_expired_task_lease_candidates(
+        db_session,
+        cutoff=utc_now(),
+        limit=1,
+    )[0]
+    # A new owner took the task after the candidate was read.
+    task.runner_id = "replacement-runner"
+    task.lease_expires_at = utc_now() + timedelta(minutes=1)
+    db_session.commit()
+
+    assert (
+        recover_task_lease_candidate_isolated(candidate, recovered_at=utc_now()) is None
+    )
+
+    assert _delivery_status(db_session, orphan) == DELIVERY_PENDING
+    db_session.refresh(task)
+    assert task.status == TaskStatus.RUNNING
+
+
+def _quiescent_task(
+    db,
+    *,
+    user: User,
+    suffix: str,
+    status: TaskStatus = TaskStatus.PAUSED,
+    control_state: str | None = None,
+) -> Task:
+    task = Task(
+        user_id=int(user.id),
+        title=f"Quiescent {suffix}",
+        description="orphan sweep test",
+        status=status,
+        execution_mode="auto",
+        run_id=f"run-{suffix}",
+        state_version=2,
+        control_state=control_state or status.value.lower(),
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def test_periodic_sweep_dispatches_only_quiescent_old_pending_rows(
+    db_session,
+) -> None:
+    user = _create_user(db_session, suffix="sweep")
+    old = utc_now() - timedelta(hours=1)
+    reconciled_rows: list[int] = []
+    untouched: dict[int, str] = {}
+
+    paused: Task | None = None
+    for status in (TaskStatus.PAUSED, TaskStatus.COMPLETED, TaskStatus.FAILED):
+        quiescent = _quiescent_task(
+            db_session, user=user, suffix=f"quiescent-{status.value}", status=status
+        )
+        paused = paused or quiescent
+        reconciled_rows.append(
+            _add_user_row(
+                db_session, quiescent, turn_id=f"old-{status.value}", created_at=old
+            )
+        )
+    assert paused is not None
+    # Rows on the same quiescent task that are not eligible.
+    untouched[_add_user_row(db_session, paused, turn_id="fresh")] = DELIVERY_PENDING
+    for settled in (DELIVERY_COMPLETED, DELIVERY_FAILED, DELIVERY_OUTCOME_UNKNOWN):
+        untouched[
+            _add_user_row(
+                db_session,
+                paused,
+                turn_id=f"settled-{settled}",
+                status=settled,
+                created_at=old,
+            )
+        ] = settled
+    untouched[
+        _add_user_row(
+            db_session, paused, turn_id="assistant", role="assistant", created_at=old
+        )
+    ] = DELIVERY_PENDING
+
+    running = _quiescent_task(
+        db_session, user=user, suffix="running", status=TaskStatus.RUNNING
+    )
+    running.runner_id = "dead-runner"
+    running.lease_expires_at = utc_now() - timedelta(minutes=5)
+    waiting = _quiescent_task(
+        db_session, user=user, suffix="waiting", status=TaskStatus.WAITING_FOR_USER
+    )
+    pending_task = _quiescent_task(
+        db_session, user=user, suffix="pending", status=TaskStatus.PENDING
+    )
+    resume_requested = _quiescent_task(
+        db_session, user=user, suffix="resume", control_state="resume_requested"
+    )
+    pause_requested = _quiescent_task(
+        db_session, user=user, suffix="pause", control_state="pause_requested"
+    )
+    leased = _quiescent_task(db_session, user=user, suffix="leased")
+    leased.runner_id = "idle-owner"
+    leased.lease_expires_at = utc_now() + timedelta(minutes=5)
+    db_session.commit()
+    for blocked in (
+        running,
+        waiting,
+        pending_task,
+        resume_requested,
+        pause_requested,
+        leased,
+    ):
+        untouched[
+            _add_user_row(
+                db_session, blocked, turn_id=f"blocked-{blocked.id}", created_at=old
+            )
+        ] = DELIVERY_PENDING
+
+    reconcile = task_lease_recovery.reconcile_orphaned_pending_deliveries_isolated
+    assert reconcile(batch_size=100) == 3
+    for row_id in reconciled_rows:
+        assert _delivery_status(db_session, row_id) == DELIVERY_DISPATCHED
+    for row_id, expected in untouched.items():
+        assert _delivery_status(db_session, row_id) == expected
+
+    assert reconcile(batch_size=100) == 0
+
+
+def test_periodic_sweep_pages_by_task(db_session) -> None:
+    user = _create_user(db_session, suffix="sweep-page")
+    old = utc_now() - timedelta(hours=1)
+    rows = []
+    for index in range(3):
+        task = _quiescent_task(db_session, user=user, suffix=f"page-{index}")
+        rows.append(
+            _add_user_row(db_session, task, turn_id=f"a-{index}", created_at=old)
+        )
+        rows.append(
+            _add_user_row(db_session, task, turn_id=f"b-{index}", created_at=old)
+        )
+
+    reconcile = task_lease_recovery.reconcile_orphaned_pending_deliveries_isolated
+    # One page covers at most ``batch_size`` tasks, and all of each one's rows.
+    assert reconcile(batch_size=2) == 4
+    assert reconcile(batch_size=2) == 2
+    assert reconcile(batch_size=2) == 0
+    assert {_delivery_status(db_session, row) for row in rows} == {DELIVERY_DISPATCHED}
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_runs_the_sweep_on_its_first_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sweeps: list[int] = []
+
+    async def fake_recover(*, cutoff: datetime, batch_size: int) -> int:
+        return 0
+
+    def fake_sweep(*, batch_size: int) -> int:
+        sweeps.append(batch_size)
+        return 2
+
+    async def stop_sleep(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        task_lease_recovery,
+        "recover_expired_task_leases_until_cutoff",
+        fake_recover,
+    )
+    monkeypatch.setattr(
+        task_lease_recovery,
+        "reconcile_orphaned_pending_deliveries_isolated",
+        fake_sweep,
+    )
+    monkeypatch.setattr(task_lease_recovery.asyncio, "sleep", stop_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task_lease_recovery_loop(poll_interval_seconds=30, batch_size=9)
+
+    assert sweeps == [9]

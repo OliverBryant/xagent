@@ -38,7 +38,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useEffect } from "react"
-import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
+import { sanitizeAppIntegrations, sanitizeConnectorStatus } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
@@ -82,6 +82,7 @@ export type { AppIntegration } from "./types"
 import type { AppIntegration } from "./types"
 
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
+import { useOAuthAccountStep } from "./oauth-account-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
 import {
@@ -111,6 +112,7 @@ export function ConnectMcpDialog({
   const { t } = useI18n()
   const { token, inTeam } = useAuth()
   const { apps: officialApps } = useMcpApps()
+  const { requestAccount, accountDialog } = useOAuthAccountStep()
   const [searchQuery, setSearchQuery] = useState("")
   const [debouncedSearch, setDebouncedSearch] = useState("")
   // Per-app-id in-flight set, not a single shared slot: every connect
@@ -168,6 +170,7 @@ export function ConnectMcpDialog({
   const [activeStatus, setActiveStatus] = useState("all")
   const [apps, setApps] = useState<AppIntegration[]>([])
   const [selectedApp, setSelectedApp] = useState<AppIntegration | null>(null)
+  const [isGooglePickerOpen, setIsGooglePickerOpen] = useState(false)
   // Key-based (non-oauth) catalog connect: only the required secret(s) are editable.
   const [connectingKeyApp, setConnectingKeyApp] = useState<AppIntegration | null>(null)
   const [keyEnvValues, setKeyEnvValues] = useState<Record<string, string>>({})
@@ -357,8 +360,7 @@ export function ConnectMcpDialog({
         body: JSON.stringify({ refs }),
       })
       if (!response.ok) return
-      const status: Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }> =
-        await response.json()
+      const status = sanitizeConnectorStatus(await response.json())
       setApps((prev) =>
         prev.map((app) => {
           const ref = connectorRef(app)
@@ -1014,7 +1016,23 @@ export function ConnectMcpDialog({
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
-  const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
+  // A provider hosted on the customer's own account needs the account label
+  // before the popup; the label comes back into handleConnectApp below.
+  const requestAppAccount = (app: AppIntegration, autoSelect: boolean, retry = false) => {
+    if (!app.oauth_account_input) return
+    requestAccount(
+      {
+        key: app.id,
+        name: app.name,
+        icon: app.icon,
+        input: app.oauth_account_input,
+        onSubmit: (account) => handleConnectApp(app, autoSelect, account),
+      },
+      { retry },
+    )
+  }
+
+  const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false, account?: string) => {
     if (app.auth_type !== "builtin_oauth") {
       // Key-based catalog app: collect the key; keyless app: connect directly;
       // remote-MCP OAuth app (catalog or user-added custom server): start the
@@ -1039,6 +1057,11 @@ export function ConnectMcpDialog({
       return;
     }
 
+    if (app.oauth_account_input && account === undefined) {
+      requestAppAccount(app, autoSelect)
+      return
+    }
+
     // #1330: same same-tick window as the mcp_oauth handler above. There is no
     // provider-side registration here (the client is static), but two calls
     // would open two provider popups and register two postMessage listeners,
@@ -1050,7 +1073,8 @@ export function ConnectMcpDialog({
     const left = window.screenX + (window.outerWidth - width) / 2;
     const top = window.screenY + (window.outerHeight - height) / 2;
 
-    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${app.id}&redirect=${encodeURIComponent(window.location.href)}`;
+    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : ''
+    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${app.id}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
       `${provider} OAuth`,
@@ -1103,6 +1127,9 @@ export function ConnectMcpDialog({
       window.removeEventListener('message', handleMessage);
       mcpOauthMessageListenersRef.current.delete(handleMessage)
       clearAppLoading(app.id);
+      // Closed without connecting: the server's own error page, if any, was
+      // shown in the popup, so offer the account step again.
+      if (account !== undefined && popup?.closed) requestAppAccount(app, autoSelect, true)
     }, 500);
     mcpOauthPollTimersRef.current.add(checkPopup)
   }
@@ -1178,18 +1205,25 @@ export function ConnectMcpDialog({
     <>
     <Dialog
       open={open}
+      modal={!isGooglePickerOpen}
       onOpenChange={(nextOpen) => {
         // Radix's own Escape/outside-click dismissal — route it through the
         // same requestClose() every explicit close action uses, so this is
         // the only place the guard logic lives.
         if (!nextOpen) {
+          if (isGooglePickerOpen) return
           requestClose()
           return
         }
         onOpenChange(nextOpen)
       }}
     >
-      <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
+      <DialogContent
+        className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50"
+        onInteractOutside={(event) => {
+          if (isGooglePickerOpen) event.preventDefault()
+        }}
+      >
         <DialogHeader className="px-6 py-4 border-b bg-white shrink-0 pr-10">
           <DialogTitle className="text-xl flex items-center gap-2 font-bold text-left">
             <Plug className="h-5 w-5 text-blue-600 shrink-0" /> {t('tools.mcp.dialog.connector')}
@@ -1487,7 +1521,19 @@ export function ConnectMcpDialog({
                                   {app.is_local ? <Home className="h-3 w-3 mr-1.5 text-slate-400" /> : <Globe className="h-3 w-3 mr-1.5 text-slate-400" />}
                                   {app.is_local ? t('tools.mcp.dialog.local') : t('tools.mcp.dialog.remote')}
                                 </Badge>
-                                {inTeam && isGloballyConnected && connectorRef(app) && (
+                                {/* The ownership badge reports team-sharing status, which is not a
+                                    credential fact, so it does not gate on isGloballyConnected.
+                                    connectorRef(app) requires the entry to have a sharing identity
+                                    at all (a numeric server_id); without it an unconnected catalog
+                                    entry would render "Private" from a shared field nobody set.
+                                    typeof app.shared === "boolean" holds for a well-formed answer
+                                    from the sharing route (the merge above only ever writes a
+                                    sanitized triple), or for a shared field the /api/mcp/apps
+                                    listing itself chose to supply -- sanitizeAppIntegrations does
+                                    not strip unknown fields. connectorRef(app) is what keeps that
+                                    second case from rendering a badge on an entry with no sharing
+                                    identity at all. */}
+                                {inTeam && connectorRef(app) && typeof app.shared === "boolean" && (
                                   <Badge variant="secondary" className={`font-medium px-2 py-0.5 rounded-md border shadow-none ${app.shared ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
                                     {!app.shared
                                       ? t('tools.mcp.sharing.private')
@@ -1756,6 +1802,7 @@ export function ConnectMcpDialog({
           setSelectedApp(null);
           openKeyConnect(appToManage);
         }}
+        onPickerOpenChange={setIsGooglePickerOpen}
         onConfigure={(appToConfigure) => {
           if (!appToConfigure.is_custom || !Number.isInteger(appToConfigure.server_id)) {
             return
@@ -1847,6 +1894,7 @@ export function ConnectMcpDialog({
         </div>
       </DialogContent>
     </Dialog>
+    {accountDialog}
     </>
   )
 }

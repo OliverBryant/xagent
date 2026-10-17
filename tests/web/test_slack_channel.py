@@ -41,6 +41,8 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import SlackOAuthFlowState, UserChannel
 from xagent.web.schemas.user_channel import UserChannelCreate, UserChannelUpdate
 from xagent.web.services.channel_runtime import ChannelConfigSnapshot
+from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
@@ -1205,33 +1207,28 @@ def test_slack_only_handles_mentions_in_shared_channels() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_slack_turn_reuses_channel_runtime(
+async def test_slack_direct_failed_result_appends_task_id_to_chat_text_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The direct path shows the task id in chat but keeps the transcript clean."""
     bot = make_bot()
+    bot.active_tasks["T1:D1:U1:direct"] = 45
     bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
     lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
-    finalized: list[tuple[TaskStatus, str]] = []
+    finalized: list[dict[str, Any]] = []
+    final_messages: list[dict[str, Any]] = []
 
     class FakeManagedLease:
         heartbeat_task = None
 
         def __init__(self) -> None:
             self.lease = lease
-            self.closed = False
 
-        async def finalize_result(
-            self,
-            *,
-            status: TaskStatus,
-            assistant_content: str = "",
-            **_kwargs: Any,
-        ) -> bool:
-            finalized.append((status, assistant_content))
+        async def finalize_result(self, **kwargs: Any) -> bool:
+            finalized.append(kwargs)
             return True
 
         async def close(self) -> bool:
-            self.closed = True
             return True
 
     managed = FakeManagedLease()
@@ -1240,7 +1237,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         return SimpleNamespace(
             user_id=5,
             task_id=45,
-            is_new_task=True,
+            is_new_task=False,
             managed_lease=managed,
         )
 
@@ -1254,23 +1251,29 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     agent_service = SimpleNamespace(
         workspace=None,
         tracer=FakeTracer(),
-        set_conversation_history=lambda _messages: None,
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
         set_execution_context_messages=lambda _messages: None,
         set_recovered_skill_context=lambda _context: None,
     )
+    execution_result = {
+        "success": False,
+        "status": "error",
+        "output": "provider token=secret",
+        "error": "provider token=secret",
+    }
 
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
             return agent_service
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
-            return {"success": True, "output": "Slack reply"}
+            return execution_result
 
-    persisted: list[dict[str, Any]] = []
-    final_messages: list[dict[str, Any]] = []
-
-    async def persist(**kwargs: Any) -> None:
-        persisted.append(kwargs)
+    async def persist(**_kwargs: Any) -> None:
+        return None
 
     async def send_text(
         _channel_id: str,
@@ -1278,7 +1281,6 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         *,
         thread_ts: str | None,
     ) -> str:
-        assert thread_ts is None
         return "loading-ts"
 
     async def send_final_text(**kwargs: Any) -> None:
@@ -1293,7 +1295,162 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         lambda *_args: SimpleNamespace(
             runtime_user=None,
             conversation_history=(),
+            conversation_watermark=None,
+            conversation_event_watermark=None,
             execution_recovery=TaskExecutionRecoverySnapshot(),
+            task=SimpleNamespace(source="internal"),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.persist_channel_user_message",
+        persist,
+    )
+    bot._send_text = send_text  # type: ignore[method-assign]
+    bot._send_final_text = send_final_text  # type: ignore[method-assign]
+
+    await bot._process_event(
+        "T1:D1:U1:direct",
+        {},
+        {
+            "type": "message",
+            "channel_type": "im",
+            "channel": "D1",
+            "user": "U1",
+            "ts": "1.0",
+            "text": "hello",
+        },
+    )
+
+    assert [message["text"] for message in final_messages] == [
+        "Task execution failed. (Task ID: 45)"
+    ]
+    assert len(finalized) == 1
+    assert finalized[0]["status"] == TaskStatus.FAILED
+    assert finalized[0]["assistant_content"] == "Task execution failed."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_unavailable", [False, True])
+@pytest.mark.parametrize("is_new_task", [False, True])
+async def test_slack_turn_reuses_channel_runtime_and_reports_auto_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    auto_unavailable: bool,
+    is_new_task: bool,
+) -> None:
+    bot = make_bot()
+    if not is_new_task:
+        bot.active_tasks["T1:D1:U1:direct"] = 45
+    bot._save_active_tasks = lambda: None  # type: ignore[method-assign]
+    lease = TaskLease(task_id=45, runner_id="runner-a", run_id="run-a")
+    finalized: list[tuple[TaskStatus, str]] = []
+    finalized_execution_results: list[Any] = []
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+            self.closed = False
+
+        async def finalize_result(
+            self,
+            *,
+            status: TaskStatus,
+            assistant_content: str = "",
+            execution_result: Any = None,
+            **_kwargs: Any,
+        ) -> bool:
+            finalized.append((status, assistant_content))
+            finalized_execution_results.append(execution_result)
+            return True
+
+        async def close(self) -> bool:
+            self.closed = True
+            return True
+
+    managed = FakeManagedLease()
+
+    async def prepare(**_kwargs: Any) -> Any:
+        return SimpleNamespace(
+            user_id=5,
+            task_id=45,
+            is_new_task=is_new_task,
+            managed_lease=managed,
+        )
+
+    class FakeTracer:
+        def __init__(self) -> None:
+            self.handlers: list[Any] = []
+
+        def add_handler(self, handler: Any) -> None:
+            self.handlers.append(handler)
+
+    agent_service = SimpleNamespace(
+        workspace=None,
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages,
+        *,
+        watermark=None,
+        event_watermark=None: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+
+    execution_result = {"success": True, "output": "Slack reply"}
+    connector_turn_ids: list[str | None] = []
+    execution_turn_ids: list[str] = []
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            connector_turn_ids.append(_kwargs.get("connector_runtime_turn_id"))
+            if auto_unavailable:
+                raise AutoModelUnavailableError("private model details")
+            return agent_service
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            execution_turn_ids.append(_kwargs["context"]["turn_id"])
+            return execution_result
+
+    persisted: list[dict[str, Any]] = []
+    final_messages: list[dict[str, Any]] = []
+
+    async def persist(**kwargs: Any) -> None:
+        persisted.append(kwargs)
+
+    async def send_text(
+        _channel_id: str,
+        _text: str,
+        *,
+        thread_ts: str | None,
+    ) -> str:
+        assert thread_ts is None
+        if auto_unavailable:
+            final_messages.append({"text": _text})
+        return "loading-ts"
+
+    async def send_final_text(**kwargs: Any) -> None:
+        final_messages.append(kwargs)
+
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.prepare_channel_task",
+        prepare,
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.slack.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            conversation_watermark=None,
+            conversation_event_watermark=None,
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+            # The turn binds ``task.source`` into the agent context (MCP
+            # approval gate identity), so the stand-in row carries the
+            # ``Task.source`` column default a channel-created task gets.
+            task=SimpleNamespace(source="internal"),
         ),
     )
     monkeypatch.setattr(
@@ -1321,8 +1478,18 @@ async def test_successful_slack_turn_reuses_channel_runtime(
     )
 
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
+    if auto_unavailable:
+        assert finalized == [(TaskStatus.FAILED, "")]
+        assert final_messages == [
+            {"text": f"{CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE} (Task ID: 45)"}
+        ]
+        assert managed.closed is True
+        return
     assert persisted[0]["content"] == "hello"
+    assert connector_turn_ids == execution_turn_ids == [persisted[0]["turn_id"]]
+    assert connector_turn_ids[0]
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
+    assert finalized_execution_results == [execution_result]
     assert final_messages == [
         {
             "channel_id": "D1",

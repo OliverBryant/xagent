@@ -102,6 +102,64 @@ def _clear_session_flushed(session: Session, transaction: Any) -> None:
         session.info[_MAY_HAVE_WRITTEN_KEY] = False
 
 
+# Hooks installed through ``services/connector_team_scope`` run on the
+# endpoint's own live session, mid-request, often with row locks already
+# held. A hook that ends that transaction releases those locks without the
+# endpoint finding out. Counting how many times the root transaction has
+# ended is what lets the seam notice: the count moving across a hook call
+# is the whole signal.
+#
+# Same ``transaction.parent is None`` test, and for the same reason, as
+# ``_clear_session_flushed`` directly above -- ``after_commit`` and
+# ``after_rollback`` fire for savepoint completion too, and a savepoint
+# completing is not the caller's transaction ending. Separate listener
+# rather than an addition to that one: clearing the write flag and
+# counting transaction ends are two jobs, and a session's write-flag
+# behavior must not change because something else started counting.
+_ROOT_TXN_END_COUNT_KEY = "xagent_root_txn_end_count"
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _count_root_transaction_end(session: Session, transaction: Any) -> None:
+    if transaction.parent is None:
+        current = session.info.get(_ROOT_TXN_END_COUNT_KEY, 0)
+        # The first listener in this module that reads a value back before
+        # writing it, and ``session.info`` is reachable from an installed
+        # hook. Without this, a non-count value left there would raise from
+        # inside a transaction-end event -- including the one ``commit()``
+        # fires, after the write is already durable. ``bool`` is excluded
+        # because ``int(True)`` would otherwise pass as a count of 1;
+        # ``root_transaction_end_count`` rejects it with the same predicate.
+        if not isinstance(current, int) or isinstance(current, bool):
+            current = 0
+        session.info[_ROOT_TXN_END_COUNT_KEY] = current + 1
+
+
+def root_transaction_end_count(db: Any) -> int | None:
+    """How many root transactions have ended on ``db`` since it was created.
+
+    ``None`` means the object cannot report a count at all: a duck-typed
+    session has no ``info`` mapping, and ``web/tools/config.py`` documents
+    that standalone embedders and unit tests supply those. A caller reads
+    ``None`` as "cannot observe" and skips whatever comparison it was
+    about to make, the same way ``_restore_session_after_hook_failure``
+    skips a session with no ``rollback``.
+
+    A value that is present but is not a count is a different thing and
+    raises. The only way one gets there is something writing into
+    ``session.info`` under this key, and a caller that cannot read the
+    count it is about to compare has to refuse rather than quietly skip
+    the comparison -- skipping is indistinguishable from passing.
+    """
+    info = getattr(db, "info", None)
+    if info is None:
+        return None
+    value = info.get(_ROOT_TXN_END_COUNT_KEY, 0)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("connector hook session counter holds a non-count value")
+    return value
+
+
 def release_db_connection_if_clean(db: Session | None) -> bool:
     """Return ``db``'s pooled connection by ending its (read-only) transaction.
 
@@ -183,6 +241,13 @@ def configure_db(
             database_url,
             connect_args={"check_same_thread": False},
             poolclass=NullPool,
+            # A StatementError's default __str__ includes bound parameter
+            # values -- without this, any `except Exception: logger.x(e)`
+            # or `str(e)` anywhere in the app that touches a commit/execute
+            # failure can put a live secret (an OAuth token, a password
+            # hash) bound as a query parameter into a log or, worse, a
+            # client-facing response.
+            hide_parameters=True,
         )
         if not read_only:
             # WAL + busy_timeout let concurrent writes wait for the lock instead
@@ -192,6 +257,9 @@ def configure_db(
         engine_kwargs: dict[str, Any] = {
             "poolclass": QueuePool,
             **get_db_pool_kwargs(),
+            # After the spread, not before: get_db_pool_kwargs() must never
+            # be able to silently win this key and turn the guard off.
+            "hide_parameters": True,
         }
         if read_only:
             # SQLAlchemy applies PostgreSQL's READ ONLY transaction mode when
@@ -204,10 +272,15 @@ def configure_db(
         )
 
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
+    from ..services.kb_reference_protection import install_file_reference_validator
+
+    install_file_reference_validator()
 
 
 def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
-    """Migrate, create, and seed the schema under one startup ownership lock."""
+    """Migrate, create, and seed the schema under one startup ownership lock,
+    and refuse to serve if the live ``taskstatus`` enum has drifted from
+    ``TaskStatus`` (``check_task_status_enum_drift``, ``models/task.py``)."""
 
     from ...db.migration import (
         database_startup_lock,
@@ -216,8 +289,11 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
     )
     from ..builtin_mcp_registry import (
         seed_builtin_oauth_and_public_mcp_apps,
+        sync_google_scope_policy,
+        sync_zoom_meeting_write_policy,
         validate_builtin_public_mcp_apps,
     )
+    from .task import check_task_status_enum_drift
 
     with database_startup_lock(engine) as locked_connection:
         startup_bind: Engine | Connection = (
@@ -230,14 +306,27 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
         )
         Base.metadata.create_all(bind=startup_bind)
 
+        # Checked on both branches rather than only where locked_connection is
+        # set: database_startup_lock yields None outright on any non-PostgreSQL
+        # backend (see that function's own docstring), so PostgreSQL always
+        # takes the locked branch and the other branch's check is a no-op there
+        # -- but tying the check to "schema is ready" rather than to "which
+        # branch we're on" means a future change to the lock's backend behavior
+        # can't silently drop it.
         if locked_connection is not None:
+            check_task_status_enum_drift(locked_connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(locked_connection)
+            sync_google_scope_policy(locked_connection)
+            sync_zoom_meeting_write_policy(locked_connection)
             return validate_builtin_public_mcp_apps(locked_connection)
 
         with engine.begin() as connection:
+            check_task_status_enum_drift(connection)
             if should_seed_builtin_mcp_registry:
                 seed_builtin_oauth_and_public_mcp_apps(connection)
+            sync_google_scope_policy(connection)
+            sync_zoom_meeting_write_policy(connection)
             return validate_builtin_public_mcp_apps(connection)
 
 
@@ -245,7 +334,10 @@ def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
     # Import all models to ensure they are registered with Base.metadata
     from . import (  # noqa: F401
+        AutoModelCandidate,
+        AutoModelConfig,
         BackgroundJob,
+        GlobalMemoryEmbeddingAuthority,
         GmailWatchState,
         KBIngestTarget,
         MCPServer,
@@ -257,6 +349,7 @@ def init_db(db_url: str | None = None) -> None:
         SystemSetting,
         Task,
         TaskChatMessage,
+        TaskCommandTerminalEvent,
         TaskConnectorRuntimeContext,
         TaskExecutionCommand,
         TemplateStats,

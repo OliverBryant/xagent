@@ -196,6 +196,16 @@ def test_coordinator_management_facade_uses_instance_storage() -> None:
         def get_ingestion_status_store(self) -> IngestionStatusStore:
             return self.status_store
 
+        def get_metadata_store(self):
+            metadata = MagicMock()
+            metadata.get_collection = AsyncMock(
+                side_effect=ValueError("Collection 'docs' not found")
+            )
+            return metadata
+
+        def get_main_pointer_store(self):
+            return MagicMock()
+
     vector_store = VectorStore()
     status_store = IngestionStatusStore()
 
@@ -310,19 +320,22 @@ def test_facade_delegates_document_cleanup_to_existing_management_impl(
 ) -> None:
     from xagent.core.tools.core.RAG_tools.kb import (
         KBCoreManagementCompatibilityFacade,
+        get_kb_coordinator,
     )
     from xagent.core.tools.core.RAG_tools.management import collections
 
     sentinel = object()
-    calls: list[tuple[str, str, int, bool]] = []
+    calls: list[tuple[str, str, int, bool, object]] = []
 
     def fake_delete_document_impl(
         collection: str,
         doc_id: str,
         user_id: int,
         is_admin: bool = False,
+        *,
+        coordinator: object = None,
     ) -> object:
-        calls.append((collection, doc_id, user_id, is_admin))
+        calls.append((collection, doc_id, user_id, is_admin, coordinator))
         return sentinel
 
     monkeypatch.setattr(
@@ -339,7 +352,7 @@ def test_facade_delegates_document_cleanup_to_existing_management_impl(
     )
 
     assert result is sentinel
-    assert calls == [("docs", "doc-1", 9, False)]
+    assert calls == [("docs", "doc-1", 9, False, get_kb_coordinator())]
 
 
 @pytest.mark.asyncio

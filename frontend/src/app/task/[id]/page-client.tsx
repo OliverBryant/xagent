@@ -5,18 +5,53 @@ import { ArrowLeft, Loader2, PanelRight } from "lucide-react"
 import { useParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { TaskAgentExecutionDrawer } from "@/components/task/task-agent-execution-drawer"
+import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { ProgressPanel, type ProgressStepView } from "@/components/task/progress-panel"
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
+import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn, getApiUrl } from "@/lib/utils"
 
+export interface SessionCheckWatch {
+  viewed: number | null // the task this view checks; null while no view is on
+  reconnects: number // the app's sameTaskReconnects as last seen
+}
+
+export const INITIAL_SESSION_CHECK_WATCH: SessionCheckWatch = { viewed: null, reconnects: 0 }
+
+// When this page asks the connector-runtime dialog to check the viewed task.
+// A view starts when the URL and the app state first agree on a task and
+// lasts while the app state stays on it, so the URL disagreeing for a moment
+// neither ends it nor starts a new one. A view is checked once when it
+// starts, and again each time the app reports that the socket reopened for
+// the task it was already connected to (sameTaskReconnects, counted in
+// onConnect). The first connect for a task is not counted there, so the page
+// coming up is not taken for a reconnect.
+export function nextSessionCheck(
+  prev: SessionCheckWatch,
+  now: { urlTaskId: number; stateTaskId: number | null; reconnects: number },
+): { next: SessionCheckWatch; check: { taskId: number; cause: SessionCheckCause } | null } {
+  if (prev.viewed !== null && now.stateTaskId === prev.viewed) {
+    if (now.reconnects === prev.reconnects) return { next: prev, check: null }
+    return { next: { ...prev, reconnects: now.reconnects }, check: { taskId: prev.viewed, cause: "reconnected" } }
+  }
+  const { stateTaskId } = now
+  if (stateTaskId === null || stateTaskId <= 0 || stateTaskId !== now.urlTaskId) {
+    return { next: { viewed: null, reconnects: now.reconnects }, check: null }
+  }
+  return { next: { viewed: stateTaskId, reconnects: now.reconnects }, check: { taskId: stateTaskId, cause: "opened" } }
+}
+
 function TaskDetailContent() {
-  const { state, setTaskId, closeFilePreview } = useApp()
+  const { state, setTaskId, closeFilePreview, sameTaskReconnects } = useApp()
+  const { openSessionCheck } = useConnectorRuntimeDialogActions()
   const { t } = useI18n()
   const params = useParams()
   const router = useRouter()
   const taskIdFromUrl = params.id
   const [progressPanelOpen, setProgressPanelOpen] = useState(false)
+  const [agentExecution, setAgentExecution] = useState<{ taskId: number; selection: AgentExecutionSummary } | null>(null)
   const dismissedProgressRunKeyRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -34,6 +69,18 @@ function TaskDetailContent() {
     }
   }, [closeFilePreview])
 
+  // Asks the connector-runtime dialog to check the viewed task (see
+  // nextSessionCheck); the dialog's provider decides whether that opens anything.
+  const urlTaskId = typeof taskIdFromUrl === "string" ? parseInt(taskIdFromUrl, 10) : NaN
+  const sessionCheckRef = useRef(INITIAL_SESSION_CHECK_WATCH)
+  useEffect(() => {
+    const { next, check } = nextSessionCheck(sessionCheckRef.current, {
+      urlTaskId, stateTaskId: state.taskId, reconnects: sameTaskReconnects,
+    })
+    sessionCheckRef.current = next
+    if (check !== null) openSessionCheck(check.taskId, check.cause)
+  }, [urlTaskId, state.taskId, sameTaskReconnects, openSessionCheck])
+
   // progressPanelOpen/dismissedProgressRunKeyRef are mount-local state, not
   // scoped to the viewed task - a soft A-to-B navigation (setTaskId without a
   // remount) would otherwise carry task A's open/dismissed state straight
@@ -48,6 +95,7 @@ function TaskDetailContent() {
   // first one) is harmless: both start already at their default values.
   useEffect(() => {
     setProgressPanelOpen(false)
+    setAgentExecution(null)
     dismissedProgressRunKeyRef.current = null
   }, [state.taskId])
 
@@ -235,7 +283,20 @@ function TaskDetailContent() {
           </div>
         )}
         <div className="flex-1 min-h-0 relative">
-          <TaskConversationPanel mode="page" />
+          <TaskConversationPanel mode="page" onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+            if (state.taskId) {
+              closeFilePreview()
+              setAgentExecution({ taskId: state.taskId, selection })
+            }
+          } : undefined} />
+          {agentExecution && agentExecution.taskId === state.taskId && (
+            <TaskAgentExecutionDrawer
+              key={`${agentExecution.taskId}:${agentExecution.selection.workerTaskId}`}
+              taskId={agentExecution.taskId}
+              selection={agentExecution.selection}
+              onClose={() => setAgentExecution(null)}
+            />
+          )}
         </div>
       </div>
 

@@ -15,7 +15,8 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.task import Task
 from ..models.user import User
-from ..utils.db_timezone import safe_timestamp_to_unix
+from ..services.task_event_metrics import monitoring_trace_source
+from ..utils.db_timezone import normalize_datetime_from_db, safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +266,9 @@ async def get_monitoring_stats(
     server's or the viewer's local day.
     """
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build TraceEvent query filter based on user permissions
         trace_event_filter = []
@@ -410,28 +413,24 @@ async def get_monitoring_stats(
             else None
         )
 
-        # Get active model count
-        try:
-            # Use safe JSON field extraction to avoid NULL character issues
-            model_name_expr = safe_get_json_field(TraceEvent.data, "model_name", db)
-            active_models = (
-                db.query(model_name_expr)
-                .filter(
-                    TraceEvent.event_type == "llm_call_start",
-                    TraceEvent.timestamp >= today_start,
-                    TraceEvent.data.isnot(None),
-                    model_name_expr.isnot(None),
-                    *trace_event_filter,
-                )
-                .distinct()
-                .count()
-            )
-        except Exception as e:
-            logger.error(f"Failed to query active models: {e}")
-            active_models = 0
+        # Reuse all starts, independently of duration matching. Empty names count.
+        active_model_names: set[str] = set()
+        for event in llm_starts:
+            if not isinstance(event.data, dict):
+                continue
+
+            model_name = event.data.get("model_name")
+            if not isinstance(model_name, str):
+                continue
+
+            timestamp = normalize_datetime_from_db(event.timestamp)
+            if timestamp >= today_start:
+                active_model_names.add(model_name)
+
+        active_models = len(active_model_names)
 
         # Get total token count
-        total_tokens: int | None = 0
+        token_sum = 0
         tokens_found = False
         llm_end_events = (
             db.query(TraceEvent)
@@ -448,14 +447,14 @@ async def get_monitoring_stats(
                 if "total_tokens" in event.data and isinstance(
                     event.data["total_tokens"], int
                 ):
-                    total_tokens += event.data["total_tokens"]
+                    token_sum += event.data["total_tokens"]
                     tokens_found = True
                 elif "usage" in event.data and isinstance(event.data["usage"], dict):
                     usage = event.data["usage"]
                     if "total_tokens" in usage and isinstance(
                         usage["total_tokens"], int
                     ):
-                        total_tokens += usage["total_tokens"]
+                        token_sum += usage["total_tokens"]
                         tokens_found = True
                     elif (
                         "prompt_tokens" in usage
@@ -463,14 +462,11 @@ async def get_monitoring_stats(
                         and isinstance(usage["prompt_tokens"], int)
                         and isinstance(usage["completion_tokens"], int)
                     ):
-                        total_tokens += (
-                            usage["prompt_tokens"] + usage["completion_tokens"]
-                        )
+                        token_sum += usage["prompt_tokens"] + usage["completion_tokens"]
                         tokens_found = True
 
         # If no token information found, set to None
-        if not tokens_found:
-            total_tokens = None
+        total_tokens = token_sum if tokens_found else None
 
         return {
             "totalCalls": total_calls,
@@ -499,7 +495,9 @@ async def get_popular_tools(
 ) -> List[Dict[str, Any]]:
     """Get popular tools statistics"""
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -563,7 +561,9 @@ async def get_model_stats(
 ) -> List[Dict[str, Any]]:
     """Get model usage statistics"""
     try:
-        from ..models.task import TraceEvent
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         trace_event_filter = []
@@ -650,7 +650,11 @@ async def get_dashboard_stats(
     server's or the viewer's local day.
     """
     try:
-        from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
+        from ..models.task import Task, TaskStatus, task_status_predicate
+
+        TraceEvent = monitoring_trace_source(
+            user_id=None if is_admin_user(current_user) else int(current_user.id)
+        )
 
         # Build filter conditions based on user permissions
         task_filter = []

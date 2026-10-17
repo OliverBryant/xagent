@@ -19,6 +19,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) => {
       if (vars?.tool) return `${key}:${vars.tool}`
+      if (vars?.connector) return `${key}:${vars.connector}`
       if (vars?.worker) return `${key}:${vars.worker}`
       if (vars && "count" in vars) return `${key}:${vars.count}`
       return key
@@ -67,6 +68,101 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 import { TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  it("renders a failed DAG end correctly both live and after replay", () => {
+    const events = [
+      {
+        event_id: "export-start",
+        event_type: "dag_step_start",
+        step_id: "export",
+        timestamp: 1000,
+        data: { step_name: "Export verified data" },
+      },
+      {
+        event_id: "export-end",
+        event_type: "dag_step_end",
+        step_id: "export",
+        timestamp: 2000,
+        data: { status: "completed", result: "Verified output" },
+      },
+      {
+        event_id: "verify-start",
+        event_type: "dag_step_start",
+        step_id: "verify",
+        timestamp: 3000,
+        data: { step_name: "Verify remaining data" },
+      },
+      {
+        event_id: "verify-end",
+        event_type: "dag_step_end",
+        step_id: "verify",
+        timestamp: 4000,
+        data: { status: "failed", error: "Iteration limit reached" },
+      },
+    ]
+    const { container, rerender, unmount } = render(
+      <TraceEventRenderer events={events.slice(0, -1)} taskStatus="running" />,
+    )
+    expect(screen.getByRole("button", { name: "Verify remaining data" })).toBeInTheDocument()
+
+    rerender(<TraceEventRenderer events={events} taskStatus="running" />)
+    const assertStepOutcomes = () => {
+      const successful = screen.getByRole("button", { name: "Export verified data" })
+      const failed = screen.getByRole("button", { name: "Verify remaining data" })
+      expect(successful.querySelector(".text-green-500")).not.toBeNull()
+      expect(failed.querySelector(".text-red-500")).not.toBeNull()
+      expect(failed.querySelector(".text-green-500")).toBeNull()
+      if (failed.getAttribute("aria-expanded") === "false") fireEvent.click(failed)
+      fireEvent.click(screen.getByRole("button", { name: /traceEventRenderer.executionFailed/ }))
+      expect(screen.getByText("Iteration limit reached")).toBeInTheDocument()
+    }
+    assertStepOutcomes()
+    expect(container.querySelector(".animate-spin")).toBeNull()
+
+    // A successful partial handoff completes the task, not its failed step.
+    unmount()
+    render(<TraceEventRenderer events={events} taskStatus="completed" />)
+    assertStepOutcomes()
+  })
+
+  describe("interrupted process", () => {
+    const events = [
+      { event_id: "start", event_type: "react_task_start", step_id: "s1", timestamp: 1000, data: {} },
+      {
+        event_id: "tool",
+        event_type: "tool_execution_start",
+        step_id: "s1",
+        timestamp: 2000,
+        data: { tool_name: "web_search", tool_args: { query: "interrupted-probe" } },
+      },
+    ]
+
+    it("renders an interrupted process as a distinct, named, non-error state", () => {
+      const { container } = render(<TraceEventRenderer events={events} taskStatus="interrupted" />)
+
+      expect(container.querySelector(".animate-spin")).toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      expect(screen.queryByText("traceEventRenderer.unknownError")).toBeNull()
+
+      const step = screen.getByRole("button", { name: /agent\.layout\.status\.interrupted/ })
+      const icon = step.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      // CircleSlash draws a diagonal bar; the Info glyph used for failed and
+      // paused steps draws a vertical stem instead.
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(icon?.querySelector("path[d='M12 16v-4']")).toBeNull()
+    })
+
+    it("collapses an action once its process becomes interrupted", async () => {
+      const { rerender } = render(<TraceEventRenderer events={events} taskStatus="running" />)
+      expect(screen.getByText("traceEventRenderer.searchQuery")).toBeInTheDocument()
+
+      rerender(<TraceEventRenderer events={events} taskStatus="interrupted" />)
+      await waitFor(() => {
+        expect(screen.queryByText("traceEventRenderer.searchQuery")).toBeNull()
+      })
+    })
+  })
+
   it("ignores null, primitive, and malformed trace event entries", () => {
     expect(() => render(
       <TraceEventRenderer
@@ -1526,6 +1622,67 @@ describe("TraceEventRenderer", () => {
     const toolToggle = screen.getByRole("button", { name: /Generate Video/ })
     fireEvent.click(toolToggle)
     expect(screen.getByText("Invalid duration")).toBeInTheDocument()
+  })
+
+  const renderUnavailableConnector = (result: Record<string, unknown>) => render(
+    <TraceEventRenderer
+      events={[
+        {
+          event_id: "start",
+          event_type: "react_task_start",
+          step_id: "step-1",
+          timestamp: 1,
+          data: { step_name: "Work" },
+        },
+        {
+          event_id: "tool-start",
+          event_type: "tool_execution_start",
+          step_id: "step-1",
+          timestamp: 2,
+          data: { tool_name: "mcp_google_drive_42_unavailable", tool_call_id: "A" },
+        },
+        {
+          event_id: "tool-failed",
+          event_type: "tool_execution_failed",
+          step_id: "step-1",
+          timestamp: 3,
+          data: {
+            tool_name: "mcp_google_drive_42_unavailable",
+            tool_call_id: "A",
+            error: "MCP server tools could not be loaded.",
+            result,
+          },
+        },
+      ]}
+    />,
+  )
+
+  it("renders an unavailable connector call as a plain status line", () => {
+    renderUnavailableConnector({ unavailable_server: "Google Drive" })
+
+    const title = screen.getByText("traceEventRenderer.connectorUnavailable:Google Drive")
+    expect(title.parentElement?.textContent).toBe(
+      "traceEventRenderer.connectorUnavailable:Google Drive",
+    )
+    expect(screen.queryByRole("button", { name: /connectorUnavailable/ })).toBeNull()
+    expect(screen.queryByRole("button", { name: /Unavailable/ })).toBeNull()
+  })
+
+  it("shows the credential error of an oauth_token_required outage on the status line", () => {
+    renderUnavailableConnector({
+      success: false,
+      status: "error",
+      error: "MCP server credentials are unavailable.",
+      failure_code: "oauth_token_required",
+      reason: "oauth_token_required",
+      content: [{ text: "MCP server credentials are unavailable. Please reconnect the MCP server credentials and retry." }],
+      is_error: true,
+      unavailable_server: "Google Drive",
+    })
+
+    const title = screen.getByText("traceEventRenderer.connectorUnavailable:Google Drive")
+    expect(title.parentElement).toHaveTextContent("MCP server credentials are unavailable.")
+    expect(screen.queryByRole("button", { name: /Unavailable/ })).toBeNull()
   })
 
   it("renders workforce delegation failures as errors", () => {

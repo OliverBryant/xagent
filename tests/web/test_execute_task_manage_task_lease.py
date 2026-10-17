@@ -13,14 +13,23 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.model.chat.token_context import TokenUsage
-from xagent.web.api.chat import AgentServiceManager, _update_task_title_isolated
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_lease_service
+from xagent.web.services.agent_service_manager import (
+    AgentServiceManager,
+    _update_task_title_isolated,
+)
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -87,7 +96,9 @@ def _create_single_connection_runtime_db(tmp_path, filename: str):
 @pytest.mark.asyncio
 async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     observed_leases: list[TaskLease | None] = []
 
     class LeaseObservingAgent(_FakeAgentService):
@@ -103,7 +114,7 @@ async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> N
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
     ):
@@ -119,10 +130,84 @@ async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> N
     assert current_task_lease() is None
 
 
+class _MustNotRunAgent(_FakeAgentService):
+    async def execute_task(self, **_kwargs):
+        raise AssertionError("an unleased shared run must not reach the agent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manage_task_lease", "task_id"),
+    [
+        # An outer orchestrator claims ownership but hands over no lease.
+        (False, "42"),
+        # Nothing to acquire a lease for.
+        (True, None),
+    ],
+)
+async def test_shared_execute_task_refuses_a_run_without_a_lease(
+    manage_task_lease: bool, task_id: str | None
+) -> None:
+    manager = AgentServiceManager()
+    acquire_sandbox = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=True,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
+        ) as mock_acquire,
+        patch.object(manager, "_acquire_sandbox_task", new=acquire_sandbox),
+    ):
+        with pytest.raises(RuntimeError, match="requires a task lease"):
+            await manager.execute_task(
+                agent_service=_MustNotRunAgent(),
+                task="hello",
+                task_id=task_id,
+                manage_task_lease=manage_task_lease,
+            )
+
+    mock_acquire.assert_not_called()
+    acquire_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_execute_task_still_runs_without_a_lease() -> None:
+    manager = AgentServiceManager()
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=False,
+        ),
+        patch.object(
+            manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+    ):
+        result = await manager.execute_task(
+            agent_service=_FakeAgentService(),
+            task="hello",
+            manage_task_lease=False,
+        )
+
+    assert result["success"] is True
+
+
 @pytest.mark.asyncio
 async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     tracker = MagicMock(
         start_tracking=AsyncMock(),
         complete_tracking=AsyncMock(),
@@ -133,15 +218,15 @@ async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=7,
         ),
         patch(
-            "xagent.web.api.chat._check_task_run_gate_on_event_loop",
+            "xagent.web.services.agent_service_manager._check_task_run_gate_on_event_loop",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated"
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated"
         ) as sync_workforce,
         patch(
             "xagent.web.tracking.task_tracker.TaskTracker",
@@ -168,6 +253,7 @@ async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
         task_id=42,
         expected_run_id="run-a",
         expected_runner_id="runner-a",
+        expected_attempt_id="test-attempt",
     )
     tracker.start_tracking.assert_awaited_once()
     tracker.complete_tracking.assert_awaited_once()
@@ -176,7 +262,9 @@ async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
 @pytest.mark.asyncio
 async def test_execute_task_external_lease_loss_cancels_agent_execution() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     execution_started = asyncio.Event()
     execution_cancelled = asyncio.Event()
 
@@ -201,7 +289,7 @@ async def test_execute_task_external_lease_loss_cancels_agent_execution() -> Non
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
     ):
@@ -220,7 +308,9 @@ async def test_execute_task_external_lease_loss_cancels_agent_execution() -> Non
 @pytest.mark.asyncio
 async def test_execute_task_managed_lease_loss_skips_usage_and_release() -> None:
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     execution_started = asyncio.Event()
     execution_cancelled = asyncio.Event()
     tracker = MagicMock(
@@ -248,23 +338,23 @@ async def test_execute_task_managed_lease_loss_skips_usage_and_release() -> None
     release = MagicMock(return_value=True)
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=lose_lease,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
@@ -297,7 +387,9 @@ async def test_execute_task_lease_loss_during_title_update_cancels_stale_write()
     None
 ):
     manager = AgentServiceManager()
-    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    lease = TaskLease(
+        task_id=42, runner_id="runner-a", run_id="run-a", attempt_id="test-attempt"
+    )
     title_started = asyncio.Event()
     title_cancelled = asyncio.Event()
 
@@ -321,11 +413,11 @@ async def test_execute_task_lease_loss_during_title_update_cancels_stale_write()
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.update_task_title_from_agent",
+            "xagent.web.services.agent_service_manager.update_task_title_from_agent",
             new=update_title,
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
     ):
@@ -356,12 +448,9 @@ async def test_execute_task_quota_pool_timeout_stops_pre_run_checkouts(
 
     try:
         with (
+            patch("xagent.web.models.database._SessionLocal", factory),
             patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
-            patch(
-                "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+                "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             ) as workforce_sync,
             patch(
                 "xagent.web.tracking.task_tracker.TaskTracker",
@@ -397,41 +486,39 @@ async def test_execute_task_workforce_pool_timeout_stops_tracker_checkout(
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     release_lease = MagicMock(return_value=True)
     stop_heartbeat = AsyncMock()
 
     try:
         with (
+            patch("xagent.web.models.database._SessionLocal", factory),
             patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
-            patch(
-                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+                "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
                 return_value=None,
             ),
             # The share-quota gate (#973) sits between the run gate and the
             # lease acquisition; stub its checkout like the run gate's so the
             # pool timeout under test still lands on the workforce stage.
             patch(
-                "xagent.web.api.chat._load_task_public_run_quota_config_isolated",
+                "xagent.web.services.agent_service_manager._load_task_public_run_quota_config_isolated",
                 return_value=None,
             ),
             patch(
-                "xagent.web.api.chat.acquire_task_lease_isolated",
+                "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
                 return_value=lease,
             ),
             patch(
-                "xagent.web.api.chat.run_task_lease_heartbeat",
+                "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
                 new=AsyncMock(),
             ),
             patch(
-                "xagent.web.api.chat.stop_task_lease_heartbeat",
+                "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
                 new=stop_heartbeat,
             ),
             patch(
-                "xagent.web.api.chat._release_managed_task_lease_isolated",
+                "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
                 release_lease,
             ),
             patch(
@@ -468,6 +555,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     workforce_started = threading.Event()
@@ -492,19 +580,19 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             side_effect=blocking_workforce_sync,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
@@ -569,6 +657,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     usage_started = threading.Event()
@@ -592,19 +681,19 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
@@ -674,6 +763,7 @@ async def test_execute_task_tracker_pool_timeout_stops_execution_and_release() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     agent_service = _FakeAgentService()
@@ -686,27 +776,27 @@ async def test_execute_task_tracker_pool_timeout_stops_execution_and_release() -
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
@@ -734,15 +824,15 @@ async def test_execute_task_non_pool_quota_error_remains_fail_open() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=7,
         ),
         patch(
-            "xagent.web.api.chat._check_task_run_gate_on_event_loop",
+            "xagent.web.services.agent_service_manager._check_task_run_gate_on_event_loop",
             side_effect=RuntimeError("quota service unavailable"),
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
@@ -809,48 +899,52 @@ async def test_execute_task_preflight_pool_wait_does_not_block_event_loop(
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        with (
-            patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
-            patch.object(
-                manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
-            ),
-            patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
-            patch(
-                "xagent.web.tracking.task_tracker.TaskTracker",
-                side_effect=RuntimeError("skip tracking in pool-boundary test"),
-            ),
-        ):
-            await asyncio.sleep(0.02)
-            ticks_before_wait = ticks
-            execute = asyncio.create_task(
-                manager.execute_task(
-                    agent_service=_FakeAgentService(),
-                    task="hello",
-                    tracking_task_id=str(task_id),
-                    db_session=caller_db,
-                    manage_task_lease=False,
+    execute = None
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            with (
+                patch("xagent.web.models.database._SessionLocal", factory),
+                patch.object(
+                    manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+                ),
+                patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+                patch(
+                    "xagent.web.tracking.task_tracker.TaskTracker",
+                    side_effect=RuntimeError("skip tracking in pool-boundary test"),
+                ),
+            ):
+                execute = asyncio.create_task(
+                    manager.execute_task(
+                        agent_service=_FakeAgentService(),
+                        task="hello",
+                        tracking_task_id=str(task_id),
+                        db_session=caller_db,
+                        manage_task_lease=False,
+                    )
                 )
-            )
-            await asyncio.sleep(0.08)
+                await gate.wait_until_contending()
+                observed = await wait_for_ticks(lambda: ticks)
+                assert observed >= LOOP_LIVENESS_TICKS
+                assert not execute.done()
 
-            assert ticks - ticks_before_wait >= 4
-            assert not execute.done()
-
-            held_connection.close()
-            result = await execute
-            assert result["success"] is True
-    finally:
-        if not held_connection.closed:
-            held_connection.close()
-        stop.set()
-        await ticker_task
-        caller_db.close()
-        engine.dispose()
+                held_connection.close()
+                gate.let_through()
+                result = await asyncio.wait_for(execute, timeout=GUARD_TIMEOUT)
+                assert result["success"] is True
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if execute is not None:
+                await asyncio.wait_for(
+                    asyncio.gather(execute, return_exceptions=True),
+                    timeout=GUARD_TIMEOUT,
+                )
+            stop.set()
+            await ticker_task
+            caller_db.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -879,11 +973,11 @@ async def test_execute_task_releases_read_only_caller_checkout_before_worker_io(
     try:
         with (
             patch(
-                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+                "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
                 side_effect=isolated_gate,
             ),
             patch(
-                "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+                "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
                 return_value=False,
             ),
             patch(
@@ -930,7 +1024,7 @@ async def test_execute_task_rejects_dirty_caller_session_before_worker_io(
     try:
         with (
             patch(
-                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+                "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             ) as quota_gate,
             pytest.raises(
                 RuntimeError,
@@ -955,8 +1049,10 @@ async def test_execute_task_rejects_dirty_caller_session_before_worker_io(
 
 
 @pytest.mark.asyncio
+# Shared execution accepts a run whose lease execute_task acquires itself.
+@pytest.mark.parametrize("shared", [False, True])
 async def test_execute_task_acquires_and_releases_lease_when_manage_true(
-    db_session,
+    db_session, shared: bool
 ) -> None:
     user = User(username="lease-user", password_hash="hash", is_admin=False)
     db_session.add(user)
@@ -975,23 +1071,29 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
         task_id=int(task.id),
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
 
     with (
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager."
+            "get_shared_task_execution_enabled",
+            return_value=shared,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=fake_lease,
         ) as mock_acquire,
         patch(
-            "xagent.web.api.chat.release_task_lease_with_workforce_sync",
+            "xagent.web.services.agent_service_manager.release_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch.object(
@@ -999,7 +1101,7 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ) as mock_sync,
     ):
@@ -1042,17 +1144,17 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
 
     with (
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
         ) as mock_acquire,
         patch(
-            "xagent.web.api.chat.release_task_lease_with_workforce_sync",
+            "xagent.web.services.agent_service_manager.release_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ) as mock_stop_hb,
         patch.object(
@@ -1060,7 +1162,7 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ) as mock_sync,
         patch(
@@ -1119,14 +1221,20 @@ async def test_execute_task_surfaces_mid_run_quota_reason(db_session) -> None:
     )
 
     with (
-        patch("xagent.web.api.chat.run_task_lease_heartbeat", new=AsyncMock()),
-        patch("xagent.web.api.chat.stop_task_lease_heartbeat", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
         patch.object(
             manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
@@ -1214,6 +1322,7 @@ async def test_execute_task_cancellation_during_workforce_sync_releases_lease() 
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     workforce_sync_started = threading.Event()
@@ -1230,27 +1339,27 @@ async def test_execute_task_cancellation_during_workforce_sync_releases_lease() 
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             side_effect=blocking_workforce_sync,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=stop_heartbeat,
         ),
         patch(
@@ -1305,6 +1414,7 @@ async def test_execute_task_cancellation_during_tracker_start_releases_lease() -
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker_start_entered = asyncio.Event()
@@ -1323,27 +1433,27 @@ async def test_execute_task_cancellation_during_tracker_start_releases_lease() -
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=stop_heartbeat,
         ),
         patch(
@@ -1407,6 +1517,7 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
         task_id=int(task.id),
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1418,18 +1529,18 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
 
     with (
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=fake_lease,
         ),
         patch(
-            "xagent.web.api.chat.release_task_lease_with_workforce_sync",
+            "xagent.web.services.agent_service_manager.release_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ) as mock_stop_hb,
         patch.object(
@@ -1439,7 +1550,7 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
         ),
         patch.object(manager, "_release_sandbox_task", new=AsyncMock()) as mock_sbx,
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
@@ -1476,6 +1587,7 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     events: list[str] = []
@@ -1501,27 +1613,27 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             side_effect=release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=stop_heartbeat,
         ),
         patch(
@@ -1547,6 +1659,7 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
         task_id=task_id,
         expected_run_id="test-run",
         expected_runner_id="test-runner",
+        expected_attempt_id="test-attempt",
     )
     assert events == ["usage", "heartbeat", "lease", "sandbox"]
 
@@ -1559,6 +1672,7 @@ async def test_execute_task_releases_sandbox_when_lease_release_raises() -> None
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1569,27 +1683,27 @@ async def test_execute_task_releases_sandbox_when_lease_release_raises() -> None
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             side_effect=RuntimeError("lease release failed"),
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
@@ -1622,6 +1736,7 @@ async def test_execute_task_final_usage_pool_timeout_retains_lease() -> None:
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1637,27 +1752,27 @@ async def test_execute_task_final_usage_pool_timeout_retains_lease() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=stop_heartbeat,
         ),
         patch(
@@ -1693,6 +1808,7 @@ async def test_execute_task_heartbeat_pool_timeout_retains_lease() -> None:
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1705,27 +1821,27 @@ async def test_execute_task_heartbeat_pool_timeout_retains_lease() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(
                 return_value=TaskLeaseHeartbeatOutcome(pool_timeout=heartbeat_timeout)
             ),
@@ -1761,6 +1877,7 @@ async def test_execute_task_heartbeat_loss_after_result_rejects_success() -> Non
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     tracker = MagicMock()
@@ -1772,27 +1889,27 @@ async def test_execute_task_heartbeat_loss_after_result_rejects_success() -> Non
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome(lease_lost=True)),
         ),
         patch(
@@ -1827,6 +1944,7 @@ def test_task_title_update_is_fenced_by_exact_lease(db_session) -> None:
         status=TaskStatus.RUNNING,
         runner_id="current-runner",
         run_id="current-run",
+        lease_attempt_id="test-attempt",
     )
     db_session.add(task)
     db_session.commit()
@@ -1835,11 +1953,13 @@ def test_task_title_update_is_fenced_by_exact_lease(db_session) -> None:
         task_id=int(task.id),
         runner_id="stale-runner",
         run_id="stale-run",
+        attempt_id="test-attempt",
     )
     current = TaskLease(
         task_id=int(task.id),
         runner_id="current-runner",
         run_id="current-run",
+        attempt_id="test-attempt",
     )
 
     assert (
@@ -1874,6 +1994,7 @@ async def test_execute_task_cancellation_during_heartbeat_stop_drains_cleanup() 
         task_id=task_id,
         runner_id="test-runner",
         run_id="test-run",
+        attempt_id="test-attempt",
     )
     manager = AgentServiceManager()
     events: list[str] = []
@@ -1904,27 +2025,27 @@ async def test_execute_task_cancellation_during_heartbeat_stop_drains_cleanup() 
 
     with (
         patch(
-            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
-            "xagent.web.api.chat.acquire_task_lease_isolated",
+            "xagent.web.services.agent_service_manager.acquire_task_lease_isolated",
             return_value=lease,
         ),
         patch(
-            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             return_value=False,
         ),
         patch(
-            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            "xagent.web.services.agent_service_manager._release_managed_task_lease_isolated",
             side_effect=release_lease,
         ),
         patch(
-            "xagent.web.api.chat.run_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.run_task_lease_heartbeat",
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            "xagent.web.services.agent_service_manager.stop_task_lease_heartbeat",
             new=stop_heartbeat,
         ),
         patch(
@@ -2068,6 +2189,7 @@ def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
         agent_id=manager.id,
         agent_config={},
         execution_mode="auto",
+        lease_attempt_id="test-attempt",
     )
     db_session.add(task)
     db_session.flush()
@@ -2089,6 +2211,7 @@ def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
             task_id=int(task.id),
             runner_id="stale-a",
             run_id="same-run",
+            attempt_id="test-attempt",
         )
         if use_stale_lease
         else None

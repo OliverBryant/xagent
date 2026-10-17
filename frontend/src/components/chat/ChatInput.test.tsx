@@ -25,10 +25,7 @@ vi.mock("@/lib/api-wrapper", async () => {
 vi.mock("@/lib/utils", () => ({
   cn: (...classes: Array<string | false | null | undefined>) =>
     classes.filter(Boolean).join(" "),
-  generateClientMessageId: vi.fn()
-    .mockReturnValueOnce("client-message-1")
-    .mockReturnValueOnce("client-message-2")
-    .mockReturnValue("client-message-next"),
+  generateClientMessageId: vi.fn(),
   getApiUrl: () => "http://api.local",
   getUploadApiUrl: () => "http://upload.local",
 }))
@@ -81,6 +78,7 @@ vi.mock("sonner", () => ({
   },
 }))
 
+import { generateClientMessageId } from "@/lib/utils"
 import { ChatInput } from "./ChatInput"
 
 const emptyJsonResponse = () =>
@@ -91,6 +89,10 @@ const emptyJsonResponse = () =>
 
 describe("ChatInput", () => {
   beforeEach(() => {
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
     authUserMock.current = { id: "1", is_admin: true }
     apiRequestMock.mockReset()
     apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
@@ -461,6 +463,85 @@ describe("ChatInput", () => {
     )
   })
 
+  it("classifies a coded unsuccessful 2xx upload response", async () => {
+    apiRequestMock.mockImplementation((url: string) => Promise.resolve(
+      url === "http://upload.local/api/files/upload"
+        ? new Response(JSON.stringify({
+            success: false,
+            error_code: "upload_too_large",
+            detail: "private storage detail",
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        : emptyJsonResponse(),
+    ))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={files}
+          hideConfig
+          inputValue=""
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["data"], "data.txt")] },
+    })
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadTooLarge",
+        { duration: 8000 },
+      )
+    })
+    expect(screen.queryByText("data.txt")).not.toBeInTheDocument()
+  })
+
+  it("rejects duplicate custom upload identifiers before mutating files", async () => {
+    const uploadFile = vi.fn().mockResolvedValue({ file_id: "duplicate-id" })
+    const files = [
+      new File(["first"], "first.txt"),
+      new File(["second"], "second.txt"),
+    ]
+
+    function Harness() {
+      const [selectedFiles, setSelectedFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={selectedFiles}
+          hideConfig
+          inputValue=""
+          onFilesChange={setSelectedFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    fireEvent.change(container.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files },
+    })
+
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(2))
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.uploadFailed",
+        { duration: 8000 },
+      )
+    })
+    expect(files.every(file => !("file_id" in file))).toBe(true)
+  })
+
   it("restores a draft file chip without displaying its canonical id and preserves that id on send", async () => {
     const onSend = vi.fn()
     const { container } = render(
@@ -529,6 +610,109 @@ describe("ChatInput", () => {
     })
     expect(resetMentionMock).toHaveBeenCalledTimes(1)
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
+    // selectedAgents no longer renders a "Using @name" chip (that
+    // mechanism was removed as unreachable dead code) - only drives the
+    // no-model guard above. A regression reintroducing it would leave
+    // this test green without an explicit check.
+    expect(screen.queryByText("@Shared Agent")).not.toBeInTheDocument()
+  })
+
+  it("clears the read-only model display instead of showing a stale lead's model while a new one's config is still loading", () => {
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      readOnlyConfig: true,
+    }
+    const { rerender } = render(<ChatInput {...commonProps} taskConfig={{ model: "agent-a-model" }} />)
+
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout).
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+  })
+
+  it("submits the live taskConfig model, not a stale value inherited by the internal mirror", async () => {
+    // The internal `agentConfig` mirror inherits the previous model when a
+    // new taskConfig doesn't specify one (`taskConfig.model || prev.model`
+    // in the syncing effect) - correct for genuine partial updates to the
+    // SAME lead, but submission (and the read-only model badge, which reads
+    // the same live-`taskConfig` value) must still prefer the live prop over
+    // that mirror once a config is meant to be authoritative (readOnlyConfig),
+    // so a real timing gap between a lead switch and its own effect catching
+    // up can't submit - or display - an unrelated previous lead's model.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // New lead's taskConfig arrives without its own model yet (e.g. only
+    // executionMode resolved so far) - the internal mirror would inherit the
+    // previous lead's model rather than clearing it, but the live-read badge
+    // must not show that stale value either.
+    rerender(<ChatInput {...commonProps} taskConfig={{ executionMode: "flash" }} />)
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ model: "" })
+      )
+    })
+  })
+
+  it("submits the live taskConfig executionMode, not a stale value inherited by the internal mirror", async () => {
+    // Same root cause as the model test above, but for executionMode: the
+    // internal `agentConfig` mirror only clears its stale executionMode
+    // asynchronously (a separate effect, once taskConfig goes away), and
+    // the submit path used to spread that live-computed value only when
+    // truthy - so a falsy live value (taskConfig gone entirely, e.g. the
+    // new lead's own config fetch is still in flight) silently fell
+    // through to whatever executionMode the mirror still held from the
+    // PREVIOUS lead, instead of clearing it the same way `model` does.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout), same as the page-level race this whole family of
+    // fixes targets.
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ executionMode: undefined })
+      )
+    })
   })
 
   it("does not show pause for uppercase terminal task status", () => {
@@ -1093,9 +1277,9 @@ describe("ChatInput", () => {
     })
   })
 
-  it("keeps the draft when durable delivery is rejected", async () => {
+  it.each([false, true])("keeps a rejected draft without duplicating a handled notification (%s)", async notificationHandled => {
     const onInputChange = vi.fn()
-    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const onSend = vi.fn().mockRejectedValue(Object.assign(new Error("Message was rejected"), { notificationHandled }))
     const { container } = render(
       <ChatInput
         hideConfig
@@ -1116,6 +1300,305 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1]).toEqual(
       expect.objectContaining({ clientMessageId: expect.any(String) })
     )
+    expect(toastErrorMock).toHaveBeenCalledTimes(notificationHandled ? 0 : 1)
+  })
+
+  it("localizes coded send failures without displaying their raw message", async () => {
+    const onSend = vi.fn().mockRejectedValue(Object.assign(
+      new Error("provider token=secret"),
+      {
+        errorCode: "task_checkpoint_unreadable",
+        userFacing: true,
+      },
+    ))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="send safely"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "clientErrors.taskCheckpointUnreadable",
+        { duration: 8000 },
+      )
+    })
+    expect(toastErrorMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("token=secret"),
+    )
+  })
+
+  it("sends a free-text draft with the interaction request active when the draft begins", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        currentInteractionRequestId="inputreq_r1"
+        hideConfig
+        hideFileUpload
+        inputValue="Answer R1"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        taskConfig={{
+          model: "model-1",
+          metadata: { source: "existing" },
+        }}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      metadata: {
+        source: "existing",
+        request_id: "inputreq_r1",
+      },
+    }))
+  })
+
+  it("keeps a draft bound to its original request when the active request rotates", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Answer begun for R1",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("binds the next draft to the request active after a successful clear", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Answer R1"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Answer R2"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r2",
+    })
+  })
+
+  it("keeps a draft id-less when it began before request identities were available", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Legacy answer",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(<ChatInput {...props} />)
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).not.toHaveProperty("metadata.request_id")
+  })
+
+  it("starts a new delivery identity after an abandoned failed draft is retyped", async () => {
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementationOnce(() => "abandoned-r1-delivery")
+      .mockImplementationOnce(() => "fresh-r2-delivery")
+      .mockReturnValue("later-delivery")
+    const onSend = vi.fn().mockRejectedValue(new Error("Delivery outcome unknown"))
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Same answer"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      clientMessageId: "abandoned-r1-delivery",
+      metadata: { request_id: "inputreq_r1" },
+    }))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Same answer"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1]).toEqual(expect.objectContaining({
+      clientMessageId: "fresh-r2-delivery",
+      metadata: { request_id: "inputreq_r2" },
+    }))
+  })
+
+  it("binds a file-only draft before a later request rotation", async () => {
+    const onSend = vi.fn()
+    const file = new File(["answer"], "answer.txt", { type: "text/plain" })
+    const props = {
+      files: [file],
+      hideConfig: true,
+      inputValue: "",
+      onFilesChange: vi.fn(),
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
+    // Server-side dedup safety net: a failure that doesn't carry
+    // `retryWithNewId` means the send's outcome is unknown (it may have
+    // actually landed), so a retry with byte-identical content must reuse
+    // the same id instead of minting a new one - otherwise the server can't
+    // tell the retry apart from a genuine second message.
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const { container } = render(
+      <ChatInput
+        currentInteractionRequestId="inputreq_r1"
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+
+    // isSubmittingRef only releases 500ms after a submit settles.
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(firstId)
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("generates a new clientMessageId when retrying after a retryWithNewId failure", async () => {
+    // The opposite case: a failure the caller marks `retryWithNewId` means
+    // the send is confirmed to have never landed, so a retry - even with
+    // identical content - should get its own fresh id rather than being
+    // conflated with the failed attempt.
+    // Keep this scenario's two delivery identities explicit.
+    vi.mocked(generateClientMessageId)
+      .mockImplementationOnce(() => "retry-with-new-id-1")
+      .mockImplementationOnce(() => "retry-with-new-id-2")
+    const onInputChange = vi.fn()
+    const retryableError = Object.assign(new Error("Message was rejected"), {
+      retryWithNewId: true,
+    })
+    const onSend = vi.fn().mockRejectedValue(retryableError)
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).not.toBe(firstId)
   })
 
   const mockDefaultModel = () => {
@@ -1205,7 +1688,7 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
   })
 
-  it("hides the execution mode picker for a template-resolved task", async () => {
+  it("hides the execution mode picker for a read-only (agent-resolved) task", async () => {
     mockDefaultModel()
     render(
       <ChatInput
@@ -1213,7 +1696,7 @@ describe("ChatInput", () => {
         inputValue="summarize this doc"
         onInputChange={vi.fn()}
         onSend={vi.fn()}
-        selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }}
+        readOnlyConfig
       />
     )
 
@@ -1235,9 +1718,7 @@ describe("ChatInput", () => {
     fireEvent.click(screen.getByText(executionModeLabel("think")))
     expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
 
-    rerender(
-      <ChatInput {...props} selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }} />
-    )
+    rerender(<ChatInput {...props} readOnlyConfig />)
     rerender(<ChatInput {...props} />)
 
     expect(screen.getByText(UNSET_MODE_LABEL)).toBeInTheDocument()
@@ -1396,5 +1877,362 @@ describe("ChatInput", () => {
       expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
     })
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
+  })
+
+  it("keeps the stop square focusable but inert while a stop is in flight", () => {
+    const onStop = vi.fn()
+    const stopProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "",
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop,
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(<ChatInput {...stopProps} stopState="idle" />)
+    const button = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(button).not.toHaveAttribute("aria-disabled")
+
+    rerender(<ChatInput {...stopProps} stopState="stopping" />)
+    const pending = screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    expect(pending).toBe(button)
+    expect(pending).not.toBeDisabled()
+    expect(pending).toHaveAttribute("aria-disabled", "true")
+    // classList, not a substring match: Button's base classes already contain
+    // "disabled:pointer-events-none", which a substring check would find.
+    expect(pending.classList.contains("pointer-events-none")).toBe(true)
+    expect(pending.classList.contains("opacity-50")).toBe(true)
+
+    // jsdom refuses focus() on a natively disabled button, so this fails if
+    // the stop square goes back to `disabled`.
+    pending.blur()
+    pending.focus()
+    expect(document.activeElement).toBe(pending)
+
+    fireEvent.click(pending)
+    expect(onStop).not.toHaveBeenCalled()
+    unmount()
+
+    const secondRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    const stopButton = screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    expect(stopButton).not.toBeDisabled()
+    expect(stopButton).toHaveAttribute("type", "button")
+    const hint = screen.getByText("widgetSession.stopTimedOut")
+    expect(hint).toBeInTheDocument()
+    expect(stopButton).toHaveAttribute("aria-describedby", hint.id)
+    expect(screen.getByRole("textbox")).not.toHaveAttribute("aria-describedby")
+    fireEvent.click(stopButton)
+    expect(onStop).toHaveBeenCalledTimes(1)
+    secondRender.unmount()
+
+    const thirdRender = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="not_sent"
+        taskStatus="running"
+      />
+    )
+    // A refusal and a timeout are different outcomes, so they get different
+    // sentences; the timed-out copy must not leak through for a refusal.
+    expect(screen.getByText("widgetSession.stopNotSent")).toBeInTheDocument()
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeDisabled()
+    thirdRender.unmount()
+
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="draft"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={onStop}
+        stopState="timed_out"
+        taskStatus="running"
+      />
+    )
+    expect(screen.queryByText("widgetSession.stopTimedOut")).not.toBeInTheDocument()
+  })
+
+  it("keeps the stop hint region mounted and changes only its text", () => {
+    const commonProps = {
+      compact: true,
+      hideConfig: true,
+      hideFileUpload: true,
+      isLoading: true,
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      onStop: vi.fn(),
+      taskStatus: "running",
+    }
+    const { rerender, unmount } = render(
+      <ChatInput {...commonProps} inputValue="" stopState="stopping" />
+    )
+    const region = screen.getByRole("status")
+    expect(region.textContent).toBe("")
+    expect(region.className).not.toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toHaveAttribute("aria-describedby")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopTimedOut")
+    expect(region.className).toContain("mb-3")
+    expect(
+      screen.getByRole("button", { name: "widgetSession.stopResponse" })
+    ).toHaveAttribute("aria-describedby", region.id)
+
+    rerender(<ChatInput {...commonProps} inputValue="draft" stopState="timed_out" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("")
+
+    rerender(<ChatInput {...commonProps} inputValue="" stopState="not_sent" />)
+    expect(screen.getByRole("status")).toBe(region)
+    expect(region.textContent).toBe("widgetSession.stopNotSent")
+    unmount()
+
+    const wide = render(
+      <ChatInput
+        {...commonProps}
+        compact={false}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+    wide.unmount()
+
+    render(
+      <ChatInput
+        {...commonProps}
+        onStop={undefined}
+        inputValue=""
+        stopState="timed_out"
+      />
+    )
+    expect(screen.queryByRole("status")).toBeNull()
+  })
+
+  it("swaps the compact submit control for a stop square", () => {
+    const cases: Array<[string, string]> = [
+      ["", "widgetSession.stopResponse"],
+      ["draft", "common.send"],
+    ]
+    const renderedClassNames: string[] = []
+
+    for (const [inputValue, expectedName] of cases) {
+      const otherName = expectedName === "common.send"
+        ? "widgetSession.stopResponse"
+        : "common.send"
+      const { unmount } = render(
+        <ChatInput
+          compact
+          hideConfig
+          hideFileUpload
+          inputValue={inputValue}
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          onStop={vi.fn()}
+          stopState="idle"
+          taskStatus="running"
+        />
+      )
+      const control = screen.getByRole("button", { name: expectedName })
+      expect(control).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: otherName })).not.toBeInTheDocument()
+      renderedClassNames.push(control.className)
+      unmount()
+    }
+
+    // Neither render dims its control here, so the two class strings differ
+    // only if the controls stopped taking their size and box styling from the
+    // same expression -- which is what would let the slot change shape when
+    // the stop square takes the send button's place.
+    const [stopClassName, submitClassName] = renderedClassNames
+    expect(stopClassName).toContain("h-8 w-8")
+    expect(submitClassName).toBe(stopClassName)
+  })
+
+  it("renders no stop control without an onStop callback", () => {
+    render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="running"
+      />
+    )
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "common.send" })).toBeInTheDocument()
+  })
+
+  it("blocks sending while a stop request is still pending", () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="stopping"
+        taskStatus="running"
+      />
+    )
+
+    // The draft keeps the send control in the slot, as it always has; what
+    // changes while a stop is outstanding is that the control cannot act, and
+    // that it says why: it carries the stop control's "Stopping..." name.
+    const submitButton = container.querySelector('button[type="submit"]') as HTMLButtonElement
+    expect(submitButton).toBeDisabled()
+    expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
+    expect(submitButton).toHaveAccessibleName("widgetSession.stoppingResponse")
+    expect(submitButton).toHaveAttribute("title", "widgetSession.stoppingResponse")
+    expect(screen.getAllByRole("button", { name: "widgetSession.stoppingResponse" })).toEqual([submitButton])
+
+    fireEvent.click(submitButton)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" })
+
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("still sends when no stop request is pending", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        compact
+        hideConfig
+        hideFileUpload
+        inputValue="please also do X"
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    const submitButton = screen.getByRole("button", { name: "common.send" })
+    expect(submitButton).not.toBeDisabled()
+    expect(submitButton.className).not.toContain("bg-muted")
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][0]).toBe("please also do X")
+  })
+
+  it("renders no stop control outside the compact toolbar", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue=""
+        isLoading
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        onStop={vi.fn()}
+        readOnlyConfig
+        stopState="idle"
+        taskStatus="running"
+      />
+    )
+
+    // The wider toolbar has no stop control by design; it carries the pause
+    // control instead, and passing onStop here changes nothing.
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stopResponse" })
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+    ).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).toBeInTheDocument()
+  })
+
+  it.each([
+    ["a wide composer with onStop", { compact: false, onStop: vi.fn() }],
+    ["a compact composer without onStop", { compact: true, onStop: undefined }],
+  ])(
+    "does not hold sending for a pending stop in %s",
+    async (_label, stopControlProps) => {
+      const onSend = vi.fn()
+      const { container } = render(
+        <ChatInput
+          {...stopControlProps}
+          hideConfig
+          hideFileUpload
+          inputValue="please also do X"
+          isLoading
+          onInputChange={vi.fn()}
+          onSend={onSend}
+          readOnlyConfig
+          stopState="stopping"
+          taskStatus="running"
+        />
+      )
+
+      expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+      expect(
+        screen.queryByRole("button", { name: "widgetSession.stoppingResponse" })
+      ).toBeNull()
+
+      fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+      await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    }
+  )
+
+  it("uses the provided placeholder and keeps the default without one", () => {
+    const onSend = vi.fn()
+    const { rerender } = render(<ChatInput hideConfig hideFileUpload onSend={onSend} />)
+
+    expect(screen.getByText("chatPage.input.placeholder")).toBeInTheDocument()
+
+    rerender(<ChatInput hideConfig hideFileUpload onSend={onSend} placeholder="custom.placeholder" />)
+
+    expect(screen.getByText("custom.placeholder")).toBeInTheDocument()
+    expect(screen.queryByText("chatPage.input.placeholder")).not.toBeInTheDocument()
   })
 })

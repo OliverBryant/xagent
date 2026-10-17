@@ -19,23 +19,21 @@ which is also used by the WebSocket UI path so both transports share
 one state machine.
 """
 
-import asyncio
-import logging
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import TypeAdapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ....core.runtime_performance import increment_counter
 from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
-from ...models.agent import Agent
 from ...models.database import get_session_local
 from ...models.task import Task, TaskStatus, TraceEvent
-from ...models.workforce import WorkforceRun
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
@@ -50,23 +48,9 @@ from ...schemas.v1 import (
     UploadedFileInfo,
     UploadFilesResponse,
 )
-from ...services.connector_runtime import (
-    bind_create_connector_runtime_plan,
-    persist_create_connector_runtime_context,
-    pop_ephemeral_runtime_values,
-    prepare_append_connector_runtime,
-    prepare_create_connector_runtime,
-    store_ephemeral_runtime_values,
-)
+from ...services import task_start as task_start_service
 from ...services.db_runtime import (
-    drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
-)
-from ...services.file_turn import (
-    append_uploaded_files_context,
-    build_uploaded_files_context,
-    normalize_attachments_for_persistence,
-    resolve_turn_file_infos,
 )
 from ...services.hot_path_cache import (
     cache_get,
@@ -76,19 +60,16 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
-from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.managed_file_ref import (
+    DurableStorageOperationError,
+)
+from ...services.task_auto_resume import TerminalView, status_only_terminal_view
+from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
     TaskTurnFileBindingError,
     TaskTurnNotFoundError,
-    TaskTurnOrchestrator,
-    TaskTurnPayload,
-    TurnKind,
-    TurnStarted,
-    _ClaimedTurn,
-    _retire_turn_session_best_effort,
-    commit_claimed_turn_or_reconcile,
 )
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
@@ -96,9 +77,14 @@ from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
 _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
+
+# ``datetime.isoformat()`` renders a UTC offset as ``+00:00``; pydantic's own
+# JSON mode renders it as ``Z``. ``StepsResponse.steps_expired_at`` goes out
+# through pydantic, so the 410 body's ``details.expired_at`` has to be
+# serialized the same way to be byte-identical for the same instant.
+_DATETIME_JSON: TypeAdapter[datetime] = TypeAdapter(datetime)
 
 
 def _resolve_upload_owner_user_id_isolated(
@@ -179,11 +165,7 @@ async def upload_task_files(
         # stable {"error": {"code": ...}} shape. 503 (durable storage) stays 503 so
         # callers can retry; 413 (too large) stays 413; other client errors -> 400.
         if exc.status_code == 503:
-            raise V1ApiError(
-                V1ErrorCode.INTERNAL_ERROR,
-                503,
-                message="File storage is temporarily unavailable.",
-            ) from exc
+            _raise_v1_storage_unavailable(exc)
         if 400 <= exc.status_code < 500:
             raise V1ApiError(
                 V1ErrorCode.INVALID_INPUT,
@@ -204,61 +186,62 @@ async def upload_task_files(
     )
 
 
-def _resolve_turn_files_or_400(
-    *,
-    file_ids: list[str],
-    owner_user_id: int,
-    db: Session,
-    task_id: Optional[int] = None,
-) -> list[dict[str, Any]]:
-    """Resolve every ``file_id`` up front (all-or-nothing) WITHOUT binding.
+def _sdk_task_scope(principal: ApiKeyPrincipal) -> task_start_service.SdkTaskScope:
+    return task_start_service.SdkTaskScope(
+        agent_id=int(principal.agent.id) if principal.agent is not None else None,
+        workforce_id=int(principal.workforce.id)
+        if principal.workforce is not None
+        else None,
+    )
 
-    Called before the task is committed (create) or the turn is claimed
-    (append), so a bad/unowned/already-bound id fails with 400 before any
-    task row is created or mutated -- no orphan task, no binding stuck to a
-    turn that later 409s. Actual binding happens via :func:`bind_turn_files`
-    only after the turn is committed to running.
-    """
-    if not file_ids:
-        return []
-    try:
-        file_infos, missing = resolve_turn_file_infos(
-            file_ids=file_ids,
-            owner_user_id=owner_user_id,
-            db=db,
-            task_id=task_id,
-        )
-    except DurableStorageOperationError as exc:
-        # Transient storage fault, not a client error -- 503 so SDK can retry.
+
+def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoReturn:
+    if exc.reason == "agent_id_required":
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT, 422, message="agent_id is required"
+        ) from exc
+    if exc.reason == "connector_runtime_setup_failed":
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR,
-            503,
-            message="File storage is temporarily unavailable.",
+            500,
+            message=_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE,
         ) from exc
-    if missing:
+    if exc.reason == "task_expired":
+        # 410, not 404: an unaware client still handles it as the 4xx it
+        # already gets for a missing task, and one that knows the code can
+        # stop polling an id that will never answer again.
+        assert exc.task_id is not None and exc.expired_at is not None
         raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT,
-            400,
-            message="These file ids are not accessible: " + ", ".join(missing),
-        )
-    return file_infos
+            V1ErrorCode.TASK_EXPIRED,
+            410,
+            details={
+                "task_id": exc.task_id,
+                "expired_at": _DATETIME_JSON.dump_python(exc.expired_at, mode="json"),
+            },
+        ) from exc
+    code, status = {
+        "agent_not_found": (V1ErrorCode.AGENT_NOT_FOUND, 404),
+        "workforce_not_found": (V1ErrorCode.WORKFORCE_NOT_FOUND, 404),
+        "task_not_found": (V1ErrorCode.TASK_NOT_FOUND, 404),
+        "runtime_agent_missing": (V1ErrorCode.INTERNAL_ERROR, 500),
+    }[exc.reason]
+    raise V1ApiError(code, status) from exc
 
 
-def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPayload:
-    """Build a :class:`TaskTurnPayload`, file-enriching the execution channel.
+def _raise_v1_storage_unavailable(exc: Exception) -> NoReturn:
+    """The retryable-503 envelope every durable-fault arm in this module answers with.
 
-    Consolidates the payload construction shared by create and append so the
-    transcript-vs-execution split can't drift between the two entry points.
+    One helper rather than the envelope inline at each arm, matching this
+    module's other ``_raise_v1_*`` helpers. It always chains ``from exc``: the
+    ``v1_api_error_handler`` does not render ``exc_info`` today, so no arm loses
+    anything by chaining, and an arm that dropped the cause would lose it
+    silently the day that boundary starts logging one (#1521).
     """
-    if not file_infos:
-        return TaskTurnPayload(transcript_message=content)
-    context = build_uploaded_files_context(file_infos)
-    return TaskTurnPayload(
-        transcript_message=content,
-        execution_message=append_uploaded_files_context(content, context),
-        attachments=normalize_attachments_for_persistence(file_infos) or None,
-        file_ids=tuple(str(info["file_id"]) for info in file_infos),
-    )
+    raise V1ApiError(
+        V1ErrorCode.INTERNAL_ERROR,
+        503,
+        message="File storage is temporarily unavailable.",
+    ) from exc
 
 
 def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:
@@ -284,273 +267,20 @@ def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     ) from exc
 
 
-def _store_connector_runtime_values_or_fail(
-    *,
-    task_id: int,
-    turn_id: str,
-    values_by_ref: dict,
-) -> None:
-    try:
-        store_ephemeral_runtime_values(turn_id, values_by_ref)
-    except Exception as exc:
-        pop_ephemeral_runtime_values(turn_id)
-        logger.warning(
-            "Connector runtime setup failed for task %s turn %s",
-            task_id,
-            turn_id,
-        )
-        raise V1ApiError(
-            V1ErrorCode.INTERNAL_ERROR,
-            500,
-            message=_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE,
-        ) from exc
-
-
-@dataclass(frozen=True)
-class _PreparedCreateTaskStart:
-    """Detached result of the atomic create-and-claim transaction."""
-
-    task_id: int
-    agent_id: int
-    task_owner_user_id: int
-    created_at: datetime
-    payload: TaskTurnPayload
-    claimed_turn: _ClaimedTurn
-
-
-@dataclass(frozen=True)
-class _PreparedAppendTurn:
-    """Detached result of the atomic append claim transaction."""
-
-    task_id: int
-    agent_id: int
-    task_owner_user_id: int
-    payload: TaskTurnPayload
-    claimed_turn: _ClaimedTurn
-
-
-def _prepare_created_task_isolated(
-    *,
-    agent_id: int,
-    task_owner_user_id: int,
-    message: str,
-    file_ids: tuple[str, ...],
-    connector_runtime_context: tuple[dict[str, Any], ...],
-) -> _PreparedCreateTaskStart:
-    """Create, claim, and commit the first turn in one DB transaction."""
-
-    SessionLocal = get_session_local()
-    db = SessionLocal()
-    payload: TaskTurnPayload | None = None
-    owned_task_id = 0
-    try:
-        agent = db.get(Agent, agent_id)
-        if agent is None:
-            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-
-        file_infos = _resolve_turn_files_or_400(
-            file_ids=list(file_ids),
-            owner_user_id=task_owner_user_id,
-            db=db,
-            task_id=None,
-        )
-        task = Task(
-            user_id=task_owner_user_id,
-            title=message[:50] or "SDK task",
-            description=message,
-            status=TaskStatus.PENDING,
-            agent_id=agent_id,
-            input=message,
-            source="sdk",
-            is_visible=False,
-        )
-        try:
-            runtime_plan = prepare_create_connector_runtime(
-                db=db,
-                agent=agent,
-                task_source="sdk",
-                connector_user_id=task_owner_user_id,
-                payload_items=connector_runtime_context,
-            )
-            bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
-        except ConnectorRuntimeError as exc:
-            _raise_v1_connector_runtime_error(exc)
-
-        db.add(task)
-        db.flush()
-        task_id = int(task.id)
-        owned_task_id = task_id
-        persist_create_connector_runtime_context(
-            db=db,
-            task_id=task_id,
-            plan=runtime_plan,
-        )
-        payload = _turn_payload(message, file_infos)
-        try:
-            claimed_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
-                db,
-                task_id=task_id,
-                task_owner_user_id=task_owner_user_id,
-                payload=payload,
-            )
-        except TaskTurnFileBindingError as exc:
-            _raise_v1_file_binding_error(exc)
-        _store_connector_runtime_values_or_fail(
-            task_id=task_id,
-            turn_id=payload.turn_id,
-            values_by_ref=runtime_plan.ephemeral_by_ref,
-        )
-        created_at = db.query(Task.created_at).filter(Task.id == task_id).scalar()
-        if created_at is None:
-            raise RuntimeError("created task has no creation timestamp")
-        commit_claimed_turn_or_reconcile(
-            db,
-            task_id=task_id,
-            task_owner_user_id=task_owner_user_id,
-            payload=payload,
-            claimed=claimed_turn,
-        )
-        return _PreparedCreateTaskStart(
-            task_id=task_id,
-            agent_id=agent_id,
-            task_owner_user_id=task_owner_user_id,
-            created_at=created_at,
-            payload=payload,
-            claimed_turn=claimed_turn,
-        )
-    except Exception:
-        db.rollback()
-        if payload is not None:
-            pop_ephemeral_runtime_values(payload.turn_id)
-        raise
-    finally:
-        _retire_turn_session_best_effort(db, task_id=owned_task_id)
-
-
 def _validate_owner_scope(
     principal: ApiKeyPrincipal,
     *,
     request_agent_id: int | None,
     request_workforce_id: int | None,
 ) -> None:
-    """Validate a request body's owner-scoping fields against the key.
-
-    Shared by every ``/v1/chat/tasks/{task_id}/*`` write that reuses the
-    ``AppendMessageRequest``-shaped owner fields (append, reply): an
-    agent-bound key must pass a matching ``agent_id`` and no
-    ``workforce_id``; a workforce-bound key must not pass ``agent_id``
-    and, if it passes ``workforce_id``, it must match the bound
-    workforce. Task ownership itself must already be resolved (e.g. via
-    :func:`_resolve_task_or_404`) before calling this, so an unrelated
-    task stays an opaque ``task_not_found`` even when the body also
-    names the wrong owner.
-    """
-    if principal.agent is not None:
-        if request_agent_id is None:
-            raise V1ApiError(
-                V1ErrorCode.INVALID_INPUT,
-                422,
-                message="agent_id is required",
-            )
-        if request_agent_id != principal.agent.id:
-            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-        if request_workforce_id is not None:
-            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-    else:
-        assert principal.workforce is not None
-        if request_agent_id is not None:
-            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-        if (
-            request_workforce_id is not None
-            and request_workforce_id != principal.workforce.id
-        ):
-            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-
-
-def _prepare_append_turn_isolated(
-    *,
-    task_id: int,
-    principal: ApiKeyPrincipal,
-    request_agent_id: int | None,
-    request_workforce_id: int | None,
-    message: str,
-    file_ids: tuple[str, ...],
-    connector_runtime_context: tuple[dict[str, Any], ...],
-) -> _PreparedAppendTurn:
-    """Resolve append authorization and runtime inputs into detached values."""
-
-    SessionLocal = get_session_local()
-    db = SessionLocal()
-    payload: TaskTurnPayload | None = None
     try:
-        task = _resolve_task_or_404(task_id, principal, db)
-        task_owner_user_id = int(task.user_id)
-
-        # Task ownership is resolved first so an unrelated task remains an
-        # opaque task_not_found even when the body also names the wrong owner.
-        _validate_owner_scope(
-            principal,
+        task_start_service.validate_sdk_owner_scope(
+            _sdk_task_scope(principal),
             request_agent_id=request_agent_id,
             request_workforce_id=request_workforce_id,
         )
-
-        runtime_agent = db.get(Agent, int(task.agent_id))
-        if runtime_agent is None:
-            raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
-        try:
-            runtime_plan = prepare_append_connector_runtime(
-                db=db,
-                agent=runtime_agent,
-                task=task,
-                connector_user_id=task_owner_user_id,
-                payload_items=connector_runtime_context,
-            )
-        except ConnectorRuntimeError as exc:
-            _raise_v1_connector_runtime_error(exc)
-
-        file_infos = _resolve_turn_files_or_400(
-            file_ids=list(file_ids),
-            owner_user_id=task_owner_user_id,
-            db=db,
-            task_id=int(task.id),
-        )
-        payload = _turn_payload(message, file_infos)
-        try:
-            claimed_turn = TaskTurnOrchestrator.claim_append_turn_no_commit(
-                db,
-                task_id=int(task.id),
-                task_owner_user_id=task_owner_user_id,
-                payload=payload,
-            )
-        except TaskTurnFileBindingError as exc:
-            _raise_v1_file_binding_error(exc)
-        _store_connector_runtime_values_or_fail(
-            task_id=int(task.id),
-            turn_id=payload.turn_id,
-            values_by_ref=runtime_plan.ephemeral_by_ref,
-        )
-        prepared = _PreparedAppendTurn(
-            task_id=int(task.id),
-            agent_id=int(task.agent_id),
-            task_owner_user_id=task_owner_user_id,
-            payload=payload,
-            claimed_turn=claimed_turn,
-        )
-        commit_claimed_turn_or_reconcile(
-            db,
-            task_id=int(task.id),
-            task_owner_user_id=task_owner_user_id,
-            payload=payload,
-            claimed=claimed_turn,
-        )
-        return prepared
-    except Exception:
-        db.rollback()
-        if payload is not None:
-            pop_ephemeral_runtime_values(payload.turn_id)
-        raise
-    finally:
-        _retire_turn_session_best_effort(db, task_id=task_id)
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
 
 
 @router.post(
@@ -580,7 +310,11 @@ async def create_chat_task(
          ``start_task_in_background`` (which uses the same coroutine
          the WebSocket handler does). Returns 202 immediately --
          callers poll ``GET /v1/chat/tasks/{task_id}`` to observe the
-         eventual ``completed`` / ``failed`` status.
+         eventual ``completed`` / ``failed`` status. A ``failed`` status
+         can be derived: when automatic resume of an interrupted task
+         gives up, the task stays ``paused`` in storage and is reported
+         as ``failed``. It can change if the task's owner resumes it by
+         hand or the caller appends a message.
 
     Args:
         request: Validated :class:`CreateTaskRequest`. ``message.content``
@@ -610,51 +344,36 @@ async def create_chat_task(
     if agent_identity is None or request.agent_id != agent_identity.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
-    task_owner_user_id = int(agent_identity.user_id)
-    actor_user_id = int(agent_identity.user_id)
-    runtime_context = tuple(
-        item.model_dump() for item in request.connector_runtime_context or ()
-    )
-
-    async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
-        prepared = await run_db_io_cancellation_safe(
-            lambda: _prepare_created_task_isolated(
-                agent_id=int(agent_identity.id),
-                task_owner_user_id=task_owner_user_id,
-                message=request.message.content,
-                file_ids=tuple(request.message.files or ()),
-                connector_runtime_context=runtime_context,
-            )
+    try:
+        started = await task_start_service.create_sdk_task(
+            agent_id=int(agent_identity.id),
+            task_owner_user_id=int(agent_identity.user_id),
+            actor_user_id=int(agent_identity.user_id),
+            message=request.message.content,
+            file_ids=tuple(request.message.files or ()),
+            connector_runtime_context=tuple(
+                item.model_dump() for item in request.connector_runtime_context or ()
+            ),
+            timezone=request.timezone,
         )
-        try:
-            started = await TaskTurnOrchestrator.schedule_claimed_create_turn(
-                task_id=prepared.task_id,
-                task_owner_user_id=prepared.task_owner_user_id,
-                actor_user_id=actor_user_id,
-                payload=prepared.payload,
-                claimed=prepared.claimed_turn,
-            )
-        except TaskTurnError as exc:
-            pop_ephemeral_runtime_values(prepared.payload.turn_id)
-            raise_for_turn_rejection(exc.reason)
-        except BaseException:
-            pop_ephemeral_runtime_values(prepared.payload.turn_id)
-            raise
-        return prepared, started
-
-    # The owned child starts before the first await. If the caller is cancelled
-    # after RUNNING commits, scheduling (or its exact-lease compensation) still
-    # settles before cancellation propagates.
-    start_task = asyncio.create_task(_prepare_and_schedule())
-    prepared, started = await drain_async_task_cancellation_safe(start_task)
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+    except task_start_service.SdkCreateTurnRejected as exc:
+        raise_for_turn_rejection(exc.reason)
+    except TaskTurnFileBindingError as exc:
+        _raise_v1_file_binding_error(exc)
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
+    except DurableStorageOperationError as exc:
+        _raise_v1_storage_unavailable(exc)
 
     await record_key_usage(str(principal.key.key_prefix))
 
     return CreateTaskResponse(
-        task_id=prepared.task_id,
-        agent_id=prepared.agent_id,
+        task_id=started.task_id,
+        agent_id=started.agent_id,
         status=started.status.value,
-        created_at=prepared.created_at,
+        created_at=cast(datetime, started.accepted_at),
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
@@ -686,15 +405,49 @@ class _TaskInfoSnapshot:
     updated_at: datetime | None
     pending_question: str | None
     pending_interactions: list[dict[str, Any]] | None
+    # Set when a status-only caller's task rests PAUSED after automatic resume
+    # stopped for good. Every other field keeps the stored value;
+    # :func:`effective_task_snapshot` and the GET response apply the view.
+    view: TerminalView | None = None
+
+
+def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
+    """``snapshot`` as the caller must read it: ``failed`` when it carries a
+    terminal view, the stored values otherwise.
+
+    ``run_id``, ``state_version`` and ``updated_at`` stay the stored ones, so
+    the stream's change detection compares what the task row says.
+    """
+
+    view = snapshot.view
+    if view is None:
+        return snapshot
+    return replace(
+        snapshot,
+        status=TaskStatus.FAILED,
+        control_state=TaskStatus.FAILED.value,
+        output=None,
+        error=view.error,
+    )
 
 
 @dataclass(frozen=True)
 class _TaskStepsVersionSnapshot:
-    """Authorized task identity and the trace version used for cache lookup."""
+    """Authorized task identity and the trace version used for cache lookup.
+
+    The version is the pair (``max_event_id``, ``traces_expired_at``).
+    A trace purge does not always move ``max_event_id``: rows outside
+    this read (build-scoped events, checkpoint blobs) can be all it
+    removed, and a dialect that reuses ids can put a later turn back on
+    the same maximum. An entry cached before the purge must not be served
+    without the ``steps_expired`` flag it now owes.
+    """
 
     task_id: int
     agent_id: int
     max_event_id: int
+    traces_expired_at: datetime | None
+    storage_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -716,63 +469,34 @@ class _TaskStepsSnapshot:
     task_id: int
     agent_id: int
     max_event_id: int
+    traces_expired_at: datetime | None
     events: tuple[_TraceEventSnapshot, ...]
+    storage_version: int = 1
+
+
+def _read_traces_expired_at(task_id: int, db: Session) -> datetime | None:
+    """``tasks.traces_expired_at``, read *after* the trace rows it qualifies.
+
+    The trace purge deletes the rows and stamps this column in one
+    transaction, but a steps read sees each statement's own committed
+    snapshot. Reading the column first could pair a pre-purge "never
+    expired" with the post-purge empty list -- a truncated history
+    presented as complete. Reading it last errs the other way: at worst
+    full steps flagged as possibly incomplete.
+    """
+    return cast(
+        datetime | None,
+        db.query(Task.traces_expired_at).filter(Task.id == task_id).scalar(),
+    )
 
 
 def _resolve_task_or_404(task_id: int, principal: ApiKeyPrincipal, db: Session) -> Task:
-    """Resolve a task_id against the calling key's ownership AND
-    SDK-source scope.
-
-    Returns the :class:`Task` row when the task:
-
-      1. Exists.
-      2. Belongs to the key's owner -- directly (``Task.agent_id`` for
-         an agent-bound key) or through a workforce run
-         (``WorkforceRun.task_id`` for a workforce-bound key; the
-         binding is 1:1 unique).
-      3. Was created by the SDK (``source == "sdk"``).
-
-    Any other case — missing row, row belongs to a different owner,
-    or row was created by the Web UI / internal paths — raises
-    :class:`V1ApiError` with ``task_not_found`` (404 not 403, so the
-    existence of tasks under other owners / other surfaces isn't
-    observable through error code).
-
-    The ``source == "sdk"`` filter exists because an SDK API key
-    binds to an owner, not to a particular product surface. Without
-    it, an SDK client could read or append to any task the Web UI
-    created under the same owner (the user's own historical Web UI
-    chats or workforce runs, for example). Whether that's intentional
-    is a product decision, but the safe default for a public SDK is to
-    scope lookups to tasks the SDK itself created — ``POST
-    /v1/chat/tasks`` and ``POST /v1/workforces/{id}/runs`` both write
-    ``source="sdk"`` so this is well-defined.
-
-    Args:
-        task_id: Path parameter from the route.
-        principal: The key-bound owner resolved by
-            ``get_principal_from_api_key``.
-        db: SQLAlchemy session.
-
-    Raises:
-        V1ApiError(TASK_NOT_FOUND, 404): task missing, not owned by
-            the calling key, or not created by the SDK.
-    """
-    query = db.query(Task).filter(
-        Task.id == task_id,
-        Task.source == "sdk",
-    )
-    if principal.agent is not None:
-        query = query.filter(Task.agent_id == principal.agent.id)
-    else:
-        assert principal.workforce is not None
-        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
-            WorkforceRun.workforce_id == principal.workforce.id
+    try:
+        return task_start_service.resolve_sdk_task(
+            task_id, _sdk_task_scope(principal), db
         )
-    task = query.first()
-    if task is None:
-        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
-    return task
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
 
 
 def _load_task_info_snapshot(
@@ -790,6 +514,18 @@ def _load_task_info_snapshot(
             pending_question, pending_interactions = get_pending_interaction_question(
                 db, task
             )
+        view: TerminalView | None = None
+        # The view re-checks both inside its own statement; this only skips
+        # the query for reads that cannot be terminal.
+        if (
+            task.status == TaskStatus.PAUSED
+            and task.control_state == TaskControlState.PAUSED.value
+        ):
+            view = status_only_terminal_view(db, int(task.id))
+        if view is not None:
+            increment_counter(
+                "xagent.v1.task.projected_failed", attributes={"state": view.state}
+            )
         return _TaskInfoSnapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
@@ -804,6 +540,7 @@ def _load_task_info_snapshot(
             updated_at=cast(datetime | None, task.updated_at),
             pending_question=pending_question,
             pending_interactions=pending_interactions,
+            view=view,
         )
 
 
@@ -816,6 +553,16 @@ def _load_task_steps_version_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        if task.conversation_storage_version == 2:
+            from ...services.task_event_display import display_horizon
+
+            return _TaskStepsVersionSnapshot(
+                task_id=int(task.id),
+                agent_id=int(task.agent_id),
+                max_event_id=display_horizon(db, task_id),
+                traces_expired_at=None,
+                storage_version=2,
+            )
         max_event_id = (
             db.query(func.max(TraceEvent.id))
             .filter(
@@ -829,6 +576,7 @@ def _load_task_steps_version_snapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
             max_event_id=int(max_event_id),
+            traces_expired_at=_read_traces_expired_at(task_id, db),
         )
 
 
@@ -841,6 +589,31 @@ def _load_task_steps_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        if task.conversation_storage_version == 2:
+            from ...services.task_event_display import load_event_display_snapshot
+
+            view = load_event_display_snapshot(db, task_id)
+            return _TaskStepsSnapshot(
+                task_id=int(task.id),
+                agent_id=int(task.agent_id),
+                max_event_id=view.horizon,
+                traces_expired_at=None,
+                storage_version=2,
+                events=tuple(
+                    _TraceEventSnapshot(
+                        task_id=task_id,
+                        event_id=event["event_id"],
+                        event_type=event["event_type"],
+                        timestamp=datetime.fromtimestamp(
+                            event["timestamp"], timezone.utc
+                        ),
+                        step_id=event["step_id"],
+                        data=event["data"],
+                    )
+                    for event in view.events
+                    if event["type"] == "trace_event"
+                ),
+            )
         rows = (
             db.query(TraceEvent)
             .filter(
@@ -865,6 +638,7 @@ def _load_task_steps_snapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
             max_event_id=int(rows[-1].id) if rows else 0,
+            traces_expired_at=_read_traces_expired_at(task_id, db),
             events=events,
         )
 
@@ -905,6 +679,13 @@ def _get_chat_task_sync(
     ``tasks.updated_at``, so a cached entry has no way to prove its
     ``pending_interaction`` is still current. Caching it anyway would
     let a stale question survive a cache hit indefinitely.
+
+    The terminal view of a status-only caller's task is kept out of the
+    cache for the same reason: automatic resume stops by writing only the
+    recovery row, and an append queues a START without touching the task
+    row's ``updated_at``, so a cached body cannot prove the view is still
+    current. The cached body holds the stored values; the view is applied
+    to the response after every cache read or write.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -917,12 +698,22 @@ def _get_chat_task_sync(
         if task.pending_question is not None
         else None
     )
+    overlay: dict[str, Any] = {"pending_interaction": pending_interaction}
+    if task.view is not None:
+        effective = effective_task_snapshot(task)
+        overlay.update(
+            status=effective.status.value,
+            control_state=effective.control_state,
+            output=effective.output,
+            error=effective.error,
+            completed_at=task.view.stopped_at,
+        )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
     if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
         response = TaskInfoResponse.model_validate(cached["response"])
-        return response.model_copy(update={"pending_interaction": pending_interaction})
+        return response.model_copy(update=overlay)
 
     response = TaskInfoResponse(
         task_id=task.task_id,
@@ -948,7 +739,7 @@ def _get_chat_task_sync(
         },
         ttl_seconds=task_cache_ttl_seconds(),
     )
-    return response.model_copy(update={"pending_interaction": pending_interaction})
+    return response.model_copy(update=overlay)
 
 
 def _get_chat_task_steps_sync(
@@ -960,7 +751,16 @@ def _get_chat_task_steps_sync(
     version = _load_task_steps_version_snapshot(task_id, principal)
     cache_key = task_steps_key(task_id)
     cached = cache_get(cache_key)
-    if isinstance(cached, dict) and cached.get("max_event_id") == version.max_event_id:
+    # An entry written before ``traces_expired_at`` existed has no such key
+    # and reads as ``None``, which matches exactly the tasks retention never
+    # touched -- the ones whose cached body is still right without the flag.
+    if (
+        isinstance(cached, dict)
+        and cached.get("storage_version", 1) == version.storage_version
+        and cached.get("max_event_id") == version.max_event_id
+        and cached.get("traces_expired_at")
+        == cache_version_token(version.traces_expired_at)
+    ):
         return StepsResponse.model_validate(cached["response"])
 
     snapshot = _load_task_steps_snapshot(task_id, principal)
@@ -969,11 +769,15 @@ def _get_chat_task_steps_sync(
         task_id=snapshot.task_id,
         agent_id=snapshot.agent_id,
         steps=[PublicStep(**step) for step in public_steps_data],
+        steps_expired=snapshot.traces_expired_at is not None,
+        steps_expired_at=snapshot.traces_expired_at,
     )
     cache_set(
         cache_key,
         {
+            "storage_version": snapshot.storage_version,
             "max_event_id": snapshot.max_event_id,
+            "traces_expired_at": cache_version_token(snapshot.traces_expired_at),
             "response": response.model_dump(mode="json"),
         },
         ttl_seconds=task_cache_ttl_seconds(),
@@ -1035,66 +839,50 @@ async def append_message_to_task(
         V1ApiError 404: task not found OR not owned by the key OR
             body.agent_id / body.workforce_id doesn't match the bound
             owner.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            a task this key could have seen; ``details`` carries
+            ``task_id`` and ``expired_at``.
         V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
             code (not retryable), or ``interaction_response_required``
             (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
-    actor_user_id = principal.owner_user_id
-    runtime_context = tuple(
-        item.model_dump() for item in request.connector_runtime_context or ()
-    )
-
-    async def _prepare_and_begin() -> tuple[_PreparedAppendTurn, TurnStarted]:
-        # A runner may still be finishing local cleanup after its terminal
-        # status is visible in the database. Reject that tail window before
-        # the domain-owned transaction stages any append mutation. The atomic
-        # status predicate inside the transaction remains authoritative across
-        # workers and concurrent requests.
-        TaskTurnOrchestrator.ensure_no_background_turn(task_id)
-        prepared = await run_db_io_cancellation_safe(
-            lambda: _prepare_append_turn_isolated(
-                task_id=task_id,
-                principal=principal,
-                request_agent_id=request.agent_id,
-                request_workforce_id=request.workforce_id,
-                message=request.message.content,
-                file_ids=tuple(request.message.files or ()),
-                connector_runtime_context=runtime_context,
-            )
-        )
-        try:
-            started = await TaskTurnOrchestrator.schedule_claimed_turn(
-                task_id=prepared.task_id,
-                task_owner_user_id=prepared.task_owner_user_id,
-                actor_user_id=actor_user_id,
-                payload=prepared.payload,
-                claimed=prepared.claimed_turn,
-                kind=TurnKind.APPEND,
-            )
-        except BaseException:
-            pop_ephemeral_runtime_values(prepared.payload.turn_id)
-            raise
-        return prepared, started
-
-    start_task = asyncio.create_task(_prepare_and_begin())
     try:
-        prepared, started = await drain_async_task_cancellation_safe(start_task)
+        started = await task_start_service.append_sdk_turn(
+            task_id=task_id,
+            scope=_sdk_task_scope(principal),
+            actor_user_id=principal.owner_user_id,
+            request_agent_id=request.agent_id,
+            request_workforce_id=request.workforce_id,
+            message=request.message.content,
+            file_ids=tuple(request.message.files or ()),
+            connector_runtime_context=tuple(
+                item.model_dump() for item in request.connector_runtime_context or ()
+            ),
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
     except TaskTurnNotFoundError:
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError as exc:
         raise_for_turn_rejection(exc.reason)
+    except TaskTurnFileBindingError as exc:
+        _raise_v1_file_binding_error(exc)
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
+    except DurableStorageOperationError as exc:
+        _raise_v1_storage_unavailable(exc)
 
     await record_key_usage(str(principal.key.key_prefix))
 
     return AppendMessageResponse(
-        task_id=prepared.task_id,
-        agent_id=prepared.agent_id,
+        task_id=started.task_id,
+        agent_id=started.agent_id,
         workforce_id=(
             int(principal.workforce.id) if principal.workforce is not None else None
         ),
         status=started.status.value,
-        accepted_at=started.updated_at,
+        accepted_at=started.accepted_at,
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
@@ -1155,6 +943,9 @@ async def get_chat_task(
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            a task this key could have seen; ``details`` carries
+            ``task_id`` and ``expired_at``.
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_sync(task_id, principal)
@@ -1196,10 +987,17 @@ async def get_chat_task_steps(
         steps array in ``started_at`` ascending order. In-flight steps
         appear with ``status='running'`` and ``completed_at=null`` so
         SDK clients can poll this endpoint and observe progress.
+        ``steps_expired`` / ``steps_expired_at`` report that the
+        retention policy removed the task's historical steps, so the
+        array may be incomplete -- it can still hold steps from turns
+        taken after that removal.
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing or not owned by the calling key.
+        V1ApiError 410: ``task_expired`` -- the retention policy expired
+            the whole task (not just its steps); ``details`` carries
+            ``task_id`` and ``expired_at``.
     """
     return await run_db_io_cancellation_safe(
         lambda: _get_chat_task_steps_sync(task_id, principal)
@@ -1237,6 +1035,17 @@ async def stream_chat_task_events(
         elsewhere in this router; the two error-code vocabularies do
         not overlap.
 
+      On the two attach-time fast paths described under Behavior below,
+      whichever of these two conclusion frames the path emits carries two
+      extra fields, ``snapshot_truncated: true`` and
+      ``snapshot_total_steps`` (the task's full public step count at
+      attach time), whenever that attach's one-shot step snapshot sent
+      fewer steps than the task has -- absent otherwise, and absent on
+      every other producer of these two frames. They ride the conclusion
+      rather than a ``step.*`` frame because the snapshot's byte budget
+      can admit no steps at all, leaving no ``step.*`` frame to carry
+      them.
+
     The other four project the task's step-by-step execution and
     streamed message text onto the same connection, from the same
     ``PublicStep`` shape and public step-type list ``GET
@@ -1245,7 +1054,16 @@ async def stream_chat_task_events(
       - ``step.started``: ``{step}``, a running ``PublicStep``.
       - ``step.completed``: ``{step}``, the same step once its end event
         (or failure) resolves it -- ``status`` is ``"completed"`` or
-        ``"failed"``.
+        ``"failed"``. On the two attach-time fast paths below (the task
+        is already finished, or already waiting on user input), these
+        frames are that attach's one-shot step snapshot: in
+        ``started_at`` order, drawn from the task's most recent steps
+        up to a step-count cap (512) and a total-wire-bytes budget over the
+        snapshot's serialized frames. When the byte budget is what binds,
+        it keeps that window's oldest contiguous run, so the very latest
+        steps may be the ones missing. Whether the snapshot was cut short
+        is reported on the conclusion frame, not on these -- ``GET
+        .../steps`` is the authoritative full history either way.
       - ``message.delta``: ``{message_id, text}``, one chunk of a
         streamed final answer as the agent generates it.
       - ``message.completed``: ``{message_id, content}``, that same
@@ -1332,20 +1150,20 @@ async def stream_chat_task_events(
         line is sent whenever 15s pass without any other frame going
         out, to keep the connection alive -- not on a fixed 15s
         cadence regardless of activity.
-      - This stream carries only what happens after the connection
-        opens; it never sends the steps that already happened, on any
-        path. That has two consequences a client must handle. First, a
-        step that was already running at attach time does not appear on
-        this stream at all: its ``step.started`` was broadcast before
-        this connection existed, and its end event arrives here with no
-        matching start, so that end is dropped rather than sent. The
-        client sees neither half of the step -- it is absent, not left
-        at ``"running"``. Second, an attach that arrives once the task
-        has already finished (or is already waiting on user input) has
-        no live content left to carry, so it closes with the lifecycle
-        frames alone. Either way, ``GET .../steps`` reads the database
-        and is unaffected by when the stream was opened, so that is
-        where a client reconciles what this stream did not carry.
+      - A stream that goes live carries only what happens after the
+        connection opens; it never resends the steps that already
+        happened. (The two attach-time fast paths below are the
+        exception: they send a one-shot snapshot of the task's steps
+        and close, rather than going live at all.) That has one
+        consequence a client must handle: a step that was already
+        running at attach time does not appear on this stream at all.
+        Its ``step.started`` was broadcast before this connection
+        existed, and its end event arrives here with no matching
+        start, so that end is dropped rather than sent -- the client
+        sees neither half of the step. ``GET .../steps`` reads the
+        database and is unaffected by when the stream was opened, so a
+        client attaching to an already-running task reconciles there
+        rather than expecting this stream to fill the gap.
       - Frame sequence into ``task.completed``: a task that fails emits
         ``task.status`` (``"failed"``) from the failure broadcast first,
         then the watchdog's authoritative ``task.completed`` close
@@ -1383,8 +1201,8 @@ async def stream_chat_task_events(
         not silent in the same way -- the
         close frame that follows a queue-drain is often itself a
         ``stream.error`` (``resync_required``/``unauthorized``/
-        ``task_deleted``/``stream_expired``) -- but that close frame
-        carries no record of what it drained on its way out, so its
+        ``task_deleted``/``task_expired``/``stream_expired``) -- but that
+        close frame carries no record of what it drained on its way out, so its
         presence or absence proves nothing about whether a content frame
         was lost this way: a ``stream.error`` does not mean content was
         dropped, and its absence does not mean nothing was. Only
@@ -1399,25 +1217,68 @@ async def stream_chat_task_events(
         content frame arrived" as "nothing happened". A task that
         succeeds has no intermediate status broadcast, so it goes
         straight to ``task.completed`` with no preceding
-        ``task.status``.
+        ``task.status``. Attaching to a task that's already terminal
+        (the fast path below) always sends the conclusion frame; the
+        generation reread below decides only whether step content
+        accompanies it, sending ``resync_required`` in place of the
+        steps on a confirmed change.
       - Attaching to an already-finished task is not an error: the
-        stream opens, emits ``task.status`` then ``task.completed``,
-        and closes immediately, with no ``step.*`` frames in between --
-        that task's steps are read through ``GET .../steps``.
+        stream opens, emits ``task.status``, the task's steps, then
+        ``task.completed``, and closes immediately. If reading those
+        steps fails, this fast path (and the waiting-for-user one
+        below) still sends its conclusion frame -- ``task.completed``
+        here, ``task.input_required`` there -- before closing with a
+        ``stream.error`` frame naming why -- ``task_deleted`` when the
+        row is gone by the time the steps are read (``task_expired``
+        when the retention policy is what removed it),
+        ``resync_required`` otherwise: a step-read failure on either
+        fast path never costs the client the lifecycle conclusion it already had in
+        hand from the snapshot that picked this path. Step content goes
+        out at all only once the task row has been read once more and
+        confirmed to still be the same run/state generation as the
+        snapshot that picked this path, *and* the steps cursor
+        (``max_event_id``) is confirmed unmoved since -- a task that
+        restarted in between (a ``POST reply`` resuming a waiting task,
+        or a WS append resuming a finished one) moves the row to a new
+        generation, which means the steps just read may already belong
+        to it while the conclusion still describes the old one; a trace
+        row landing in that same window can advance the cursor without
+        touching ``run_id``/``state_version`` at all (trace rows write
+        through their own commit, which can update the task row's own
+        checkpoint-pointer columns while the task is running but never
+        touches those two fields), so the generation check alone cannot
+        see it. Both checks have to pass for the steps to go out: a
+        confirmed match on both sends the steps, then the conclusion; a
+        confirmed change on either still sends the conclusion but
+        withholds the steps, closing with ``resync_required`` instead;
+        and a reread that fails outright is treated like the steps-read
+        failure above -- no step content goes out, but the conclusion
+        (already known-good, independent of this reread) still does,
+        followed by ``stream.error`` naming why -- ``task_deleted``
+        (``task_expired`` when retention expired the task) or
+        ``resync_required`` by the same rule. A failure while
+        serializing an individual step is handled the same way: the
+        conclusion frame goes out, followed by
+        ``stream.error(resync_required)``, and the step list sent
+        before the failure may be partial.
       - The stream force-closes with ``task.input_required`` if the task
-        is found waiting on user input (same shape: ``task.status``,
-        then ``task.input_required``, then close); with ``stream.error``
-        if the API key is revoked/paused, the task row disappears
-        (within one watchdog cycle, 30s in production, of the delete),
-        the client can't keep up (``resync_required``), or the stream
-        has been open for the 1-hour maximum (``stream_expired``,
-        emitted before the connection closes so it's distinguishable
-        from a clean end). After any ``stream.error``, re-attaching is
-        the supported recovery path (no replay of missed frames --
-        reconcile via ``steps()`` first).
+        is found waiting on user input (same steps-then-close shape:
+        ``task.status``, the task's steps, then ``task.input_required``);
+        with ``stream.error`` if the API key is revoked/paused, the task
+        row disappears (within one watchdog cycle, 30s in production, of
+        the delete: ``task_expired`` when the retention policy expired
+        it, ``task_deleted`` for any other removal), the client can't
+        keep up (``resync_required``), or the stream has been open for the 1-hour maximum
+        (``stream_expired``, emitted before the connection closes so
+        it's distinguishable from a clean end). After any
+        ``stream.error``, re-attaching is the supported recovery path
+        (no replay of missed frames -- reconcile via ``steps()`` first).
       - A task that's ``paused`` does not close the stream (matching
-        SDK ``wait()`` semantics: another process may resume it); the
-        1-hour cap is what eventually ends an orphaned paused stream.
+        SDK ``wait()`` semantics: it may still be resumed). A paused
+        task whose automatic resume has stopped for good, with nothing
+        queued that could move it, is read as ``failed`` and closes
+        with ``task.completed`` within one watchdog cycle; the 1-hour
+        cap ends a paused stream that nothing resumes or stops.
       - No ``task.status`` frame is guaranteed to be fresh or in order,
         at any point in the stream's life, not only at attach: this
         endpoint never buffers or reconciles ``task.status`` frame
@@ -1436,6 +1297,9 @@ async def stream_chat_task_events(
             the stream never opens).
         V1ApiError 404: task missing or not owned by the calling key
             (plain JSON; the stream never opens).
+        V1ApiError 410 ``task_expired``: the retention policy expired a
+            task this key could have seen (plain JSON with ``details``
+            ``task_id`` / ``expired_at``; the stream never opens).
         V1ApiError 429 ``rate_limited``: 2 or more concurrent streams
             already open on this task, or 32 or more already open for
             this key across all tasks (the per-key cap). Both caps are
@@ -1453,8 +1317,25 @@ async def stream_chat_task_events(
             times the worker count. An attach that takes the terminal
             or waiting-for-user fast path (see Behavior above) never
             registers a sink at all, so it never counts toward either
-            cap. Broadcast delivery is per-process too: a sink only
-            receives the broadcasts fanned out by its own worker
+            cap -- its step snapshot read goes through the same
+            ``max_event_id``-keyed cache ``GET .../steps`` uses. That
+            snapshot is bounded by a step-count cap and a
+            total-wire-bytes budget; a snapshot cut short by either
+            carries the ``snapshot_truncated``/``snapshot_total_steps``
+            marker on its conclusion frame as described above. When a
+            shared cache backend is configured (Redis; see
+            ``hot_path_cache.get_cache_backend``), a burst of fast-path
+            attaches on one task (or repeated attaches after it's
+            already terminal) usually collapses into cache hits rather
+            than each one re-reading and re-projecting the task's full
+            trace history. Without one configured -- ``NoOpCache``, what
+            this reads through whenever Redis is disabled -- every
+            attach re-reads and re-projects the task's full trace
+            history regardless of this shared code path; the cache-hit
+            collapsing only actually happens with a real backend behind
+            it. Broadcast delivery is per-process
+            too: a sink only receives the broadcasts fanned out by its
+            own worker
             process's connection manager, so a task transition driven
             by a different worker reaches this stream only once the
             watchdog's 30s database poll picks it up, not via broadcast.
@@ -1471,11 +1352,15 @@ async def stream_chat_task_events(
             delivery path regardless of worker count.
     """
     snapshot = await run_db_io_cancellation_safe(
-        lambda: _load_task_info_snapshot(task_id, principal)
+        lambda: effective_task_snapshot(_load_task_info_snapshot(task_id, principal))
     )
     return await _events_stream.build_event_stream_response(
         task_id=task_id,
         principal=principal,
         initial_snapshot=snapshot,
-        read_task_snapshot=_load_task_info_snapshot,
+        read_task_snapshot=lambda tid, p: effective_task_snapshot(
+            _load_task_info_snapshot(tid, p)
+        ),
+        read_task_steps_response=_get_chat_task_steps_sync,
+        read_task_steps_version=_load_task_steps_version_snapshot,
     )

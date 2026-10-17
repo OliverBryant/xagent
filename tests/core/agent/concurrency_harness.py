@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from xagent.core.agent import ReActPattern
@@ -170,15 +172,25 @@ class RecordingContext:
         tool_name: str,
         result: Any,
         tool_call_id: str | None = None,
+        *,
+        invocation_id: str | None = None,
     ) -> _RecordedMessage:
         self.tool_results.append(
             {
                 "tool_name": tool_name,
                 "result": result,
                 "tool_call_id": tool_call_id,
+                "invocation_id": invocation_id,
             }
         )
-        message = _RecordedMessage("tool", result, tool_call_id=tool_call_id)
+        message = _RecordedMessage(
+            "tool",
+            result,
+            tool_call_id=tool_call_id,
+            metadata=(
+                {"invocation_id": invocation_id} if invocation_id is not None else {}
+            ),
+        )
         self.messages.append(message)
         return message
 
@@ -223,12 +235,26 @@ class FakeRuntime:
     async def should_interrupt(self) -> bool:
         return bool(self._interrupt)
 
-    async def send_message(self, **kwargs: Any) -> None:
-        self.events.append(("send_message", dict(kwargs)))
+    async def send_message(self, **kwargs: Any) -> dict[str, Any]:
+        payload = dict(kwargs)
+        if bool(payload.get("expect_response")) or payload.get("message_type") == (
+            "question"
+        ):
+            message_number = 1 + sum(
+                kind == "send_message" for kind, _payload in self.events
+            )
+            payload["event_id"] = f"fake-agent-message-{message_number}"
+        self.events.append(("send_message", payload))
+        return payload
 
     def request_interrupt(self, reason: str | None = None) -> None:
         self._interrupt = True
         self.interrupt_reason = reason
+
+    async def load_committed_tool_outcome(
+        self, tool_call: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        return None
 
     async def run_tool_call(self, invoke: Any) -> Any:
         result = invoke()
@@ -312,6 +338,8 @@ def make_tool_call(
         "name": name,
         "args": dict(args or {}),
         "id": id if id is not None else f"call_{next(_tool_call_ids)}",
+        "invocation_id": uuid.uuid4().hex,
+        "issued_at": datetime.now(timezone.utc).timestamp(),
     }
 
 

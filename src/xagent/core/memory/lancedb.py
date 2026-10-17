@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -18,6 +18,7 @@ from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from .base import MemoryStore
 from .core import MemoryNote, MemoryResponse
+from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
     MemoryMismatchKind,
     classify_memory_schema_mismatch,
@@ -32,6 +33,12 @@ from .scope_columns import (
     encode_scope_dims,
     scope_dim_where_term,
 )
+from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
+from .vector_compatibility import (
+    EmbeddingIdentity,
+    _is_fully_admitted,
+    classify_vector_compatibility,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,8 @@ class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
 
     _embedding_model: Optional[BaseEmbedding]
+    # Rows per backend batch on the streamed text-search path.
+    _stream_batch_size: int = DEFAULT_STREAM_BATCH_SIZE
 
     def __init__(
         self,
@@ -59,6 +68,85 @@ class LanceDBMemoryStore(MemoryStore):
             similarity_threshold: Cosine distance threshold for vector search (lower = more strict)
             **embedding_kwargs: Additional arguments for embedding model
         """
+        self._set_up(
+            db_dir,
+            collection_name,
+            embedding_model,
+            similarity_threshold,
+            embedding_kwargs,
+            ensure_table=True,
+        )
+        self._ensure_table_schema()
+
+    @classmethod
+    def open_admitted(
+        cls,
+        admitted: AdmittedLanceDBMemoryStore,
+        identity: EmbeddingIdentity,
+        *,
+        db_dir: str,
+        embedding_model: Optional[BaseEmbedding] = None,
+        similarity_threshold: float = 1.0,
+    ) -> "LanceDBMemoryStore":
+        """Open the table storage admission just certified, without changing it.
+
+        The constructor may create a placeholder table, reshape an empty one
+        and promote scope columns. None of that is safe here: it would run
+        after the admission lock is released, next to other workers, on a
+        table admission has already certified. So this path only opens the
+        table and checks that it is still the one admission certified: the
+        table exists, still carries the full-admission marker and still
+        classifies against ``identity`` the way admission classified it.
+        Anything else raises, and nothing is published.
+        """
+        store = cls.__new__(cls)
+        store._set_up(
+            db_dir,
+            admitted.handle.table_name,
+            embedding_model,
+            similarity_threshold,
+            {},
+            ensure_table=False,
+        )
+        store._verify_admitted_table(admitted, identity)
+        return store
+
+    def _verify_admitted_table(
+        self, admitted: AdmittedLanceDBMemoryStore, identity: EmbeddingIdentity
+    ) -> None:
+        try:
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Admitted memory table {self._collection_name!r} is missing"
+            ) from exc
+        try:
+            if not _is_fully_admitted(table):
+                raise RuntimeError(
+                    f"Memory table {self._collection_name!r} lost its admission "
+                    "certificate after admission"
+                )
+            compatibility = classify_vector_compatibility(table.schema, identity)
+        finally:
+            _safe_close_table(table)
+        if compatibility is not admitted.vector_compatibility:
+            raise RuntimeError(
+                f"Memory table {self._collection_name!r} changed vector space "
+                "after admission"
+            )
+
+    def _set_up(
+        self,
+        db_dir: str,
+        collection_name: str,
+        embedding_model: Optional[Union[BaseEmbedding, EmbeddingModelConfig]],
+        similarity_threshold: float,
+        embedding_kwargs: dict[str, Any],
+        *,
+        ensure_table: bool,
+    ) -> None:
         self._collection_name = collection_name
 
         # Handle different types of embedding_model input
@@ -87,9 +175,10 @@ class LanceDBMemoryStore(MemoryStore):
                 f"Unsupported embedding model type: {type(embedding_model)}"
             )
         self._similarity_threshold = similarity_threshold
-        self._vector_store = LanceDBVectorStore(db_dir, collection_name)
+        self._vector_store = LanceDBVectorStore(
+            db_dir, collection_name, ensure_table=ensure_table
+        )
         self._conn_manager = LanceDBConnectionManager()
-        self._ensure_table_schema()
 
     def _ensure_table_schema(self) -> None:
         """Ensure the table has the correct schema for memory storage.
@@ -109,6 +198,7 @@ class LanceDBMemoryStore(MemoryStore):
         try:
             table = conn.open_table(self._collection_name)
             column_names = set(table.schema.names)
+            row_count = table.count_rows()
         except Exception:
             # Table doesn't exist yet, create it with the basic schema.
             logger.info(f"Creating table {self._collection_name} with basic schema")
@@ -117,11 +207,13 @@ class LanceDBMemoryStore(MemoryStore):
         finally:
             _safe_close_table(table)
 
-        # Table exists. Init's trigger is a missing required non-vector column;
-        # a vector-dimension mismatch is detected and migrated lazily on the
-        # add() path instead. Route the resolution through the shared classifier
-        # and transform-then-swap primitive so we migrate rather than wipe.
-        if not {"id", "text", "metadata"} <= column_names:
+        # The generic vector-store constructor bootstraps a new table with an
+        # empty three-dimensional placeholder. Resolve that empty-table schema
+        # here, before the store can be published or accept a write. Existing
+        # non-empty tables still enter this path only for missing required
+        # non-vector columns; vector-space changes there require explicit
+        # admission/maintenance and are never deferred to add().
+        if row_count == 0 or not {"id", "text", "metadata"} <= column_names:
             logger.warning(
                 f"Table {self._collection_name} has incompatible schema, "
                 "migrating in place"
@@ -354,7 +446,12 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
     def _resolve_schema_mismatch(
-        self, conn: Any, expected_dim: Optional[int], *, raise_when_compatible: bool
+        self,
+        conn: Any,
+        expected_dim: Optional[int],
+        *,
+        raise_when_compatible: bool,
+        allow_vector_rebuild: bool = True,
     ) -> None:
         """Classify and safely resolve a schema mismatch (shared by add/init).
 
@@ -367,6 +464,11 @@ class LanceDBMemoryStore(MemoryStore):
         controls behavior: the ``add()`` path passes ``True`` (its insert failed,
         so a compatible schema means an unexpected error to surface rather than
         silently drop); the init path passes ``False`` (nothing to migrate).
+
+        ``allow_vector_rebuild=False`` makes ordinary writes schema-immutable:
+        the add-error path may backfill missing non-vector columns, but it may
+        never replace or re-embed an admitted table. Vector-space repair stays
+        an explicit, quiesced maintenance/admission operation.
         """
         table = conn.open_table(self._collection_name)
         try:
@@ -375,6 +477,18 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
         mismatch = classify_memory_schema_mismatch(schema, expected_dim)
+        if (
+            mismatch.kind is MemoryMismatchKind.VECTOR_REBUILD
+            and not allow_vector_rebuild
+        ):
+            # Keep the live vector schema and rows; resolve only an additive
+            # non-vector backfill, if one is also needed.
+            if mismatch.missing_columns:
+                self._backfill_missing_columns(conn, mismatch.missing_columns)
+                return
+            raise RuntimeError(
+                "add() vector schema mismatch requires offline admission or repair"
+            )
 
         if mismatch.kind is MemoryMismatchKind.MISSING_NON_VECTOR_COLUMN:
             self._backfill_missing_columns(conn, mismatch.missing_columns)
@@ -393,7 +507,16 @@ class LanceDBMemoryStore(MemoryStore):
             )
 
     def _migrate_schema_mismatch(self, conn: Any, record: dict[str, Any]) -> None:
-        """Resolve the schema mismatch that made an ``add()`` insert fail."""
+        """Resolve the schema mismatch that made an ``add()`` insert fail.
+
+        A failed insert is not proof of a schema mismatch: disk pressure, lock
+        contention or a backend hiccup fail it too. So this never drops the
+        vector column: a store that cannot produce vectors (no adapter, e.g.
+        TEXT_ONLY, or an embedding call that just failed) must not rewrite a
+        table whose vectors were written under another identity. An insert
+        failure with nothing resolvable is raised and reported as a failed
+        write, leaving the table untouched.
+        """
         # The dimension we are trying to store now determines the target schema.
         if record.get("vector"):
             expected_dim: Optional[int] = len(record["vector"])
@@ -402,7 +525,12 @@ class LanceDBMemoryStore(MemoryStore):
         else:
             expected_dim = None
 
-        self._resolve_schema_mismatch(conn, expected_dim, raise_when_compatible=True)
+        self._resolve_schema_mismatch(
+            conn,
+            expected_dim,
+            raise_when_compatible=True,
+            allow_vector_rebuild=False,
+        )
 
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
         """Insert a record, adapting it to the (possibly migrated) table schema."""
@@ -702,6 +830,56 @@ class LanceDBMemoryStore(MemoryStore):
         filters: Optional[dict[str, Any]] = None,
         similarity_threshold: Optional[float] = None,
     ) -> list[MemoryNote]:
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=False,
+        )
+
+    def search_with_null_vector_fallback(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> list[MemoryNote]:
+        """Dormant admission primitive that safely supplements ANN results."""
+        return self._search(
+            query,
+            k=k,
+            filters=filters,
+            similarity_threshold=similarity_threshold,
+            include_null_vector_fallback=True,
+        )
+
+    def _residual_note_filter(
+        self, residual_filters: dict[str, Any]
+    ) -> Callable[[MemoryNote], bool]:
+        """Bind the shared filter dispatch to one residual filter set.
+
+        ``_flat_other_filters`` is note-independent, so it is computed once here
+        rather than per scanned row.
+        """
+        other_filters = self._flat_other_filters(residual_filters)
+        return lambda note: self._matches_filters(note, residual_filters, other_filters)
+
+    def _dormant_memory_handle(self) -> DormantLanceDBMemoryHandle:
+        """This collection as the layer B handle the streaming scan takes."""
+        return DormantLanceDBMemoryHandle(
+            self._vector_store.get_raw_connection(), self._collection_name
+        )
+
+    def _search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        similarity_threshold: Optional[float] = None,
+        *,
+        include_null_vector_fallback: bool,
+    ) -> list[MemoryNote]:
         """Search memory notes by query text with optional filters.
 
         Known limitation (#916): on the vector path, residual filters —
@@ -725,6 +903,7 @@ class LanceDBMemoryStore(MemoryStore):
                 self._collection_name
             )
             results = []
+            ann_search_completed = False
 
             # #822: push user_id + scope-dimension filters into a `where`
             # prefilter so the ANN returns k already-scoped neighbours; the rest
@@ -753,6 +932,7 @@ class LanceDBMemoryStore(MemoryStore):
                                     where_sql, prefilter=True
                                 )
                             vector_df = vector_query.limit(k).to_pandas()
+                            ann_search_completed = True
 
                             for _, row in vector_df.iterrows():
                                 # Check similarity threshold
@@ -828,56 +1008,63 @@ class LanceDBMemoryStore(MemoryStore):
                     f"Embedding generation failed, using text search: {embedding_error}"
                 )
 
-            # Fallback to text search if no vector results or vector search failed
-            if not results:
-                # Text search
-                df = table.search().to_pandas()
-                other_filters = self._flat_other_filters(filters)
-
-                # Filter by query text and apply filters
-                for _, row in df.iterrows():
-                    text = row.get("text", "")
-
-                    # Simple text matching
-                    if query and query.lower() not in text.lower():
-                        continue
-
-                    note_data = {
-                        "id": row.get("id", ""),
-                        "text": text,
-                        "metadata": row.get("metadata", "{}"),
-                    }
-                    # #847: here a malformed row would escape to the outer
-                    # except and turn the whole query into an empty result.
-                    try:
-                        note = self._dict_to_memory_note(note_data)
-                    except Exception as row_error:
-                        logger.warning(
-                            "Skipping malformed memory row %r in text "
-                            "search results: %s",
-                            note_data["id"],
-                            row_error,
-                        )
-                        continue
-
-                    # Unlike the vector path, nothing was pushed into `where`
-                    # here, so the full filters apply (including the
-                    # scope-exclusive directive and nested metadata isolation).
-                    if filters and not self._matches_filters(
-                        note, filters, other_filters
-                    ):
-                        continue
-
-                    results.append(note)
-
+            if include_null_vector_fallback:
+                seen_ids: set[str] = set()
+                deduplicated: list[MemoryNote] = []
+                for note in results:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        deduplicated.append(note)
+                results = deduplicated
+                # Ranked streaming retrieval (#2346), reached only from the
+                # dormant admission primitive: bounded batches, the scope
+                # clause pushed into `where`, and a heap bounded at the
+                # outstanding quota. ANN ids are excluded at the source, so a
+                # duplicate cannot consume a lexical slot.
+                candidates = (
+                    stream_lexical_top_k(
+                        self._dormant_memory_handle(),
+                        query,
+                        k - len(results),
+                        row_to_note=self._dict_to_memory_note,
+                        note_filter_factory=self._residual_note_filter,
+                        filters=filters,
+                        exclude_ids=seen_ids,
+                        null_vectors_only=ann_search_completed,
+                    )
+                    if len(results) < k
+                    else []
+                )
+                for note in candidates:
+                    identity = str(note.id)
+                    if identity not in seen_ids:
+                        seen_ids.add(identity)
+                        results.append(note)
                     if len(results) >= k:
                         break
+                return results[:k]
+
+            # Fallback to text search if no vector results or vector search
+            # failed: the first k substring matches in scan order, streamed in
+            # bounded batches with the scope clause pushed into `where` and the
+            # residual filters applied per batch, instead of materialising the
+            # whole table.
+            if not results:
+                results = stream_lexical_top_k(
+                    self._dormant_memory_handle(),
+                    query,
+                    k,
+                    row_to_note=self._dict_to_memory_note,
+                    note_filter_factory=self._residual_note_filter,
+                    filters=filters,
+                    null_vectors_only=False,
+                    batch_size=self._stream_batch_size,
+                    ranked=False,
+                )
 
             return results[:k]
 
-        except Exception as e:
-            logger.error(f"Failed to search memories with query '{query[:50]}...': {e}")
-            return []
         finally:
             _safe_close_table(table)
 
@@ -897,14 +1084,10 @@ class LanceDBMemoryStore(MemoryStore):
         so list_all and search cannot diverge (#909). Results are sorted
         newest-first to match InMemoryStore.list_all.
         """
-        try:
-            notes = self.search(query="", k=10000, filters=filters or None)
-            # Mirror InMemoryStore: newest first.
-            notes.sort(key=lambda n: n.timestamp, reverse=True)
-            return notes
-        except Exception as e:
-            logger.error(f"Failed to list all memories: {e}")
-            return []
+        notes = self.search(query="", k=10000, filters=filters or None)
+        # Mirror InMemoryStore: newest first.
+        notes.sort(key=lambda n: n.timestamp, reverse=True)
+        return notes
 
     def get_stats(self) -> dict[str, Any]:
         """Get statistics about the memory store."""

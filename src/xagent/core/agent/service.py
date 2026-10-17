@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 from ...config import get_uploads_dir
 from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
+from ..model.chat.basic.call_boundary import UnavailableVisionModel
 from ..task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     FILE_OPERATION_ACCESS_VERSION_KEY,
@@ -26,8 +27,16 @@ from ..tools.adapters.vibe.config import (
 )
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
+from .budget import BudgetPolicyProvider
+from .context.execution import (
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
+    TRANSCRIPT_WATERMARK_METADATA_KEY,
+)
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
+
+if TYPE_CHECKING:
+    from .runner import UserMessageInjectionOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +44,15 @@ _UNSET = object()
 
 
 class AgentService:
-    """Service facade that executes tasks through agent only."""
+    """Service facade that executes tasks through agent only.
+
+    Capability controls are deny-capable overrides: ``enable_default_tools``
+    controls automatic tool construction, ``skills_enabled=False`` suppresses
+    supplied skill managers and allowlists, and ``user_interaction_enabled=False``
+    blocks outbound user-facing control calls and waits. ``execution_metadata``
+    is trusted internal metadata copied into runner and result records; untrusted
+    request data belongs in the separate task context passed to ``execute_task``.
+    """
 
     def __init__(
         self,
@@ -59,12 +76,19 @@ class AgentService:
         compact_llm: BaseLLM | None = None,
         memory_similarity_threshold: float | None = None,
         memory_enabled: bool = True,
+        memory_available: bool = True,
+        memory_availability_reason: str | None = None,
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
         preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
         react_max_iterations: int = 200,
+        enable_default_tools: bool = True,
+        skills_enabled: bool = True,
+        user_interaction_enabled: bool = True,
+        execution_metadata: dict[str, Any] | None = None,
+        budget_policy_provider: BudgetPolicyProvider | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -85,7 +109,18 @@ class AgentService:
         self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        # Why memory is off, when it is off for a reason the runtime chose
+        # rather than one the caller asked for. Caller-safe by construction:
+        # whoever builds this service is responsible for passing a value fit
+        # to publish (see the web layer's memory availability policy).
+        self.memory_available = memory_available
+        self.memory_availability_reason = memory_availability_reason
         self.react_max_iterations = max(1, int(react_max_iterations))
+        self.enable_default_tools = enable_default_tools
+        self.skills_enabled = skills_enabled
+        self.user_interaction_enabled = user_interaction_enabled
+        self.execution_metadata = dict(execution_metadata or {})
+        self.budget_policy_provider = budget_policy_provider
         if tools is not None and tool_config is not None:
             handoff_factory_runtime = getattr(
                 tool_config, "handoff_factory_runtime", None
@@ -191,7 +226,7 @@ class AgentService:
         elif self.enable_workspace:
             self._setup_workspace()
 
-        if not self.tools and not self.tool_config:
+        if self.enable_default_tools and not self.tools and not self.tool_config:
             self.tool_config = self._create_default_tool_config()
             self.allowed_skills = self._get_allowed_skills_from_config(self.tool_config)
 
@@ -333,10 +368,11 @@ class AgentService:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> "UserMessageInjectionOutcome":
         if self._execution_adapter is None:
             self._execution_adapter = self._build_execution_adapter()
-        return bool(
+        return cast(
+            "UserMessageInjectionOutcome",
             await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
@@ -346,7 +382,7 @@ class AgentService:
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
-            )
+            ),
         )
 
     async def resume_execution_by_id(
@@ -378,6 +414,42 @@ class AgentService:
             dict[str, Any] | None, self._execution_adapter.get_status(execution_id)
         )
 
+    def revoke_memory(
+        self,
+        *,
+        inert_store: MemoryStore,
+        availability_reason: str | None,
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Take this service off persistent memory before its next turn.
+
+        Sets exactly the fields a service constructed with unavailable memory
+        already carries, so a reconciled turn is indistinguishable from a
+        freshly built one: the inert store replaces the published one, memory
+        is disabled -- which is what withholds the execution-scoped memory
+        tools, because the pattern builds them from the store the adapter is
+        handed -- and the reason reaches both the service status and the
+        execution metadata that rides into the trace and the checkpoint.
+
+        Applied to the adapter as well as to the service, so the change has
+        landed by the time this returns rather than at the start of the next
+        execution. That is what lets a caller treat the swap as atomic with
+        respect to the turn it is about to run.
+        """
+        self.memory = inert_store
+        # Keep the compatibility shim in step with a freshly built service.
+        self.agent.memory_store = inert_store
+        self.memory_enabled = False
+        self.memory_available = False
+        self.memory_availability_reason = availability_reason
+        if execution_metadata:
+            self.execution_metadata.update(execution_metadata)
+        if self._execution_adapter is not None:
+            self._execution_adapter.config.memory_store = None
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
+            )
+
     def add_pattern(self, pattern: Any) -> None:
         self.patterns.append(pattern)
         self.agent.patterns = self.patterns
@@ -394,11 +466,17 @@ class AgentService:
             "patterns_count": 1 if self.llm else 0,
             "tools_count": len(self.tools),
             "memory_type": self.memory.__class__.__name__,
+            "memory_enabled": self.memory_enabled,
+            "memory_available": self.memory_available,
+            "memory_availability_reason": self.memory_availability_reason,
             "ready": self.llm is not None,
             "execution_type": self._execution_type(),
             "llm_configured": self.llm is not None,
             "fast_llm_configured": self.fast_llm is not None,
-            "vision_llm_configured": self.vision_llm is not None,
+            # The stand-in for a deliberately missing vision model refuses
+            # every call; it is not a configured vision model.
+            "vision_llm_configured": self.vision_llm is not None
+            and not isinstance(self.vision_llm, UnavailableVisionModel),
             "compact_llm_configured": self.compact_llm is not None,
             "dual_llm_enabled": self.fast_llm is not None,
             "compact_llm_enabled": self.compact_llm is not None,
@@ -407,11 +485,42 @@ class AgentService:
     def get_dag_pattern(self) -> Any | None:
         return None
 
-    def set_conversation_history(self, messages: list[dict[str, Any]]) -> None:
+    def set_conversation_history(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        watermark: int | None = None,
+        event_watermark: dict[str, Any] | None = None,
+    ) -> None:
+        """Install the prior conversation, and where a summary may pick up.
+
+        ``watermark`` is the largest stored transcript row ``messages``
+        covers. It rides along in ``execution_metadata`` so a compaction
+        during this turn can record which stored rows its summary stands in
+        for; the next turn then replays the summary instead of those rows.
+        Callers without one leave the slot cleared, and compaction emits a
+        summary that no later turn can position -- correct, just not reusable.
+        """
         self._conversation_history = list(messages)
+        if event_watermark is not None:
+            self.execution_metadata[MODEL_CONTEXT_WATERMARK_METADATA_KEY] = dict(
+                event_watermark
+            )
+        else:
+            self.execution_metadata.pop(MODEL_CONTEXT_WATERMARK_METADATA_KEY, None)
+        if isinstance(watermark, int) and not isinstance(watermark, bool):
+            self.execution_metadata[TRANSCRIPT_WATERMARK_METADATA_KEY] = watermark
+        else:
+            # Cleared rather than left stale: a watermark from an earlier turn
+            # describes a window this one is not replaying, and reusing it
+            # would tell compaction it absorbed rows nobody showed it.
+            self.execution_metadata.pop(TRANSCRIPT_WATERMARK_METADATA_KEY, None)
         if self._execution_adapter is not None:
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
             )
 
     def set_execution_context_messages(self, messages: list[dict[str, Any]]) -> None:
@@ -484,6 +593,9 @@ class AgentService:
                 self._outbound_message_handler
             )
             self._execution_adapter.config.interrupt_checker = self._interrupt_checker
+            self._execution_adapter.config.budget_policy_provider = (
+                self.budget_policy_provider
+            )
             self._execution_adapter.config.conversation_history = (
                 self._conversation_history
             )
@@ -497,8 +609,16 @@ class AgentService:
                 self.memory if self.memory_enabled else None
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
+            self._execution_adapter.config.skills_enabled = self.skills_enabled
+            self._execution_adapter.config.workspace_enabled = self.enable_workspace
+            self._execution_adapter.config.user_interaction_enabled = (
+                self.user_interaction_enabled
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
             )
             self._execution_adapter.config.system_prompt = self.system_prompt
             self._execution_adapter.config.preferred_input_modalities = (
@@ -532,6 +652,7 @@ class AgentService:
         )
         return AgentExecutionAdapter(
             AgentExecutionConfig(
+                budget_policy_provider=self.budget_policy_provider,
                 name=self.name,
                 tools=self.tools,
                 llm=self.llm,
@@ -540,6 +661,7 @@ class AgentService:
                 tracer=tracer,
                 system_prompt=self.system_prompt,
                 workspace_base_dir=self.workspace_base_dir,
+                workspace_enabled=self.enable_workspace,
                 allowed_external_dirs=self.allowed_external_dirs,
                 scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
@@ -554,7 +676,10 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                skills_enabled=self.skills_enabled,
+                user_interaction_enabled=self.user_interaction_enabled,
                 preferred_input_modalities=self.preferred_input_modalities,
+                execution_metadata=dict(self.execution_metadata),
             )
         )
 

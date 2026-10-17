@@ -1,10 +1,8 @@
 from typing import Any, List
 
-import aiohttp
-
 from ...model import ImageModelConfig
 from ...retry import create_retry_wrapper
-from .base import BaseImageModel, default_image_abilities
+from .base import BaseImageModel, default_image_abilities, retry_image_call
 from .dashscope import DashScopeImageModel
 from .gemini import GeminiImageModel
 from .openai import OpenAIImageModel
@@ -33,11 +31,22 @@ def get_image_model_instance(db_model: Any) -> BaseImageModel:
         db_model.abilities or default_image_abilities(provider, model_name)
     )
     timeout = getattr(db_model, "timeout", 300.0) or 300.0
-    max_retries = getattr(db_model, "max_retries", 3) or 3
+    # Clamped to at least 1: `or 3` only substitutes when the row's value is
+    # falsy (None or 0), so a negative row value passed straight through, and
+    # RetryWrapper's `range(max_retries)` is empty for anything <= 0 -- every
+    # call raised a bare RuntimeError without the target ever being invoked.
+    max_retries = max(getattr(db_model, "max_retries", 3) or 3, 1)
+    # The row's own model_id, not a name+provider composite. `id` is what
+    # create_image_model hands the provider as its billing identity, and the
+    # aggregator groups on `model_id or model` -- a composite of the two
+    # non-unique halves still collapses two same-name configurations of one
+    # provider into a single billing group. Falls back to the composite only
+    # when the row carries no model_id, so an identity is always recorded.
+    configured_id = str(getattr(db_model, "model_id", "") or "").strip()
 
     # Create ImageModelConfig
     config = ImageModelConfig(
-        id=f"{model_name}-{provider}",
+        id=configured_id or f"{model_name}-{provider}",
         model_name=model_name,
         model_provider=provider,
         base_url=base_url,
@@ -48,14 +57,6 @@ def get_image_model_instance(db_model: Any) -> BaseImageModel:
     )
 
     return create_image_model(config)
-
-
-def retry_on(e: Exception) -> bool:
-    ERRORS = aiohttp.ServerTimeoutError
-
-    if isinstance(e, aiohttp.ClientResponseError):
-        return e.status == 429 or 500 <= e.status < 600  # 429 and 5xx
-    return isinstance(e, ERRORS)
 
 
 def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
@@ -76,6 +77,7 @@ def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
             base_url=model_config.base_url,
             timeout=model_config.timeout,
             abilities=model_config.abilities,
+            model_id=model_config.id,
         )
     elif provider == "dashscope":
         llm = DashScopeImageModel(
@@ -85,6 +87,7 @@ def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
             or "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
             timeout=model_config.timeout,
             abilities=model_config.abilities,
+            model_id=model_config.id,
         )
     elif provider == "openai":
         llm = OpenAIImageModel(
@@ -93,6 +96,7 @@ def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
             base_url=model_config.base_url,
             timeout=model_config.timeout,
             abilities=model_config.abilities,
+            model_id=model_config.id,
         )
     elif provider == "xinference":
         llm = XinferenceImageModel(
@@ -101,15 +105,22 @@ def create_image_model(model_config: ImageModelConfig) -> BaseImageModel:
             api_key=model_config.api_key,
             timeout=model_config.timeout,
             abilities=model_config.abilities,
+            model_id=model_config.id,
         )
     else:
         raise ValueError(f"Unsupported image model provider: {provider}")
 
+    # A retry predicate is passed explicitly: create_retry_wrapper defaults to
+    # `lambda _: True`, which retried every exception -- including the
+    # already-billed invalid-200 responses that providers meter before
+    # validation, so one billed call became up to max_retries charges and
+    # max_retries billing rows.
     return create_retry_wrapper(
         llm,
         BaseImageModel,  # type: ignore[type-abstract]
         retry_methods={"generate_image", "edit_image"},
         max_retries=model_config.max_retries,
+        retry_on=retry_image_call,
     )
 
 

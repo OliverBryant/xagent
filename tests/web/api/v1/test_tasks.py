@@ -17,7 +17,6 @@ drive the mapping.
 import asyncio
 import io
 import threading
-import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -28,6 +27,10 @@ from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 from sqlalchemy.orm import Session
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    gated_pool_checkout,
+)
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import (
@@ -45,6 +48,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.services import task_start
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -260,6 +264,79 @@ def mock_start_task():
 
 
 # ===== POST /v1/chat/tasks =====
+
+
+def test_create_task_forwards_timezone_to_the_first_turn(mock_start_task):
+    """SDK callers have no websocket, so the create body is their only chance
+    to declare a zone for the turn that task creation starts."""
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_task_without_timezone_sends_no_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
+
+
+def test_create_task_rejects_an_over_long_timezone(mock_start_task):
+    # Guest-reachable free-text field is bounded to IANA lengths (max_length=64).
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "A" * 65,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+def test_create_task_treats_a_blank_timezone_as_absent(mock_start_task):
+    # The shared helper normalizes whitespace-only to None, so the SDK path
+    # matches the workforce path rather than sending {"timezone": "  "}.
+    agent_id, full_key = _create_agent_with_key()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+            "timezone": "   ",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_args.kwargs["context"] is None
 
 
 def test_create_task_happy_path(mock_start_task):
@@ -541,10 +618,15 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
     engine = _install_one_slot_queue_pool(monkeypatch)
     checked_out_during_durable: list[int] = []
     original_sync = ManagedFileRef.sync_to_durable
+    entered = threading.Event()
+    release = threading.Event()
+    loop_thread = threading.get_ident()
 
     def delayed_sync(self, *args, **kwargs):  # type: ignore[no-untyped-def]
         checked_out_during_durable.append(engine.pool.checkedout())
-        time.sleep(0.1)
+        entered.set()
+        assert threading.get_ident() != loop_thread
+        assert release.wait(timeout=30), "durable upload was never released"
         return original_sync(self, *args, **kwargs)
 
     monkeypatch.setattr(ManagedFileRef, "sync_to_durable", delayed_sync)
@@ -564,17 +646,18 @@ async def test_upload_durable_phase_releases_pool_and_event_loop(
             user_id=user_id,
         )
 
-    started_at = asyncio.get_running_loop().time()
     upload_task = asyncio.create_task(upload_once())
-    ticker_task = asyncio.create_task(asyncio.sleep(0.02))
     try:
-        await ticker_task
-        assert asyncio.get_running_loop().time() - started_at < 0.08
-        await upload_task
+        assert await asyncio.to_thread(entered.wait, 30)
+        assert not upload_task.done()
         assert checked_out_during_durable == [0]
         assert engine.pool.checkedout() == 0
     finally:
-        engine.dispose()
+        release.set()
+        try:
+            await asyncio.wait_for(upload_task, timeout=30)
+        finally:
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -615,7 +698,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
         with open(target_path, "xb") as buffer:
             buffer.write(b"partial")
         write_started.set()
-        assert allow_write.wait(timeout=2)
+        assert allow_write.wait(timeout=GUARD_TIMEOUT)
         return target_path
 
     monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
@@ -634,11 +717,18 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             user_id=user_id,
         )
     )
-    assert await asyncio.to_thread(write_started.wait, 2)
-    upload_task.cancel()
-    allow_write.set()
-    with pytest.raises(asyncio.CancelledError):
-        await upload_task
+    try:
+        assert await asyncio.to_thread(write_started.wait, GUARD_TIMEOUT)
+        upload_task.cancel()
+        allow_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(upload_task, timeout=GUARD_TIMEOUT)
+    finally:
+        allow_write.set()
+        upload_task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(upload_task, return_exceptions=True), timeout=GUARD_TIMEOUT
+        )
 
     assert written_path is not None
     assert not written_path.exists()
@@ -1115,7 +1205,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
-    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+    prepare_runtime_plan = task_start.prepare_create_connector_runtime
 
     def prepare_mismatched_identity(**kwargs):
         plan = prepare_runtime_plan(**kwargs)
@@ -1125,7 +1215,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
         )
 
     monkeypatch.setattr(
-        v1_tasks,
+        task_start,
         "prepare_create_connector_runtime",
         prepare_mismatched_identity,
     )
@@ -1408,7 +1498,7 @@ def test_create_task_rolls_back_when_runtime_secret_store_fails(mock_start_task)
     )
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer tenant-token"),
     ):
         resp = client.post(
@@ -1466,7 +1556,7 @@ def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
 
     with (
         patch(
-            "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+            "xagent.web.services.task_start.store_ephemeral_runtime_values",
             new=recording_store,
         ),
         patch(
@@ -2083,9 +2173,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
     mock_start_task.reset_mock()
 
     with patch.object(
-        v1_tasks.TaskTurnOrchestrator,
+        task_start.TaskTurnOrchestrator,
         "schedule_claimed_turn",
-        wraps=v1_tasks.TaskTurnOrchestrator.schedule_claimed_turn,
+        wraps=task_start.TaskTurnOrchestrator.schedule_claimed_turn,
     ) as schedule_claimed_turn:
         response = client.post(
             f"/v1/chat/tasks/{task_id}/messages",
@@ -2623,7 +2713,7 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
     mock_start_task.reset_mock()
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         side_effect=RuntimeError("store failed for Bearer append-token"),
     ):
         resp = client.post(
@@ -2698,7 +2788,7 @@ def test_append_message_does_not_store_runtime_secret_when_task_is_busy(
         store_ephemeral_runtime_values(turn_id, values_by_ref)
 
     with patch(
-        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        "xagent.web.services.task_start.store_ephemeral_runtime_values",
         new=recording_store,
     ):
         resp = client.post(
@@ -2952,7 +3042,7 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
     """
     import asyncio
 
-    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_execution import background_task_manager
 
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")
@@ -3440,23 +3530,31 @@ async def test_task_read_pool_wait_does_not_block_event_loop(
         return original_helper(*args, **kwargs)
 
     monkeypatch.setattr(v1_tasks, helper_name, recording_helper)
-    operation = asyncio.create_task(
-        v1_tasks.get_chat_task(task_id, principal)
-        if read_surface == "task"
-        else v1_tasks.get_chat_task_steps(task_id, principal)
-    )
+    with gated_pool_checkout(engine) as gate:
+        operation = asyncio.create_task(
+            v1_tasks.get_chat_task(task_id, principal)
+            if read_surface == "task"
+            else v1_tasks.get_chat_task_steps(task_id, principal)
+        )
 
-    try:
-        assert await asyncio.to_thread(worker_entered.wait, 1)
-        await asyncio.wait_for(asyncio.sleep(0.02), timeout=0.1)
-        assert not operation.done()
-    finally:
-        held_connection.close()
+        try:
+            await gate.wait_until_contending()
+            # A checkpoint while the checkout is still parked proves loop progress.
+            await asyncio.sleep(0)
+            assert worker_entered.is_set()
+            assert not operation.done()
+        finally:
+            held_connection.close()
+            gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), timeout=GUARD_TIMEOUT
+            )
+            checked_out = engine.pool.checkedout()
+            engine.dispose()
 
-    response = await operation
-    assert response.task_id == task_id
-    assert engine.pool.checkedout() == 0
-    engine.dispose()
+        response = operation.result()
+        assert response.task_id == task_id
+        assert checked_out == 0
 
 
 def test_get_missing_task_returns_404(mock_start_task):
@@ -3633,6 +3731,99 @@ def test_get_steps_returns_mapped_steps_in_order(mock_start_task):
 
     assert steps[2]["type"] == "message"
     assert steps[2]["data"] == {"role": "assistant", "content": "Here's the result"}
+
+
+def test_get_steps_on_a_trace_expired_task_is_empty_not_an_error(mock_start_task):
+    """Acceptance criterion from #2563: empty, not 500.
+
+    Retention's trace path deletes a terminal task's ``trace_events`` while
+    keeping the task itself, so this endpoint is left authorizing a task that
+    exists and reading a timeline that no longer does. The cache makes that
+    worth pinning rather than assuming: the cached entry is versioned on
+    ``max(trace_events.id)``, which the purge takes to 0, so a version compared
+    loosely enough could serve the purged steps back.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-expired-1",
+        timestamp=base,
+        data={"content": "before expiry"},
+    )
+
+    # A real backend, because the default is a no-op: without this the
+    # "warm the cache first" step below caches nothing and the versioned-read
+    # path this test exists for is never exercised.
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        _run_trace_expiry_steps_case(task_id, agent_id, full_key, base)
+    finally:
+        set_cache_backend_for_testing(None)
+
+
+def _run_trace_expiry_steps_case(task_id, agent_id, full_key, base) -> None:
+    from datetime import timedelta
+
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services.task_retention_purge import (
+        RetentionPurgeAction,
+        purge_task,
+    )
+
+    # Populate the cache first: a purge that only looked correct on a cold
+    # read would pass without this.
+    warm = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert warm.status_code == 200, warm.text
+    assert len(warm.json()["steps"]) == 1
+
+    now = base + timedelta(days=200)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = TaskStatus.COMPLETED
+        task.last_activity_at = base
+        task.lease_expires_at = None
+        # The transcript was written at wall-clock time, and the assessment
+        # measures from the newest message as well as the stored anchor
+        # (#2580), so it has to be as old as the anchor it stands beside.
+        db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).update(
+            {TaskChatMessage.created_at: base}, synchronize_session=False
+        )
+        db.commit()
+        # Task creation stages a start command; the predicate counts a pending
+        # command as work still owed, which is the point of that leg. Clear it
+        # so this test is about the trace path rather than about eligibility.
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.commit()
+        assert (
+            purge_task(
+                db,
+                task_id,
+                now=now,
+                conversation_days=365,
+                trace_days=90,
+            )
+            is RetentionPurgeAction.PURGED_TRACES
+        )
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["steps"] == []
+    # #2565: the empty list is told apart from "never had steps".
+    assert body["steps_expired"] is True
+    expired_at = datetime.fromisoformat(body["steps_expired_at"])
+    assert expired_at.replace(tzinfo=expired_at.tzinfo or UTC) == now
 
 
 def test_get_steps_task_not_found_returns_404(mock_start_task):

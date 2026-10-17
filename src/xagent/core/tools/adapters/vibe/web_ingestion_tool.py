@@ -3,9 +3,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
-from .factory import register_tool
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +121,7 @@ async def _create_knowledge_base_from_url_impl(
         )
 
         ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
-        kb_service = AgentKnowledgeBaseService(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+        kb_service = AgentKnowledgeBaseService(user_id=user_id)
         collection_name = await kb_service.prepare_collection(collection_name)
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if the import produces nothing.
@@ -191,7 +186,24 @@ async def _create_knowledge_base_from_url_impl(
                 ),
                 pages_crawled=result.pages_crawled,
             ).model_dump()
-        await kb_service.refresh_collection_metadata(collection_name)
+        if result.crawl_blocked_by_site:
+            # Narrower than status == "partial" on purpose: a partial caused by
+            # individual pages failing to parse keeps reporting success, which
+            # is the existing policy. This is the other kind - nothing failed,
+            # the site simply refused everything past the start page. The pages
+            # that did land stay published (re-importing would re-crawl them),
+            # but calling it success would let an agent build on a knowledge
+            # base holding one page.
+            return CreateKnowledgeBaseFromUrlResult(
+                success=False,
+                collection_name=collection_name,
+                message=(
+                    f"{result.message} '{collection_name}' is published and "
+                    f"usable with what did land. Re-importing under the same "
+                    f"crawl settings will hit the same refusals."
+                ),
+                pages_crawled=result.pages_crawled,
+            ).model_dump()
 
         return CreateKnowledgeBaseFromUrlResult(
             success=True,
@@ -220,30 +232,3 @@ async def _create_knowledge_base_from_url_impl(
             message=str(e),
             pages_crawled=0,
         ).model_dump()
-
-
-@register_tool(categories={"knowledge"})
-async def create_web_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
-    """Create web ingestion tools."""
-    return await _get_tool_compatibility_facade().create_web_ingestion_tools(config)
-
-
-async def _create_web_ingestion_tools_impl(
-    config: WebToolConfig,
-) -> list[AbstractBaseTool]:
-    """Create web ingestion tools."""
-    try:
-        user_id = config.get_user_id()
-        is_admin = config.is_admin()
-        if not user_id:
-            return []
-
-        tool = CreateKnowledgeBaseFromUrlTool(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        logger.debug(f"Created CreateKnowledgeBaseFromUrlTool for user {user_id}")
-        return [tool]
-    except Exception as e:
-        logger.warning(f"Failed to create CreateKnowledgeBaseFromUrlTool: {e}")
-        return []

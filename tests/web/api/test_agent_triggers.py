@@ -47,6 +47,8 @@ from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
     _coerce_utc,
     _compute_next_run_at,
+    _finish_trigger_run_after_task,
+    _PreparedTriggerStart,
     _start_prepared_trigger_run_id,
     dispatch_pending_trigger_runs,
     scan_due_scheduled_triggers,
@@ -348,7 +350,15 @@ def test_trigger_config_validation_dispatches_through_provider() -> None:
     assert "webhook trigger config invalid" in invalid.json()["detail"]
 
 
-def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
+@pytest.mark.parametrize("shared", [False, True])
+def test_trigger_test_run_creates_hidden_agent_task(
+    mock_bg_scheduler, monkeypatch, shared
+) -> None:
+    from xagent.web.models.task_command import TaskExecutionCommand
+    from xagent.web.services import task_event_bridge
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", str(shared).lower())
+    monkeypatch.setattr(task_event_bridge, "get_task_event_bridge", lambda: MagicMock())
     headers = _admin_headers()
     agent_id = _create_agent(headers)
     created = client.post(
@@ -372,15 +382,23 @@ def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
     assert run_body["status"] == TriggerRunStatus.RUNNING.value
     assert run_body["task_id"]
     assert fired.json()["duplicate"] is False
-    assert mock_bg_scheduler.call_count == 1
+    assert mock_bg_scheduler.call_count == (0 if shared else 1)
 
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
+        if shared:
+            command = db.query(TaskExecutionCommand).filter_by(task_id=task.id).one()
+            assert command.status == "pending"
+            assert task.run_id is None
+            assert command.target_run_id == command.payload["run_id"]
+            assert command.target_run_id is not None
+            assert command.payload["kind"] == "create"
+            assert task.runner_id is None
         assert task.agent_id == agent_id
         assert task.source == "trigger"
         assert task.is_visible is False
-        assert task.status == TaskStatus.RUNNING
+        assert task.status == (TaskStatus.PENDING if shared else TaskStatus.RUNNING)
         assert "hello" in (task.description or "")
     finally:
         db.close()
@@ -420,7 +438,7 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
             new=_real_schedule_bg,
         ),
         patch(
-            "xagent.web.api.chat.AgentServiceManager.get_agent_for_task",
+            "xagent.web.services.agent_service_manager.AgentServiceManager.get_agent_for_task",
             new=fail_required_mcp_setup,
         ),
         TestClient(app_for_tests, raise_server_exceptions=False) as live_client,
@@ -448,13 +466,18 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
                 )
             finally:
                 db.close()
+            if final_state[4] is not None:
+                assert final_state[0] in {
+                    TriggerRunStatus.COMPLETED.value,
+                    TriggerRunStatus.FAILED.value,
+                }, f"finished_at set on a non-terminal run: {final_state}"
             if final_state[0] == TriggerRunStatus.FAILED.value:
                 break
             time.sleep(0.01)
         else:
             pytest.fail(f"trigger run did not reach FAILED: {final_state}")
 
-    safe_error = "Required MCP servers are unavailable."
+    safe_error = "Required MCP servers are unavailable: oauth_token_required."
     assert final_state is not None
     run_status, run_error, task_status, task_error, run_finished_at = final_state
     assert setup_calls == 1
@@ -464,6 +487,121 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
     assert task_error == safe_error
     assert run_finished_at is not None
     assert private_detail not in str(final_state)
+
+
+def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Finalizer invariant"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    fired = client.post(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+        headers=headers,
+        json={"payload": {"subject": "finalize"}},
+    )
+    assert fired.status_code == 200, fired.text
+    run_body = fired.json()["trigger_run"]
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
+        owner_user_id = int(task.user_id)
+    finally:
+        db.close()
+    return _PreparedTriggerStart(
+        run_id=int(run_body["id"]),
+        trigger_id=trigger_id,
+        task_id=int(run_body["task_id"]),
+        task_owner_user_id=owner_user_id,
+        prompt="finalize",
+        trigger_type="webhook",
+        test=True,
+    )
+
+
+def _set_task_status(
+    task_id: int, status: TaskStatus, error_message: str | None = None
+) -> None:
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.status = status
+        task.error_message = error_message
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "non_terminal",
+    [
+        TaskStatus.PENDING,
+        TaskStatus.RUNNING,
+        TaskStatus.PAUSED,
+        TaskStatus.WAITING_FOR_USER,
+    ],
+)
+def test_finish_trigger_run_after_task_leaves_non_terminal_run_alone(
+    non_terminal: TaskStatus,
+) -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    _set_task_status(start.task_id, non_terminal)
+
+    _finish_trigger_run_after_task(start)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        assert run.status == TriggerRunStatus.RUNNING.value
+        assert run.error_message is None
+        assert run.finished_at is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_run_status", "expected_error"),
+    [
+        (TaskStatus.COMPLETED, TriggerRunStatus.COMPLETED.value, None),
+        (TaskStatus.FAILED, TriggerRunStatus.FAILED.value, "boom"),
+    ],
+)
+def test_finish_trigger_run_after_task_finalizes_terminal_run(
+    terminal: TaskStatus,
+    expected_run_status: str,
+    expected_error: str | None,
+) -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    _set_task_status(start.task_id, terminal, error_message=expected_error)
+
+    # Seed a stale error so the assertions below prove the finalizer
+    # overwrites error_message in both directions (clears it on COMPLETED,
+    # replaces it on FAILED) instead of passing against the NULL default.
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        run.error_message = "stale-error-from-previous-attempt"
+        db.add(run)
+        db.commit()
+    finally:
+        db.close()
+
+    _finish_trigger_run_after_task(start)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        assert run.status == expected_run_status
+        assert run.error_message == expected_error
+        assert run.finished_at is not None
+    finally:
+        db.close()
 
 
 def test_trigger_run_preparation_wraps_raising_team_hook_without_leaking_message() -> (
@@ -941,6 +1079,36 @@ def test_gmail_trigger_requires_oauth_account() -> None:
     assert "oauth_account_id" in created.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "oauth_account_id",
+    [None, True, 1.5, "not-an-account-id", 0, "0"],
+)
+def test_gmail_trigger_rejects_invalid_oauth_account_id(
+    oauth_account_id: object,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Invalid account",
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": oauth_account_id,
+            },
+        },
+    )
+
+    assert created.status_code == 400
+    assert created.json()["detail"] == (
+        "gmail trigger config invalid: gmail.oauth_account_id: "
+        "oauth_account_id must be a positive integer"
+    )
+
+
 def test_gmail_trigger_rejects_foreign_oauth_account() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -1253,6 +1421,96 @@ def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
     assert released == [first_account_id]
 
 
+@pytest.mark.parametrize("operation", ["disable", "delete", "rebind"])
+def test_gmail_legacy_trigger_releases_previous_mailbox(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_email = "legacy-first@gmail.example"
+    first_account_id = _connect_gmail_account(email=first_email)
+    second_account_id = _connect_gmail_account(email="legacy-second@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Legacy inbox",
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": first_account_id,
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        trigger = db.get(AgentTrigger, trigger_id)
+        assert trigger is not None
+        trigger.config = {"watch_label": "INBOX"}
+        trigger.resource_id = first_email
+        db.commit()
+    finally:
+        db.close()
+
+    if operation == "delete":
+        response = client.delete(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}",
+            headers=headers,
+        )
+    else:
+        updates = (
+            {"enabled": False}
+            if operation == "disable"
+            else {
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": second_account_id,
+                }
+            }
+        )
+        response = client.patch(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}",
+            headers=headers,
+            json=updates,
+        )
+
+    assert response.status_code == 200, response.text
+    assert released == [first_account_id]
+    expected_provisioned = (
+        [first_account_id, second_account_id]
+        if operation == "rebind"
+        else [first_account_id]
+    )
+    assert provisioned == expected_provisioned
+
+
 def test_gmail_trigger_update_still_provisions_new_binding_when_previous_unregister_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1541,7 +1799,9 @@ def test_trigger_crud_dispatches_through_provider_protocol() -> None:
             db.commit()
             return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
 
-        async def unregister(self, db, trigger, config) -> None:
+        async def unregister(
+            self, db, trigger, config, *, resource_id: str | None = None
+        ) -> None:
             calls.append(("unregister", int(config["oauth_account_id"])))
 
     register_trigger_provider(RecordingProvider(), replace=True)
@@ -4279,3 +4539,71 @@ def test_finish_turn_syncs_trigger_run_status() -> None:
         assert run.error_message is None
     finally:
         db.close()
+
+
+def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() -> None:
+    """#2565: a run keeps its outcome and says why its task is gone.
+
+    The rows are what the retention purge leaves (``task_id`` SET NULL,
+    ``task_expired_at`` stamped, ``status`` untouched) next to what any other
+    deletion leaves (``task_id`` NULL and nothing else). The list and the
+    single-run read serialize through the same function.
+    """
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Expiry webhook", "config": {}},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    expired_at = datetime(2026, 9, 1, 8, 30, tzinfo=timezone.utc)
+
+    db = _direct_db_session()
+    try:
+        expired_run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=None,
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="expiry:expired",
+            task_expired_at=expired_at,
+        )
+        deleted_run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=None,
+            status=TriggerRunStatus.FAILED.value,
+            idempotency_key="expiry:deleted",
+        )
+        db.add_all([expired_run, deleted_run])
+        db.commit()
+        expired_run_id = int(expired_run.id)
+        deleted_run_id = int(deleted_run.id)
+    finally:
+        db.close()
+
+    listed = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs", headers=headers
+    )
+    assert listed.status_code == 200, listed.text
+    runs = {run["id"]: run for run in listed.json()}
+
+    expired = runs[expired_run_id]
+    assert expired["task_id"] is None
+    assert expired["status"] == "completed"
+    # SQLite stores this naive; the field must still carry an explicit UTC
+    # offset on the wire rather than leaving the client to guess one (#2565).
+    parsed_expired_at = datetime.fromisoformat(expired["task_expired_at"])
+    assert parsed_expired_at.utcoffset() == timedelta(0)
+    assert parsed_expired_at == expired_at
+    assert runs[deleted_run_id]["task_id"] is None
+    assert runs[deleted_run_id]["status"] == "failed"
+    assert runs[deleted_run_id]["task_expired_at"] is None
+
+    detail = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{expired_run_id}",
+        headers=headers,
+    )
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == "completed"
+    assert detail.json()["task_expired_at"] == expired["task_expired_at"]

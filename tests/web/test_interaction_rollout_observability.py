@@ -60,7 +60,13 @@ def _reset_state(monkeypatch):
     clear_degradation(INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE)
 
 
-def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
+def _set_policy(
+    monkeypatch,
+    *,
+    mode="legacy",
+    native_sources=frozenset(),
+    shared_task_execution=True,
+):
     monkeypatch.setattr(
         ir,
         "_policy",
@@ -68,6 +74,7 @@ def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
             mode=mode,
             native_sources=frozenset(native_sources),
             native_protocol_version=1,
+            shared_task_execution=shared_task_execution,
         ),
     )
 
@@ -111,7 +118,7 @@ async def test_to2_default_mode_ready_behavior_is_unchanged_zero_queries(
     monkeypatch,
 ):
     _set_policy(monkeypatch, mode="legacy")
-    monkeypatch.setattr(database_module, "get_session_local", _PoisonSessionLocal())
+    monkeypatch.setattr(database_module, "_SessionLocal", _PoisonSessionLocal())
     app_module.app.state.file_storage_startup_sync_task = None
     app_module.app.state.file_storage_startup_sync_error = None
 
@@ -132,7 +139,7 @@ async def test_to3_native_mode_table_absent_returns_503_without_table_name(
         bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     response = await app_module.readiness_check()
 
@@ -157,7 +164,7 @@ async def test_to4_native_mode_table_present_returns_200_and_clears_degradation(
     engine = create_engine(f"sqlite:///{tmp_path / 'with_table.db'}")
     Base.metadata.create_all(bind=engine)
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     response = await app_module.readiness_check()
 
@@ -175,7 +182,7 @@ async def test_to4b_latch_positive_means_zero_queries_on_next_probe(
     engine = create_engine(f"sqlite:///{tmp_path / 'with_table.db'}")
     Base.metadata.create_all(bind=engine)
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     first = await app_module.readiness_check()
     assert first.status_code == 200
@@ -183,7 +190,7 @@ async def test_to4b_latch_positive_means_zero_queries_on_next_probe(
 
     # Second probe: swap in a poison session-factory. If the latch were not
     # honored, this would raise instead of returning 200.
-    monkeypatch.setattr(database_module, "get_session_local", _PoisonSessionLocal())
+    monkeypatch.setattr(database_module, "_SessionLocal", _PoisonSessionLocal())
     second = await app_module.readiness_check()
     assert second.status_code == 200
 
@@ -198,7 +205,7 @@ async def test_to4c_latch_negative_rechecks_every_probe(monkeypatch, tmp_path):
         bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     first = await app_module.readiness_check()
     assert first.status_code == 503
@@ -283,11 +290,12 @@ async def test_to5_non_admin_gets_403_with_exact_detail(
 
 
 async def test_to5b_admin_gets_200(monkeypatch, sqlite_session_with_table):
-    _set_policy(monkeypatch, mode="legacy")
+    _set_policy(monkeypatch, mode="legacy", shared_task_execution=False)
     response = await get_interaction_rollout_diagnostics(
         current_user=_admin_user(), db=sqlite_session_with_table
     )
     assert response["policy"]["mode"] == "legacy"
+    assert response["policy"]["shared_task_execution"] is False
 
 
 async def test_to6_empty_table_returns_zero_active_count_and_no_oldest_age(

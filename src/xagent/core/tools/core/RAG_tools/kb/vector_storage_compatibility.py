@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
         EmbeddingReadResponse,
         EmbeddingWriteResponse,
     )
-    from .collection_handle import LanceDBCollectionHandle
+    from .collection_handle import KBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
 
@@ -68,7 +68,7 @@ class KBVectorStorageCompatibilityFacade:
 
     def _open_collection_handle(
         self, collection: str, *, user_id: Optional[int], is_admin: bool
-    ) -> "LanceDBCollectionHandle":
+    ) -> "KBCollectionHandle":
         """Open the collection handle that owns embedding storage (#510).
 
         Routed through the active coordinator so an injected shim keeps
@@ -82,6 +82,7 @@ class KBVectorStorageCompatibilityFacade:
                 is_admin=is_admin,
                 access_mode=KBAccessMode.WRITE,
                 hide_missing=True,
+                deployment_engine_only=True,
             )
         )
 
@@ -153,6 +154,29 @@ class KBVectorStorageCompatibilityFacade:
                 embeddings,
                 create_index=create_index,
                 user_id=user_id,
+            )
+
+    def commit_vectors(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        model: str,
+        commit_gate: Optional[Callable[[], None]] = None,
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
+    ) -> None:
+        with self._storage_context():
+            handle = self._open_collection_handle(
+                collection, user_id=user_id, is_admin=is_admin
+            )
+            handle.commit_embeddings(
+                doc_id,
+                parse_hash,
+                model,
+                commit_gate=commit_gate,
+                user_id=user_id,
+                is_admin=is_admin,
             )
 
     def cleanup_vectors_for_document(

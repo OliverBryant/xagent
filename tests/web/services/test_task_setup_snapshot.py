@@ -36,11 +36,13 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
+    detach_runtime_user_fields,
     load_task_setup_snapshot_sync,
 )
 from xagent.web.services.trace_message_storage import (
@@ -199,6 +201,64 @@ def test_basic_task_no_agent_builder(db_session) -> None:
 
     # task_pattern derived from execution_mode
     assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
+
+
+def test_runtime_user_voice_reduced_from_preferences(db_session) -> None:
+    """`RuntimeUserFields.voice` is reduced from the owner's preferences
+    JSON by the SAME query that fetches id/is_admin - see
+    api/agents.py's apply_user_voice, which relies on this to avoid a
+    second query against a request session that may already be
+    released by the time a system prompt is assembled."""
+    user = _create_user(db_session)
+    user.preferences = {"voice": "warm", "department": "Sales"}
+    db_session.commit()
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user == RuntimeUserFields(
+        id=int(user.id), is_admin=False, voice="warm"
+    )
+
+
+def test_runtime_user_voice_is_none_without_preferences(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user.voice is None
+
+
+def test_detach_runtime_user_fields_reduces_a_live_user_row(db_session) -> None:
+    """detach_runtime_user_fields is the fallback get_agent_for_task uses
+    when a live ORM User made it into `runtime_user` and the richer
+    snapshot load that would normally replace it with a RuntimeUserFields
+    failed - see chat.py's _get_agent_for_task_unlocked. Must reduce to
+    the exact same shape load_task_setup_snapshot_sync produces, read
+    while the row is still attached (not after a session release would
+    have expired it)."""
+    user = _create_user(db_session)
+    user.preferences = {"voice": "warm", "department": "Sales"}
+    db_session.commit()
+
+    fields = detach_runtime_user_fields(user)
+
+    assert fields == RuntimeUserFields(id=int(user.id), is_admin=False, voice="warm")
+
+
+def test_detach_runtime_user_fields_handles_missing_preferences(db_session) -> None:
+    user = _create_user(db_session)
+
+    fields = detach_runtime_user_fields(user)
+
+    assert fields.voice is None
 
 
 @pytest.mark.parametrize("source", ["sdk", "trigger", None])
@@ -514,8 +574,7 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
     expected_excluded,
 ) -> None:
     """The live DB reader authorizes preview IDs as the persisted task owner."""
-    from xagent.web.api import chat as chat_module
-    from xagent.web.api.chat import AgentServiceManager
+    from xagent.web.services.agent_service_manager import AgentServiceManager
 
     owner = _create_user(db_session)
     actor = User(username="preview-actor", password_hash="hash", is_admin=False)
@@ -536,7 +595,7 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
     )
 
     resolved_owner_ids: list[int] = []
-    real_resolver = chat_module.resolve_authorized_agent
+    real_resolver = agent_runtime_service.resolve_authorized_agent
 
     def observe_resolver(session, owner_user_id, candidate_id):
         resolved_owner_ids.append(owner_user_id)
@@ -548,8 +607,10 @@ async def test_build_tools_inline_preview_uses_persisted_task_owner(
         observed_excluded_ids.append(kwargs["excluded_agent_id"])
         return [], object()
 
-    monkeypatch.setattr(chat_module, "resolve_authorized_agent", observe_resolver)
-    monkeypatch.setattr(chat_module, "create_default_tools", capture_tools)
+    monkeypatch.setattr(
+        agent_runtime_service, "resolve_authorized_agent", observe_resolver
+    )
+    monkeypatch.setattr(agent_runtime_service, "create_default_tools", capture_tools)
     monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
 
     manager = AgentServiceManager()

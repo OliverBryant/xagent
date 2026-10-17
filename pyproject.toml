@@ -9,6 +9,7 @@ description = "a powerful agent os with great compatibility"
 license = { text = "Xagent Source License" }
 readme = "README.md"
 requires-python = ">=3.11"
+
 classifiers = [
   "Development Status :: 1 - Planning",
   "Operating System :: OS Independent",
@@ -38,23 +39,37 @@ dependencies = [
   "rich >= 14.0.0",
   "prompt_toolkit >= 3.0.0",
   "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
+  "opentelemetry-api >= 1.39.0, < 2.0.0",
+  "opentelemetry-sdk >= 1.39.0, < 2.0.0",
+  "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
   "python-dotenv >= 1.0.1",
   "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
-  "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
+  "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
+  "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
+  "boto3 >= 1.34.59",  # Converse/ConverseStream plus AWS built-in MCP connectors
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
   "pillow >= 10.0.0",
+  "defusedxml>=0.7.1",
+  "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
-  "lancedb>=0.13.0",
+  # Bounded: the memory admission primitives depend on LanceDB table, metadata
+  # and commit semantics that no major/minor bump is contracted to preserve.
+  # See "LanceDB memory compatibility" in docs/deployment.md.
+  "lancedb>=0.32.0,<0.38",
+  # Dictionary for lance FTS jieba tokenizer; only the macOS wheel embeds one.
+  "jieba>=0.42.1",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)
   "pypdf>=4.0.0",
   "tiktoken>=0.8.0",
   # Database ORM and migrations (core for web interface)
   "sqlalchemy>=2.0.0",
+  "aiosqlite>=0.20.0",
+  "greenlet>=3.0",
   "alembic>=1.13.0",
   "python-jose[cryptography]>=3.3.0",
   "cryptography>=3.0.0",
@@ -71,6 +86,11 @@ dependencies = [
   "matplotlib>=3.5.0",
   "google-auth-oauthlib>=1.2.0",
   "google-api-python-client>=2.145.0",
+  # zoneinfo's IANA timezone database - stdlib zoneinfo relies on the OS's
+  # tz data, which minimal container images may not ship; this guarantees
+  # it's present regardless of platform (calendar/outlook conflict-check
+  # timezone math needs real zone offsets, not just zone names).
+  "tzdata>=2024.1",
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",
@@ -99,7 +119,7 @@ command-path-guard = ["bashlex>=0.18"]
 # does not declare its bundled predictor runtime deps, so keep them explicit
 # here until upstream does.
 router = [
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.6",
   "sentence-transformers>=3.0.0",
   # xrouter-llm's embedding model is a Qwen3-architecture checkpoint; transformers
   # only registered the `qwen3` model type in 4.51.
@@ -126,7 +146,8 @@ ai-document = ["docling>=2.68.0"]
 
 # PostgreSQL driver (uses psycopg2-binary for convenience)
 # Note: For production, consider installing psycopg2 from source instead
-postgresql = ["psycopg2-binary>=2.9.0"]
+postgresql = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0"]
+postgresql-async = ["psycopg2-binary>=2.9.0", "psycopg[binary]>=3.2.0", "greenlet>=3.0"]
 
 duckdb = ["duckdb>=1.0.0,<2.0", "duckdb-engine>=0.10.0,<1.0"]
 
@@ -154,11 +175,13 @@ all = [
   "pypdf2>=3.0.1",
   "docling>=2.68.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
+  "greenlet>=3.0",
   "playwright>=1.40.0",
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.6",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -175,6 +198,7 @@ sandbox = [
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",
   "openpyxl>=3.1.0",
+  "python-docx>=1.1.0",
   "fsspec>=2024.0.0",
 ]
 
@@ -189,13 +213,14 @@ backend-image = [
   "pypdf2>=3.0.1",
   "docling>=2.68.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
   "playwright>=1.40.0",
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
   "torch",
   "torchvision",
-  "xrouter-llm>=0.1.2",
+  "xrouter-llm>=0.3.6",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -221,11 +246,13 @@ test = [
   "pytest-timeout>=2.4.0",
   "pytest-socket>=0.7.0",
   "psycopg2-binary>=2.9.0",
+  "psycopg[binary]>=3.2.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
   "copilotkit==0.1.69",
   "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
+  "python-docx>=1.1.0",
   "asyncssh>=2.14.0",
 ]
 
@@ -236,6 +263,7 @@ static-type-check = [
   "types-openpyxl>=3.1.5",
   "types-setuptools>=69.0.0",
   "types-docker>=7.1.0.20251009",
+  "types-python-dateutil>=2.8.19",
 ]
 
 [project.scripts]
@@ -266,10 +294,14 @@ addopts = "-ra -q"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["tests/_stubs"]
+# Fail a hung test instead of blocking its CI job until the job timeout.
+# A test's own @pytest.mark.timeout(...) still takes precedence.
+timeout = 300
 markers = [
   "integration: marks tests as integration tests",
   "slow: marks tests as slow running tests",
   "postgresql: marks tests that require PostgreSQL database",
+  "milvus: needs a Milvus server at MILVUS_URI; skipped when it is unset",
   "real_rag: real embedding/provider/search KB integration; prefer serial CI (-n 0) under load",
   "contract_stub: stable API contract tests using stub embedding or mocks",
   "e2e: end-to-end style tests (may be slow)",
@@ -295,9 +327,14 @@ module = [
   "asyncssh",
   "bashlex",
   "docx",
+  "docx.*",
+  "defusedxml",
+  "defusedxml.*",
   "pptx",
   "pptx.*",
   "pdfplumber",
+  "pypdf",
+  "pypdf.*",
   "unstructured.*",
   "fitz",
   "pandas",
@@ -305,6 +342,7 @@ module = [
   "matplotlib.pyplot",
   "deepdoc",
   "deepdoc.*",
+  "jieba",
   "json_repair",
   "langchain_core.*",
   "langchain.*",
@@ -355,6 +393,9 @@ module = [
   # asyncssh ships no type stubs; the runner annotates connection types that
   # would otherwise trip disallow_any_unimported.
   "xagent.core.ssh.runner",
+  # python-docx ships no type stubs; this module annotates its Document type
+  # (docx.document.Document) which would otherwise trip disallow_any_unimported.
+  "xagent.web.tools.mcp.word",
 ]
 disallow_any_unimported = false
 warn_unused_ignores = false
@@ -380,3 +421,6 @@ profile = "black"
 line_length = 88
 multi_line_output = 3
 include_trailing_comma = true
+
+[tool.ruff]
+target-version = "py311"

@@ -3,10 +3,22 @@
 import React, { createContext, useContext, useState, useEffect } from "react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import type { AppIntegration } from "@/components/mcp/types"
 import { useAuth } from "./auth-context"
 import { useI18n } from "./i18n-context"
 
-interface McpApp {
+// auth_type/launch_config/configured_env_keys/oauth_account_input are picked
+// from AppIntegration (components/mcp/types.ts), not redeclared, so this
+// catalog-entry shape can't drift from the one the connector dialog and
+// settings dialog share - the exact drift that file's own header comment
+// exists to prevent. All of them come from the /api/mcp/apps response;
+// oauth_account_input is present only for account-hosted builtin OAuth apps
+// (see _app_to_dict in src/xagent/web/mcp_apps.py).
+export interface McpApp
+  extends Pick<
+    AppIntegration,
+    "auth_type" | "launch_config" | "configured_env_keys" | "oauth_account_input"
+  > {
   id: string
   name: string
   description: string

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.agent import (
@@ -14,22 +17,40 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
+    CheckpointPersistenceError,
     CheckpointUnavailableError,
 )
-from xagent.core.agent.runner import AgentRunner
+from xagent.core.agent.context.execution import (
+    COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    tool_evidence_state,
+)
+from xagent.core.agent.interruption import InterruptionReason
+from xagent.core.agent.language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    reset_output_language_to_request_context,
+)
+from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.model.chat.exceptions import (
+    LLMEmptyContentError,
+    LLMTimeoutError,
+    ModelProviderError,
+    ModelProviderRetryableError,
+)
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
 @pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
+def reset_compact_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The once-per-model warning set is process-global; isolate it per test.
+    monkeypatch.setattr(runtime_module, "_COMPACT_WINDOW_WARNED_MODELS", set())
 
 
 @dataclass
@@ -121,6 +142,16 @@ class FakePattern:
         return dict(self.result)
 
 
+class CheckpointingPattern(FakePattern):
+    """Checkpoints once, as real patterns do, so later input can restore it."""
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        await kwargs["runtime"].checkpoint(
+            "before_llm", context=kwargs["context"], pattern=self
+        )
+        return await super().run(**kwargs)
+
+
 class FailingPattern:
     def __init__(self, error: str) -> None:
         self.error = error
@@ -164,7 +195,7 @@ class InjectingPattern:
         )
         return {
             "success": True,
-            "same_context": injected is context,
+            "same_context": injected.context is context,
             "messages": [message.content for message in context.messages],
         }
 
@@ -280,6 +311,12 @@ class TracerCheckpointStore:
         return dict(payload) if payload is not None else None
 
 
+class RecordingCheckpointTracer(RecordingTraceEventTracer, TracerCheckpointStore):
+    def __init__(self) -> None:
+        RecordingTraceEventTracer.__init__(self)
+        TracerCheckpointStore.__init__(self)
+
+
 class EmptyCanonicalCheckpointStore:
     def __init__(self) -> None:
         self.legacy_reads = 0
@@ -294,6 +331,27 @@ class EmptyCanonicalCheckpointStore:
         raise AssertionError("canonical empty result must end checkpoint lookup")
 
 
+def test_user_message_injection_outcome_truthiness_contract() -> None:
+    """Preserve baseline truthiness; consumers handle unknown explicitly first."""
+    assert UserMessageInjectionOutcome.NOT_POSTED == ""
+    assert not UserMessageInjectionOutcome.NOT_POSTED
+    assert UserMessageInjectionOutcome.POSTED_FRESH
+    assert UserMessageInjectionOutcome.POSTED_REPLAY
+    assert UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    assert UserMessageInjectionOutcome.REJECTED_RETRYABLE
+
+
+def test_user_message_injection_outcome_member_set_has_not_drifted() -> None:
+    """Adding outcomes requires auditing every success and interaction-close path."""
+    assert {member.name for member in UserMessageInjectionOutcome} == {
+        "NOT_POSTED",
+        "POSTED_FRESH",
+        "POSTED_REPLAY",
+        "OUTCOME_UNKNOWN",
+        "REJECTED_RETRYABLE",
+    }
+
+
 @pytest.mark.asyncio
 async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
     checkpoint_store = EmptyCanonicalCheckpointStore()
@@ -302,13 +360,14 @@ async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> No
         tracer=checkpoint_store,
     )
 
-    context = await runner.inject_user_message(
+    result = await runner.inject_user_message(
         "missing-execution",
         "Continue",
         request_interrupt=False,
     )
 
-    assert context is None
+    assert result.context is None
+    assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
     assert checkpoint_store.legacy_reads == 0
 
 
@@ -430,7 +489,8 @@ async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
         request_interrupt=False,
     )
 
-    assert result is context
+    assert result.context is context
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     assert len(context.messages) == 1
     assert tracer.by_execution_id["exec-residue"]["context"]["messages"]
 
@@ -481,7 +541,8 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
     assert [message.role for message in context.messages] == ["user", "assistant"]
     assert context.messages[0].content == "Write a summary"
     assert context.messages[1].content == "done"
-    assert ContextManager().get_context("exec-1") is context
+    # No run is left, so the checkpoint is authoritative again.
+    assert ContextManager().get_context("exec-1") is None
 
     pattern_call = pattern.calls[0]
     assert pattern_call["task"] == "Write a summary"
@@ -731,6 +792,109 @@ async def test_runner_tries_multiple_patterns_and_collects_failures(
     ]
 
 
+class CheckpointFailingPattern:
+    """Raises the typed durability error, as a DAG step does when its
+    checkpoint writer refuses the write."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        self.calls += 1
+        raise CheckpointPersistenceError("checkpoint writer unavailable")
+
+
+class RaisingPattern:
+    """Raises an ordinary exception, which stays a recoverable failure."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        self.calls += 1
+        raise RuntimeError("ordinary pattern failure")
+
+
+@pytest.mark.asyncio
+async def test_runner_aborts_the_run_on_a_checkpoint_durability_failure(
+    tmp_path: Path,
+) -> None:
+    """A durability failure must not fall through to the next pattern.
+
+    The state transition was never committed, so running the fallback could
+    repeat a non-idempotent side effect the first pattern already performed,
+    or report success while the checkpoint needed for recovery is missing.
+    """
+
+    first = CheckpointFailingPattern()
+    second = FakePattern({"success": True, "message": "second worked"})
+    agent = Agent(name="writer", patterns=[first, second])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(task="Durability", execution_id="exec-durability")
+
+    assert first.calls == 1
+    assert second.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_still_falls_back_after_an_ordinary_pattern_exception(
+    tmp_path: Path,
+) -> None:
+    """The contrast: an ordinary raised exception stays recoverable."""
+
+    first = RaisingPattern()
+    second = FakePattern({"success": True, "message": "second worked"})
+    agent = Agent(name="writer", patterns=[first, second])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Recover", execution_id="exec-recover-raise")
+
+    assert first.calls == 1
+    assert len(second.calls) == 1
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_a_terminal_trace_for_a_custom_pattern_that_never_calls_on_pattern_error(
+    tmp_path: Path,
+) -> None:
+    """A custom pattern that only raises must still get a terminal trace.
+
+    The ``AgentPattern`` interface requires only ``run()``; unlike
+    ``DAGPattern``/``ReActPattern``, a custom pattern is not required to call
+    ``runtime.on_pattern_error()`` itself before letting
+    ``CheckpointPersistenceError`` propagate. Without a fallback report here,
+    the abort would still correctly propagate to the caller, but no terminal
+    ``trace_error`` would ever be recorded -- an audit/trace visibility gap.
+    """
+
+    tracer = RecordingTraceEventTracer()
+    first = CheckpointFailingPattern()
+    agent = Agent(name="writer", patterns=[first])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with pytest.raises(CheckpointPersistenceError):
+        await runner.run(task="Durability", execution_id="exec-custom-pattern-trace")
+
+    error_events = [
+        event for event in tracer.events if event["event_type"] == "task_error_general"
+    ]
+    assert error_events
+    assert error_events[-1]["data"]["error_type"] == "agent_pattern_error"
+
+
 @pytest.mark.asyncio
 async def test_runner_returns_aggregate_error_when_all_patterns_fail(
     tmp_path: Path,
@@ -750,6 +914,312 @@ async def test_runner_returns_aggregate_error_when_all_patterns_fail(
     assert result["patterns_attempted"] == 2
     assert len(result["pattern_errors"]) == 2
     assert result["context"].messages[0].content == "Impossible"
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        None,
+        None,
+    ]
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_promote_code_from_only_one_failed_pattern(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "status": "invalid_tool_protocol",
+                    "failure_code": "excel_workbook_access_denied",
+                }
+            ),
+            FailingPattern("unclassified failure"),
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Impossible", execution_id="exec-mixed-failure-codes"
+    )
+
+    assert result["success"] is False
+    assert "failure_code" not in result
+
+
+class ErrorRaisingPattern:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_agreed_interruption_reason(tmp_path: Path) -> None:
+    provider_down = RuntimeError("chat failed")
+    provider_down.__cause__ = LLMTimeoutError("first token timeout")
+    agent = Agent(
+        name="writer",
+        patterns=[
+            ErrorRaisingPattern(LLMTimeoutError("timed out")),
+            ErrorRaisingPattern(provider_down),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-agree")
+
+    assert result["success"] is False
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        "llm_unavailable",
+        "llm_unavailable",
+    ]
+    assert result["interruption_reason"] == "llm_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_raising_pattern_reports_reason(tmp_path: Path) -> None:
+    agent = Agent(
+        name="writer", patterns=[ErrorRaisingPattern(LLMEmptyContentError("empty"))]
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-single")
+
+    assert result["pattern_errors"][0]["interruption_reason"] == "model_output_invalid"
+    assert result["pattern_errors"][0]["exception_type"] == "LLMEmptyContentError"
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+def _model_provider_error(
+    status_code: int = 403, *, cls: type[ModelProviderError] = ModelProviderError
+) -> ModelProviderError:
+    return cls(
+        prefix="Provider API error",
+        kind="access_denied",
+        status_code=status_code,
+        provider_code="provider_code_4204",
+        provider_message="Model is decommissioned",
+        sdk_message=f"Error code: {status_code} - Model is decommissioned",
+        details=["request_id=req-1"],
+    )
+
+
+def _rate_limited_provider_error() -> ModelProviderError:
+    error = _model_provider_error(429, cls=ModelProviderRetryableError)
+    request = httpx.Request("POST", "https://provider.example/v1/chat/completions")
+    error.__cause__ = openai.RateLimitError(
+        "slow down", response=httpx.Response(429, request=request), body=None
+    )
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build_error",
+    [_model_provider_error, _rate_limited_provider_error],
+    ids=["non_retryable", "retryable_rate_limit"],
+)
+async def test_runner_single_pattern_model_provider_error_carries_details(
+    tmp_path: Path, build_error: Any
+) -> None:
+    error = build_error()
+    agent = Agent(name="writer", patterns=[ErrorRaisingPattern(error)])
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-model-error")
+
+    assert result["success"] is False
+    assert result["diagnostic_error"] == str(error)
+    assert result["model_error"] == error.structured_fields()
+    assert result["error"].startswith("All 1 patterns failed")
+    entry = result["pattern_errors"][0]
+    assert entry["exception_type"] == type(error).__name__
+    assert entry["error"] == str(error)
+    if isinstance(error, ModelProviderRetryableError):
+        assert result["interruption_reason"] == "llm_unavailable"
+    else:
+        assert result.get("interruption_reason") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "build_patterns",
+    [
+        lambda: [ErrorRaisingPattern(RuntimeError("chat failed"))],
+        lambda: [
+            ErrorRaisingPattern(_model_provider_error()),
+            FailingPattern("structured failure"),
+        ],
+        lambda: [
+            ErrorRaisingPattern(_model_provider_error()),
+            ErrorRaisingPattern(_model_provider_error()),
+        ],
+    ],
+    ids=["other_exception", "two_patterns_one_provider_error", "two_provider_errors"],
+)
+async def test_runner_omits_model_error_keys_unless_sole_pattern_raised_it(
+    tmp_path: Path, build_patterns: Any
+) -> None:
+    patterns = build_patterns()
+    agent = Agent(name="writer", patterns=patterns)
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-no-model-error")
+
+    assert result["success"] is False
+    assert result["error"].startswith(f"All {len(patterns)} patterns failed")
+    assert "diagnostic_error" not in result
+    assert "model_error" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "second",
+    [
+        ErrorRaisingPattern(ValueError("bad tool arguments")),
+        ErrorRaisingPattern(LLMEmptyContentError("empty")),
+        FailingPattern("structured failure"),
+    ],
+)
+async def test_runner_omits_interruption_reason_when_patterns_disagree(
+    tmp_path: Path, second: Any
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[ErrorRaisingPattern(LLMTimeoutError("timed out")), second],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-mixed")
+
+    assert result["success"] is False
+    assert result["pattern_errors"][0]["interruption_reason"] == "llm_unavailable"
+    assert result["pattern_errors"][1]["interruption_reason"] != "llm_unavailable"
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_classifies_unsuccessful_pattern_results(tmp_path: Path) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern({"success": False, "status": "invalid_tool_protocol"}),
+            FakePattern({"success": False, "status": "invalid_tool_protocol"}),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-result")
+
+    assert [entry["interruption_reason"] for entry in result["pattern_errors"]] == [
+        "model_output_invalid",
+        "model_output_invalid",
+    ]
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_unsuccessful_pattern_result_carries_reason(
+    tmp_path: Path,
+) -> None:
+    """Production runs one pattern; its returned result must carry the reason."""
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "status": "invalid_tool_protocol"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-single")
+
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["interruption_reason"] == "model_output_invalid"
+
+
+@pytest.mark.asyncio
+async def test_runner_single_pattern_keeps_its_own_interruption_reason(
+    tmp_path: Path,
+) -> None:
+    # The enum member, not its value: only the classifier's own-reason branch
+    # turns it into a plain string. ``InterruptionReason`` subclasses ``str``,
+    # so equality alone would pass either way; the type is what is pinned.
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "interruption_reason": InterruptionReason.LLM_UNAVAILABLE,
+                }
+            )
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-own")
+
+    assert result["interruption_reason"] == "llm_unavailable"
+    assert type(result["interruption_reason"]) is str
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("own_reason", ["not_a_real_reason", 42, None])
+async def test_runner_single_pattern_drops_invalid_own_reason(
+    tmp_path: Path, own_reason: object
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {"success": False, "error": "x", "interruption_reason": own_reason}
+            )
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-bad")
+
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_single_terminal_pattern_result_has_no_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": False, "error": "bad request"})],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Impossible", execution_id="exec-reason-none")
+
+    assert "interruption_reason" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_success_after_failed_pattern_has_no_interruption_reason(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            ErrorRaisingPattern(LLMTimeoutError("timed out")),
+            FakePattern({"success": True, "output": "done"}),
+        ],
+    )
+    runner = AgentRunner(agent=agent, workspace_manager=FakeWorkspaceManager(tmp_path))
+
+    result = await runner.run(task="Answer", execution_id="exec-reason-success")
+
+    assert result["success"] is True
+    assert "interruption_reason" not in result
+    assert "pattern_errors" not in result
 
 
 @pytest.mark.asyncio
@@ -795,6 +1265,200 @@ async def test_runner_does_not_add_empty_user_message_for_missing_task(
 
     assert result["success"] is True
     assert result["context"].messages == []
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_replay_tool_pairs(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "read_file",
+            "tool_call_id": "call-1",
+            "raw_result": {"output": "file contents"},
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-replay",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    # initial_messages[0] is role "assistant", so AgentRunner.run prepends a
+    # synthetic leading user turn (Anthropic's Messages API rejects a request
+    # whose first message isn't role "user") before replaying the
+    # assistant/tool pair.
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+
+    synthetic_message = messages[0]
+    assert synthetic_message.content == "(conversation start)"
+    assert synthetic_message.metadata["_xagent_synthetic"] == "leading_user_turn"
+
+    assistant_message = messages[1]
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == initial_messages[0]["tool_calls"]
+
+    tool_message = messages[2]
+    assert tool_message.content == "Tool read_file returned: file contents"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.metadata["raw_result"] == {"output": "file contents"}
+    assert tool_message.metadata["tool_name"] == "read_file"
+    # The synthetic turn is prepended, not interleaved, so tool-call pairing
+    # is undisturbed: every "tool" message is still immediately preceded by
+    # the assistant message declaring its tool_call_id.
+    for index, message in enumerate(messages):
+        if message.role == "tool":
+            assert messages[index - 1].role == "assistant"
+            assert message.tool_call_id in {
+                call["id"] for call in (messages[index - 1].tool_calls or [])
+            }
+
+
+@pytest.mark.asyncio
+async def test_initial_assistant_with_empty_content_and_tool_calls_survives(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-empty-content-tool-calls",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    # The original defect this test guards: an assistant message with
+    # content="" and non-empty tool_calls must not be dropped by the replay
+    # loop's "is there anything to keep" check. The leading synthetic user
+    # turn (added because initial_messages[0] is role "assistant") must not
+    # mask that — the assistant message must still be present right after it.
+    assert [message.role for message in messages] == ["user", "assistant"]
+
+    synthetic_message = messages[0]
+    assert synthetic_message.content == "(conversation start)"
+    assert synthetic_message.metadata["_xagent_synthetic"] == "leading_user_turn"
+
+    assistant_message = messages[1]
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == initial_messages[0]["tool_calls"]
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_starting_with_user_no_synthetic_turn(
+    tmp_path: Path,
+) -> None:
+    """A realistically-shaped reconstruction that already starts with a user
+    transcript message, followed by an assistant/tool pair, must NOT trigger
+    the synthetic leading-user-turn correction: it is only needed when the
+    replay would otherwise start with role "assistant".
+    """
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {"role": "user", "content": "Please read the file"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-3",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_name": "read_file",
+            "tool_call_id": "call-3",
+            "raw_result": {"output": "file contents"},
+        },
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-replay-user-first",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [message.role for message in messages] == ["user", "assistant", "tool"]
+    assert messages[0].content == "Please read the file"
+    assert not any(
+        message.metadata.get("_xagent_synthetic") == "leading_user_turn"
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_messages_plain_roles_unchanged(tmp_path: Path) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    initial_messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hello there"},
+        {"role": "user", "content": ""},  # dropped: no content/context_refs
+    ]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-plain-initial",
+        initial_messages=initial_messages,
+    )
+
+    assert result["success"] is True
+    messages = result["context"].messages
+    assert [(message.role, message.content) for message in messages] == [
+        ("system", "You are helpful."),
+        ("user", "Hello there"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -899,6 +1563,83 @@ def test_merge_context_metadata_restored_clears_absent_modality_key(
 
     assert PREFERRED_INPUT_MODALITIES_METADATA_KEY not in context.metadata
     assert context.metadata["execution_type"] == "checkpointed"
+
+
+def test_merge_context_metadata_restored_overlays_execution_identity(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-trusted-identity")
+    context.metadata.update(
+        {"task_source": "spoofed", "run_id": "stale", "other": "checkpointed"}
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {"task_source": "slack", "run_id": "run-current"},
+        restored=True,
+    )
+
+    assert context.metadata["task_source"] == "slack"
+    assert context.metadata["run_id"] == "run-current"
+    assert context.metadata["other"] == "checkpointed"
+
+
+@pytest.mark.parametrize("key", ["task_source", "run_id"])
+def test_merge_context_metadata_restored_keeps_identity_against_none(
+    tmp_path: Path, key: str
+) -> None:
+    """A resume entry point with no trusted source must not erase the real one.
+
+    Several resume paths pass these keys unconditionally with a None value.
+    Overwriting the checkpointed identity with None would permanently deny a
+    pending approval that was gated under it.
+    """
+
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-trusted-identity")
+    context.metadata.update({"task_source": "slack", "run_id": "run-original"})
+
+    runner._merge_context_metadata(context, {key: None}, restored=True)
+
+    assert context.metadata["task_source"] == "slack"
+    assert context.metadata["run_id"] == "run-original"
+
+
+def test_merge_context_metadata_replaces_legacy_raw_memory_reason(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-safe-memory-reason")
+    context.metadata.update(
+        {
+            "memory_available": False,
+            "memory_availability_reason": "host resolver secret shard eu-3",
+            "other": "checkpointed",
+        }
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {
+            "memory_available": False,
+            "memory_availability_reason": "unavailable",
+        },
+        restored=True,
+    )
+
+    assert context.metadata["memory_available"] is False
+    assert context.metadata["memory_availability_reason"] == "unavailable"
+    assert context.metadata["other"] == "checkpointed"
 
 
 @pytest.mark.asyncio
@@ -1087,8 +1828,8 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
     the new Message so they survive checkpoints and (b) fire the trace
     callback so the chip is broadcast live (instead of only appearing after
     a page reload via historical replay)."""
-    tracer = RecordingTraceEventTracer()
-    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    tracer = RecordingCheckpointTracer()
+    agent = Agent(name="writer", patterns=[CheckpointingPattern({"success": True})])
     runner = AgentRunner(
         agent=agent,
         tracer=tracer,
@@ -1105,16 +1846,16 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
             "type": "application/pdf",
         }
     ]
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-cont-files",
         "Use the attached PDF.",
         request_interrupt=False,
         files=files,
     )
 
-    assert context is not None
+    assert result.context is not None
     new_user_message = next(
-        msg for msg in reversed(context.messages) if msg.role == "user"
+        msg for msg in reversed(result.context.messages) if msg.role == "user"
     )
     assert new_user_message.metadata.get("files") == files
     turn_id = new_user_message.metadata.get("turn_id")
@@ -1156,15 +1897,15 @@ async def test_runner_post_user_message_alias_matches_inject_behavior(
         metadata={},
     )
 
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-alias",
         "Follow-up from user.",
         request_interrupt=False,
     )
 
-    assert context is not None
+    assert result.context is not None
     user_messages = [
-        message.content for message in context.messages if message.role == "user"
+        message.content for message in result.context.messages if message.role == "user"
     ]
     assert user_messages == ["Original task", "Follow-up from user."]
 
@@ -1194,6 +1935,10 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
     failing_runner.pause = MagicMock(return_value=True)
+    # A live input needs a run of this execution active in this process.
+    failing_runner.context_manager.set_context(
+        ExecutionContext.from_dict(checkpoint_context.to_dict())
+    )
 
     accepted = await failing_runner.post_user_message(
         execution_id,
@@ -1202,7 +1947,8 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         request_interrupt=True,
     )
 
-    assert accepted is not None
+    assert accepted.context is not None
+    assert accepted.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     failing_runner.pause.assert_called_once_with(
         execution_id,
         reason="new user message",
@@ -1214,17 +1960,21 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         tracer=tracer,
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
-    context = await retry_runner.post_user_message(
+    result = await retry_runner.post_user_message(
         execution_id,
         "Choose B",
         turn_id="a2a:42:msg-1",
         request_interrupt=False,
     )
 
-    assert context is not None
+    # The retry cold-starts from the checkpoint the first (pre-callback-
+    # failure) attempt already persisted, so this is the short-circuit
+    # replaying an already-seen turn id, not a second fresh write.
+    assert result.context is not None
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
     retried_messages = [
         message
-        for message in context.messages
+        for message in result.context.messages
         if message.role == "user" and message.metadata.get("turn_id") == "a2a:42:msg-1"
     ]
     assert len(retried_messages) == 1
@@ -1268,6 +2018,67 @@ async def test_runner_rejects_reused_turn_id_with_different_content(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_runner_inject_user_message_reports_fresh_vs_replay(
+    tmp_path: Path, scenario: str
+) -> None:
+    """The three states this contract exists to name: a first write reports
+    POSTED_FRESH, a repeat of the same turn id with the same content
+    short-circuits and reports POSTED_REPLAY without persisting anything
+    new, and a repeat with different content still raises -- unchanged from
+    before this contract existed."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-fresh-replay-grid"
+    agent = Agent(name="writer", patterns=[CheckpointingPattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Original task", execution_id=execution_id)
+
+    first = await runner.inject_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="turn-fresh-replay-grid",
+        request_interrupt=False,
+    )
+    assert first.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert first.context is not None
+
+    if scenario == "fresh":
+        return
+
+    if scenario == "replay":
+        second = await runner.inject_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="turn-fresh-replay-grid",
+            request_interrupt=False,
+        )
+        assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
+        matching = [
+            message
+            for message in second.context.messages
+            if message.role == "user"
+            and message.metadata.get("turn_id") == "turn-fresh-replay-grid"
+        ]
+        assert len(matching) == 1
+        return
+
+    assert scenario == "conflicting_content"
+    with pytest.raises(ValueError, match="different user message"):
+        await runner.inject_user_message(
+            execution_id,
+            "Choose C",
+            turn_id="turn-fresh-replay-grid",
+            request_interrupt=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_runner_post_user_message_preserves_display_and_execution_contract(
     tmp_path: Path,
 ) -> None:
@@ -1293,7 +2104,7 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
 
     execution_message = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
     files = [{"file_id": "file-123", "name": "notes.txt"}]
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-display-contract",
         execution_message=execution_message,
         display_message="Read file",
@@ -1302,10 +2113,10 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
         request_interrupt=False,
     )
 
-    assert context is not None
-    latest_user = [message for message in context.messages if message.role == "user"][
-        -1
-    ]
+    assert result.context is not None
+    latest_user = [
+        message for message in result.context.messages if message.role == "user"
+    ][-1]
     assert latest_user.content == execution_message
     assert latest_user.metadata["display_message"] == "Read file"
     assert latest_user.metadata["files"] == files
@@ -1354,6 +2165,9 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert first_user.content == execution_message
     assert first_user.metadata["display_message"] == "Read file"
     assert first_user.metadata["files"] == files
+    assert result["context"].current_user_request_text(prefer_display=True) == (
+        "Read file"
+    )
     turn_id = first_user.metadata.get("turn_id")
     assert isinstance(turn_id, str) and turn_id
     user_event = next(
@@ -1361,6 +2175,31 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     )
     assert user_event["data"]["message"] == "Read file"
     assert user_event["data"]["turn_id"] == turn_id
+
+
+@pytest.mark.parametrize(
+    ("request_context", "expected"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param({"display_message": None}, "", id="null"),
+        pytest.param({"display_message": 17}, "", id="non-string"),
+        pytest.param({"display_message": ""}, "", id="blank"),
+        pytest.param({"display_message": "  \n\t"}, "  \n\t", id="whitespace"),
+        pytest.param({"display_message": "Read file"}, "Read file", id="text"),
+    ],
+)
+def test_runner_normalizes_initial_display_message_state(
+    request_context: dict[str, Any], expected: str | None
+) -> None:
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[]))
+    context = ExecutionContext(metadata={"request_context": request_context})
+
+    metadata = runner._initial_user_message_metadata(context)
+
+    if expected is None:
+        assert "display_message" not in metadata
+    else:
+        assert metadata["display_message"] == expected
 
 
 @pytest.mark.asyncio
@@ -1396,7 +2235,7 @@ async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
     tmp_path: Path,
 ) -> None:
     tracer = TracerCheckpointStore()
-    agent = Agent(name="vision", patterns=[FakePattern({"success": True})])
+    agent = Agent(name="vision", patterns=[CheckpointingPattern({"success": True})])
     runner = AgentRunner(
         agent=agent,
         tracer=tracer,
@@ -1404,15 +2243,15 @@ async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
     )
     await runner.run(task="Start", execution_id="exec-injected-image")
 
-    context = await runner.inject_user_message(
+    result = await runner.inject_user_message(
         "exec-injected-image",
         "Inspect the new image",
         files=[{"file_id": "image-456", "name": "screen.jpg", "type": "image/jpeg"}],
         request_interrupt=False,
     )
 
-    assert context is not None
-    assert context.messages[-1].context_refs[0].file_id == "image-456"
+    assert result.context is not None
+    assert result.context.messages[-1].context_refs[0].file_id == "image-456"
 
 
 @pytest.mark.asyncio
@@ -1521,41 +2360,209 @@ async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
 
 
 class _FakeLLM:
-    def __init__(self, context_window: Any) -> None:
+    def __init__(self, context_window: Any, model_name: str = "fake-model") -> None:
         self.context_window = context_window
+        self.model_name = model_name
 
 
-def _threshold_runner(context_window: Any) -> AgentRunner:
-    agent = Agent(name="t", patterns=[FakePattern({})], llm=_FakeLLM(context_window))
+def _threshold_runner(
+    context_window: Any, model_name: str = "fake-model"
+) -> AgentRunner:
+    agent = Agent(
+        name="t",
+        patterns=[FakePattern({})],
+        llm=_FakeLLM(context_window, model_name),
+    )
     return AgentRunner(agent=agent)
 
 
 def test_resolve_compact_threshold_uses_window_ratio(monkeypatch) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
     # 128000 * 0.75
-    assert _threshold_runner(128000)._resolve_compact_threshold() == 96000
+    assert _threshold_runner(128000)._resolve_compact_threshold() == (
+        96000,
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    )
 
 
 def test_resolve_compact_threshold_respects_ratio_env(monkeypatch) -> None:
     monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_RATIO", "0.8")
-    assert _threshold_runner(200000)._resolve_compact_threshold() == 160000
+    assert _threshold_runner(200000)._resolve_compact_threshold() == (
+        160000,
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    )
 
 
 @pytest.mark.parametrize("window", [None, 0, -1, "128000"])
 def test_resolve_compact_threshold_falls_back_to_default(monkeypatch, window) -> None:
     monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
     # None / non-positive / non-int all fall back to the global default.
-    assert _threshold_runner(window)._resolve_compact_threshold() == 32000
+    assert _threshold_runner(window)._resolve_compact_threshold() == (
+        32000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
 
 
 def test_resolve_compact_threshold_default_env_override(monkeypatch) -> None:
     monkeypatch.setenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", "50000")
-    assert _threshold_runner(None)._resolve_compact_threshold() == 50000
+    assert _threshold_runner(None)._resolve_compact_threshold() == (
+        50000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
 
 
 def test_resolve_compact_threshold_missing_llm() -> None:
     agent = Agent(name="t", patterns=[FakePattern({})], llm=None)
-    assert AgentRunner(agent=agent)._resolve_compact_threshold() == 32000
+    assert AgentRunner(agent=agent)._resolve_compact_threshold() == (
+        32000,
+        COMPACT_THRESHOLD_SOURCE_DEFAULT,
+    )
+
+
+def test_resolve_compact_threshold_warns_once_per_model_on_fallback(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
+    runner = _threshold_runner(None, model_name="moonshotai.kimi-k2.5")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        runner._resolve_compact_threshold()
+        runner._resolve_compact_threshold()
+        _threshold_runner(None, model_name="other-model")._resolve_compact_threshold()
+        _threshold_runner(128000, model_name="sized")._resolve_compact_threshold()
+
+    fallback_records = [
+        record
+        for record in caplog.records
+        if "context_window" in record.getMessage()
+        and "compaction threshold" in record.getMessage()
+    ]
+    assert len(fallback_records) == 2
+    assert "moonshotai.kimi-k2.5" in fallback_records[0].getMessage()
+    assert "32000" in fallback_records[0].getMessage()
+    assert "other-model" in fallback_records[1].getMessage()
+
+
+def test_resolve_compact_threshold_does_not_warn_for_virtual_models(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_DEFAULT", raising=False)
+
+    class VirtualLLM:
+        model_name = "auto"
+        context_window = None
+
+        async def prepare_for_call(self, messages: Any, **_: Any) -> Any:
+            return self
+
+    agent = Agent(name="t", patterns=[FakePattern({})], llm=VirtualLLM())
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        resolved = AgentRunner(agent=agent)._resolve_compact_threshold()
+
+    # The window is resolved per call and the threshold recomputed then.
+    assert resolved == (32000, COMPACT_THRESHOLD_SOURCE_DEFAULT)
+    assert not any("compaction threshold" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_run_records_compact_threshold_source_on_context(monkeypatch) -> None:
+    monkeypatch.delenv("XAGENT_COMPACT_THRESHOLD_RATIO", raising=False)
+    captured: dict[str, Any] = {}
+
+    class CapturingPattern(FakePattern):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            context = kwargs["context"]
+            captured["threshold"] = context.compact_config.threshold
+            captured["source"] = context.compact_config.threshold_source
+            return await super().run(**kwargs)
+
+    agent = Agent(name="t", patterns=[CapturingPattern({})], llm=_FakeLLM(128000))
+    await AgentRunner(agent=agent).run("hello")
+
+    assert captured == {
+        "threshold": 96000,
+        "source": COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_resume_warns_when_restored_threshold_is_the_default(
+    tmp_path: Path, caplog
+) -> None:
+    """A task resumed in a fresh process has no in-memory record of why its
+    compaction threshold is what it is; ``AgentRunner.run`` re-issues the
+    fallback warning from the restored checkpoint so the missing
+    ``context_window`` column is still visible in this process's log."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-warn"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    assert (
+        checkpoint_context.compact_config.threshold_source
+        == COMPACT_THRESHOLD_SOURCE_DEFAULT
+    )
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(None, "moonshotai.kimi-k2.5"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "resumed task" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "moonshotai.kimi-k2.5" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_run_resume_stays_silent_when_model_now_has_a_window(
+    tmp_path: Path, caplog
+) -> None:
+    """The model row backing this resumed task now has a ``context_window``
+    (populated after the checkpoint was written, or simply since a fresh
+    process last saw it), so the restored default threshold is not running
+    blind and must not be re-warned about."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-resume-silent"
+    checkpoint_context = ExecutionContext(execution_id=execution_id)
+    checkpoint_context.add_user_message("Original task")
+    tracer.by_execution_id[execution_id] = {
+        "execution_id": execution_id,
+        "context": checkpoint_context.to_dict(),
+    }
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "message": "ok"})],
+        llm=_FakeLLM(256_000, "sized"),
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="xagent.core.agent.runtime"):
+        result = await runner.run(task=None, execution_id=execution_id, resume=True)
+
+    assert result["success"] is True
+    assert not any("resumed task" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -1599,3 +2606,417 @@ async def test_inject_user_message_raises_corrupt_on_contextless_checkpoint() ->
             "exec-inject-contextless",
             message="hello",
         )
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-legacy-router-language")
+    checkpoint_context.metadata["pattern"] = "auto"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint_context.add_user_message("Summarize the release notes in one paragraph.")
+    child_context = ExecutionContext(execution_id="exec-legacy-router-language_child")
+    child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {
+            "output": "restored",
+            "active_step_contexts": {"step_1": child_context.to_dict()},
+        },
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-legacy-router-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    metadata = result["context"].metadata
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in metadata
+    restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert "Summarize the release notes in one paragraph." in system_content
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-legacy-plan-language")
+    checkpoint_context.metadata["pattern"] = "dag_plan_execute"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint_context.add_user_message("Summarize the release notes in one paragraph.")
+    child_context = ExecutionContext(execution_id="exec-legacy-plan-language_child")
+    child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {
+            "output": "restored",
+            "active_step_contexts": {"step_1": child_context.to_dict()},
+        },
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-legacy-plan-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    metadata = result["context"].metadata
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in metadata
+    restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert "Summarize the release notes in one paragraph." in system_content
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_caller_supplied_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-caller-language")
+    checkpoint_context.metadata["request_context"] = {
+        OUTPUT_LANGUAGE_METADATA_KEY: "French"
+    }
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    checkpoint_context.add_user_message("Summarize the release notes.")
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-caller-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    assert result["context"].metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: French" in system_content
+
+
+class _StoredContextCheckpointStore:
+    def __init__(self, context: ExecutionContext) -> None:
+        self.payload = {"type": "checkpoint", "context": context.to_dict()}
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        return self.payload
+
+
+def _cold_start_runner(context: ExecutionContext) -> AgentRunner:
+    return AgentRunner(
+        agent=Agent(name="writer", patterns=[], llm=None),
+        tracer=_StoredContextCheckpointStore(context),
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_drops_legacy_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-legacy-language")
+    stored.metadata["pattern"] = "auto"
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    result = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-legacy-language",
+        message="continue",
+    )
+
+    assert result.context is not None
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_keeps_caller_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-caller-language")
+    stored.metadata["request_context"] = {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    result = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-caller-language",
+        message="continue",
+    )
+
+    assert result.context is not None
+    assert result.context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
+
+
+def test_resume_migration_only_touches_execution_context_nodes() -> None:
+    """The migration owns ExecutionContext metadata and nothing else: a
+    ``metadata`` dict inside a message, a tool argument, or a step result is
+    someone else's payload, and a cold start would persist a silent edit."""
+    root = ExecutionContext(execution_id="exec-migration-ownership")
+    root.metadata["pattern"] = "dag_plan_execute"
+    root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    root.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    root.add_user_message(
+        "Translate the attached note.",
+        metadata={OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+    )
+    child = ExecutionContext(execution_id="exec-migration-ownership_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+
+    checkpoint = {
+        "context": root.to_dict(),
+        "pattern": "DAGPattern",
+        "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+        "pattern_state": {
+            "active_step_contexts": {"step_1": child.to_dict()},
+            "step_results": {
+                "step_1": {"metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}}
+            },
+            "active_step_pattern_states": {
+                "step_1": {
+                    "last_response": {
+                        "tool_calls": [
+                            {
+                                "arguments": {
+                                    "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    restored_child = checkpoint["pattern_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child["metadata"]
+
+    message_metadata = checkpoint["context"]["messages"][0]["metadata"]
+    assert message_metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert checkpoint["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    step_result = checkpoint["pattern_state"]["step_results"]["step_1"]
+    assert step_result["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    tool_arguments = checkpoint["pattern_state"]["active_step_pattern_states"][
+        "step_1"
+    ]["last_response"]["tool_calls"][0]["arguments"]
+    assert tool_arguments["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+
+
+def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
+    child = ExecutionContext(execution_id="exec-migration-nested_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint = {
+        "context": ExecutionContext(execution_id="exec-migration-nested").to_dict(),
+        "pattern_state": {
+            "dag_state": {"active_step_contexts": {"step_1": child.to_dict()}}
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_try_another_pattern_after_fact_commit_failure() -> None:
+    from xagent.core.agent.checkpoint import ExecutionEventPersistenceError
+
+    class UncertainPattern:
+        async def run(self, **_: Any) -> dict[str, Any]:
+            raise ExecutionEventPersistenceError("tool result commit failed")
+
+    fallback = FakePattern({"success": True, "output": "must not retry"})
+    runner = AgentRunner(
+        agent=Agent(
+            name="fact-failure", patterns=[UncertainPattern(), fallback], llm=None
+        ),
+        workspace_enabled=False,
+    )
+    with pytest.raises(ExecutionEventPersistenceError):
+        await runner.run(task="write once", execution_id="uncertain-effect")
+    assert fallback.calls == []
+
+
+@pytest.mark.parametrize(
+    "client_value, engine_value",
+    [(True, False), ("true", False), (1, False), (False, True)],
+    ids=["client_true", "client_string", "client_one", "client_false_on_latched_run"],
+)
+@pytest.mark.parametrize("surface", ["top_level", "request_context"])
+def test_a_client_cannot_set_the_tool_evidence_marker(
+    tmp_path: Path, surface: str, client_value: object, engine_value: bool
+) -> None:
+    """Both surfaces that carry client input into metadata refuse this key.
+
+    Each cell sends the opposite of what the engine currently holds, so a cell
+    goes red if the client's value lands -- including the dangerous direction,
+    a client sending False to clear a run that really did lose observations.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-reserved-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = engine_value
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: client_value,
+        "some_client_key": "kept",
+    }
+    metadata = (
+        dict(client_keys)
+        if surface == "top_level"
+        else {"request_context": dict(client_keys)}
+    )
+
+    runner._merge_context_metadata(context, metadata)
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is engine_value
+    # Proves the merge actually ran; without it, the line above could pass
+    # simply because nothing was merged at all.
+    assert context.metadata["some_client_key"] == "kept"
+
+
+def test_a_restored_context_takes_no_client_metadata_at_all(tmp_path: Path) -> None:
+    """The restore branch returns before both filters because it merges nothing.
+
+    A run rebuilt from a checkpoint keeps what it latched: the current turn's
+    metadata contributes only the modality preference, so neither surface that
+    carries client input reaches it.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = True
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: False,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is True
+    assert "some_client_key" not in context.metadata
+    assert "request_context" not in context.metadata
+
+
+def test_a_restored_context_with_no_marker_key_is_never_backfilled(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint written before this key existed must stay keyless on resume.
+
+    Backfilling either value here would erase the distinction the third state
+    exists to carry: False would tell a run that really did lose observations
+    that nothing was removed, and True would tell a run that lost nothing
+    that something was. The restore branch returns before either client-input
+    filter runs, so nothing it does can write this key in either direction.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-no-key")
+    context.metadata.pop(TOOL_EVIDENCE_REMOVED_METADATA_KEY, None)
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: True,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert TOOL_EVIDENCE_REMOVED_METADATA_KEY not in context.metadata
+    assert tool_evidence_state(context) == "unknown"
+
+
+@pytest.mark.parametrize("stored", [True, False], ids=["removed", "intact"])
+def test_a_restored_context_with_a_marker_key_keeps_its_stored_value(
+    tmp_path: Path, stored: bool
+) -> None:
+    """A checkpoint that does carry the key is never recomputed on restore."""
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-restored-has-key")
+    context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] = stored
+    client_keys = {
+        TOOL_EVIDENCE_REMOVED_METADATA_KEY: not stored,
+        "some_client_key": "kept",
+    }
+
+    runner._merge_context_metadata(
+        context,
+        {**client_keys, "request_context": dict(client_keys)},
+        restored=True,
+    )
+
+    assert context.metadata[TOOL_EVIDENCE_REMOVED_METADATA_KEY] is stored
+    assert tool_evidence_state(context) == ("removed" if stored else "intact")
+
+
+def test_the_marker_is_stamped_before_any_client_metadata_is_merged(
+    tmp_path: Path,
+) -> None:
+    """The refusal must not depend on the stamp happening to win a race.
+
+    ``create_context`` writes False before the merge runs, so the ordering is
+    asserted here and a later refactor that moves the stamp cannot pass quietly.
+    """
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ContextManager().create_context(execution_id="exec-reserved-order")
+    seen: list[object] = []
+    original = runner._apply_request_context
+
+    def record(ctx: ExecutionContext, request_context: dict[str, Any]) -> None:
+        seen.append(ctx.metadata.get(TOOL_EVIDENCE_REMOVED_METADATA_KEY))
+        original(ctx, request_context)
+
+    runner._apply_request_context = record  # type: ignore[method-assign]
+    runner._merge_context_metadata(context, {"request_context": {"a": 1}})
+    assert seen == [False]

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -6,10 +6,13 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import type { SessionStopState } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
+import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -32,49 +35,9 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 
-// Shared accent styling for the "Using @agent" / "Agent template: X" chips
-// rendered above the input.
-const CHIP_ACCENT_STYLE = { borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" };
-
-// The "Using @agent" and "Agent template: X" chips are the same shape (an
-// italic label, a pill with the value, an optional remove button) - one
-// component instead of two near-identical blocks.
-function SelectionChip({
-  label,
-  value,
-  onRemove,
-  removeLabel,
-}: {
-  label: string;
-  value: string;
-  onRemove?: () => void;
-  removeLabel: string;
-}) {
-  return (
-    <div
-      className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-      style={CHIP_ACCENT_STYLE}
-    >
-      <span className="italic">{label}</span>
-      <span className="rounded-md border px-2 py-0.5 not-italic" style={CHIP_ACCENT_STYLE}>
-        {value}
-      </span>
-      {onRemove && (
-        <button
-          type="button"
-          onClick={onRemove}
-          className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-          title={removeLabel}
-        >
-          <X className="h-3 w-3" />
-        </button>
-      )}
-    </div>
-  );
-}
-
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
+  placeholder?: string;
   isLoading?: boolean;
   files?: File[];
   onFilesChange?: (files: File[]) => void;
@@ -83,9 +46,18 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  currentInteractionRequestId?: string;
+  // Fires on the editor's own focus/blur, independent of `isLoading`/task
+  // status - lets a controlled caller know it's currently unsafe to rely
+  // on a programmatic `inputValue` change being reflected in the visible
+  // editor (see the DOM-sync effect below, which intentionally skips
+  // updating a focused editor from an external value change).
+  onFocusChange?: (focused: boolean) => void;
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
+  onStop?: () => void;
+  stopState?: SessionStopState;
   taskConfig?: Partial<AgentConfig>;
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
@@ -96,13 +68,13 @@ interface ChatInputProps {
   autoFocus?: boolean;
   minHeightClass?: string;
   promptHighlightTerms?: string[];
+  // Drives `hasSelectedAgent` below (skips the no-model-selected guard) -
+  // never rendered as a visible chip; callers that assign a task lead show
+  // that in their own header instead (see ChatStartScreen's hero swap).
   selectedAgents?: Array<{
     id: number | string;
     name: string;
   }>;
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
-  selectedTemplate?: { id: string; name: string } | null;
-  onRemoveSelectedTemplate?: () => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
 }
@@ -119,6 +91,7 @@ interface AgentConfig {
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
   clientMessageId?: string;
+  metadata?: Record<string, unknown>;
   runtimeExtensions?: Record<string, Record<string, unknown>>;
 }
 
@@ -136,15 +109,20 @@ interface DefaultModelRecord {
 
 export function ChatInput({
   onSend,
+  placeholder,
   isLoading,
   files = [],
   onFilesChange,
   mode,
   inputValue,
   onInputChange,
+  currentInteractionRequestId,
+  onFocusChange,
   taskStatus,
   onPause,
   onResume,
+  onStop,
+  stopState = "idle",
   taskConfig,
   hideConfig = false,
   readOnlyConfig = false,
@@ -156,9 +134,6 @@ export function ChatInput({
   minHeightClass = "min-h-[130px]",
   promptHighlightTerms = [],
   selectedAgents = [],
-  onRemoveSelectedAgent,
-  selectedTemplate = null,
-  onRemoveSelectedTemplate,
   uploadFile,
   deferFileUpload = false,
 }: ChatInputProps) {
@@ -180,6 +155,7 @@ export function ChatInput({
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
+  const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { user } = useAuth();
@@ -396,6 +372,7 @@ export function ChatInput({
     });
 
     const failedFiles = new Set<File>();
+    const uploadedFileIds = new Map<File, string>();
     let uploadErrorMessage: string | null = null;
 
     // Upload files individually to ensure better reliability and progress tracking
@@ -409,8 +386,9 @@ export function ChatInput({
 
         if (uploadFile) {
           const result = await uploadFile(file, { taskType: currentTaskType });
-          if (result && typeof result.file_id === 'string') {
-            (file as File & { file_id?: string }).file_id = result.file_id;
+          const fileId = normalizeUploadFileIds([result?.file_id], 1)?.[0] ?? null;
+          if (fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
           }
@@ -428,20 +406,15 @@ export function ChatInput({
 
           const parsed = await parseApiResponse(response);
 
-          if (response.ok && isJsonRecord(parsed.data)) {
-            const data = parsed.data;
-            if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
-              (file as File & { file_id?: string }).file_id = data.file_id;
-            } else {
-              failedFiles.add(file);
-            }
+          const data = isJsonRecord(parsed.data) ? parsed.data : null;
+          const fileId = normalizeUploadFileIds([data?.file_id], 1)?.[0] ?? null;
+          if (response.ok && data?.success === true && fileId) {
+            uploadedFileIds.set(file, fileId);
           } else {
             failedFiles.add(file);
-            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-              generic: t("files.uploadFailed") || "Failed to upload some files",
-              ...UPLOAD_ERROR_MESSAGES,
-            });
+            const uploadError = classifyUploadError(response, parsed);
+            uploadErrorMessage = uploadErrorMessage
+              || t(clientErrorTranslationKey(uploadError.errorCode));
           }
         }
       } catch (error) {
@@ -450,7 +423,7 @@ export function ChatInput({
         } else {
           console.error("Error uploading file:", error);
           failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
+          uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
         }
       } finally {
         uploadAbortControllersRef.current.delete(fileId);
@@ -461,6 +434,30 @@ export function ChatInput({
         });
       }
     }));
+
+    const successfulFiles = newFiles.filter(file => (
+      !failedFiles.has(file) && uploadedFileIds.has(file)
+    ));
+    const existingUploadedFileIds = filesRef.current
+      .filter(file => !newFiles.includes(file))
+      .map(file => (file as File & { file_id?: unknown }).file_id)
+      .filter(fileId => fileId !== undefined);
+    const normalizedFileIds = normalizeUploadFileIds(
+      [
+        ...existingUploadedFileIds,
+        ...successfulFiles.map(file => uploadedFileIds.get(file)),
+      ],
+      existingUploadedFileIds.length + successfulFiles.length,
+    );
+    if (!normalizedFileIds) {
+      successfulFiles.forEach(file => failedFiles.add(file));
+      uploadErrorMessage = uploadErrorMessage || t("clientErrors.uploadFailed");
+    } else {
+      const newFileIds = normalizedFileIds.slice(existingUploadedFileIds.length);
+      successfulFiles.forEach((file, index) => {
+        (file as File & { file_id?: string }).file_id = newFileIds[index];
+      });
+    }
 
     // Handle failed files
     if (failedFiles.size > 0) {
@@ -576,6 +573,21 @@ export function ChatInput({
         compactModel: defaultAgentConfig.compactModel,
         executionMode: undefined
       }));
+    } else {
+      // readOnlyConfig is true but taskConfig hasn't arrived yet - e.g. the
+      // caller just switched to a different lead and that lead's own
+      // config fetch is still in flight. The disabled read-only model
+      // button below renders straight from `agentConfig`, so leaving the
+      // previous lead's stale model/mode in place would show it as if it
+      // belonged to whoever is selected now.
+      setAgentConfig(prev => ({
+        ...prev,
+        model: "",
+        smallFastModel: undefined,
+        visualModel: undefined,
+        compactModel: undefined,
+        executionMode: undefined
+      }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
@@ -595,7 +607,7 @@ export function ChatInput({
   // Only a new standalone task: the backend takes execution_mode at creation
   // only, and an agent (a template resolves into one) overrides it anyway.
   const showExecutionModePicker =
-    !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
+    !hideConfig && !readOnlyConfig && !taskConfig;
   // Unset reads as "Default", not "Auto": the server default is auto only when
   // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
   const executionModeTriggerLabel = pickedExecutionMode
@@ -608,6 +620,23 @@ export function ChatInput({
   const activeTaskRuntimeSelection = showTaskRuntimeExtension
     ? taskRuntimeSelection
     : null;
+  // `agentConfig` mirrors `taskConfig` via a separate effect (below) that
+  // runs asynchronously after a prop change, not synchronously with it - a
+  // read landing in that gap (e.g. right after switching to a different
+  // read-only lead, before its own config has finished loading) would
+  // otherwise still show/send the PREVIOUS lead's model, even though
+  // `taskConfig` itself already correctly reflects the new one (or the
+  // absence of one yet). Read model fields straight from the live prop
+  // instead of the mirror, whenever one is meant to be authoritative -
+  // shared by both the read-only model badge below and handleSubmit, so a
+  // future caller of either one doesn't have to remember this separately.
+  // `hideConfig` alone (no taskConfig, not read-only) legitimately means
+  // "use my own configured default", not "mirror of taskConfig", so it's
+  // excluded here even though no current caller combines them.
+  const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
+  const displayModel = configIsDrivenByTaskConfig
+    ? taskConfig?.model || ""
+    : agentConfig.model;
   useEffect(() => {
     if (!showExecutionModePicker) {
       setPickedExecutionMode(undefined);
@@ -640,15 +669,89 @@ export function ChatInput({
   };
 
   const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
+  useEffect(() => {
+    if (!hasDraft) {
+      draftRequestSnapshotRef.current = null;
+      deliveryAttemptRef.current = null;
+    } else if (draftRequestSnapshotRef.current === null) {
+      draftRequestSnapshotRef.current = {
+        requestId: currentInteractionRequestId,
+      };
+    }
+  }, [currentInteractionRequestId, hasDraft]);
+  // The stop control exists only in the compact toolbar, and only when the
+  // caller passes onStop. Every stop rule in this composer -- the stop square,
+  // its hints, the "Stopping..." names and the hold on sending -- keys on this
+  // one condition, so a composer without the stop control behaves the same
+  // whatever stopState it is handed.
+  const offersStopControl = compact && !!onStop;
+  const isStopInFlight = offersStopControl && stopState === "stopping";
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
-    return hasDraft && !isInputBusy && !isUploadingFiles;
+    // A stop request the server has not answered yet still owns this turn, so
+    // a composer that offers the stop control accepts nothing new until it
+    // resolves: the send control stays in its slot, dimmed and inert, instead
+    // of delivering a message into the run the visitor has just asked to end.
+    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight;
   };
   const canPauseTask =
     !!isLoading &&
     !!onPause &&
     isPausableTaskStatus(normalizedTaskStatus);
   const shouldShowPauseButton = canPauseTask && !hasDraft;
+  const reactId = useId();
+  const stopHintId = `${reactId}-stop-hint`;
+  // The stop control lives only in the compact toolbar. That is deliberate:
+  // the compact toolbar is the only layout that offers it, and the wider
+  // toolbar below carries the pause control instead, so a caller that passes
+  // `onStop` without `compact` gets no stop control at all. It steps aside for
+  // the send button whenever there is a draft — the same rule the pause button
+  // already follows above — but a send button shown while a stop is in flight
+  // is inert (see canSubmit), so stepping aside never opens a way into the
+  // turn being stopped. The not-sent and timed-out hints both explain that
+  // control, so each is gated on exactly the same condition; a hint with no
+  // visible control on screen would have nothing to refer to.
+  const showStopButton = offersStopControl && !hasDraft;
+  // The stop control and the send control take turns in the same slot, so the
+  // size and the box styling come from here instead of each of them carrying
+  // its own copy: the slot keeps one shape whichever control is on screen.
+  const composerActionButtonProps = (isDimmed: boolean) => ({
+    size: "icon" as const,
+    className: cn(
+      "h-8 w-8 rounded-lg transition-all duration-300",
+      // opacity-50 and pointer-events-none repeat what Button's `disabled:`
+      // styles give a natively disabled control, so the stop control -- which
+      // uses aria-disabled to keep focus -- looks and behaves under the
+      // pointer exactly like the send control when either is dimmed.
+      isDimmed && "bg-muted text-muted-foreground/50 opacity-50 pointer-events-none"
+    ),
+  });
+  // Two outcomes, two sentences: "timed_out" means the request went out and
+  // was never confirmed; "not_sent" means the socket refused it and nobody
+  // received it.
+  const stopHintKey =
+    stopState === "timed_out"
+      ? "widgetSession.stopTimedOut"
+      : stopState === "not_sent"
+        ? "widgetSession.stopNotSent"
+        : null;
+  const showStopHint = showStopButton && stopHintKey !== null;
+  const stopButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("widgetSession.stopResponse");
+  // With a draft the send control takes the stop control's slot, and while a
+  // stop is in flight it is inert (see canSubmit). It carries the same
+  // "Stopping..." name the stop control would, so the reason stays on screen.
+  const sendButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("common.send");
+  // The hint's status region stays mounted for as long as this composer
+  // offers the stop control, and only its text changes: a status region that
+  // appears together with its text is not announced by many screen readers.
+  // It is empty when there is nothing to say (no hint, or a draft has put the
+  // send control in the stop control's slot), and composers without the stop
+  // control do not render it at all.
+  const stopHintText = showStopHint ? t(stopHintKey) : "";
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (
@@ -721,6 +824,9 @@ export function ChatInput({
       const executionMode = showExecutionModePicker
         ? pickedExecutionMode
         : taskConfig?.executionMode;
+      const normalizedExecutionMode = executionMode
+        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+        : undefined;
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -738,10 +844,37 @@ export function ChatInput({
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
+      const existingMetadata = {
+        ...(agentConfig.metadata || {}),
+        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      };
+      const draftRequestId = draftRequestSnapshotRef.current?.requestId;
+      const metadataToSend = draftRequestId
+        ? { ...existingMetadata, request_id: draftRequestId }
+        : Object.keys(existingMetadata).length > 0
+          ? existingMetadata
+          : undefined;
 
       const configToSend = {
         ...agentConfig,
+        ...(configIsDrivenByTaskConfig
+          ? {
+              model: displayModel,
+              smallFastModel: taskConfig?.smallFastModel,
+              visualModel: taskConfig?.visualModel,
+              compactModel: taskConfig?.compactModel,
+              // Same live-vs-mirror reasoning as the model fields above,
+              // applied to executionMode: a falsy live value must still
+              // explicitly clear the key here rather than being skipped,
+              // or it would silently fall through to whatever stale
+              // executionMode `agentConfig` (spread below) still carries
+              // from the previous lead while its own mirroring effect
+              // hasn't caught up yet.
+              executionMode: normalizedExecutionMode,
+            }
+          : {}),
         clientMessageId,
+        ...(metadataToSend ? { metadata: metadataToSend } : {}),
         ...(extraRuntimeExtensions
           ? {
               runtimeExtensions: {
@@ -750,18 +883,14 @@ export function ChatInput({
               },
             }
           : {}),
-        ...(executionMode
-          ? {
-              executionMode:
-                typeof executionMode === "string"
-                  ? { mode: executionMode }
-                  : executionMode,
-            }
+        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
+          ? { executionMode: normalizedExecutionMode }
           : {}),
       };
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      draftRequestSnapshotRef.current = null;
       setPickedExecutionMode(undefined);
       setExecutionModeMenuOpen(false);
       setLocalBrowserTarget(null);
@@ -780,8 +909,18 @@ export function ChatInput({
       ) {
         deliveryAttemptRef.current = null;
       }
-      toast.error(
-        error instanceof Error
+      // A containing surface (e.g. Builder preview) may already show a
+      // persistent error. Keep retry state, but do not duplicate its notice.
+      if (typeof error === "object" && error !== null
+        && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
+      const errorCode = typeof error === "object" && error !== null
+        ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
+        : null;
+      const userFacing = typeof error === "object" && error !== null
+        && (error as { userFacing?: unknown }).userFacing === true;
+      toast.error(errorCode
+        ? t(clientErrorTranslationKey(errorCode))
+        : userFacing && error instanceof Error
           ? error.message
           : t("builds.list.chat.sendFailed") || "Message was not sent"
       );
@@ -918,13 +1057,23 @@ export function ChatInput({
     }
   }, [filesDisabled, message, promptHighlightTerms]);
 
-  const hasTopChip = selectedAgents.length > 0 || !!selectedTemplate;
-
   return (
-    <div className="space-y-3">
+    // No space-y here: the hint region below is mounted while it is empty, so
+    // it carries its own gap and only while it has text, which keeps the
+    // composer from shifting when the region mounts.
+    <div>
+      {offersStopControl && (
+        <p
+          id={stopHintId}
+          role="status"
+          className={cn("text-xs text-muted-foreground", stopHintText && "mb-3")}
+        >
+          {stopHintText}
+        </p>
+      )}
       {/* Input area */}
       <div
-        className={cn("relative", hasTopChip && "pt-9")}
+        className="relative"
         ref={containerRef}
       >
         {fileMention.fileMentionsEnabled && (
@@ -938,34 +1087,10 @@ export function ChatInput({
             position={fileMention.dropdownPosition}
           />
         )}
-        {hasTopChip && (
-          <div className="absolute top-0 z-10 flex flex-wrap gap-2">
-            {selectedAgents.map((agent) => (
-              <SelectionChip
-                key={agent.id}
-                label={t("chatPage.input.usingAgentLabel")}
-                value={`@${agent.name}`}
-                onRemove={onRemoveSelectedAgent ? () => onRemoveSelectedAgent(agent.id) : undefined}
-                removeLabel={t("common.remove")}
-              />
-            ))}
-            {selectedTemplate && (
-              <SelectionChip
-                label={t("chatPage.templateQuickAccess.usingTemplateLabel")}
-                value={selectedTemplate.name}
-                onRemove={onRemoveSelectedTemplate}
-                removeLabel={t("common.remove")}
-              />
-            )}
-          </div>
-        )}
         <form
           onSubmit={handleSubmit}
           className={cn(
-            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm",
-            hasTopChip
-              ? "rounded-tr-2xl rounded-br-2xl rounded-bl-2xl rounded-tl-none"
-              : "rounded-2xl",
+            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm rounded-2xl",
             isFocused
               ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
               : ""
@@ -975,7 +1100,7 @@ export function ChatInput({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           style={{
-            borderColor: hasTopChip ? "#3040cf" : isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
+            borderColor: isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
           }}
         >
           {isDraggingFiles && (
@@ -1037,14 +1162,20 @@ export function ChatInput({
               onInput={handleInput}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              onFocus={() => setIsFocused(true)}
-              onBlur={() => setIsFocused(false)}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
               role="textbox"
               aria-multiline="true"
             />
             {!message && (
               <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
-                {t("chatPage.input.placeholder")}
+                {placeholder ?? t("chatPage.input.placeholder")}
               </div>
             )}
           </div>
@@ -1102,21 +1233,40 @@ export function ChatInput({
                   )}
                 </Button>
               )}
-              <Button
-                type="submit"
-                size="icon"
-                disabled={!canSubmit()}
-                className={cn(
-                  "h-8 w-8 rounded-lg transition-all duration-300",
-                  !canSubmit() && "bg-muted text-muted-foreground/50"
-                )}
-              >
-                {isInputBusy ? (
-                  <Sparkles className="h-4 w-4 animate-pulse" />
-                ) : (
-                  <ArrowUp className="h-4 w-4" />
-                )}
-              </Button>
+              {showStopButton ? (
+                <Button
+                  type="button"
+                  {...composerActionButtonProps(isStopInFlight)}
+                  // Not `disabled`: the visitor has just pressed this button,
+                  // and disabling a focused button drops keyboard focus to the
+                  // page. While a stop is pending it stays focusable, reports
+                  // itself unavailable, reads "Stopping...", and ignores presses.
+                  aria-disabled={isStopInFlight || undefined}
+                  onClick={() => {
+                    if (isStopInFlight) return;
+                    onStop?.();
+                  }}
+                  aria-label={stopButtonLabel}
+                  title={stopButtonLabel}
+                  aria-describedby={showStopHint ? stopHintId : undefined}
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  {...composerActionButtonProps(!canSubmit())}
+                  disabled={!canSubmit()}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
             </div>
           ) : (
             <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
@@ -1131,11 +1281,11 @@ export function ChatInput({
                         size="sm"
                         className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
                         disabled={true}
-                        title={models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        title={models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                       >
                         <Globe className="h-4 w-4" />
                         <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          {models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                         </span>
                       </Button>
                     ) : (

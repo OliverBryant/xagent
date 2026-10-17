@@ -4,10 +4,14 @@ import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
@@ -227,11 +231,9 @@ function PublicConversationContent({
     safeRemoveItem(storageKey)
     setTaskId(null, { navigate: false })
     // Nulling taskId closes the socket, so no terminal WS event will ever
-    // reset these. Left stale mid-run, isProcessing keeps the start screen's
-    // composer disabled forever, currentTask pins the header on
+    // reset these. Left stale mid-run, currentTask pins the header on
     // "Connecting...", and isHistoryLoading (cleared by an onConnect timer
     // that may never have been scheduled) pins it on "Initializing".
-    dispatch({ type: "SET_PROCESSING", payload: false })
     dispatch({ type: "SET_CURRENT_TASK", payload: null })
     dispatch({ type: "SET_HISTORY_LOADING", payload: false })
     setDraftMessage("")
@@ -263,6 +265,13 @@ function PublicConversationContent({
         title: message,
         description: message,
       }
+      // Workforce opening turns start inside this request and never reach
+      // sendChatMessage, so the zone has to ride along here or the first
+      // answer is rendered against UTC.
+      const openingTimezone = resolveReportedTimezone()
+      if (openingTimezone) {
+        taskPayload.timezone = openingTimezone
+      }
       if (agentId) {
         taskPayload.agent_id = agentId
       }
@@ -280,8 +289,16 @@ function PublicConversationContent({
           file,
           taskType: "task",
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         })))
-        taskPayload.files = uploaded.map((item) => item.file_id)
+        const uploadedFileIds = normalizeUploadFileIds(
+          uploaded.map(item => item.file_id),
+          files.length,
+        )
+        if (!uploadedFileIds) {
+          throw new Error(t("clientErrors.uploadFailed"))
+        }
+        taskPayload.files = uploadedFileIds
       }
 
       const response = await fetch(`${getApiUrl()}${publicApiPrefix}/chat/task/create`, {
@@ -387,16 +404,29 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
-          {state.taskId && (
-            <button
-              type="button"
-              onClick={handleNewConversation}
-              title={t("widgetChat.newConversation")}
-              aria-label={t("widgetChat.newConversation")}
-              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-            >
-              <MessageSquarePlus className="w-4 h-4" />
-            </button>
+          {/* A standalone share link has no parent widget.js to signal, so
+              it keeps its own visible reset button instead of the "..."
+              menu -- the embedded widget is the only mode that can be
+              hidden from a host page. */}
+          {authMode === "share" ? (
+            state.taskId && (
+              <button
+                type="button"
+                onClick={handleNewConversation}
+                title={t("widgetChat.newConversation")}
+                aria-label={t("widgetChat.newConversation")}
+                className={`ml-auto ${iconButtonClassName}`}
+              >
+                <MessageSquarePlus className="w-4 h-4" />
+              </button>
+            )
+          ) : (
+            <WidgetChromeControls
+              newConversation={state.taskId ? {
+                label: t("widgetChat.newConversation"),
+                onClick: handleNewConversation,
+              } : undefined}
+            />
           )}
         </div>
       </div>
@@ -588,6 +618,7 @@ export function PublicAgentChatPage({
   const fileAccess = usePublicFileAccessPolicy(publicAccessToken)
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       agentCards: "disabled",
       voice: "disabled",
@@ -609,6 +640,7 @@ export function PublicAgentChatPage({
           taskType: params.taskType,
           taskId: params.taskId,
           fallbackError: t("files.uploadFailed"),
+          formatError: (code) => t(clientErrorTranslationKey(code)),
         }),
       )),
   }), [authMode, fileAccess, publicAccessToken, t])

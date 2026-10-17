@@ -14,14 +14,13 @@ result dict verbatim into ``AutoPattern.last_result`` (see
 ``pattern/auto/auto.py``), and a waiting ReAct child's result carries the
 draft under ``result["clarification_draft"]``.
 
-``turn_marker`` is the only idempotency-relevant value this module produces,
-and it carries no persistence-format promise of its own: it is a stable,
-opaque string. Its idempotency scope is a single ``(task_id, run_id)``
-partition -- two different tasks or runs may legitimately produce equal
-markers, since neither identifier is a marker component. Deriving a storage
-key (length limits, character-set validation, or any other on-disk
-contract) is a web-layer concern that reads this string; this module does
-not know what that contract looks like.
+``event_id`` is the clarification's stable identity. The runtime allocates it
+before publishing the question and stores that same value in the waiting
+request, so a draft reconstructed after checkpoint restore still names the
+published question occurrence. ``turn_marker`` remains a deterministic,
+opaque description of the waiting turn, but it is not a second publication
+identity. Storage validation and on-disk key constraints remain web-layer
+concerns; this core module does not know what those contracts look like.
 """
 
 from __future__ import annotations
@@ -30,13 +29,15 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
+from pydantic import JsonValue
+
 logger = logging.getLogger(__name__)
 
 CLARIFICATION_SOURCES = frozenset({"send_message", "ask_user_question", "tool_waiting"})
 
 # Marker composition constants. ``_MARKER_KEEP`` must stay character-for-
 # character identical to the whitelist in
-# ``src/xagent/web/api/trace_handlers.py``'s ``clean_string`` (see
+# ``src/xagent/web/services/trace_handlers.py``'s ``clean_string`` (see
 # ``_marker_clean`` below for the full cross-layer contract note).
 _MARKER_KEEP = "\n\r\t"
 _MARKER_SEP = "|"
@@ -64,7 +65,9 @@ class ClarificationRequestItem:
 class ClarificationDraft:
     """A typed view over a waiting turn, common to all clarification sources.
 
-    ``requests`` carries one item per pending question: the single-source
+    ``event_id`` names the already-published question occurrence. Legacy
+    absence is empty; malformed restored values remain unchanged for web
+    validation. ``requests`` carries one item per pending question: the single-source
     waiting points (``send_message`` / ``ask_user_question``) contribute
     exactly one item, and the multi-tool waiting point contributes one item
     per waiting tool. A malformed or legacy waiting payload can yield an
@@ -98,6 +101,7 @@ class ClarificationDraft:
     origin_execution_id: str
     turn_message_count: int
     turn_marker: str
+    event_id: JsonValue = ""
 
     def with_origin_step(self, step_id: str) -> "ClarificationDraft":
         """Return a copy attributed to ``step_id``, with the marker redone.
@@ -120,8 +124,8 @@ class ClarificationDraft:
         ``ClarificationDraft`` (under ``result["clarification_draft"]``) is
         serialized into trace events by handlers that use the ``to_dict``
         protocol -- ``DatabaseTraceHandler._serialize_data_for_json`` and its
-        WebSocket twins, ``WebSocketTraceHandler._serialize_data`` in
-        ``ws_trace_handlers.py`` and ``SharedWebSocketTracer._serialize_data``
+        WebSocket twins, ``TaskEventTraceHandler._serialize_data`` in
+        ``task_event_trace_handler.py`` and ``SharedWebSocketTracer._serialize_data``
         in ``websocket.py``, call ``value.to_dict()`` whenever it is
         callable, and then recursively re-serialize whatever that call
         returns. So this
@@ -141,6 +145,7 @@ class ClarificationDraft:
 
         return {
             "source": self.source,
+            "event_id": self.event_id,
             "message": self.message,
             "message_type": self.message_type,
             "interactions": list(self.interactions),
@@ -158,9 +163,9 @@ def _marker_clean(value: str) -> str:
     Five independent copies of this control-character filter exist in the
     codebase, and all five must stay in the same domain: this function,
     three web-layer closures that the core layer cannot import and so
-    cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
+    cannot share code with -- ``src/xagent/web/services/trace_handlers.py``'s
     ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
-    ``src/xagent/web/api/ws_trace_handlers.py``'s
+    ``src/xagent/web/services/task_event_trace_handler.py``'s
     ``serialize_trace_data`` (``clean_string``), and
     ``src/xagent/web/api/websocket.py``'s
     ``SharedWebSocketTracer._serialize_data`` (``clean_string``) -- and
@@ -229,9 +234,14 @@ def draft_from_waiting_request(
 
     - ``request["kind"] == "tool_waiting_for_user"`` -> ``"tool_waiting"``,
       one :class:`ClarificationRequestItem` per entry in ``request["requests"]``.
-    - otherwise ``request["message_type"] == "question"`` *and* ``request``
-      has an ``"interactions"`` key (key presence, not truthiness -- an
-      empty-form ``ask_user_question`` still has the key) -> ``"ask_user_question"``.
+    - otherwise ``request["tool_name"] == "ask_user_question"`` ->
+      ``"ask_user_question"``. Keyed on the tool name rather than on the
+      presence of an ``"interactions"`` key, because every waiting path now
+      carries that key: the engine appends a default free-text field
+      whenever nothing the model supplied is answerable, so key presence no
+      longer tells the two control tools apart. ``tool_name`` has always
+      been written here, so checkpoints written before that classify the same
+      way.
     - otherwise -> ``"send_message"``.
 
     Returns ``None`` in two cases, both meaning "no typed draft could be
@@ -240,14 +250,11 @@ def draft_from_waiting_request(
     - ``request`` is not a dict (``None``, a stray ``str``, a ``list``,
       ...) -- a type mismatch from the caller.
     - ``request`` is a dict but carries neither a non-empty message nor an
-      ``"interactions"`` key nor a non-empty ``"requests"`` list. This is
-      reachable in production today: a ``send_message`` call with an empty
-      ``message`` and ``expect_response=True`` reaches ``waiting_for_user``
-      with no message, no ``"interactions"`` key, and no ``"requests"``
-      list (see the ``send_message`` branch of
-      ``ReActPattern._handle_control_tool`` in ``react.py``). It also
-      covers resuming a checkpoint written by an older schema, which
-      degrades to "no draft" instead of raising and blocking resume.
+      ``"interactions"`` key nor a non-empty ``"requests"`` list. No ReAct
+      waiting path produces that shape any more -- every one of them now
+      writes an ``"interactions"`` key. What remains is resuming a checkpoint
+      written by an older schema, which degrades to "no draft" instead of
+      raising and blocking resume.
     """
 
     if not isinstance(request, dict):
@@ -295,7 +302,7 @@ def draft_from_waiting_request(
                     )
                 )
         requests = tuple(items)
-    elif request.get("message_type") == "question" and has_interactions_key:
+    elif request.get("tool_name") == "ask_user_question":
         source = "ask_user_question"
         tool_call_id = str(request.get("tool_call_id") or "")
         requests = (
@@ -326,6 +333,7 @@ def draft_from_waiting_request(
 
     return ClarificationDraft(
         source=source,
+        event_id=request.get("event_id", ""),
         message=message,
         message_type=message_type,
         interactions=interactions,

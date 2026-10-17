@@ -18,7 +18,9 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 - **Frontend**: Next.js standalone build served by nginx
 - **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
-- **PostgreSQL**: PostgreSQL 16 database
+- **PostgreSQL**: PostgreSQL 17 database; the image tag is overridable via `POSTGRES_IMAGE_TAG`
+
+> **Required action on upgrade:** A `postgres_data` volume initialized by PostgreSQL 16 cannot be switched to 17 in place. PostgreSQL 17 refuses to open it and exits, so `postgres` restart-loops and `backend`, `worker`, and `scheduler` never start. Pin `POSTGRES_IMAGE_TAG="16-bookworm"` to defer, then migrate with [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17). Fresh installations are unaffected.
 
 ## Quick Start
 
@@ -48,6 +50,14 @@ DEEPSEEK_API_KEY="your-deepseek-api-key"
 # Database Password (auto-generated if using docker-compose)
 POSTGRES_PASSWORD="xagent_password"
 ```
+
+Backend images built from the current source start one web process and two Agent
+workers. If `ENCRYPTION_KEY` is empty, the image creates one in the persistent
+`xagent_secrets` volume; keep that volume with database backups. The checked-in
+Compose file uses fixed release image tags, so this behavior begins when those
+tags are bumped to a release containing the worker-pool default. To run that
+image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
+`XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
 
 Optional Gmail incoming-email trigger provisioning:
 
@@ -245,11 +255,19 @@ container control.
 
 Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
 overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
-and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
-also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
+and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
+`backend`, `worker`, `scheduler` and `nginx` (read-only), so they all see the
+same uploads and data. The host directory stays authoritative for a
+deployment that ran this overlay before: the backend always wrote its uploads,
+LanceDB ledger and `.kb-engine` there. See "Upgrading an existing
+sandbox.docker deployment" below.
+
+The overlay also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
 workspace mounts under `/root/.xagent` are translated back to the host storage
-path before they reach the host Docker daemon. Override these values when the
-host checkout or storage directory lives elsewhere:
+path before they reach the host Docker daemon. When set,
+`XAGENT_SANDBOX_HOST_STORAGE_ROOT` must be an absolute Docker-host path;
+relative paths and `~` are not supported. Override these values when the host
+checkout or storage directory lives elsewhere:
 
 ```bash
 XAGENT_SANDBOX_HOST_PROJECT_ROOT="$PWD" \
@@ -263,6 +281,20 @@ docker compose \
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container.
+
+Sandbox workspace guest paths are reserved below
+`<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
+`XAGENT_EXTERNAL_UPLOAD_DIRS` mount at that directory or any descendant now
+fails backend readiness, because Docker would let the more-specific bind hide
+the managed workspace. Move shared mounts elsewhere under the uploads root
+(for example `<uploads>/shared`) or mount a suitable ancestor before upgrading.
+
+External-upload symlink aliases authorize the physical directory they resolve
+to. Ordinary aliases are supported, but ambiguous spellings such as
+`symlink/..` are rejected; configure the intended directory directly.
+Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
+directory; replacing one with a symlink or changing that topology while the
+service is running is unsupported.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
@@ -313,6 +345,66 @@ Rollback also requires a maintenance window. Drain and stop the namespaced
 backends and their v2 containers before starting pre-namespace code; the old
 backend cannot see v2 containers and otherwise double-provisions sandboxes.
 
+#### Upgrading an existing sandbox.docker deployment
+
+The `xagent_data` volume holds what the worker wrote (staged and published
+uploads, and LanceDB rows and a `.kb-engine` from its own ingests such as web
+ingests). Do not copy the volume's `data` over the host directory, because
+LanceDB cannot be merged by copying files. Set `COMPOSE_PROJECT_NAME` and
+`XAGENT_HOST_STORAGE_ROOT` (an absolute path) in your shell first, then
+confirm the volume name; a mistyped name makes `docker run -v` create an empty
+volume, so the listing below would be silently empty:
+
+```bash
+docker volume ls | grep xagent_data
+```
+
+List the volume:
+
+```bash
+docker run --rm -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro alpine find /v -type f
+```
+
+If `uploads` holds files the host lacks, copy only those, never overwriting a
+host file (`cp -n` in Alpine's BusyBox skips a whole directory that already
+exists, so use a loop):
+
+```bash
+docker run --rm \
+  -v "${COMPOSE_PROJECT_NAME}_xagent_data":/v:ro \
+  -v "${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}":/h alpine sh -c '
+  cd /v/uploads && find . -type f | while IFS= read -r f; do
+    [ -e "/h/uploads/$f" ] || { mkdir -p "/h/uploads/$(dirname "$f")"; cp -p "$f" "/h/uploads/$f"; }
+  done'
+```
+
+Documents that only the worker ingested must be ingested again. Review the
+listing for any other paths the worker may have written before removing the
+volume.
+
+### Milvus Knowledge-Base Engine
+
+Knowledge bases are stored in LanceDB by default. On a new deployment, the Milvus
+add-on starts a Milvus standalone server and makes it the knowledge-base engine:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.milvus.yml \
+  up -d
+```
+
+The image tags in `docker-compose.yml` (`0.8.1`) do not contain the Milvus engine:
+that release predates it, so the add-on needs images built from `main` (see
+[Building Individual Images](#building-individual-images)) or from a later release.
+With the `0.8.1` images the add-on starts and Milvus idles, but the first
+knowledge-base request fails with `Vector backend 'milvus' is not implemented yet`.
+
+A deployment that already holds LanceDB knowledge-base data is refused at startup,
+and Milvus's official guidance is 8 GB of RAM. Resources, the engine lock, the
+consistency window, the chunk size limit, backup and restore, and the differences
+from LanceDB are in [README.milvus.md](README.milvus.md).
+
 ## Docker Files
 
 - `Dockerfile.backend` - Backend image (FastAPI, Python, Node.js)
@@ -321,6 +413,8 @@ backend cannot see v2 containers and otherwise double-provisions sandboxes.
 - `../docker-compose.yml` - Base multi-service orchestration
 - `docker-compose.sandbox.boxlite.yml` - Boxlite/KVM sandbox overlay
 - `docker-compose.sandbox.docker.yml` - Docker sibling sandbox overlay
+- `docker-compose.milvus.yml` - Milvus knowledge-base engine add-on
+- `README.milvus.md` - Milvus add-on deployment notes
 - `.dockerignore` - Backend build exclusions
 - `.dockerignore.frontend` - Frontend build exclusions
 - `nginx.conf` - Frontend nginx configuration
@@ -351,7 +445,7 @@ the backend image build runs `uv sync --locked` for reproducible installs.
 
 | Arg | Default | Effect |
 |-----|---------|--------|
-| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the `/opt/google/chrome/chrome` binary + npx cache for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. **This flag does not remove all root/`--no-sandbox` browser exposure in the image**: Playwright Chromium is installed unconditionally in a separate build stage and is already launched with `--no-sandbox` as root by the pre-existing `browser_use` tool, independent of this connector and this flag. Operator note: the connector launches via `npx` with an exact version pin; on a deployment whose npx cache is cold (a non-Docker install, or an `INSTALL_CHROME=false` image later flipped visible), the first tool call fetches that pinned package from the npm registry, as the backend user, before the server starts. |
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64) plus a warmed `npx` cache for the built-in Chrome MCP connector (`chrome-devtools-mcp`). Pass `--build-arg INSTALL_CHROME=false` to skip both, dropping the image size and the `/opt/google/chrome/chrome` binary + npx cache for deployments that never enable the connector — it ships hidden from the connector catalog until #1200 lands regardless of this flag. This flag does not change the browser-use sandbox setting. The image defaults to Chromium sandboxing; the published Compose deployment explicitly sets `XAGENT_BROWSER_ALLOW_UNSANDBOXED=true` because its backend runs as root. This weakens Chromium isolation. Run the backend as a non-root user and set the variable to `false` whenever possible. Operator note: the connector launches via `npx` with an exact version pin; on a deployment whose npx cache is cold (a non-Docker install, or an `INSTALL_CHROME=false` image later flipped visible), the first tool call fetches that pinned package from the npm registry, as the backend user, before the server starts. |
 
 ```bash
 docker buildx build \
@@ -371,8 +465,13 @@ group from the lockfile and checks all supported imports during the image build.
 The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
 image.
 
-Custom `SANDBOX_IMAGE` images used with sandboxed uvx MCP connections must
-provide `uvx` on `PATH`; Xagent no longer installs uv dynamically.
+Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox`. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
+
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. **Runs as root under `DockerSandboxService`** (which always execs sandboxed commands as root regardless of the image's own `USER` directive), **but not under Boxlite** — this project's other sandbox backend, sharing this same image, execs as the image's declared `sandbox` user by default. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache`; it is warmed with `umask 0022` and then owned by the image's uid 1100 sandbox user, so both Docker's root execution and Boxlite's unprivileged execution can reuse it and Boxlite can safely update npm metadata on a cache miss. The execution-scoped Chrome controller passes this cache path explicitly to its sandbox child together with `CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1`. The connector's launch config passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`, matching (not exceeding) the same root-Chrome exposure Dockerfile.backend already carries. |
 
 ```bash
 docker buildx build \
@@ -386,8 +485,13 @@ The `Publish Sandbox Image` workflow in
 `.github/workflows/sandbox-publish.yml` publishes release tags and supports
 manual tags. After a new sandbox tag is published, update the `SANDBOX_IMAGE`
 pins in `docker/docker-compose.sandbox.boxlite.yml` and
-`docker/docker-compose.sandbox.docker.yml` to reference it. Rolling back only
-requires restoring the previous sandbox image tag.
+`docker/docker-compose.sandbox.docker.yml` to reference it. Rolling back means
+restoring the previous tag, but the change is not free: Xagent reconciles
+running sandboxes against the new image spec, so they are stopped, deleted and
+recreated. Bind-mounted workspace and upload data survives; the container's
+writable layer (`/tmp`, `$HOME`, packages a tool installed at run time) does not.
+
+The same workflow publishes `docker/README.sandbox.md` as the Docker Hub overview for [`xprobe/xagent-sandbox`](https://hub.docker.com/r/xprobe/xagent-sandbox). That file is the public description of the image, so keep it in step with changes to the `sandbox` dependency group, the runtime requirements above, or the sandbox lifecycle. It only reaches Docker Hub when the image is published, so an edit merged without a release tag will not appear until the next publish.
 
 ### Frontend
 
@@ -496,7 +600,11 @@ GHCR publishing.
    - Add `DOCKERHUB_USERNAME`: Your Docker Hub username
    - Add `DOCKERHUB_PASSWORD`: Your Docker Hub access token (not your password)
      - Create at: https://hub.docker.com/settings/security
-     - Use "Read & Write" permissions for pushing images
+     - "Read & Write" is enough to push images. The sandbox workflow also
+       updates the `xprobe/xagent-sandbox` Hub description with this same
+       token; that step additionally needs "Read, Write, Delete" scope and
+       Admin access on the repository, and is allowed to fail without
+       failing the release when the token lacks them
 
 2. Ensure Docker Hub repositories exist:
    - `xprobe/xagent-backend`
@@ -540,9 +648,30 @@ Key production variables:
 # Database (set via docker-compose.yml)
 DATABASE_URL="postgresql://xagent:password@postgres:5432/xagent"
 
+# Image tag of the bundled postgres service (default: 17-bookworm).
+# Pin "16-bookworm" for a postgres_data volume that v16 initialized.
+POSTGRES_IMAGE_TAG="17-bookworm"
+
 # Security
 ENCRYPTION_KEY="your-encryption-key"
+XAGENT_JWT_SECRET="a-unique-random-secret"
 ```
+
+The stock backend image persists generated encryption and JWT signing keys in
+the shared `xagent_secrets` volume. An explicit `ENCRYPTION_KEY` or strong
+`XAGENT_JWT_SECRET` always takes precedence. On the first upgrade to an image
+with JWT bootstrap support, deployments that still use the exact
+`replace-with-a-long-random-secret` example value receive a generated persistent
+secret; deployments with an existing strong value keep it unchanged.
+Any browser session or password-reset token previously signed with the example
+placeholder is intentionally invalid after that first startup, so users must
+sign in again.
+
+This release also replaces wildcard credentialed CORS for private API routes
+with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,
+list every other trusted browser origin that calls non-widget APIs as a
+comma-separated value. Public `/api/widget/` embedding remains origin-agnostic
+and credential-free.
 
 ### Volumes
 
@@ -550,6 +679,7 @@ Data persists in Docker volumes:
 
 - `postgres_data` - PostgreSQL database
 - `xagent_data` - User data (~/.xagent/)
+- `xagent_secrets` - Generated encryption and JWT signing keys
 - `xagent_uploads` - Uploaded files
 
 ### Backup
@@ -561,6 +691,122 @@ docker compose exec postgres pg_dump -U xagent xagent > backup.sql
 # Restore database
 docker compose exec -T postgres psql -U xagent xagent < backup.sql
 ```
+
+### LanceDB full-text index rebuild
+
+Knowledge-base full-text indexes store their tokenizer at build time, so a database created before the jieba tokenizer switch keeps the old one until the index is rebuilt, and no ingestion or maintenance path rebuilds it on its own. Existing deployments run this once; new installations do not need it.
+
+```bash
+# Report what would be rebuilt
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes --dry-run
+
+# Rebuild (exit 1 means at least one table was not rebuilt; safe to re-run)
+docker compose exec backend python -m xagent.migrations.lancedb.rebuild_fts_indexes
+```
+
+Run it inside `backend` so it uses the same `LANCEDB_DIR` as the application. Full context, exit codes and verification are the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
+### PostgreSQL major version upgrade (16 to 17)
+
+The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a v16 directory, exits with `FATAL: database files are incompatible with server`, and restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler`. It does not modify the directory, so pinning `POSTGRES_IMAGE_TAG="16-bookworm"` restores service at any point.
+
+The steps below are the standard major-version path — dump under v16, initialize a fresh v17 cluster, restore. **This is a general method, not a procedure tuned to your deployment: use the backup and verification process you already trust for this database, and rehearse it against a copy first.** Release-level context is the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
+> **Data loss warning:** `docker compose down -v` and removing the live `<project>_postgres_data` volume destroy the database irreversibly. Neither is an upgrade step. Removing the separate `_pg16_backup` copy created in step 4 is expected.
+
+> **Sandbox overlays:** keep the `-f docker/docker-compose.sandbox.*.yml` arguments on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
+
+Set up. `PGVOL` is the Compose-prefixed volume name — find it with `docker volume ls | grep postgres_data`. Keep `BACKUP` outside the checkout; the dump carries password hashes, OAuth tokens, and encrypted provider credentials.
+
+```bash
+PGVOL=xagent_postgres_data
+BACKUP="$HOME/xagent-pg16-backup.sql"
+unset POSTGRES_IMAGE_TAG   # Compose prefers a shell value over .env
+```
+
+**1. Pin v16 and confirm the deployment is healthy.**
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+docker compose exec postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
+```
+
+**2. Stop the writers**, leaving `postgres` running. `nginx` and `frontend` keep serving errors for the whole window; stop them too if that is unacceptable.
+
+```bash
+docker compose stop backend worker scheduler
+```
+
+**3. Back up and record what you will compare against.** An interrupted `pg_dump` still leaves a plausible-looking file, so check the result.
+
+```bash
+docker compose exec -T postgres pg_dump -U xagent -d xagent > "$BACKUP"
+grep -q 'PostgreSQL database dump complete' "$BACKUP" && echo OK || echo 'INCOMPLETE - do not proceed'
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
+```
+
+**4. Stop the stack and copy the v16 volume**, so rollback never depends on the dump alone. No `-v`; `-t 60` lets Postgres finish its shutdown checkpoint. The destination must be a fresh volume, because `cp -a` merges rather than mirrors.
+
+```bash
+docker compose down -t 60
+docker volume rm "${PGVOL}_pg16_backup" 2>/dev/null   # absent on a first attempt
+docker volume create "${PGVOL}_pg16_backup"
+docker run --rm -v "$PGVOL":/from:ro -v "${PGVOL}_pg16_backup":/to alpine sh -c 'cp -a /from/. /to/'
+docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION   # expect: 16
+```
+
+**5. Remove the v16 data directory from the live volume.** The guard blocks the destructive command unless the dump completed and the copy really is v16.
+
+```bash
+if grep -q 'PostgreSQL database dump complete' "$BACKUP" \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+else
+  echo 'PRECONDITIONS NOT MET - nothing changed; do not continue'
+fi
+```
+
+**6. Delete the `POSTGRES_IMAGE_TAG` line from `.env`** and start `postgres`, which initializes a fresh v17 cluster. `pg_isready` needs `-h 127.0.0.1`: during initialization the image runs a temporary server on the Unix socket only, which a socket check reports as ready.
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres pg_isready -h 127.0.0.1 -U xagent -d xagent
+```
+
+**7. Restore and verify.** `ON_ERROR_STOP=1` fails loudly instead of leaving a half-populated database.
+
+```bash
+docker compose exec -T postgres psql -U xagent -d xagent -v ON_ERROR_STOP=1 < "$BACKUP"
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'                        # expect: 17.x
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'    # expect: the step 3 value
+docker compose exec -T postgres vacuumdb -U xagent --all --analyze-in-stages
+```
+
+Those two queries establish only that the schema arrived. Run whatever proves the *data* arrived for your deployment — row counts on the tables you care about, spot checks against recent records, an application smoke test. `vacuumdb` rebuilds the optimizer statistics that `pg_dump` does not carry across.
+
+**8. Bring the writers back, only after your verification passes.**
+
+```bash
+docker compose up -d
+```
+
+**Rollback — valid only until step 8 restarts the writers.** Until then nothing has written to the v16 copy from step 4. Confirm it exists and really is v16 *before* removing anything: `docker run -v` creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+
+```bash
+docker compose down -t 60
+if docker volume inspect "${PGVOL}_pg16_backup" >/dev/null 2>&1 \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+  docker run --rm -v "${PGVOL}_pg16_backup":/from:ro -v "$PGVOL":/to alpine sh -c 'cp -a /from/. /to/'
+  printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+  docker compose up -d
+else
+  echo "BACKUP VOLUME MISSING OR NOT v16 - live data untouched; restore from $BACKUP instead"
+fi
+```
+
+After v17 accepts writes the copy is stale, and copying it back discards everything written since the cutover; recovery from that point means a fresh v17 backup plus reconciliation. Keep the copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
 
 ## Troubleshooting
 
@@ -583,6 +829,24 @@ docker compose exec postgres pg_isready -U xagent
 # Check database logs
 docker compose logs postgres
 ```
+
+### PostgreSQL Won't Start After an Upgrade
+
+`docker compose ps` reports `postgres` as `restarting` and `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. A data directory initialized by an older major version produces this in `docker compose logs postgres`:
+
+```
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 16, which is not compatible with this version 17.11 (Debian 17.11-1.pgdg12+2).
+```
+
+PostgreSQL 17 refuses to open the directory rather than modifying it, so the v16 data is intact. Pin the previous major version to restore service immediately, then upgrade deliberately using [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17).
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+```
+
+If `postgres` still starts on 17 after this, a `POSTGRES_IMAGE_TAG` exported in the shell is overriding `.env`; `unset` it and retry.
 
 ### Rebuild After Code Changes
 

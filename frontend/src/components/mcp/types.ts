@@ -1,3 +1,6 @@
+import type { McpConnectionStatus } from "@/lib/mcp-connection-status"
+import type { OAuthAccountInput } from "@/lib/oauth-account"
+
 // Shared shape for a connector catalog entry / connected MCP app. Kept in one
 // place so the connector dialog and the settings dialog can't drift apart.
 export interface AppIntegration {
@@ -13,11 +16,22 @@ export interface AppIntegration {
   server_id?: number
   transport?: string
   connected_account?: string
+  // Persisted grant state of a builtin OAuth server row, carried over from
+  // GET /api/mcp/servers. The /api/mcp/apps catalog does not send it.
+  connection_status?: McpConnectionStatus | null
+  // Whether the deployment has configured the browser-facing Google Picker
+  // key. The connector still works for files created by Xagent when false;
+  // only the existing-file authorization button is hidden.
+  picker_configured?: boolean
   is_custom?: boolean
   // Canonical connect classification derived on the catalog entry by the
   // backend (mcp_apps.classify_app_auth). Read this instead of re-deriving
   // from provider/required_env so the dialogs can't drift from the backend.
   auth_type?: "builtin_oauth" | "api_key" | "keyless" | "mcp_oauth" | "unconnectable"
+  // Builtin OAuth apps whose provider authorizes on the customer's own
+  // account host: the connect flow asks for this account label before the
+  // popup (oauth-account-dialog.tsx). Absent for every other app.
+  oauth_account_input?: OAuthAccountInput
   launch_config?: {
     command?: string
     args?: string[]
@@ -30,6 +44,13 @@ export interface AppIntegration {
   platform_env_available?: boolean
   // Key-based apps: this user has set their own per-user key.
   user_env_configured?: boolean
+  // Key-based apps: which of launch_config.required_env this user already
+  // has a stored value for - a per-key breakdown of user_env_configured's
+  // all-or-nothing flag (see _app_configured_env_keys in
+  // src/xagent/web/api/mcp.py), so a reconnect for an app with more than
+  // one required key doesn't have to blank a key it can't tell is already
+  // set (submitting blank for a key clears it - see connect_mcp_app).
+  configured_env_keys?: string[]
   // Key-based apps: the user's current env-source pick, if any.
   env_source?: "own" | "shared" | "platform" | null
   // Whether this entry may be selected into an agent, decided by the backend

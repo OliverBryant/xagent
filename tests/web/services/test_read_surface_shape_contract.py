@@ -9,9 +9,9 @@ event below is not one of those four; it reuses the ``task_info``
 event's already-fetched tuple instead of calling the adapter a second
 time for a value that cannot have changed. Already covered structurally
 by the static guards in ``test_interaction_rollout_guards.py``. What
-this file proves is behavioral: that the switch did not change what any
-of the five call sites puts on the wire. Each of the compatibility
-view's seven tiers is
+this file proves is behavioral: all five call sites expose the same
+public question projection, without the legacy transcript's generated
+interaction appendix. Each of the compatibility view's seven tiers is
 constructed once (real writes for every tier except the two the database
 schema or a code path makes otherwise unreachable, exactly as
 ``test_task_interaction_service.py`` and ``test_task_interaction_read.py``
@@ -53,13 +53,14 @@ from sqlalchemy.orm import Session
 
 import xagent.web.api.websocket as websocket_module
 import xagent.web.services.task_interaction_service as interaction_service_module
+from tests.shared.auth_database import auth_db_override
 from tests.web.services.task_interaction_schema_shared import anchor_event_id
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
-from xagent.core.agent.transcript import build_assistant_transcript_content
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
 from xagent.web.api.chat import chat_router
 from xagent.web.api.v1 import v1_router
+from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import (
     Base,
     get_db,
@@ -151,7 +152,20 @@ class _Environment:
 
 
 @pytest.fixture(scope="module")
-def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environment]:
+def _environment(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[_Environment]:
+    from xagent.web.models import database
+
+    previous = database._SessionLocal, database._engine
+
+    def restore_database_binding() -> None:
+        current = database._engine
+        database._SessionLocal, database._engine = previous
+        if current is not None and current is not previous[1]:
+            current.dispose()
+
+    request.addfinalizer(restore_database_binding)
     db_path = tmp_path_factory.mktemp("read_surface_shape_contract") / "test.db"
     init_db(db_url=f"sqlite:///{db_path}")
     engine = get_engine()
@@ -172,6 +186,7 @@ def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environm
     app.include_router(chat_router)
     app.include_router(v1_router)
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_auth_db] = auth_db_override(_override_get_db)
     client = TestClient(app)
 
     status_response = client.get("/api/auth/setup-status")
@@ -217,16 +232,17 @@ def _environment(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Environm
     assert key_resp.status_code == 200, key_resp.text
     api_key_headers = {"Authorization": f"Bearer {key_resp.json()['full_key']}"}
 
-    yield _Environment(
-        client=client,
-        session_factory=session_factory,
-        user_id=user_id,
-        agent_id=agent_id,
-        jwt_headers=jwt_headers,
-        api_key_headers=api_key_headers,
-    )
-
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield _Environment(
+            client=client,
+            session_factory=session_factory,
+            user_id=user_id,
+            agent_id=agent_id,
+            jwt_headers=jwt_headers,
+            api_key_headers=api_key_headers,
+        )
+    finally:
+        Base.metadata.drop_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +361,9 @@ def _build_t0(env: _Environment) -> _Tier:
         )
     finally:
         db.close()
-    # persist_assistant_message stores the interaction descriptors folded
-    # into the transcript text itself (build_assistant_transcript_content),
-    # not just the raw string passed in -- the stored question is that
-    # combined form, which is what every call site actually reads back.
-    expected_question = build_assistant_transcript_content(
-        raw_content, _LEGACY_INTERACTIONS
-    )
-    return _Tier("T0", task_id, expected_question, _LEGACY_INTERACTIONS)
+    # The stored transcript includes the generated interaction appendix,
+    # but public callers expose the introduction and form fields separately.
+    return _Tier("T0", task_id, raw_content, _LEGACY_INTERACTIONS)
 
 
 def _build_t1(env: _Environment) -> _Tier:
@@ -375,10 +386,7 @@ def _build_t1(env: _Environment) -> _Tier:
         )
     finally:
         db.close()
-    expected_question = build_assistant_transcript_content(
-        raw_content, _LEGACY_INTERACTIONS
-    )
-    return _Tier("T1", task_id, expected_question, _LEGACY_INTERACTIONS)
+    return _Tier("T1", task_id, raw_content, _LEGACY_INTERACTIONS)
 
 
 def _build_t2(env: _Environment) -> _Tier:
@@ -762,10 +770,6 @@ def test_a_relabelled_question_reaches_the_wire_instead_of_the_default_message(
         )
     finally:
         db.close()
-    expected_question = build_assistant_transcript_content(
-        raw_content, _LEGACY_INTERACTIONS
-    )
-
     _disable_websocket_cache(monkeypatch)
     snapshot = websocket_module._load_historical_stream_snapshot_sync(
         task_id,
@@ -776,8 +780,8 @@ def test_a_relabelled_question_reaches_the_wire_instead_of_the_default_message(
 
     event = _status_reassertion_event(snapshot)
     assert event["message"] != _DEFAULT_WAITING_MESSAGE
-    assert event["message"] == expected_question
-    assert event["question"] == expected_question
+    assert event["message"] == raw_content
+    assert event["question"] == raw_content
     assert event["interactions"] == _LEGACY_INTERACTIONS
 
 

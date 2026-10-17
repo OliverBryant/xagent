@@ -97,6 +97,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --group backend-image \
     ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}
 
+# A raw backend image must reach its local combined-mode startup admission
+# without deployment-only Redis or encryption configuration. A configured
+# worker pool or split host still selects shared execution and strict validation.
+RUN env -u XAGENT_SHARED_TASK_EXECUTION_ENABLED \
+        -u XAGENT_TASK_EXECUTION_ROLE \
+        -u XAGENT_WORKER_COUNT \
+        -u XAGENT_REDIS_URL \
+        -u ENCRYPTION_KEY \
+        /opt/venv/bin/python -c \
+        'from xagent.config import get_shared_task_execution_enabled, validate_task_execution_host_config; assert not get_shared_task_execution_enabled(); validate_task_execution_host_config()'
+
 ############################
 # Runtime
 ############################
@@ -108,6 +119,12 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV NODE_PATH="/opt/xagent/frontend/node_modules"
+# Chromium sandboxing stays enabled by default. The published Compose
+# deployment runs this image as root for its existing mounted-volume
+# integrations, so docker-compose.yml opts into the compatibility flag
+# explicitly. Direct deployments should run as a non-root user; only set
+# XAGENT_BROWSER_ALLOW_UNSANDBOXED=true when that is not possible.
+ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=false
 
 WORKDIR /opt/xagent
 
@@ -120,7 +137,6 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    docker.io \
     gnupg \
     openssl \
     libreoffice \
@@ -161,6 +177,24 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker CLI only: no daemon runs here, so docker.io's engine + containerd +
+# runc are dead weight. Swapped rather than dropped because command_policy.py
+# gates the agent shell by path -- /usr/bin/docker must stay. arch must come
+# from `dpkg --print-architecture` or the arm64 image breaks.
+# --no-install-recommends drops buildx/compose (+109 MiB): plain `docker build`
+# still works via the legacy builder, DOCKER_BUILDKIT=1 hard-errors. Supported
+# paths are the Python SDK and the sandbox overlay, not ad-hoc CLI builds.
+# See https://github.com/xorbitsai/xagent/pull/1807
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && test -x /usr/bin/docker \
+    && docker --version \
+    && ! command -v dockerd \
+    && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/docker.list /usr/share/keyrings/docker.gpg
+
 # Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp).
 # Gated behind INSTALL_CHROME (default true: the default build invocation is
 # unchanged, but the resulting image gains a Chrome install and a warmed npx
@@ -170,15 +204,10 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
 # image. A build ARG is the actual release gate for the image; deployments
 # that never intend to enable this connector can pass
 # --build-arg INSTALL_CHROME=false to drop the image size and the
-# /opt/google/chrome/chrome binary + npx cache. That flag does NOT remove
-# all root/--no-sandbox browser exposure from the image: Playwright Chromium
-# is installed unconditionally in a separate stage below and is already
-# launched with --no-sandbox as root by the pre-existing browser_use tool,
-# independent of this connector and this flag. Also note the container has
-# no USER directive anywhere (root throughout, pre-existing and out of scope
-# here) -- see the follow-up issue tracking both that (scoped to cover the
-# generic custom-MCP-server path too, not just this connector's visibility
-# toggle) and the security review needed before unhiding.
+# /opt/google/chrome/chrome binary + npx cache. Playwright Chromium is
+# installed unconditionally in a separate stage below. The published backend
+# image still runs as root. The Compose deployment supplies the explicit
+# compatibility opt-in; direct non-root deployments keep Chromium sandboxed.
 ARG INSTALL_CHROME=true
 # Distinct from the Playwright Chromium below, which chrome-devtools-mcp does
 # not detect. Its default "stable" channel resolution checks exactly
@@ -275,6 +304,13 @@ ARG XAGENT_BUILD_TIME=""
 ENV XAGENT_VERSION=${XAGENT_VERSION}
 ENV XAGENT_GIT_COMMIT=${XAGENT_GIT_COMMIT}
 ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
+
+# The published backend image is the team/self-hosting artifact: run one web
+# process plus two Agent workers by default.  The entrypoint creates or reuses a
+# private key at this path; Compose mounts it on the persistent secrets volume.
+ENV XAGENT_WORKER_COUNT=2
+ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key
+ENV XAGENT_JWT_SECRET_FILE=/run/xagent-secrets/jwt.secret
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

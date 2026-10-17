@@ -9,22 +9,14 @@ import pytest
 
 from xagent.core.agent import (
     Agent,
-    ContextManager,
     ExecutionContext,
     ExecutionLifecycleStatus,
     PatternRuntime,
 )
 from xagent.core.agent import registry as registry_module
+from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.registry import ExecutionRegistry
-from xagent.core.agent.runner import AgentRunner
-
-
-@pytest.fixture(autouse=True)
-def reset_context_manager() -> None:
-    manager = ContextManager()
-    manager._contexts.clear()  # type: ignore[attr-defined]
-    yield
-    manager._contexts.clear()  # type: ignore[attr-defined]
+from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 
 
 @dataclass
@@ -117,6 +109,14 @@ class BlockingPattern:
         return {"success": True, "output": "unreachable"}
 
 
+class CheckpointFailingPattern:
+    """Raises the typed durability error, as a real pattern does when its
+    checkpoint writer refuses the write mid-run."""
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise CheckpointPersistenceError("after_tool checkpoint failed")
+
+
 @pytest.mark.asyncio
 async def test_registry_routes_live_execution_control_and_resume(
     tmp_path: Path,
@@ -151,15 +151,15 @@ async def test_registry_routes_live_execution_control_and_resume(
     assert registry.get_status(execution_id) == stored.to_dict()
     assert registry.list_statuses() == [stored.to_dict()]
 
-    context = await registry.post_user_message(
+    result = await registry.post_user_message(
         execution_id,
         "Reply with only the number.",
         request_interrupt=False,
     )
-    assert context is not None
+    assert result.context is not None
     assert any(
         message.role == "user" and message.content == "Reply with only the number."
-        for message in context.messages
+        for message in result.context.messages
     )
 
     resumed_agent = Agent(
@@ -224,6 +224,48 @@ async def test_registry_emits_lifecycle_and_message_events(
     assert events[2]["execution_message"] == "Reply with only the number."
     assert registry.unsubscribe(subscription_id) is True
     assert registry.unsubscribe(subscription_id) is False
+
+
+@pytest.mark.asyncio
+async def test_registry_does_not_emit_message_posted_for_outcome_unknown(
+    tmp_path: Path,
+) -> None:
+    """An available context is not evidence that the turn was posted."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-unknown-event"
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    registry.subscribe(events.append)
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, execution_id)]
+
+    handle = registry.start(runner, execution_id=execution_id, task="Calculate 6*7")
+    await handle.task
+
+    unknown_context = ExecutionContext(execution_id=execution_id)
+
+    async def fake_inject_user_message(*_args: Any, **_kwargs: Any) -> Any:
+        from xagent.core.agent.runner import UserMessageInjectionResult
+
+        return UserMessageInjectionResult(
+            context=unknown_context,
+            outcome=UserMessageInjectionOutcome.OUTCOME_UNKNOWN,
+        )
+
+    runner.inject_user_message = fake_inject_user_message  # type: ignore[method-assign]
+
+    result = await registry.post_user_message(
+        execution_id, "Reply", request_interrupt=False
+    )
+
+    assert result.outcome is UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    event_types = [event["type"] for event in events]
+    assert "execution.message_posted" not in event_types
 
 
 @pytest.mark.asyncio
@@ -336,6 +378,37 @@ async def test_registry_cancelled_execution_cannot_resume(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_registry_resume_settles_a_checkpoint_failure_as_non_resumable(
+    tmp_path: Path,
+) -> None:
+    """A durability failure during resume must not leave the handle resumable.
+
+    Before this fix, ``ExecutionRegistry.resume()`` had no exception handling
+    around ``handle.runner.resume()``: a raised ``CheckpointPersistenceError``
+    exited before ``_apply_result``/``unregister`` ran, so the retained handle
+    stayed advertised as resumable. A caller could then resume it again and
+    repeat whatever non-idempotent work already happened before the failure.
+    """
+
+    registry = ExecutionRegistry()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[CheckpointFailingPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    handle = registry.register("exec-resume-checkpoint-failure", runner)
+    handle.status = ExecutionLifecycleStatus.WAITING_FOR_USER
+
+    with pytest.raises(CheckpointPersistenceError):
+        await registry.resume("exec-resume-checkpoint-failure")
+
+    assert registry.get("exec-resume-checkpoint-failure") is None
+
+    # A second resume on the same execution id must come back None (unknown
+    # handle) rather than silently retrying the same non-idempotent work.
+    assert await registry.resume("exec-resume-checkpoint-failure") is None
+
+
+@pytest.mark.asyncio
 async def test_registry_unregisters_completed_execution_tasks(tmp_path: Path) -> None:
     registry = ExecutionRegistry()
     runner = AgentRunner(
@@ -359,9 +432,10 @@ async def test_registry_unregisters_completed_execution_tasks(tmp_path: Path) ->
 async def test_registry_returns_none_for_unknown_execution_on_message_post() -> None:
     registry = ExecutionRegistry()
 
-    context = await registry.post_user_message("missing", "hello")
+    result = await registry.post_user_message("missing", "hello")
 
-    assert context is None
+    assert result.context is None
+    assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
 
 
 @pytest.mark.asyncio
@@ -408,6 +482,30 @@ async def test_registry_registers_handle_metadata() -> None:
     assert handle.to_dict()["is_resumable"] is False
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"success": True, "status": "completed"},
+        {"success": False, "status": "waiting_for_user"},
+        {"success": False, "status": "failed", "error": "tool failed"},
+    ],
+)
+def test_registry_reports_unknown_input_as_interrupted_whatever_the_run_said(
+    result: dict[str, Any],
+) -> None:
+    runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))
+    registry = ExecutionRegistry()
+    events: list[dict[str, Any]] = []
+    handle = registry.register("exec-unknown", runner, requested_task="task")
+    registry.subscribe(events.append)
+
+    registry._apply_result(handle, {**result, "injection_outcome_unknown": True})
+
+    assert handle.status == ExecutionLifecycleStatus.INTERRUPTED
+    assert [event["type"] for event in events] == ["execution.interrupted"]
+    assert handle.last_error == result.get("error")
+
+
 @pytest.mark.asyncio
 async def test_registry_emits_registered_event_for_manual_handle_registration() -> None:
     runner = AgentRunner(agent=Agent(name="writer", patterns=[SuccessfulPattern()]))
@@ -449,6 +547,63 @@ async def test_registry_cancel_non_running_handle_marks_terminal_and_unregisters
         "execution.cancelled",
     ]
     assert events[-1]["handle"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_registry_post_user_message_reports_fresh_vs_replay(
+    tmp_path: Path, scenario: str
+) -> None:
+    """The registry layer forwards AgentRunner.inject_user_message's report
+    unmodified: a first write is POSTED_FRESH, a repeat of the same turn id
+    with the same content short-circuits as POSTED_REPLAY without a second
+    write, and a repeat with different content still raises -- the
+    pre-existing conflict behavior, untouched by this contract."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-registry-fresh-replay"
+    registry = ExecutionRegistry()
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, execution_id)]
+    handle = registry.start(runner, execution_id=execution_id, task="Calculate 6*7")
+    await handle.task
+
+    first = await registry.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="turn-registry-fresh-replay",
+        request_interrupt=False,
+    )
+    assert first.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert first.context is not None
+
+    if scenario == "fresh":
+        return
+
+    if scenario == "replay":
+        second = await registry.post_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="turn-registry-fresh-replay",
+            request_interrupt=False,
+        )
+        assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+        # The idle context was evicted, so the replay is read from the checkpoint.
+        assert second.context is not None
+        return
+
+    assert scenario == "conflicting_content"
+    with pytest.raises(ValueError, match="different user message"):
+        await registry.post_user_message(
+            execution_id,
+            "Choose C",
+            turn_id="turn-registry-fresh-replay",
+            request_interrupt=False,
+        )
 
 
 @pytest.mark.asyncio

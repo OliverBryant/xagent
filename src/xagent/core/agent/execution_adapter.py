@@ -12,10 +12,16 @@ from ..task_runtime import (
 )
 from .agent import Agent
 from .attachments import build_image_context_references
+from .budget import BudgetPolicyProvider
+from .interruption import (
+    INTERRUPTION_REASON_KEY,
+    classify_run_result,
+    interruption_reason_value,
+)
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
-from .result import NO_OUTPUT_PLACEHOLDER
-from .runner import AgentRunner
+from .result import NO_OUTPUT_PLACEHOLDER, normalize_tool_failure_code
+from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
 logger = logging.getLogger(__name__)
@@ -35,6 +41,7 @@ class AgentExecutionConfig:
     tracer: Any | None = None
     system_prompt: str | None = None
     workspace_base_dir: str = "workspace"
+    workspace_enabled: bool = True
     allowed_external_dirs: list[str] | None = None
     scope_segments: tuple[str, ...] = ()
     current_task_id: str | None = None
@@ -56,7 +63,12 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    # Capability gate: False overrides an explicitly supplied manager/list.
+    skills_enabled: bool = True
+    user_interaction_enabled: bool = True
     preferred_input_modalities: tuple[str, ...] = ()
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
+    budget_policy_provider: BudgetPolicyProvider | None = None
 
 
 class AgentExecutionAdapter:
@@ -157,6 +169,12 @@ class AgentExecutionAdapter:
         # Carry the mid-run quota checker into the resumed run too, so a
         # paused-and-resumed continuation is gated like a fresh run.
         kwargs.setdefault("interrupt_checker", self.config.interrupt_checker)
+        # The handle may have been built by post_user_message before the
+        # host installed the outbound handler, so re-read it from config
+        # for the resumed run (#1328).
+        kwargs.setdefault(
+            "outbound_message_handler", self.config.outbound_message_handler
+        )
         resume_metadata = dict(kwargs.get("metadata") or {})
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
@@ -174,6 +192,10 @@ class AgentExecutionAdapter:
                 metadata=self._execution_metadata(execution_type=execution_type),
             )
         else:
+            # AgentService may have rebuilt the tool objects after a connection
+            # or policy change. A paused runner still holds the previous list.
+            handle.runner.agent.tools = self.config.tools
+            handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
             )
@@ -198,7 +220,7 @@ class AgentExecutionAdapter:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> bool:
+    ) -> UserMessageInjectionOutcome:
         if self.registry.get(execution_id) is None:
             runner, execution_type = self._build_runner()
             self.registry.register(
@@ -206,7 +228,7 @@ class AgentExecutionAdapter:
                 runner,
                 metadata=self._execution_metadata(execution_type=execution_type),
             )
-        context = await self.registry.post_user_message(
+        result = await self.registry.post_user_message(
             execution_id,
             message,
             execution_message=execution_message,
@@ -216,7 +238,7 @@ class AgentExecutionAdapter:
             request_interrupt=request_interrupt,
             reason=reason,
         )
-        return context is not None
+        return result.outcome
 
     def cancel(self, execution_id: str, reason: str | None = None) -> bool:
         return self.registry.cancel(execution_id, reason=reason)
@@ -240,6 +262,7 @@ class AgentExecutionAdapter:
         include_request_context: bool = False,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
+            **self.config.execution_metadata,
             "execution_type": execution_type,
             "pattern": self.config.pattern,
         }
@@ -257,8 +280,10 @@ class AgentExecutionAdapter:
 
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()
-        skill_manager = self.config.skill_manager
-        if skill_manager is None:
+        skill_manager = (
+            self.config.skill_manager if self.config.skills_enabled else None
+        )
+        if self.config.skills_enabled and skill_manager is None:
             from ...skills.utils import create_skill_manager
 
             skill_manager = create_skill_manager(
@@ -271,18 +296,25 @@ class AgentExecutionAdapter:
             llm=self.config.llm,
             compact_llm=self.config.compact_llm,
             system_prompt=self.config.system_prompt,
-            metadata={"pattern": self.config.pattern},
+            metadata={
+                **self.config.execution_metadata,
+                "pattern": self.config.pattern,
+            },
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
-            allowed_skills=self.config.allowed_skills,
+            allowed_skills=(
+                self.config.allowed_skills if self.config.skills_enabled else None
+            ),
         )
         return (
             AgentRunner(
+                budget_policy_provider=self.config.budget_policy_provider,
                 agent=agent,
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
+                workspace_enabled=self.config.workspace_enabled,
                 scope_segments=self.config.scope_segments,
                 outbound_message_handler=self.config.outbound_message_handler,
             ),
@@ -295,6 +327,7 @@ class AgentExecutionAdapter:
                 DAGPattern(
                     LLMPlanGenerator(),
                     max_concurrency=self.config.dag_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_dag",
             )
@@ -305,10 +338,12 @@ class AgentExecutionAdapter:
                         max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                 ),
                 "agent_auto",
@@ -316,10 +351,17 @@ class AgentExecutionAdapter:
         if self.config.pattern == "single_call":
             return (
                 ReActPattern(
+                    # Two counted iterations: the tool call and the answer.
+                    # Each stored-result read on the forced answer turn, and
+                    # each read refused there because its path is not a
+                    # stored result, adds one more on top
+                    # (forced_answer_extra_iterations), so a read does not use
+                    # up the answer's iteration.
                     max_iterations=2,
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
                     tool_max_concurrency=self.config.tool_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_single_call",
             )
@@ -328,6 +370,7 @@ class AgentExecutionAdapter:
                 max_iterations=self.config.react_max_iterations,
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
+                user_interaction_enabled=self.config.user_interaction_enabled,
             ),
             "agent_react",
         )
@@ -414,17 +457,42 @@ class AgentExecutionAdapter:
             "success": result.get("success", False),
             "error": result.get("error"),
             "metadata": {
+                **self.config.execution_metadata,
                 "agent_name": self.config.name,
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,
                 "task_id": execution_id,
             },
             "agent_result": result,
+            "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome
             normalized["metadata"]["completion_outcome"] = completion_outcome
+        termination_reason = result.get("termination_reason")
+        if termination_reason in ("max_iterations", "step_failed", "token_budget"):
+            normalized["termination_reason"] = termination_reason
+            normalized["metadata"]["termination_reason"] = termination_reason
+        # The supported contract for whatever settles the run; only a value
+        # the classifier recognises crosses this boundary.
+        if not result.get("success"):
+            interruption_reason = interruption_reason_value(classify_run_result(result))
+            if interruption_reason is not None:
+                normalized[INTERRUPTION_REASON_KEY] = interruption_reason
+                normalized["metadata"][INTERRUPTION_REASON_KEY] = interruption_reason
+        # The provider failure behind a failed run travels in its own keys;
+        # ``output`` above is still backfilled from ``error``. Only a
+        # well-formed value crosses this boundary.
+        diagnostic_error = result.get("diagnostic_error")
+        if type(diagnostic_error) is str and diagnostic_error.strip():
+            normalized["diagnostic_error"] = diagnostic_error
+        model_error = result.get("model_error")
+        if type(model_error) is dict:
+            normalized["model_error"] = model_error
+        failure_code = normalize_tool_failure_code(result.get("failure_code"))
+        if failure_code is not None:
+            normalized["failure_code"] = failure_code
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

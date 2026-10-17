@@ -17,6 +17,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import (
+    GUARD_TIMEOUT,
+    LOOP_LIVENESS_TICKS,
+    gated_pool_checkout,
+    wait_for_ticks,
+)
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.task_runtime import TaskRuntimeContext
 from xagent.core.tools.adapters.vibe.config import (
@@ -32,6 +38,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.tool_config import ToolConfig
 from xagent.web.models.user import User
+from xagent.web.services import agent_service_manager as agent_runtime_service
 from xagent.web.services.tool_credentials import (
     set_user_tool_allowlist_hook,
     set_user_tool_overrides_hook,
@@ -357,12 +364,21 @@ def test_live_db_path_unchanged():
     cfg.close()  # must not raise; caller owns the request session
 
 
+def test_get_voice_defaults_to_none_when_not_passed():
+    """Every construction site that doesn't have a resolved voice in hand
+    (or predates the voice feature) omits the parameter - get_voice() must
+    degrade to the same no-op apply_output_voice already treats as
+    "no voice", not raise or silently return something else."""
+    cfg = WebToolConfig(db=None, request=None)
+    assert cfg.get_voice() is None
+
+
 @pytest.mark.asyncio
 async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch,
 ):
     """The chat bootstrap delegates all runtime preparation to ToolFactory."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     session_factory = object()
     captured: dict[str, object] = {}
@@ -380,10 +396,7 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     async def create_tools(config):
         return ["prepared-tool"]
 
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", session_factory)
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
@@ -412,7 +425,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
     monkeypatch,
     agent_config,
 ):
-    from xagent.web.api.chat import AgentServiceManager
+    from xagent.web.services.agent_service_manager import AgentServiceManager
 
     captured: dict[str, object] = {}
 
@@ -427,7 +440,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        "xagent.web.api.chat.create_default_tools",
+        "xagent.web.services.agent_service_manager.create_default_tools",
         fake_create_default_tools,
     )
 
@@ -453,7 +466,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
 async def test_create_default_tools_preserves_legacy_positional_owner(
     monkeypatch,
 ):
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     captured: dict[str, object] = {}
 
@@ -467,10 +480,7 @@ async def test_create_default_tools_preserves_legacy_positional_owner(
     async def create_tools(_config):
         return []
 
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
@@ -490,8 +500,7 @@ async def test_create_default_tools_preserves_legacy_positional_owner(
 async def test_create_default_tools_skips_runtime_workspace_without_providers(
     monkeypatch,
 ):
-    import xagent.web.api.chat as chat_module
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     class _FakeToolConfig:
         def __init__(self, **kwargs):
@@ -510,14 +519,11 @@ async def test_create_default_tools_skips_runtime_workspace_without_providers(
         raise AssertionError("runtime build must not run without providers")
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
-    monkeypatch.setattr(chat_module, "build_task_runtime", unexpected_runtime)
-    monkeypatch.setattr(chat_module, "registered_task_extensions", lambda: ())
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", unexpected_runtime)
+    monkeypatch.setattr(agent_runtime_service, "registered_task_extensions", lambda: ())
 
     tools, config = await create_default_tools(
         None,
@@ -540,8 +546,7 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
     monkeypatch,
     caplog,
 ):
-    import xagent.web.api.chat as chat_module
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
     from xagent.web.services.task_runtime import TaskRuntimeExtensionError
 
     class _FakeToolConfig:
@@ -571,19 +576,16 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
         )
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(
         ToolFactory,
         "create_workspace",
         lambda _config: SimpleNamespace(id="workspace"),
     )
-    monkeypatch.setattr(chat_module, "build_task_runtime", fail_runtime)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", fail_runtime)
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "registered_task_extensions",
         lambda: ("broken_runtime",),
     )
@@ -611,7 +613,6 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
     monkeypatch,
     caplog,
 ):
-    import xagent.web.api.chat as chat_module
     from xagent.core.task_runtime import (
         TaskRuntimeContribution,
         merge_task_runtime_contributions,
@@ -619,7 +620,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
     from xagent.core.tools.adapters.vibe.config import (
         ToolConfig as StandaloneToolConfig,
     )
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
 
     core_tool = SimpleNamespace(
         name="computer",
@@ -666,10 +667,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
         )
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(
         ToolRegistry,
         "create_registered_tools",
@@ -680,9 +678,9 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
         "create_workspace",
         lambda _config: SimpleNamespace(id="workspace"),
     )
-    monkeypatch.setattr(chat_module, "build_task_runtime", build_runtime)
+    monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
     monkeypatch.setattr(
-        chat_module,
+        agent_runtime_service,
         "registered_task_extensions",
         lambda: ("desktop_runtime",),
     )
@@ -708,7 +706,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
 @pytest.mark.asyncio
 async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkeypatch):
     """The prefetched agent policy must include the excluded agent ID."""
-    from xagent.web.api.chat import create_default_tools
+    from xagent.web.services.agent_service_manager import create_default_tools
     from xagent.web.tools.config import _ToolFactoryRuntimeSnapshot
 
     plans = []
@@ -725,10 +723,7 @@ async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkey
         "xagent.web.tools.config._load_tool_factory_runtime_snapshot",
         load_runtime_snapshot,
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", session_factory)
     monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", create_tools)
 
     tools, _ = await create_default_tools(
@@ -789,25 +784,29 @@ async def test_tool_factory_credential_prefetch_waits_off_event_loop(tmp_path):
     async def build_tools() -> list:
         return await ToolFactory.create_all_tools(cfg)
 
-    ticker_task = asyncio.create_task(ticker())
-    build_task = asyncio.create_task(build_tools())
-    try:
-        await asyncio.sleep(0.08)
-        assert ticks >= 4
-        assert not build_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        build_task = asyncio.create_task(build_tools())
+        try:
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not build_task.done()
 
-        held_connection.close()
-        await build_task
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        if not build_task.done():
-            build_task.cancel()
+            gate.let_through()
+            await asyncio.wait_for(build_task, timeout=GUARD_TIMEOUT)
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            if not build_task.done():
+                build_task.cancel()
             await asyncio.gather(build_task, return_exceptions=True)
-        stop.set()
-        await ticker_task
-        cfg.close()
-        engine.dispose()
+            stop.set()
+            await ticker_task
+            cfg.close()
+            engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -2436,6 +2435,208 @@ def test_runtime_policy_propagates_later_input_checkout_timeout():
         set_user_tool_allowlist_hook(None)
 
 
+# --------------------------------------------------------------------------- #
+# Fail-closed policy resolution (xagent #1739)
+#
+# The policy hooks are how a registering application enforces authorization. On
+# the two branches below the hook never runs, so the application has nothing to
+# intercept: reporting "no policy configured" would build the globally available
+# tool set and run the turn unrestricted.
+# --------------------------------------------------------------------------- #
+class _UserReloadSession:
+    """Session whose ``User`` reload misbehaves in a configurable way."""
+
+    def __init__(self, mode: str):
+        self._mode = mode
+        self.closed = False
+
+    def connection(self):
+        return object()
+
+    def query(self, *_args, **_kwargs):
+        if self._mode == "raise":
+            raise RuntimeError("user reload failed")
+        if self._mode == "cancel":
+            raise asyncio.CancelledError()
+        return _ListChain([] if self._mode == "missing" else [SimpleNamespace(id=1)])
+
+    def close(self):
+        self.closed = True
+
+
+def _policy_snapshot_for(mode: str, *, overrides=None, allowlist=None):
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(overrides or (lambda _db, _user: {}))
+    set_user_tool_allowlist_hook(allowlist or (lambda _db, _user: None))
+    try:
+        return _load_tool_runtime_policy_snapshot(session_factory, 1), sessions
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_denies_every_tool_when_user_reload_fails(mode):
+    # ``raise`` is an ordinary loader failure; ``missing`` is a reload that
+    # returns None. Both used to yield overrides={} / allowlist=None, which the
+    # factory reads as "no disable set, no positive filter" — the full tool set.
+    snapshot, sessions = _policy_snapshot_for(
+        mode,
+        # A permissive-looking hook makes the point: even when the policy would
+        # have allowed something, an unresolved read grants nothing.
+        allowlist=lambda _db, _user: ["file", "shell"],
+    )
+
+    assert snapshot.tool_allowlist == []
+    # The overrides mapping stays a dict: the tool-listing API indexes it.
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_keeps_a_healthy_read_unrestricted():
+    # The guard above must be conditional, not a blanket deny: a resolvable
+    # policy is passed through untouched. Without this case, an implementation
+    # that denied every turn would satisfy the two tests above.
+    snapshot, _ = _policy_snapshot_for(
+        "ok",
+        overrides=lambda _db, _user: {"file": {"enabled": False}},
+        allowlist=lambda _db, _user: ["shell"],
+    )
+
+    assert snapshot.tool_allowlist == ["shell"]
+    assert snapshot.tool_overrides == {"file": {"enabled": False}}
+
+
+def test_runtime_policy_keeps_a_healthy_read_without_an_allowlist():
+    # "No allowlist configured" is a legitimate resolved answer and must stay
+    # ``None`` (no filtering) rather than collapsing into the deny-all value.
+    snapshot, _ = _policy_snapshot_for("ok")
+
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_stays_open_without_a_registered_hook(mode):
+    """Standalone xagent must keep its unrestricted default."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(None)
+    set_user_tool_allowlist_hook(None)
+    snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+    # No hook registered means no policy to lose: denying every tool here would
+    # break every deployment that never delegated authorization to a hook.
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_still_propagates_pool_timeouts():
+    """A pool timeout is retried by the caller, not converted to deny-all."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    checkout_timeout = SQLAlchemyTimeoutError("overrides checkout timed out")
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession(checkout_error=checkout_timeout)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert exc_info.value is checkout_timeout
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_still_propagates_cancellation():
+    """CancelledError is a BaseException and must not be swallowed."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession("cancel")
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_denies_when_only_the_overrides_read_fails():
+    """An unresolved overrides read must not be rescued by a healthy allowlist.
+
+    The two inputs load through independent Sessions, so one can succeed while
+    the other fails. The disable set the hook would have returned is unknown, so
+    the allowlist it did return cannot be trusted to be complete.
+    """
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_overrides(db: _PostgresAbortSession, _user):
+        db.swallow_statement_failure()
+        raise RuntimeError("overrides read failed")
+
+    allowlist_hook_called = False
+
+    def load_allowlist(_db, _user):
+        nonlocal allowlist_hook_called
+        allowlist_hook_called = True
+        return ["file"]
+
+    set_user_tool_overrides_hook(load_overrides)
+    set_user_tool_allowlist_hook(load_allowlist)
+    try:
+        snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        # The independent allowlist read still runs (its own Session is clean)…
+        assert allowlist_hook_called is True
+        # …but the unresolved overrides input still denies the turn.
+        assert snapshot.tool_allowlist == []
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
 @pytest.mark.asyncio
 async def test_default_model_prefetch_returns_every_pool_checkout(
     monkeypatch,
@@ -2632,28 +2833,34 @@ async def test_runtime_policy_refresh_waits_for_pool_off_event_loop(tmp_path):
             ticks += 1
             await asyncio.sleep(0.01)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.sleep(0.02)
-        ticks_before_wait = ticks
-        refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
-        await asyncio.sleep(0.08)
-        assert ticks - ticks_before_wait >= 4
-        assert not refresh_task.done()
+    with gated_pool_checkout(engine) as gate:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            refresh_task = asyncio.create_task(cfg.refresh_runtime_policy())
+            await gate.wait_until_contending()
+            observed = await wait_for_ticks(lambda: ticks)
+            assert observed >= LOOP_LIVENESS_TICKS
+            assert not refresh_task.done()
 
-        held_connection.close()
-        await refresh_task
-        assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
-        assert cfg.get_user_tool_allowlist() == ["file"]
-    finally:
-        if not held_connection.closed:
             held_connection.close()
-        stop.set()
-        await ticker_task
-        cfg.close()
-        set_user_tool_overrides_hook(None)
-        set_user_tool_allowlist_hook(None)
-        engine.dispose()
+            gate.let_through()
+            await asyncio.wait_for(refresh_task, timeout=GUARD_TIMEOUT)
+            assert cfg.get_user_tool_overrides() == {"calculator": {"enabled": False}}
+            assert cfg.get_user_tool_allowlist() == ["file"]
+        finally:
+            if not held_connection.closed:
+                held_connection.close()
+                gate.let_through()
+            await asyncio.wait_for(
+                asyncio.gather(refresh_task, return_exceptions=True),
+                timeout=GUARD_TIMEOUT,
+            )
+            stop.set()
+            await ticker_task
+            cfg.close()
+            set_user_tool_overrides_hook(None)
+            set_user_tool_allowlist_hook(None)
+            engine.dispose()
 
 
 def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():

@@ -183,6 +183,7 @@ class AgentStore:
             "description": agent.description,
             "template_id": agent.template_id,
             "logo_url": agent.logo_url,
+            "suggested_prompts": ensure_list(agent.suggested_prompts) or [],
             "status": agent.status.value,
             "visibility": agent.visibility,
             "created_at": agent.created_at.isoformat(),
@@ -391,6 +392,9 @@ class AgentStore:
         if visibility is not None and visibility not in _VALID_VISIBILITIES:
             raise ValueError(f"Unsupported agent visibility: {visibility}")
         widget_key = new_widget_key() if widget_enabled else None
+        from .model_service import with_default_general_model
+
+        models = with_default_general_model(self.db, models, user_id=user_id)
         # Agents are created personal (team_id NULL). Team ownership is granted
         # only by an explicit promote (see ``promote_agent_to_team``); a create
         # never stamps the caller's team. ``visibility`` is stored but only

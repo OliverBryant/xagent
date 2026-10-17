@@ -17,7 +17,7 @@ services:
 
   # Xagent Frontend (Next.js)
   frontend:
-    image: xprobe/xagent-frontend:0.7.0
+    image: xprobe/xagent-frontend:0.8.2
     container_name: xagent_frontend
     restart: unless-stopped
     networks:
@@ -31,16 +31,23 @@ services:
 
   # Xagent Backend (FastAPI)
   backend:
-    image: xprobe/xagent-backend:0.7.0
+    image: xprobe/xagent-backend:0.8.2
     container_name: xagent_backend
     restart: unless-stopped
     # Don't expose ports, only accessible through nginx
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      # The published image runs this service as root for its existing volume
+      # layout. Keep the compatibility opt-in explicit here; non-root
+      # deployments should set this to false and use Chromium's sandbox.
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
       - XAGENT_REDIS_URL=redis://redis:6379/0
       - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
       - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
@@ -58,6 +65,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,7 +82,7 @@ services:
 
   # Celery worker for triggers and KB ingestion. Agent execution stays in backend.
   worker:
-    image: xprobe/xagent-backend:0.7.0
+    image: xprobe/xagent-backend:0.8.2
     container_name: xagent_worker
     restart: unless-stopped
     command:
@@ -88,10 +96,14 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
+      - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
+      - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
       - XAGENT_REDIS_URL=redis://redis:6379/0
       - XAGENT_HOT_PATH_CACHE_ENABLED=${XAGENT_HOT_PATH_CACHE_ENABLED:-true}
       - XAGENT_CELERY_ENABLED=${XAGENT_CELERY_ENABLED:-true}
@@ -101,6 +113,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,7 +124,7 @@ services:
 
   # Celery beat schedules trigger scans. It never runs agent execution.
   scheduler:
-    image: xprobe/xagent-backend:0.7.0
+    image: xprobe/xagent-backend:0.8.2
     container_name: xagent_scheduler
     restart: unless-stopped
     command:
@@ -123,6 +136,7 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_REDIS_URL=redis://redis:6379/0
@@ -133,6 +147,7 @@ services:
       - .env
     volumes:
       - xagent_data:/root/.xagent
+      - xagent_secrets:/run/xagent-secrets
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,7 +158,7 @@ services:
 
   # PostgreSQL Database
   postgres:
-    image: postgres:16-bookworm
+    image: postgres:${POSTGRES_IMAGE_TAG:-17-bookworm}
     container_name: xagent_postgres
     restart: unless-stopped
     environment:
@@ -181,6 +196,8 @@ volumes:
   postgres_data:
     driver: local
   xagent_data:
+    driver: local
+  xagent_secrets:
     driver: local
   redis_data:
     driver: local

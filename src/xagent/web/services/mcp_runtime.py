@@ -3,15 +3,84 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Callable, Iterator, Protocol
 
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
-from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
+from .mcp_oauth import (
+    MCPOAuthDiscoveryError,
+    MCPOAuthRuntimeError,
+    mcp_oauth_required_scope,
+    redact_oauth_url_for_diagnostics,
+    resolve_mcp_oauth_runtime_auth,
+)
+from .user_oauth import normalize_user_oauth_resource_owner_key
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
+
+
+class MCPBuiltinOAuthActorPolicyRequiredError(RuntimeError):
+    """A marked task was used without its trusted actor policy."""
+
+
+class MCPBuiltinOAuthActorPolicyMismatchError(RuntimeError):
+    """A task's already-bound actor policy was replaced."""
+
+
+@dataclass(frozen=True)
+class MCPActorAuthorizationPolicy:
+    """Trusted actor identity and connector capabilities for MCP execution.
+
+    Server visibility and catalog classification remain xagent runtime
+    decisions. The caller supplies only the immutable credential owner. The
+    owner governs builtin-provider OAuth, remote MCP OAuth, and explicitly
+    enabled actor-scoped stdio credentials. Stdio remains disabled by default
+    so existing OAuth-only callers retain their current behavior.
+    """
+
+    resource_owner_key: str = dataclass_field(repr=False)
+    allow_builtin_stdio: bool = False
+
+    def __post_init__(self) -> None:
+        owner_key = normalize_user_oauth_resource_owner_key(self.resource_owner_key)
+        if owner_key is None:  # pragma: no cover - normalization preserves None only
+            raise ValueError("resource_owner_key must not be null")
+        if type(self.allow_builtin_stdio) is not bool:
+            raise ValueError("allow_builtin_stdio must be a boolean")
+        object.__setattr__(self, "resource_owner_key", owner_key)
+
+
+# Compatibility import for trusted callers deployed before actor-scoped stdio
+# support. Keep this as a direct alias so equality and isinstance semantics do
+# not diverge between old and new callers.
+MCPBuiltinOAuthActorPolicy = MCPActorAuthorizationPolicy
+
+
+@dataclass(frozen=True)
+class MCPActorExecutionIdentity:
+    """Exact task turn and lease acquisition that owns one actor execution."""
+
+    task_id: int
+    run_id: str
+    turn_id: str
+    lease_attempt_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.task_id, bool)
+            or not isinstance(self.task_id, int)
+            or self.task_id <= 0
+        ):
+            raise ValueError("actor execution identity requires a persisted task_id")
+        for field_name in ("run_id", "turn_id", "lease_attempt_id"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(
+                    f"actor execution identity requires an exact {field_name}"
+                )
 
 
 @dataclass(frozen=True)
@@ -462,7 +531,7 @@ async def build_mcp_runtime_connection(
                 message=exc.message,
                 resource_owner_key=str(resource_owner_key),
                 resource=selection.get("resource") or auth_config.get("resource"),
-                scope=selection.get("scope") or auth_config.get("scope"),
+                scope=selection.get("scope") or _diagnostic_required_scope(auth_config),
                 issuer=selection.get("issuer") or auth_config.get("issuer"),
             ),
         )
@@ -472,6 +541,18 @@ async def build_mcp_runtime_connection(
     )
     connection.pop("auth", None)
     return MCPRuntimeConnectionBuild(connection=connection)
+
+
+def _diagnostic_required_scope(auth_config: dict[str, Any]) -> Any:
+    """The configured scope a grant had to cover, for a runtime diagnostic.
+
+    A configuration whose required scope is invalid fails with its own code;
+    its diagnostic falls back to the requested scope.
+    """
+    try:
+        return mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError:
+        return auth_config.get("scope")
 
 
 def connection_to_transport_config(connection: dict[str, Any]) -> dict[str, Any]:
@@ -555,16 +636,25 @@ def mcp_oauth_runtime_diagnostic(
     scope: Any | None = None,
     issuer: Any | None = None,
 ) -> dict[str, Any]:
-    """Build the common runtime diagnostic payload for MCP OAuth failures."""
+    """Build the common runtime diagnostic payload for MCP OAuth failures.
+
+    ``resource``/``issuer`` are redacted (query string + userinfo stripped)
+    before being placed here -- this dict is returned verbatim as an HTTP 400
+    body (api/mcp.py) to any user with an active association to the server,
+    not just its owner, and ``resource`` is free text that commonly carries
+    an API key or token in its query string. See issue #2239.
+    """
     return {
         "code": code,
         "message": message,
         "server_id": getattr(server, "id", None),
         "server_name": getattr(server, "name", None),
         "resource_owner_key": resource_owner_key,
-        "resource": str(resource) if resource else None,
+        "resource": redact_oauth_url_for_diagnostics(
+            str(resource) if resource else None
+        ),
         "scope": str(scope) if scope else "",
-        "issuer": str(issuer) if issuer else None,
+        "issuer": redact_oauth_url_for_diagnostics(str(issuer) if issuer else None),
     }
 
 
@@ -572,9 +662,46 @@ def _is_mcp_oauth_http_server(server: Any, auth_config: Any) -> bool:
     # Runtime classification of a *connected* server from its decrypted auth,
     # a different layer than the catalog auth_type (mcp_apps.classify_app_auth):
     # this also covers user-added custom HTTP servers that were never catalog
-    # entries, so it stays independent by design.
+    # entries, so it stays independent by design. Keep in sync with
+    # connector_auth_type() below: that function reports "mcp_oauth" for the
+    # same shape of ``auth`` this function treats as mcp_oauth (transport is
+    # not part of connector_auth_type's own check, since it only classifies
+    # the declared auth, not whether the transport is HTTP).
     return (
         getattr(server, "transport", None) in HTTP_MCP_TRANSPORTS
         and isinstance(auth_config, dict)
         and auth_config.get("type") == "mcp_oauth"
     )
+
+
+def connector_auth_type(server: Any) -> str | None:
+    """Return the connector's declared auth type without decrypting it.
+
+    ``"none"`` when the connector declares no authentication (``auth`` absent,
+    JSON null, an empty object, ``{"type": null}``, or an explicit
+    ``{"type": "none"}``); the declared ``type`` string otherwise; ``None``
+    when the shape is not recognisable (non-``dict`` ``auth``, or a ``type``
+    that is a non-string or the empty string). Callers must treat ``None`` as
+    unknown, not as "no credential".
+
+    ``"none"`` means only that the connector declares no ``auth`` JSON; it does
+    not mean the connector carries no credential, because static ``headers``
+    (e.g. ``Authorization``) are sent regardless and are not inspected here.
+
+    Reads the raw (encrypted-at-rest) ``auth`` JSON rather than the decrypted
+    form used by ``_is_mcp_oauth_http_server`` above: ``type`` is not one of
+    the sensitive fields encryption touches (see ``SENSITIVE_AUTH_FIELDS`` in
+    ``xagent.core.tools.core.mcp.model``), so no decryption is needed to
+    classify it.
+    """
+    auth = getattr(server, "auth", None)
+    if auth is None:
+        return "none"
+    if not isinstance(auth, dict):
+        return None
+    raw = auth.get("type")
+    if raw is None:
+        return "none"
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw

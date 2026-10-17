@@ -1,5 +1,6 @@
 """Unit tests for core/config.py configuration functions."""
 
+import logging
 import os
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    CORS_ORIGINS,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -46,6 +48,7 @@ from xagent.config import (
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
     FILE_STREAM_TICKET_TTL_SECONDS,
+    FORM_ANSWER_CONTINUATION_ENABLED,
     FRONTEND_DIST_DIR,
     GMAIL_PUBSUB_PROJECT_ID,
     GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
@@ -56,6 +59,8 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_MILVUS_CLEANUP_ENABLED,
+    KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
     KB_SEARCH_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
@@ -102,9 +107,11 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
+    TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS,
     TRUSTED_EGRESS_PROXY,
     UPLOADED_FILE_RECOVERY_BATCH_SIZE,
     UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS,
@@ -113,6 +120,8 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    XROUTER_EXCLUDED_MODELS,
+    ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
@@ -129,6 +138,7 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_cors_origins,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -152,6 +162,7 @@ from xagent.config import (
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
     get_file_stream_ticket_ttl_seconds,
+    get_form_answer_continuation_enabled,
     get_frontend_dist_dir,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
@@ -162,6 +173,8 @@ from xagent.config import (
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
     get_kb_collections_timeout_seconds,
+    get_kb_milvus_cleanup_enabled,
+    get_kb_milvus_cleanup_interval_seconds,
     get_kb_search_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
@@ -206,9 +219,11 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_trusted_egress_proxy_enabled,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
@@ -217,9 +232,81 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
 )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "garbage"])
+def test_artifact_validation_byte_budget_invalid(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_max_bytes()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "garbage"])
+def test_artifact_validation_timeout_invalid(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_timeout_seconds()
+
+
+def test_artifact_validation_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", raising=False)
+    monkeypatch.delenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", raising=False)
+    assert config.get_artifact_validation_max_bytes() == 32 * 1024 * 1024
+    assert config.get_artifact_validation_timeout_seconds() == 8
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", "")
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", "")
+    assert config.get_artifact_validation_max_bytes() == 32 * 1024 * 1024
+    assert config.get_artifact_validation_timeout_seconds() == 8
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", "1024")
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS", "0.5")
+    assert config.get_artifact_validation_max_bytes() == 1024
+    assert config.get_artifact_validation_timeout_seconds() == 0.5
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("32M", 32 * 1024**2), ("1.5MB", 1572864), ("512K", 524288), ("1024", 1024)],
+)
+def test_artifact_validation_and_upload_share_size_parser(monkeypatch, value, expected):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", value)
+    assert config.get_artifact_validation_max_bytes() == expected
+    assert config.get_max_upload_size_bytes() == expected
+
+
+@pytest.mark.parametrize("value", ["inf", "infM", "nan", "nanM", "-1M"])
+def test_artifact_validation_size_rejects_invalid_and_nonfinite(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ARTIFACT_VALIDATION_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_artifact_validation_max_bytes()
+
+
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_google_scope_config(monkeypatch, value):
+    flag = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.GOOGLE_RESTRICTED_SCOPES_ENABLED
+    assert config.get_google_restricted_scopes() is (value in {"true", "1", "ON"})
+
+
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_zoom_meeting_write_config(monkeypatch, value):
+    flag = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.ZOOM_MEETING_WRITE_ENABLED
+    assert config.get_zoom_meeting_write_enabled() is (value in {"true", "1", "ON"})
 
 
 class TestEnvironmentVariableConstants:
@@ -352,6 +439,9 @@ class TestEnvironmentVariableConstants:
             == "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
         )
 
+    def test_xrouter_excluded_models_constant(self):
+        assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
+
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 
@@ -474,6 +564,31 @@ class TestAuthEmailConfig:
         assert get_slack_app_token() is None
         assert get_slack_oauth_redirect_uri() is None
 
+    def test_cors_origins_default_to_frontend_url(self, monkeypatch):
+        monkeypatch.delenv(CORS_ORIGINS, raising=False)
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", " https://app.example.com/ ")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_parse_explicit_list(self, monkeypatch):
+        monkeypatch.setenv(
+            CORS_ORIGINS,
+            " https://app.example.com/ , https://admin.example.com ",
+        )
+        assert get_cors_origins() == [
+            "https://app.example.com",
+            "https://admin.example.com",
+        ]
+
+    def test_cors_origins_treat_blank_as_unset(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "")
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", "https://app.example.com")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_reject_wildcard_with_credentials(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "*")
+        with pytest.raises(ValueError, match=r"cannot contain '\*'"):
+            get_cors_origins()
+
     def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
         monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
         monkeypatch.setenv(SLACK_CLIENT_SECRET, " client-secret ")
@@ -563,6 +678,48 @@ class TestOpenRouterConfig:
         monkeypatch.setenv(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, value)
         assert get_openrouter_official_providers_only() is False
 
+    def test_xrouter_excluded_models_defaults_empty(self, monkeypatch):
+        monkeypatch.delenv(XROUTER_EXCLUDED_MODELS, raising=False)
+        assert get_xrouter_excluded_models() == ()
+
+    def test_xrouter_excluded_models_parses_and_deduplicates(self, monkeypatch):
+        monkeypatch.setenv(
+            XROUTER_EXCLUDED_MODELS,
+            " z-ai/glm-5.3-flash, openai/gpt-5.6-luna, z-ai/glm-5.3-flash,, ",
+        )
+
+        assert get_xrouter_excluded_models() == (
+            "z-ai/glm-5.3-flash",
+            "openai/gpt-5.6-luna",
+        )
+
+
+class TestFormAnswerContinuationConfig:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(None, True, id="unset-is-on"),
+            pytest.param("true", True, id="true"),
+            pytest.param(" TRUE ", True, id="true-padded-uppercase"),
+            pytest.param("1", True, id="one"),
+            pytest.param("false", False, id="false"),
+            pytest.param("0", False, id="zero"),
+            pytest.param("", False, id="empty-is-off"),
+        ],
+    )
+    def test_env_table(self, monkeypatch, value, expected):
+        if value is None:
+            monkeypatch.delenv(FORM_ANSWER_CONTINUATION_ENABLED, raising=False)
+        else:
+            monkeypatch.setenv(FORM_ANSWER_CONTINUATION_ENABLED, value)
+        assert get_form_answer_continuation_enabled() is expected
+
+    def test_env_var_name_constant(self):
+        assert (
+            FORM_ANSWER_CONTINUATION_ENABLED
+            == "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
+        )
+
 
 class TestMCPOAuthConfig:
     def test_allow_private_hosts_defaults_false(self, monkeypatch):
@@ -595,6 +752,20 @@ class TestMCPOAuthConfig:
         monkeypatch.setenv(MCP_OAUTH_PROXY_URL, value)
         with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
             get_mcp_oauth_proxy_url()
+
+    def test_hubspot_credentials_are_trimmed(self, monkeypatch):
+        monkeypatch.setenv(config.HUBSPOT_MCP_CLIENT_ID, " client-id ")
+        monkeypatch.setenv(config.HUBSPOT_MCP_CLIENT_SECRET, " client-secret ")
+
+        assert config.get_hubspot_mcp_client_id() == "client-id"
+        assert config.get_hubspot_mcp_client_secret() == "client-secret"
+
+    def test_hubspot_credentials_default_none(self, monkeypatch):
+        monkeypatch.delenv(config.HUBSPOT_MCP_CLIENT_ID, raising=False)
+        monkeypatch.delenv(config.HUBSPOT_MCP_CLIENT_SECRET, raising=False)
+
+        assert config.get_hubspot_mcp_client_id() is None
+        assert config.get_hubspot_mcp_client_secret() is None
 
 
 class TestTrustedEgressProxyConfig:
@@ -687,20 +858,51 @@ class TestCeleryBackgroundJobConfig:
         assert get_background_job_stale_seconds() == 7200
         assert get_background_job_sweep_interval_seconds() == 300
 
+    def test_kb_milvus_cleanup_interval_default(self, monkeypatch):
+        monkeypatch.delenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, raising=False)
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
+
+    def test_kb_milvus_cleanup_interval_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "600")
+        assert get_kb_milvus_cleanup_interval_seconds() == 600
+
+    def test_kb_milvus_cleanup_interval_below_minimum_falls_back_to_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "299")
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
+
+    def test_kb_milvus_cleanup_enabled_defaults_to_true(self, monkeypatch):
+        monkeypatch.delenv(KB_MILVUS_CLEANUP_ENABLED, raising=False)
+        assert get_kb_milvus_cleanup_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE", " false "])
+    def test_kb_milvus_cleanup_enabled_false_values(self, monkeypatch, value):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_ENABLED, value)
+        assert get_kb_milvus_cleanup_enabled() is False
+
+    def test_kb_milvus_cleanup_enabled_true_value(self, monkeypatch):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_ENABLED, "true")
+        assert get_kb_milvus_cleanup_enabled() is True
+
     def test_trigger_dispatcher_tuning(self, monkeypatch):
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, raising=False)
         monkeypatch.delenv(TRIGGER_DISPATCHER_BATCH_SIZE, raising=False)
+        monkeypatch.delenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, raising=False)
         assert get_trigger_dispatcher_enabled() is True
         assert get_trigger_dispatcher_interval_seconds() == 5
         assert get_trigger_dispatcher_batch_size() == 20
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 30
 
         monkeypatch.setenv(TRIGGER_DISPATCHER_ENABLED, "false")
         monkeypatch.setenv(TRIGGER_DISPATCHER_INTERVAL_SECONDS, "9")
         monkeypatch.setenv(TRIGGER_DISPATCHER_BATCH_SIZE, "3")
+        monkeypatch.setenv(TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS, "0")
         assert get_trigger_dispatcher_enabled() is False
         assert get_trigger_dispatcher_interval_seconds() == 9
         assert get_trigger_dispatcher_batch_size() == 3
+        assert get_trigger_dispatcher_startup_jitter_seconds() == 0
 
     def test_task_lease_recovery_tuning(self, monkeypatch):
         monkeypatch.setenv(TASK_LEASE_TTL_SECONDS, "60")
@@ -740,6 +942,28 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_interval_seconds() == 60
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
+
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
 
 class TestGetWebSearchProvider:
@@ -1208,6 +1432,47 @@ class TestGetExternalUploadDirs:
             assert len(result) == 2
             assert dir1 in result
             assert dir2 in result
+
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = "relative-external"
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
 
 
 class TestGetExternalSkillsDirs:
@@ -1990,6 +2255,16 @@ class TestBrowserToolDefaultLocaleConfig:
         assert config.get_browser_tool_default_timezone() is None
 
 
+class TestBrowserSandboxConfig:
+    def test_defaults_to_sandboxed(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_ALLOW_UNSANDBOXED, raising=False)
+        assert config.get_browser_allow_unsandboxed() is False
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_ALLOW_UNSANDBOXED, "true")
+        assert config.get_browser_allow_unsandboxed() is True
+
+
 class TestCheckpointStorageConfig:
     """Config for checkpoint trace-event storage encoding and retention."""
 
@@ -2221,6 +2496,237 @@ class TestOrphanUploadGcConfig:
 
         monkeypatch.setenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", "900")
         assert get_orphan_upload_sweep_interval_seconds() == 900
+
+
+class TestTaskCleanupRetryConfig:
+    """Config for retrying the external cleanup a task deletion owes (#2587)."""
+
+    def test_retry_interval_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", raising=False)
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_retry_interval_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "120")
+        assert get_task_cleanup_retry_interval_seconds() == 120
+
+    def test_retry_interval_below_minimum_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_retry_interval_seconds
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS", "1")
+        assert get_task_cleanup_retry_interval_seconds() == 300
+
+    def test_max_attempts_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.delenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", raising=False)
+        assert get_task_cleanup_max_attempts() == 8
+
+    def test_max_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "3")
+        assert get_task_cleanup_max_attempts() == 3
+
+    def test_max_attempts_zero_falls_back_to_default(self, monkeypatch):
+        from xagent.config import get_task_cleanup_max_attempts
+
+        monkeypatch.setenv("XAGENT_TASK_CLEANUP_MAX_ATTEMPTS", "0")
+        assert get_task_cleanup_max_attempts() == 8
+
+
+class TestLlmRetryBudgetConfig:
+    """#2605: the two bounds that attempt counting cannot express."""
+
+    def test_deadline_default(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.delenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", raising=False)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_deadline_env_override(self, monkeypatch):
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "45.5")
+        assert get_llm_retry_deadline_seconds() == 45.5
+
+    @pytest.mark.parametrize(
+        "value", ["", "   ", "not-a-number", "0", "-5", "nan", "inf"]
+    )
+    def test_deadline_rejects_unusable_values(self, monkeypatch, value):
+        """An unbounded loop is the bug; never let bad config reintroduce it."""
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", value)
+        assert get_llm_retry_deadline_seconds() == 300.0
+
+    def test_capacity_attempts_default(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.delenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", raising=False)
+        assert get_llm_capacity_max_attempts() == 2
+
+    def test_capacity_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", "1")
+        assert get_llm_capacity_max_attempts() == 1
+
+    @pytest.mark.parametrize("value", ["", "1.5", "not-a-number", "0", "-3"])
+    def test_capacity_attempts_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_capacity_max_attempts
+
+        monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", value)
+        assert get_llm_capacity_max_attempts() == 2
+
+
+class TestLlmStreamProgressConfig:
+    """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops
+    making progress."""
+
+    def test_empty_delta_limit_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", raising=False)
+        assert get_llm_stream_empty_delta_limit() == 200
+
+    def test_empty_delta_limit_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "50")
+        assert get_llm_stream_empty_delta_limit() == 50
+
+    def test_empty_delta_limit_zero_disables(self, monkeypatch):
+        """0 is a valid, explicit way to disable the check."""
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", "0")
+        assert get_llm_stream_empty_delta_limit() == 0
+
+    @pytest.mark.parametrize("value", ["abc", "-5"])
+    def test_empty_delta_limit_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_empty_delta_limit
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT", value)
+        assert get_llm_stream_empty_delta_limit() == 200
+
+    def test_degenerate_window_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", raising=False)
+        assert get_llm_stream_degenerate_window() == 256
+
+    def test_degenerate_window_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "128")
+        assert get_llm_stream_degenerate_window() == 128
+
+    def test_degenerate_window_zero_disables(self, monkeypatch):
+        """0 is a valid, explicit way to disable the check."""
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", "0")
+        assert get_llm_stream_degenerate_window() == 0
+
+    @pytest.mark.parametrize("value", ["abc", "-5"])
+    def test_degenerate_window_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_degenerate_window
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_WINDOW", value)
+        assert get_llm_stream_degenerate_window() == 256
+
+    def test_degenerate_max_period_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", raising=False)
+        assert get_llm_stream_degenerate_max_period() == 64
+
+    def test_degenerate_max_period_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", "32")
+        assert get_llm_stream_degenerate_max_period() == 32
+
+    @pytest.mark.parametrize("value", ["abc", "-5", "0"])
+    def test_degenerate_max_period_rejects_unusable_values(self, monkeypatch, value):
+        """Unlike the window/limit knobs, 0 is below the minimum of 1 here."""
+        from xagent.config import get_llm_stream_degenerate_max_period
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD", value)
+        assert get_llm_stream_degenerate_max_period() == 64
+
+    def test_no_payload_abort_models_unset(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.delenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", raising=False)
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_abort_models_parses_and_strips(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", " a , b,,c ")
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == {"a", "b", "c"}
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_abort_models_blank(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_abort_models
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS", "   ")
+        result = get_llm_stream_no_payload_abort_models()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_no_payload_timeout_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+        assert any("falling back to 30.0" in r.getMessage() for r in caplog.records)
+
+    def test_retry_deadline_invalid_value_logs_the_real_default(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from xagent.config import get_llm_retry_deadline_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_RETRY_DEADLINE_SECONDS", "abc")
+        with caplog.at_level(logging.WARNING, logger="xagent.config"):
+            assert get_llm_retry_deadline_seconds() == 300.0
+        assert any("falling back to 300.0" in r.getMessage() for r in caplog.records)
+
+    def test_no_payload_timeout_default(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.delenv(
+            "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", raising=False
+        )
+        assert get_llm_stream_no_payload_timeout_seconds() == 30.0
+
+    def test_no_payload_timeout_env_override(self, monkeypatch):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", "15.5")
+        assert get_llm_stream_no_payload_timeout_seconds() == 15.5
+
+    @pytest.mark.parametrize("value", ["0", "nan", "abc"])
+    def test_no_payload_timeout_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_llm_stream_no_payload_timeout_seconds
+
+        monkeypatch.setenv("XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS", value)
+        assert get_llm_stream_no_payload_timeout_seconds() == 30.0
 
 
 class TestWorkforcePreviewRunReapConfig:
@@ -2546,6 +3052,38 @@ class TestGetSandboxAllowLocalFallbackOnCapacity:
             assert get_sandbox_allow_local_fallback_on_capacity() is False
 
 
+class TestCheckpointGateStallWarningConfig:
+    """Config for reporting a long-held exclusive checkpoint section."""
+
+    def test_defaults_to_30_seconds(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.delenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, raising=False)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+    def test_env_override(self, monkeypatch):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, "2.5")
+        assert get_checkpoint_gate_stall_warning_seconds() == 2.5
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-1", "nan", "inf"])
+    def test_invalid_values_fall_back(self, monkeypatch, value):
+        from xagent.config import (
+            CHECKPOINT_GATE_STALL_WARNING_SECONDS,
+            get_checkpoint_gate_stall_warning_seconds,
+        )
+
+        monkeypatch.setenv(CHECKPOINT_GATE_STALL_WARNING_SECONDS, value)
+        assert get_checkpoint_gate_stall_warning_seconds() == 30.0
+
+
 class TestCompactThresholdConfig:
     """Config for context-compaction threshold derivation."""
 
@@ -2631,3 +3169,889 @@ class TestUrlUserinfoRejectionIsScopedToDeepDoc:
 
         assert get_public_api_base_url() == "http://user:pw@api.example.com"
         assert get_s2s_api_base_url() == "http://user:pw@api.example.com"
+
+
+def test_inline_file_delivery_budget(monkeypatch, caplog):
+    monkeypatch.delenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, raising=False)
+    assert config.get_inline_file_delivery_max_bytes() == 8 * 1024 * 1024
+    for value in ("0", "1024"):
+        monkeypatch.setenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, value)
+        assert config.get_inline_file_delivery_max_bytes() == int(value)
+    for value in ("-1", "invalid", ""):
+        monkeypatch.setenv(config.INLINE_FILE_DELIVERY_MAX_BYTES, value)
+        caplog.clear()
+        assert config.get_inline_file_delivery_max_bytes() == 0
+        assert "Invalid XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES" in caplog.text
+
+
+_OTEL_ENV_VARS = (
+    "XAGENT_RUNTIME_TELEMETRY_ENABLED",
+    "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS",
+    "XAGENT_OTEL_SERVICE_NAME",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_SERVICE_NAME",
+)
+
+
+def _clear_otel_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_var in _OTEL_ENV_VARS:
+        monkeypatch.delenv(env_var, raising=False)
+
+
+def test_runtime_telemetry_defaults_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+
+    assert config.get_otel_metrics_endpoint() is None
+    assert config.get_runtime_telemetry_enabled() is False
+    assert config.get_otel_export_interval_milliseconds() == 10_000
+    assert config.get_otel_service_name() == "xagent"
+
+
+def test_xagent_otel_endpoint_enables_export_and_explicit_false_disables_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        " http://collector:4318/v1/metrics/ ",
+    )
+
+    assert config.get_otel_metrics_endpoint() == "http://collector:4318/v1/metrics"
+    assert config.get_runtime_telemetry_enabled() is True
+
+    monkeypatch.setenv("XAGENT_RUNTIME_TELEMETRY_ENABLED", "false")
+    assert config.get_runtime_telemetry_enabled() is False
+
+
+def test_standard_otel_fallbacks_and_xagent_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_otel_env(monkeypatch)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://standard:4318/")
+    monkeypatch.setenv("OTEL_METRIC_EXPORT_INTERVAL", "30000")
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "standard-xagent")
+
+    assert config.get_otel_metrics_endpoint() == "http://standard:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 30_000
+    assert config.get_otel_service_name() == "standard-xagent"
+
+    monkeypatch.setenv(
+        "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "http://xagent:4318/v1/metrics",
+    )
+    monkeypatch.setenv("XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS", "5000")
+    monkeypatch.setenv("XAGENT_OTEL_SERVICE_NAME", "xagent-override")
+    assert config.get_otel_metrics_endpoint() == "http://xagent:4318/v1/metrics"
+    assert config.get_otel_export_interval_milliseconds() == 5_000
+    assert config.get_otel_service_name() == "xagent-override"
+
+
+def test_toby_personal_stdio_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv(config.TOBY_PERSONAL_STDIO_ENABLED, raising=False)
+
+    assert config.get_toby_personal_stdio_enabled() is False
+
+
+def test_trace_database_defaults_and_opt_in(monkeypatch):
+    monkeypatch.delenv(config.ASYNC_TRACE_DB_ENABLED, raising=False)
+    monkeypatch.delenv(config.TRACE_DB_MAX_INFLIGHT, raising=False)
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 4
+    monkeypatch.setenv(config.ASYNC_TRACE_DB_ENABLED, "true")
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, "8")
+    assert config.get_async_trace_db_enabled() is True
+    assert config.get_trace_db_max_inflight() == 8
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
+    monkeypatch.setenv(config.TRACE_DB_MAX_INFLIGHT, value)
+    assert config.get_trace_db_max_inflight() == 4
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
+    monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
+
+    assert config.get_toby_personal_stdio_enabled() is True
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_shared_task_execution_explicit_setting_wins(monkeypatch, value, expected):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.setenv(config.WORKER_COUNT, "4")
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+@pytest.mark.parametrize("value", ["", " "])
+@pytest.mark.parametrize(
+    "role,worker_count",
+    [("combined", "4"), ("web", None), ("worker", None)],
+)
+def test_blank_shared_task_execution_setting_uses_topology(
+    monkeypatch, value, role, worker_count
+):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, value)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "role,worker_count,expected",
+    [
+        ("combined", None, False),
+        ("combined", "4", True),
+        ("web", None, True),
+        ("worker", None, True),
+    ],
+)
+def test_shared_task_execution_default_follows_topology(
+    monkeypatch, role, worker_count, expected
+):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if worker_count is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, worker_count)
+
+    assert config.get_shared_task_execution_enabled() is expected
+
+
+def test_default_task_execution_host_configuration_is_self_contained(monkeypatch):
+    monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)
+    monkeypatch.delenv(config.TASK_EXECUTION_ROLE, raising=False)
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    monkeypatch.delenv(config.REDIS_URL, raising=False)
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+
+    assert config.get_shared_task_execution_enabled() is False
+    assert config.get_task_execution_role() == "combined"
+    assert config.get_channel_ingress_enabled() is False
+    config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_local_host_rejects_invalid_runtime_secret_ttl_at_startup(monkeypatch, value):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "combined")
+    monkeypatch.setenv(config.TASK_RUNTIME_SECRETS_TTL_SECONDS, value)
+    with pytest.raises(ValueError):
+        config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("value", ["", " ", "deployment/channel"])
+def test_task_event_channel_prefix_rejects_invalid_namespace(monkeypatch, value):
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, value)
+    with pytest.raises(ValueError, match="channel prefix"):
+        config.get_task_event_channel_prefix()
+
+
+def test_task_event_channel_prefix_default_and_override(monkeypatch):
+    monkeypatch.delenv(config.TASK_EVENT_CHANNEL_PREFIX, raising=False)
+    assert config.get_task_event_channel_prefix() == "xagent:task-events:v1"
+    monkeypatch.setenv(config.TASK_EVENT_CHANNEL_PREFIX, "xagent:staging:v1")
+    assert config.get_task_event_channel_prefix() == "xagent:staging:v1"
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_task_runtime_secrets_reject_unconfigured_key(monkeypatch, key):
+    monkeypatch.delenv(config.ENCRYPTION_KEY, raising=False)
+    if key is not None:
+        monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() is None
+
+
+def test_task_runtime_secrets_use_explicit_fallback_key(monkeypatch):
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+
+    assert (
+        config.get_task_runtime_secrets_encryption_key()
+        == config.DEV_FALLBACK_ENCRYPTION_KEY
+    )
+
+
+def test_task_runtime_secrets_use_explicit_key(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, key)
+    assert config.get_task_runtime_secrets_encryption_key() == key
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
+)
+def test_task_reply_wait_timeout(value, expected, monkeypatch):
+    from xagent.config import get_task_reply_wait_timeout_seconds
+
+    monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
+    assert get_task_reply_wait_timeout_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "shared,role,override,expected",
+    [
+        (False, "combined", None, True),
+        (True, "combined", None, False),
+        (True, "web", "true", True),
+        (True, "web", "false", False),
+        (True, "worker", "true", False),
+    ],
+)
+def test_designated_channel_ingress(monkeypatch, shared, role, override, expected):
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, str(shared).lower())
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.delenv(config.CHANNEL_INGRESS_ENABLED, raising=False)
+    if override is not None:
+        monkeypatch.setenv(config.CHANNEL_INGRESS_ENABLED, override)
+    assert config.get_channel_ingress_enabled() is expected
+
+
+@pytest.mark.parametrize("role", ["combined", "web", "worker"])
+def test_shared_host_configuration(monkeypatch, role):
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "true")
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, role)
+    monkeypatch.setenv(config.REDIS_URL, "redis://localhost:6379/0")
+    monkeypatch.setenv(config.ENCRYPTION_KEY, Fernet.generate_key().decode())
+    config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.ENCRYPTION_KEY, config.DEV_FALLBACK_ENCRYPTION_KEY)
+    config.validate_task_execution_host_config()
+    monkeypatch.delenv(config.ENCRYPTION_KEY)
+    with pytest.raises(ValueError, match="private common ENCRYPTION_KEY"):
+        config.validate_task_execution_host_config()
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "false")
+    if role == "combined":
+        config.validate_task_execution_host_config()
+    else:
+        with pytest.raises(ValueError, match="requires"):
+            config.validate_task_execution_host_config()
+
+
+def test_unknown_task_execution_role_rejected(monkeypatch):
+    monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
+    with pytest.raises(ValueError, match="combined, web or worker"):
+        config.validate_task_execution_host_config()
+
+
+@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
+def test_shared_boxlite_home_is_scoped_to_worker(
+    monkeypatch, tmp_path, configured_home
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+    if configured_home is None:
+        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
+    else:
+        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
+    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
+    assert get_boxlite_home_dir() == expected_root / "worker-1"
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, None), ("", None), ("1", 1), ("4", 4)]
+)
+def test_worker_count_optional_positive_integer(monkeypatch, value, expected):
+    monkeypatch.delenv(config.WORKER_COUNT, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.WORKER_COUNT, value)
+    assert config.get_worker_count() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_worker_count_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv(config.WORKER_COUNT, value)
+    with pytest.raises(
+        ValueError, match="XAGENT_WORKER_COUNT must be a positive integer"
+    ):
+        config.get_worker_count()
+
+
+# ---------------------------------------------------------------------------
+# Conversation data retention (#2563).
+#
+# Two properties run through these cases, and every test here is one of them:
+# a period that cannot be read disables the leg it configures rather than
+# falling back to a number of days, and a switch that cannot be read resolves
+# to whichever side deletes nothing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_retention_env(monkeypatch):
+    """Clear every retention variable, so no case inherits another's state.
+
+    Driven from ``config.RETENTION_ENV_VARS`` rather than a list written here,
+    so a setting added without a test cannot silently inherit whatever the
+    surrounding suite left behind.
+    """
+    for name in config.RETENTION_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _warnings(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("0", None),
+        ("365", 365),
+        ("1", 1),
+        (str(config.MAX_RETENTION_DAYS), config.MAX_RETENTION_DAYS),
+        # Every one of these is a mistake, and must disable rather than fall
+        # back to some working number of days.
+        ("-1", None),
+        ("90d", None),
+        ("ninety", None),
+        ("9.5", None),
+        # An operator pasting a date. Parses as an integer, and no date can
+        # express it -- `now - timedelta(days=20260923)` raises OverflowError,
+        # which a consumer would hit on every use.
+        ("20260923", None),
+        ("1000000000", None),
+        (str(config.MAX_RETENTION_DAYS + 1), None),
+    ],
+)
+def test_conversation_retention_days(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    assert config.get_conversation_retention_days() == expected
+
+
+def test_an_accepted_period_can_always_be_expressed_as_a_date(no_retention_env):
+    """The bound is only correct if everything under it actually works.
+
+    Pinned against the arithmetic it protects rather than against a number
+    written twice: ``retention_cutoff`` is what raises, so it decides whether
+    ``MAX_RETENTION_DAYS`` is set right. This caught the first value written.
+    """
+    from datetime import datetime, timezone
+
+    from xagent.web.services.task_retention import retention_cutoff
+
+    no_retention_env.setenv(
+        config.CONVERSATION_RETENTION_DAYS, str(config.MAX_RETENTION_DAYS)
+    )
+    parsed = config.get_conversation_retention_days()
+
+    assert parsed == config.MAX_RETENTION_DAYS
+    assert retention_cutoff(now=datetime.now(timezone.utc), days=parsed) is not None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Every spelling of zero inherits the conversation period, because "0"
+        # means "same as the conversation period" and ``int`` is the authority
+        # on what zero is. Comparing the raw string against "0" instead
+        # disagreed with ``int`` about these, and silently disabled traces.
+        ("0", 365),
+        (" 0 ", 365),
+        ("00", 365),
+        ("-0", 365),
+        # Absent, likewise inherits.
+        ("", 365),
+        ("   ", 365),
+        ("90", 90),
+        # Longer than the conversation period: accepted, and inert.
+        ("3650", 3650),
+        # Unusable: disables the leg being configured rather than inheriting.
+        ("0.0", None),
+        ("90d", None),
+        ("-5", None),
+        ("800000", None),
+    ],
+)
+def test_trace_period_reads_every_spelling_the_way_int_does(
+    no_retention_env, raw, expected
+):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "365")
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, raw)
+
+    assert config.get_trace_retention_days() == expected
+
+
+def test_trace_alone_expires_traces_while_conversations_are_kept(no_retention_env):
+    """A supported shape, not an accident: traces are most of the bytes."""
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "90")
+
+    assert config.get_trace_retention_days() == 90
+    assert config.get_conversation_retention_days() is None
+
+
+def test_an_unusable_conversation_period_does_not_reach_the_trace_leg(
+    no_retention_env,
+):
+    """Each leg is disabled on its own; neither failure contaminates the other."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "90d")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "30")
+    assert config.get_trace_retention_days() == 30
+
+
+def test_both_periods_zero_disables_everything(no_retention_env):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, "0")
+    no_retention_env.setenv(config.TRACE_RETENTION_DAYS, "0")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+
+
+@pytest.mark.parametrize("value", ["-1", "90d", str(config.MAX_RETENTION_DAYS + 1)])
+def test_an_unusable_period_warns(no_retention_env, caplog, value):
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert any(config.CONVERSATION_RETENTION_DAYS in m for m in _warnings(caplog))
+
+
+@pytest.mark.parametrize("value", ["0", "", "   ", "365"])
+def test_a_usable_or_absent_period_does_not_warn(no_retention_env, caplog, value):
+    """Zero and blank are documented spellings, not mistakes."""
+    no_retention_env.setenv(config.CONVERSATION_RETENTION_DAYS, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_conversation_retention_days()
+
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, False),
+        ("true", True),
+        ("TRUE", True),
+        (" yes ", True),
+        ("1", True),
+        ("y", True),
+        ("false", False),
+        ("n", False),
+        ("off", False),
+        # Unrecognised: this is the setting an operator reaches for before a
+        # first real run, so the failure direction is "reported, not deleted".
+        ("enabled", True),
+        ("maybe", True),
+        # Blank is unset, not a typo: a compose file interpolating an unset
+        # shell variable passes an empty string, which says nothing.
+        ("", False),
+        ("   ", False),
+    ],
+)
+def test_dry_run_resolves_an_unrecognised_value_to_dry(
+    no_retention_env, value, expected
+):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_DRY_RUN, value)
+    assert config.get_retention_dry_run() is expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, True),
+        ("true", True),
+        ("y", True),
+        (" ON ", True),
+        ("false", False),
+        ("off", False),
+        ("n", False),
+        # Unrecognised resolves to "stopped": for a kill switch, refusing to
+        # act is the side that cannot delete anything.
+        ("enabled", False),
+        ("t", False),
+        # Blank is unset, so it must not read as a deliberate stop.
+        ("", True),
+        ("   ", True),
+    ],
+)
+def test_kill_switch_resolves_an_unrecognised_value_to_stopped(
+    no_retention_env, value, expected
+):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_ENABLED, value)
+    assert config.get_retention_enabled() is expected
+
+
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+def test_an_unrecognised_switch_warns(no_retention_env, caplog, name):
+    """Unlike a period, there is no legitimate spelling a switch rejects."""
+    no_retention_env.setenv(name, "enabled")
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_retention_dry_run()
+        config.get_retention_enabled()
+
+    assert any(name in message for message in _warnings(caplog))
+
+
+@pytest.mark.parametrize("name", [config.RETENTION_DRY_RUN, config.RETENTION_ENABLED])
+@pytest.mark.parametrize("value", ["", "   ", "true", "no"])
+def test_a_readable_or_blank_switch_does_not_warn(
+    no_retention_env, caplog, name, value
+):
+    no_retention_env.setenv(name, value)
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        config.get_retention_dry_run()
+        config.get_retention_enabled()
+
+    assert _warnings(caplog) == []
+
+
+def test_blank_is_unset_for_every_setting(no_retention_env):
+    """All four parsers must agree about what an empty value means.
+
+    They did not at first: the periods read blank as unset while the switches
+    read it as an unrecognised value and the batch size read it as invalid.
+    The visible consequence was a compose file interpolating an unset shell
+    variable turning into a deliberate stop, warning on every read.
+    """
+    for name in config.RETENTION_ENV_VARS:
+        no_retention_env.setenv(name, "")
+
+    assert config.get_conversation_retention_days() is None
+    assert config.get_trace_retention_days() is None
+    assert config.get_retention_enabled() is True
+    assert config.get_retention_dry_run() is False
+    assert config.get_retention_batch_size() == 100
+    assert config.get_retention_sweep_interval_seconds() == 86400.0
+    assert config.get_retention_batch_pause_seconds() == 5.0
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 100), ("250", 250), ("0", 100), ("nope", 100), ("", 100)]
+)
+def test_retention_batch_size(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_SIZE, value)
+    assert config.get_retention_batch_size() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, 86400.0), ("60", 60.0), ("0", 86400.0), ("-1", 86400.0), ("x", 86400.0)],
+)
+def test_retention_sweep_interval(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_SWEEP_INTERVAL_SECONDS, value)
+    assert config.get_retention_sweep_interval_seconds() == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 5.0), ("0.5", 0.5), ("0", 5.0), ("nope", 5.0)]
+)
+def test_retention_batch_pause(no_retention_env, value, expected):
+    if value is not None:
+        no_retention_env.setenv(config.RETENTION_BATCH_PAUSE_SECONDS, value)
+    assert config.get_retention_batch_pause_seconds() == expected
+
+
+def test_no_module_assigns_a_retention_environment_variable():
+    """Pins the claim the section comment makes about needing a restart.
+
+    That claim holds only while nothing writes these names into the
+    environment, and other code in this repository does write ``os.environ``
+    (``worker_pool`` sets the execution role for the processes it spawns), so
+    it has to be checked rather than assumed.
+
+    The scan is a heuristic and says so: it covers assignment, ``update``,
+    ``setdefault``, ``putenv`` and ``load_dotenv(override=True)``, spelled
+    through either the literal name or the constant. A computed key would slip
+    past it. It is worth having anyway -- every way this claim has actually
+    been broken in review is on the list -- but it is a tripwire, not a proof.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    source_root = _Path(config.__file__).parent
+    names = "|".join(
+        [re.escape(name) for name in config.RETENTION_ENV_VARS]
+        + [
+            re.escape(name.removeprefix("XAGENT_"))
+            for name in config.RETENTION_ENV_VARS
+        ]
+    )
+    quoted = rf"""["']?({names})["']?"""
+    pattern = re.compile(
+        "|".join(
+            [
+                rf"environ\[\s*{quoted}\s*\]\s*=",
+                rf"environ\.setdefault\(\s*{quoted}",
+                rf"putenv\(\s*{quoted}",
+                rf"environ\.update\([^)]*{quoted}",
+                r"load_dotenv\([^)]*override\s*=\s*True",
+            ]
+        )
+    )
+
+    offenders = sorted(
+        str(path.relative_to(source_root))
+        for path in source_root.rglob("*.py")
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore"))
+    )
+
+    assert offenders == [], (
+        "these modules can change a retention variable after start-up, which "
+        f"breaks the documented 'takes a restart' guarantee: {offenders}"
+    )
+
+
+_AUTO_RESUME_INT_SETTINGS = [
+    ("TASK_AUTO_RESUME_POLL_SECONDS", "get_task_auto_resume_poll_seconds", 5),
+    ("TASK_AUTO_RESUME_MAX_PER_TICK", "get_task_auto_resume_max_per_tick", 20),
+    ("TASK_AUTO_RESUME_MAX_INFLIGHT", "get_task_auto_resume_max_inflight", 50),
+    ("TASK_AUTO_RESUME_WINDOW_SECONDS", "get_task_auto_resume_window_seconds", 86400),
+    (
+        "TASK_AUTO_RESUME_CHANNEL_WINDOW_SECONDS",
+        "get_task_auto_resume_channel_window_seconds",
+        1800,
+    ),
+    (
+        "TASK_AUTO_RESUME_MAX_TOTAL_PER_RUN",
+        "get_task_auto_resume_max_total_per_run",
+        20,
+    ),
+    (
+        "TASK_AUTO_RESUME_SHORT_INITIAL_BACKOFF_SECONDS",
+        "get_task_auto_resume_short_initial_backoff_seconds",
+        10,
+    ),
+    (
+        "TASK_AUTO_RESUME_SHORT_MAX_NO_PROGRESS",
+        "get_task_auto_resume_short_max_no_progress",
+        3,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_INITIAL_BACKOFF_SECONDS",
+        "get_task_auto_resume_llm_initial_backoff_seconds",
+        60,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_MAX_BACKOFF_SECONDS",
+        "get_task_auto_resume_llm_max_backoff_seconds",
+        900,
+    ),
+    (
+        "TASK_AUTO_RESUME_LLM_MAX_ELAPSED_SECONDS",
+        "get_task_auto_resume_llm_max_elapsed_seconds",
+        7200,
+    ),
+    (
+        "TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS",
+        "get_task_auto_resume_model_output_max_no_progress",
+        2,
+    ),
+]
+
+_AUTO_RESUME_BOOL_SETTINGS = [
+    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", True),
+    ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
+]
+
+
+class TestTaskAutoRecoveryConfig:
+    @pytest.mark.parametrize("const,getter,default", _AUTO_RESUME_INT_SETTINGS)
+    def test_int_setting_defaults_overrides_and_invalid(
+        self, monkeypatch, caplog, const, getter, default
+    ):
+        env_var = getattr(config, const)
+        assert env_var == f"XAGENT_{const}"
+        read = getattr(config, getter)
+
+        monkeypatch.delenv(env_var, raising=False)
+        assert read() == default
+
+        monkeypatch.setenv(env_var, "7")
+        assert read() == 7
+
+        for invalid in ("", "abc", "0", "-3", "1.5"):
+            monkeypatch.setenv(env_var, invalid)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() == default
+            assert env_var in caplog.text
+
+    @pytest.mark.parametrize("const,getter,default", _AUTO_RESUME_BOOL_SETTINGS)
+    def test_bool_setting_defaults_overrides_and_invalid(
+        self, monkeypatch, caplog, const, getter, default
+    ):
+        env_var = getattr(config, const)
+        assert env_var == f"XAGENT_{const}"
+        read = getattr(config, getter)
+
+        monkeypatch.delenv(config.TASK_AUTO_RESUME_ENABLED, raising=False)
+        monkeypatch.delenv(env_var, raising=False)
+        assert read() is default
+
+        for falsy in ("false", "0", "no", "off", " FALSE "):
+            monkeypatch.setenv(env_var, falsy)
+            assert read() is False
+        for truthy in ("true", "1", "yes", "on", "True"):
+            monkeypatch.setenv(env_var, truthy)
+            assert read() is True
+
+        for blank in ("", "   "):
+            monkeypatch.setenv(env_var, blank)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() is default
+            assert env_var not in caplog.text
+
+        for invalid in ("maybe", "2"):
+            monkeypatch.setenv(env_var, invalid)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="xagent.config"):
+                assert read() is default
+            assert env_var in caplog.text
+
+    @pytest.mark.parametrize("auto_resume", [True, False])
+    def test_infra_failure_pause_follows_auto_resume_unless_set(
+        self, monkeypatch, auto_resume
+    ):
+        monkeypatch.setenv(config.TASK_AUTO_RESUME_ENABLED, str(auto_resume).lower())
+        read = config.get_task_infra_failure_pause_enabled
+
+        for unset in (None, "", "maybe"):
+            if unset is None:
+                monkeypatch.delenv(
+                    config.TASK_INFRA_FAILURE_PAUSE_ENABLED, raising=False
+                )
+            else:
+                monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, unset)
+            assert read() is auto_resume
+
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "true")
+        assert read() is True
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "false")
+        assert read() is False
+
+    def test_example_env_documents_every_setting(self):
+        example = (Path(config.__file__).parents[2] / "example.env").read_text()
+        names = [f"XAGENT_{const}" for const, *_ in _AUTO_RESUME_INT_SETTINGS]
+        names += [f"XAGENT_{const}" for const, *_ in _AUTO_RESUME_BOOL_SETTINGS]
+        for name in names:
+            assert f"# {name}=" in example
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, 80, False),
+        ("7", 7, False),
+        ("1", 1, False),
+        (" 7 ", 7, False),
+        ("100000", 100000, False),
+        ("0", 80, True),
+        ("-1", 80, True),
+        ("abc", 80, True),
+        ("", 80, True),
+        ("7.5", 80, True),
+    ],
+)
+def test_dispatcher_max_inflight_env_parsing(monkeypatch, caplog, raw, expected, warns):
+    env_var = config.DISPATCHER_MAX_INFLIGHT_PER_PROCESS
+    assert env_var == "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert config.get_dispatcher_max_inflight_per_process() == expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),
+        ("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "0"),
+        ("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "100"),
+        ("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "no"),
+    ],
+)
+def test_execution_budget_invalid_env_rejected(monkeypatch, name, value):
+    from xagent.config import get_execution_budget_defaults
+
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        get_execution_budget_defaults()
+
+
+def test_execution_budget_env_defaults(monkeypatch):
+    from xagent.config import get_execution_budget_defaults
+
+    for key in ("DEFAULT_TOKENS", "MAX_TOKENS", "SOFT_PERCENT"):
+        monkeypatch.delenv(f"XAGENT_EXECUTION_BUDGET_{key}", raising=False)
+    assert get_execution_budget_defaults() == {
+        "default_tokens": None,
+        "max_tokens": None,
+        "soft_limit_percent": 80,
+    }
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "12345")
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_SOFT_PERCENT", "65")
+    assert get_execution_budget_defaults()["default_tokens"] == 12345
+    assert get_execution_budget_defaults()["soft_limit_percent"] == 65
+
+
+def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
+    from xagent.config import get_execution_budget_defaults
+
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "200")
+    monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
+    with pytest.raises(ValueError, match="must not exceed"):
+        get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", " development ", "DEVELOPMENT"])
+def test_environment_defaults_and_normalizes_development(monkeypatch, value):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    if value is None:
+        monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_ENVIRONMENT", value)
+
+    assert config.get_environment() == "development"
+
+
+def test_legacy_environment_alias_is_normalized(monkeypatch):
+    monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", " Production ")
+
+    assert config.get_environment() == "production"
+
+
+def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
+    monkeypatch.setenv("ENVIRONMENT", " production ")
+    assert config.get_environment() == "production"

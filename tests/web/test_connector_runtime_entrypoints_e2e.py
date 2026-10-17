@@ -1193,14 +1193,7 @@ async def test_telegram_voice_is_transcribed_as_prompt_and_kept_as_input_file(
             def __init__(self) -> None:
                 self.closed = False
 
-            async def transcribe(
-                self,
-                *,
-                audio: str,
-                format: str | None = None,
-                verbose: bool = False,
-                **kwargs: object,
-            ) -> str:
+            async def transcribe(self, *, audio: str, format: str | None = None) -> str:
                 assert audio == "/workspace/input/voice.oga"
                 assert format == "ogg"
                 return "今晚有世界杯比赛吗？"

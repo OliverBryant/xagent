@@ -791,9 +791,10 @@ class TestModelAPI:
             degraded_llm = UserAwareModelStorage(db).get_llm_by_id(
                 data["auto_model"]["model_id"], regular_user["id"]
             )
-            assert isinstance(degraded_llm, RouterLLM)
-            assert degraded_llm._candidate_models == ("deepseek/deepseek-v4-flash",)
-            assert degraded_llm._fallback_model == "deepseek/deepseek-v4-flash"
+            # One candidate left: Auto runs it directly, with its own retries.
+            assert not isinstance(degraded_llm, RouterLLM)
+            assert degraded_llm.model_id == second.json()["model_id"]
+            assert degraded_llm._retry_wrapper.max_retries == 10
 
             second_db_model.is_active = False
             db.flush()

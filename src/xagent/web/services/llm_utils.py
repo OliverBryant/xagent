@@ -734,6 +734,11 @@ class UserAwareModelStorage:
                     configured_model, resolver = self._build_configured_router_resolver(
                         model_config, db_model
                     )
+                    candidates = configured_model.router_candidate_models or []
+                    if len(candidates) == 1:
+                        # Nothing to choose between: run the only available
+                        # candidate directly instead of routing to it.
+                        return resolver(candidates[0])
                     return self.core_storage.create_llm_instance(
                         configured_model,
                         downstream_resolver=resolver,

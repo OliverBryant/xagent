@@ -78,6 +78,7 @@ from ..services.llm_utils import (
     is_platform_model_id,
 )
 from ..services.model_store import ModelSharingConflictError, ModelStore
+from ..tracking.standalone_usage import usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -961,6 +962,8 @@ async def test_model_connection(
         elif request.category == "embedding":
             embedding_config = EmbeddingModelConfig(
                 id="test-model",
+                # An unsaved model has no configured id to bill under.
+                billing_model_id="",
                 model_provider=provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
@@ -969,10 +972,12 @@ async def test_model_connection(
                 abilities=request.abilities or ["embedding"],
             )
             embedding_model = create_embedding_adapter(embedding_config)
-            await asyncio.wait_for(
-                asyncio.to_thread(embedding_model.encode, "hello"),
-                timeout=timeout_seconds,
-            )
+            # The probe is a real provider call, recorded for the operator.
+            async with usage_scope(int(user.id), source="model_probe"):
+                await asyncio.wait_for(
+                    asyncio.to_thread(embedding_model.encode, "hello"),
+                    timeout=timeout_seconds,
+                )
 
         elif request.category == "image":
             image_config = ImageModelConfig(
@@ -1130,6 +1135,7 @@ async def test_model_connection(
 
             rerank_config = RerankModelConfig(
                 id="test-model",
+                billing_model_id="",
                 model_provider=provider,
                 model_name=request.model_name,
                 api_key=request.api_key,
@@ -1147,10 +1153,11 @@ async def test_model_connection(
                     )
                 )
 
-            await asyncio.wait_for(
-                asyncio.to_thread(_probe_rerank),
-                timeout=timeout_seconds,
-            )
+            async with usage_scope(int(user.id), source="model_probe"):
+                await asyncio.wait_for(
+                    asyncio.to_thread(_probe_rerank),
+                    timeout=timeout_seconds,
+                )
 
         else:
             raise ValueError(f"Unsupported category for testing: {request.category}")
@@ -1215,14 +1222,17 @@ async def transcribe_speech_input(
     db_model = _resolve_asr_model_for_transcription(db, user, model_id)
     asr_model = get_asr_model_instance(db_model)
     try:
-        result = await asyncio.wait_for(
-            asr_model.transcribe(
-                audio_bytes,
-                language=language,
-                format=_format_from_upload(file),
-            ),
-            timeout=180.0,
-        )
+        # The provider records the transcription; this delivers it for the
+        # requesting user, since no agent run is tracking it.
+        async with usage_scope(int(user.id), source="speech_transcribe"):
+            result = await asyncio.wait_for(
+                asr_model.transcribe(
+                    audio_bytes,
+                    language=language,
+                    format=_format_from_upload(file),
+                ),
+                timeout=180.0,
+            )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:

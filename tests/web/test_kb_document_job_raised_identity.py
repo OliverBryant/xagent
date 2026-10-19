@@ -479,3 +479,55 @@ def test_duplicate_submit_skips_the_existence_check(test_env, temp_uploads) -> N
 
     assert second == first
     check.assert_awaited_once()
+
+
+def _embed_then(outcome: Any) -> Any:
+    """Ingest that bills one embedding call, then succeeds or raises."""
+    from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+
+    def _ingest(**kwargs: Any) -> Any:
+        add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=4, model_id="e")
+        return outcome(**kwargs)
+
+    return _ingest
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["success", "raised"])
+def test_document_job_bills_its_submitter_once(test_env, temp_uploads, raises):
+    from xagent.web.services import quota_hooks
+
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    try:
+        job_id = _submit(test_env, b"billed")
+        db = test_env[3]()
+        try:
+            job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).one()
+            submitter = int(job.user_id)
+            job.attempts, job.max_attempts = 1, 3
+            db.commit()
+            outcome = (
+                _raise_before_registration if raises else _register_and_succeed({})
+            )
+            with patch(_INGEST, side_effect=_embed_then(outcome)):
+                try:
+                    handle_kb_ingest_document(db, job)
+                except Exception:  # noqa: BLE001
+                    assert raises
+        finally:
+            db.close()
+    finally:
+        quota_hooks.set_standalone_usage_hook(None)
+
+    [(user_id, [row], source)] = calls
+    assert (user_id, source, row["quantity"]) == (submitter, "kb_ingest_job", 4.0)
+
+
+def test_job_billing_user_is_the_job_owner_not_the_storage_tenant():
+    from xagent.web.jobs.kb_tasks import _job_billing_user_id
+
+    job = BackgroundJob(user_id=101, payload={"user_id": 999})
+    assert _job_billing_user_id(job) == 101
+    assert _job_billing_user_id(BackgroundJob(user_id=None, payload={})) is None

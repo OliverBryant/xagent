@@ -5,7 +5,7 @@ import hashlib
 import logging
 import shutil
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from sqlalchemy.orm import Session
 
@@ -36,6 +36,7 @@ from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from ..services.kb_reference_protection import coordinate_ingest_job
+from ..tracking.standalone_usage import usage_scope
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
@@ -60,6 +61,18 @@ def _collection_existed_before(payload: dict[str, Any]) -> bool:
     while a sibling ingest runs.
     """
     return bool(payload.get("collection_existed_before", True))
+
+
+def _job_billing_user_id(job: BackgroundJob) -> Optional[int]:
+    """The member a job's provider usage is billed to: whoever submitted it.
+
+    ``None`` when the job has no usable owner; the usage is then delivered as
+    unattributed rather than charged to a guessed user.
+    """
+    try:
+        return int(job.user_id) if job.user_id is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _get_job_user(
@@ -214,9 +227,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     try:
-        with user_scope_context(
-            user_id=int(payload["user_id"]),
-            is_admin=bool(payload.get("is_admin", False)),
+        # Billed to the member who submitted the job (the job's owner), not
+        # the storage tenant in payload["user_id"].
+        with (
+            usage_scope(_job_billing_user_id(job), source="kb_ingest_job"),
+            user_scope_context(
+                user_id=int(payload["user_id"]),
+                is_admin=bool(payload.get("is_admin", False)),
+            ),
         ):
             api_result = _get_api_compatibility_facade().run_with_operation_outcome(
                 lambda: run_document_ingestion(
@@ -388,7 +406,11 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     update_job_progress(db, job, message="Crawling website")
     try:
-        with user_scope_context(user_id=user_id, is_admin=is_admin):
+        with (
+            usage_scope(_job_billing_user_id(job), source="kb_ingest_web_job"),
+            user_scope_context(user_id=user_id, is_admin=is_admin),
+        ):
+            # asyncio.run carries this context into the crawl's tasks.
             api_result = asyncio.run(
                 _get_api_compatibility_facade().run_async_with_operation_outcome(
                     lambda: run_web_ingestion(

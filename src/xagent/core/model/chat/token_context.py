@@ -754,6 +754,34 @@ def set_token_usage(usage: TokenUsage) -> TokenUsage:
     return usage
 
 
+def call_with_own_usage(
+    fn: Callable[..., Any], *args: Any
+) -> tuple[TokenUsage, Any, Optional[BaseException]]:
+    """Run ``fn(*args)`` recording into a fresh ``TokenUsage`` of its own.
+
+    For work submitted to a thread pool, which does not carry the caller's
+    context: the worker records into this private usage, and the caller merges
+    it into its own on its own thread (``get_token_usage().merge(usage)``), so
+    no ``TokenUsage`` is ever appended to from two threads. Runs in a copied
+    context, leaving the pool thread's own context untouched for whatever
+    task reuses it next.
+
+    Returns ``(usage, result, error)``. The error is returned rather than
+    raised so the caller can merge the usage first -- calls the provider
+    billed before the failure still count.
+    """
+    usage = TokenUsage()
+
+    def _run() -> Any:
+        token_context.set(usage)
+        return fn(*args)
+
+    try:
+        return usage, contextvars.copy_context().run(_run), None
+    except Exception as e:  # noqa: BLE001
+        return usage, None, e
+
+
 def get_and_reset_token_usage() -> TokenUsage:
     """Get current usage and reset the context."""
     usage = get_token_usage()

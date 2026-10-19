@@ -31,14 +31,12 @@ Recording is best-effort: nothing in this module raises into the media call.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import math
 import shutil
 import struct
 import subprocess
 import tempfile
-import wave
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Any, Awaitable, Callable, Mapping, Optional
@@ -346,13 +344,52 @@ def _mp3_seconds(data: bytes) -> Optional[float]:
     return samples / sample_rate
 
 
+# WAVE format tags whose block_align is one frame of samples: integer PCM,
+# IEEE float, A-law and µ-law. Compressed tags (ADPCM, MP3-in-WAV...) pack
+# several frames per block, so they are left to ffprobe.
+_WAV_FRAME_FORMATS = {0x0001, 0x0003, 0x0006, 0x0007}
+_WAV_FORMAT_EXTENSIBLE = 0xFFFE
+
+
 def _wav_seconds(data: bytes) -> Optional[float]:
-    try:
-        with wave.open(io.BytesIO(data)) as wav:
-            rate = wav.getframerate()
-            return wav.getnframes() / rate if rate else None
-    except (wave.Error, EOFError, ValueError):
-        return None
+    """Duration of a WAV file from the audio it actually contains.
+
+    The ``data`` chunk header declares its own size, and an upload can declare
+    far more than it carries -- a 1000-byte file claiming 2 GiB of samples
+    would otherwise bill as 18 hours. The frame count is therefore the
+    smaller of the declared size and the bytes really present. Formats this
+    does not measure (compressed, or a header it cannot read) return None, so
+    the caller can fall back to ffprobe rather than record nothing.
+    """
+    pos = 12
+    end = len(data)
+    rate = 0
+    block_align = 0
+    while pos + 8 <= end:
+        chunk_id = data[pos : pos + 4]
+        size = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        body = pos + 8
+        if chunk_id == b"fmt ":
+            if size < 16 or body + 16 > end:
+                return None
+            tag = int.from_bytes(data[body : body + 2], "little")
+            if tag == _WAV_FORMAT_EXTENSIBLE:
+                # The real tag is the first two bytes of the SubFormat GUID.
+                if size < 40 or body + 26 > end:
+                    return None
+                tag = int.from_bytes(data[body + 24 : body + 26], "little")
+            if tag not in _WAV_FRAME_FORMATS:
+                return None
+            rate = int.from_bytes(data[body + 4 : body + 8], "little")
+            block_align = int.from_bytes(data[body + 12 : body + 14], "little")
+        elif chunk_id == b"data":
+            if not rate or not block_align:
+                return None
+            present = min(size, end - body)
+            return positive_seconds((present // block_align) / rate)
+        # Chunks are word-aligned: an odd size is followed by a pad byte.
+        pos = body + size + (size & 1)
+    return None
 
 
 _OGG_PAGE_HEADER = struct.Struct("<4sBBqIIIB")
@@ -406,7 +443,60 @@ def _ogg_seconds(data: bytes) -> Optional[float]:
     return positive_seconds((last_granule - pre_skip) / rate)
 
 
-def _ffprobe_seconds(data: bytes) -> Optional[float]:
+# Demuxer for each container hint a caller may pass, keyed by the hint's first
+# ``_``-separated part (ElevenLabs writes ``opus_48000_64``).
+_FFPROBE_DEMUXERS = {
+    "aac": "aac",
+    "amr": "amr",
+    "flac": "flac",
+    "m4a": "mov",
+    "mkv": "matroska",
+    "mov": "mov",
+    "mp3": "mp3",
+    "mp4": "mov",
+    "oga": "ogg",
+    "ogg": "ogg",
+    "opus": "ogg",
+    "wav": "wav",
+    "webm": "webm",
+}
+# The only demuxers ffprobe may pick when the hint names none. Playlist and
+# indirection formats (HLS, concat, ...) are absent on purpose.
+_FFPROBE_FORMAT_WHITELIST = ",".join(sorted(set(_FFPROBE_DEMUXERS.values())))
+
+
+def _ffprobe_command(ffprobe: str, path: str, audio_format: str) -> list[str]:
+    """The ffprobe argv for measuring the caller-supplied file at ``path``.
+
+    The bytes come from the caller, so ffprobe must read that one file and
+    nothing else: a playlist upload (HLS, an ffconcat list) would otherwise
+    make it open other local files or URLs. ``-protocol_whitelist file``
+    keeps it off the network, the format whitelist keeps playlist demuxers
+    out, and a known hint pins the demuxer outright.
+    """
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        "file",
+        "-format_whitelist",
+        _FFPROBE_FORMAT_WHITELIST,
+    ]
+    demuxer = _FFPROBE_DEMUXERS.get(audio_format.partition("_")[0])
+    if demuxer:
+        command += ["-f", demuxer]
+    return command + [
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        "-i",
+        path,
+    ]
+
+
+def _ffprobe_seconds(data: bytes, audio_format: str = "") -> Optional[float]:
     """Container-reported duration via ffprobe, when it is installed.
 
     The bytes go through a temporary file rather than a pipe: several
@@ -422,17 +512,7 @@ def _ffprobe_seconds(data: bytes) -> Optional[float]:
             audio_file.write(data)
             audio_file.flush()
             completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                [
-                    ffprobe,
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    "-i",
-                    audio_file.name,
-                ],
+                _ffprobe_command(ffprobe, audio_file.name, audio_format),
                 capture_output=True,
                 timeout=_FFPROBE_TIMEOUT_SECONDS,
                 check=False,
@@ -486,7 +566,10 @@ def measure_audio_seconds(data: Any, audio_format: str = "") -> Optional[float]:
             rate, width = raw
             return positive_seconds(len(payload) / (rate * width))
         if payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
-            return positive_seconds(_wav_seconds(payload))
+            seconds = _wav_seconds(payload)
+            if seconds is not None:
+                return seconds
+            return _ffprobe_seconds(payload, "wav")
         if payload[:4] == b"OggS":
             seconds = _ogg_seconds(payload)
             if seconds is not None:
@@ -499,7 +582,7 @@ def measure_audio_seconds(data: Any, audio_format: str = "") -> Optional[float]:
             seconds = positive_seconds(_mp3_seconds(payload))
             if seconds is not None:
                 return seconds
-        return _ffprobe_seconds(payload)
+        return _ffprobe_seconds(payload, fmt)
     except Exception as e:  # noqa: BLE001
         logger.warning("Measuring audio duration failed: %s", e)
         return None

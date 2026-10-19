@@ -11,6 +11,8 @@ import os
 import signal
 import socket
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -514,16 +516,28 @@ class SharedExecutionApp:
         assert not failures, "\n".join(failures) + "\n" + self.diagnostics()
 
 
-@pytest.fixture
-def shared_app(tmp_path, monkeypatch, request):
+@contextmanager
+def open_shared_app(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    database_url: str,
+    host_database_url: str | None = None,
+    event_read_acceptance: bool = False,
+) -> Iterator[SharedExecutionApp]:
+    """A web host and a worker on ``database_url``, closed on exit.
+
+    The hosts reach the database through ``host_database_url`` when given;
+    this process always uses ``database_url`` directly.
+    """
     from xagent.web.models.database import get_engine, get_session_local, init_db
     from xagent.web.models.user import User
 
     root = tmp_path / "hosts"
     root.mkdir()
-    if getattr(request, "param", 1) == 2:
+    if event_read_acceptance:
         (root / "event-read-acceptance").touch()
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'shared.db'}")
+    monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "false")
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "10")
@@ -533,25 +547,39 @@ def shared_app(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS", "0")
     monkeypatch.setenv("XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED", "false")
     init_db()
-    with get_session_local()() as db:
-        user = User(username="e2e-owner", password_hash="unused", is_admin=True)
-        db.add(user)
-        db.commit()
-        user_id = user.id
-    app = SharedExecutionApp(
-        root,
-        dict(os.environ),
-        build_access_token(username="e2e-owner", user_id=user_id),
-        user_id,
-    )
     try:
-        app.start_all("web", "worker")
-        yield app
-    finally:
+        with get_session_local()() as db:
+            user = User(username="e2e-owner", password_hash="unused", is_admin=True)
+            db.add(user)
+            db.commit()
+            user_id = user.id
+        environment = dict(os.environ)
+        if host_database_url is not None:
+            environment["DATABASE_URL"] = host_database_url
+        app = SharedExecutionApp(
+            root,
+            environment,
+            build_access_token(username="e2e-owner", user_id=user_id),
+            user_id,
+        )
         try:
-            app.close()
+            app.start_all("web", "worker")
+            yield app
         finally:
-            get_engine().dispose()
+            app.close()
+    finally:
+        get_engine().dispose()
+
+
+@pytest.fixture
+def shared_app(tmp_path, monkeypatch, request):
+    with open_shared_app(
+        tmp_path,
+        monkeypatch,
+        database_url=f"sqlite:///{tmp_path / 'shared.db'}",
+        event_read_acceptance=getattr(request, "param", 1) == 2,
+    ) as app:
+        yield app
 
 
 def receive_event(ws, event_type):
@@ -681,7 +709,7 @@ def auto_resume_commands(task_id: int) -> list[str]:
 def ws_url(app, task_id: int) -> str:
     return (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
 
 
@@ -700,6 +728,19 @@ def create_task(app, title: str, description: str) -> int:
     return response.json()["task_id"]
 
 
+def create_sdk_task(app, content: str) -> tuple[int, str, dict[str, str]]:
+    """An agent's SDK task: its id, run id and the caller's headers."""
+    agent_id, headers = app.create_agent()
+    response = app.client.post(
+        "/v1/chat/tasks",
+        headers=headers,
+        json={"agent_id": agent_id, "message": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 202, response.text
+    accepted = response.json()
+    return accepted["task_id"], accepted["run_id"], headers
+
+
 def start_task(app, description: str = "e2e:gate") -> int:
     """An owner's internal balanced task, executed over the WebSocket.
 
@@ -709,7 +750,7 @@ def start_task(app, description: str = "e2e:gate") -> int:
     from websockets.sync.client import connect
 
     task_id = create_task(app, "Auto resume", description)
-    with connect(ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id), additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         receive_event(ws, "execution_started")

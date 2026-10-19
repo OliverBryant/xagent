@@ -16,10 +16,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import create_access_token
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps, oauth_account_hosts
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_login
+from xagent.web.api.auth import generic_oauth_login
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -57,7 +58,12 @@ class _ProviderResponse:
 
 def _token_for(user: User) -> str:
     return create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -341,7 +347,7 @@ def _fake_token_endpoint(monkeypatch, data: dict, status_code: int = 200) -> lis
             posted.append((url, kwargs))
             return _ProviderResponse(data, status_code)
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
     return posted
 
 

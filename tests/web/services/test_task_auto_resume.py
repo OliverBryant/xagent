@@ -508,6 +508,38 @@ def test_due_row_is_dispatched_as_one_fenced_resume_command(factory, notified):
     assert "total_resumes" not in str(message)
 
 
+@pytest.mark.parametrize(
+    ("source", "previous", "expected"),
+    [
+        pytest.param("sdk", "interactive", "batch", id="sdk-ignores-previous"),
+        pytest.param("future_unknown", "interactive", "interactive", id="inherits"),
+    ],
+)
+def test_auto_resume_command_gets_the_upstream_dispatch_class(
+    factory, notified, source, previous, expected
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now, source=source)
+        if previous is not None:
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    command_id="earlier-start",
+                    kind="start",
+                    payload={},
+                    status="completed",
+                    dispatch_class=previous,
+                )
+            )
+        db.commit()
+
+    assert run_auto_resume_tick(now=now).staged_commands == 1
+
+    resume = [c for c in _commands(factory, task_id) if c.kind == "resume"]
+    assert [c.dispatch_class for c in resume] == [expected]
+
+
 def test_dispatch_does_not_require_an_empty_runner(factory, notified):
     # A PAUSED task may hold an idle shared coordinator's owner lease.
     now = utc_now()
@@ -845,6 +877,21 @@ def test_max_inflight_counts_running_and_queued_resumes(
     assert sum(_row(factory, i).state == "dispatched" for i in ids) == 3 - expected
 
 
+def _add_completed_command(db: Session, task_id: int, command_id: str) -> None:
+    """A completed command of the task's owner, flushed so ids follow call order."""
+    db.add(
+        TaskExecutionCommand(
+            task_id=task_id,
+            actor_user_id=db.get(Task, task_id).user_id,
+            command_id=command_id,
+            kind="message" if command_id.startswith("message") else "resume",
+            payload={},
+            status="completed",
+        )
+    )
+    db.flush()
+
+
 @pytest.mark.parametrize(
     ("later_command", "counted"),
     [
@@ -876,25 +923,74 @@ def test_inflight_running_excludes_runs_a_person_resumed(
             paused_state_version=PV,
             last_command_id=dispatch_id,
         )
-        user_id = db.get(Task, task_id).user_id
         for command_id in (dispatch_id, later_command):
-            if command_id is None:
-                continue
-            db.add(
-                TaskExecutionCommand(
-                    task_id=task_id,
-                    actor_user_id=user_id,
-                    command_id=command_id,
-                    kind="message" if command_id.startswith("message") else "resume",
-                    payload={},
-                    status="completed",
-                )
-            )
-            db.flush()
+            if command_id is not None:
+                _add_completed_command(db, task_id, command_id)
         db.commit()
 
     with factory() as db:
         assert task_auto_resume.count_inflight(db) == (1 if counted else 0)
+
+
+def test_inflight_running_checks_each_run_against_its_own_dispatch(factory):
+    # Two auto-resumed runs RUNNING at once. Each run's "a person acted since"
+    # check must compare against that run's own dispatch: on PostgreSQL a
+    # check that sees every dispatch fails outright once there are two.
+    now = utc_now()
+    with factory() as db:
+        tasks = {}
+        for run_id in ("run-a", "run-b"):
+            tasks[run_id] = _seed(
+                db,
+                now,
+                state="dispatched",
+                due_in=None,
+                status=TaskStatus.RUNNING,
+                control_state="running",
+                run_id=run_id,
+                state_version=PV + 4,
+                paused_state_version=PV,
+                last_command_id=auto_resume_command_id(PV, 1, run_id),
+            )
+        # run-b's dispatch is the oldest command, and run-a has a message a
+        # person sent before run-a's own dispatch: run-a is still automatic.
+        for run_id, command_id in (
+            ("run-b", auto_resume_command_id(PV, 1, "run-b")),
+            ("run-a", "message-before-dispatch"),
+            ("run-a", auto_resume_command_id(PV, 1, "run-a")),
+        ):
+            _add_completed_command(db, tasks[run_id], command_id)
+        db.commit()
+
+    with factory() as db:
+        assert task_auto_resume.count_inflight(db) == 2
+
+
+def test_tick_dispatches_while_an_auto_resumed_run_is_running(factory, notified):
+    # The sweeper keeps filling free slots while earlier resumes still run,
+    # instead of waiting for every one of them to stop.
+    now = utc_now()
+    with factory() as db:
+        # A running resumed run whose dispatch command has completed, next to
+        # one whose dispatch is still queued.
+        _dispatched(
+            db,
+            now,
+            command_status="completed",
+            due_in=None,
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            run_id="run-a",
+            state_version=PV + 2,
+        )
+        _inflight_queued(db, now)
+        due = _seed(db, now, due_in=-10)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.inflight, report.dispatched) == (2, 1)
+    assert _row(factory, due).state == "dispatched"
 
 
 def test_give_ups_still_advance_when_no_dispatch_budget_is_left(
@@ -1122,10 +1218,10 @@ def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeyp
     full_for: set[int] = set()
     real = task_execution_admission.stage_task_admission
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     monkeypatch.setattr(
         "xagent.web.services.task_execution_admission.stage_task_admission", admission
@@ -1155,7 +1251,7 @@ def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeyp
 
 
 def _team_admission(
-    factory: sessionmaker, monkeypatch, request, *, full_for: User
+    factory: sessionmaker, monkeypatch, request, *, full_for: User, install: str
 ) -> None:
     """Admission buckets per user (a stand-in for a team), the user's bucket
     already holding its one pending slot."""
@@ -1167,8 +1263,19 @@ def _team_admission(
             return None
         return AdmissionPolicy(bucket=f"team:{task.user_id}", capacity=1, max_pending=1)
 
-    task_execution_admission.set_task_admission_hook(classify)
-    request.addfinalizer(lambda: task_execution_admission.set_task_admission_hook(None))
+    if install == "legacy":
+        task_execution_admission.set_task_admission_hook(classify)
+        request.addfinalizer(
+            lambda: task_execution_admission.set_task_admission_hook(None)
+        )
+    else:
+        task_execution_admission.set_command_classifier(
+            lambda db, command, view: task_execution_admission.CommandClassification(
+                admission=classify(db, command)
+            ),
+            admission_enabled=True,
+        )
+        request.addfinalizer(task_execution_admission.reset_command_classifier)
     now = utc_now()
     with factory() as db:
         holder = _seed(db, now, user=full_for, state="manual", due_in=None)
@@ -1195,9 +1302,10 @@ def _team_admission(
         db.commit()
 
 
+@pytest.mark.parametrize("install", ["legacy", "classifier"])
 @pytest.mark.parametrize("team_a_rows", [1, 200])
 def test_admission_full_in_one_team_does_not_block_another(
-    factory, notified, monkeypatch, request, team_a_rows
+    factory, notified, monkeypatch, request, team_a_rows, install
 ):
     now = utc_now()
     with factory() as db:
@@ -1206,7 +1314,7 @@ def test_admission_full_in_one_team_does_not_block_another(
         team_a_id, team_b_id = team_a.id, team_b.id
     with factory() as db:
         team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
-        _team_admission(factory, monkeypatch, request, full_for=team_a)
+        _team_admission(factory, monkeypatch, request, full_for=team_a, install=install)
         # Team A's rows are due first; team B's row and an internal row the
         # host's hook does not classify come after them.
         a_rows = [
@@ -2329,10 +2437,10 @@ def test_failure_while_postponing(
     real = task_execution_admission.stage_task_admission
     full_for: set[int] = set()
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     def broken(*_args, **_kwargs):
         raise postpone_error

@@ -10,12 +10,14 @@ import requests
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api.auth import (
     _merge_oauth_scopes,
     _oauth_scope_separator,
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
@@ -124,7 +126,12 @@ def test_scope_separator_joins_linear_scopes_with_commas():
 def test_login_sends_comma_separated_scope_param(db_session):
     db, user = db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -144,7 +151,12 @@ def test_login_forces_consent_prompt(db_session):
     silently leave the user on the earlier, narrower grant."""
     db, user = db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -606,7 +618,7 @@ async def test_linear_expired_token_refresh_uses_generic_form_body(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "linear")

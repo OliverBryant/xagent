@@ -76,6 +76,25 @@ def local_execution_unless_selected(monkeypatch):
 
 
 _DATABASE_MODULE = "xagent.web.models.database"
+
+
+@pytest.fixture(autouse=True)
+def isolated_local_authentication_budgets():
+    """Each test is an independent deployment, not one shared client IP."""
+
+    def clear():
+        module = sys.modules.get("xagent.web.api.auth")
+        if module is not None:
+            with module._login_failure_lock:
+                module._login_failures.clear()
+            with module._password_recovery_lock:
+                module._password_recovery_attempts.clear()
+
+    clear()
+    yield
+    clear()
+
+
 _DATABASE_ACCESSORS = (
     "get_session_local",
     "get_optional_session_local",
@@ -489,6 +508,8 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+        "XAGENT_MODEL_PRIVATE_ENDPOINTS",
+        "XAGENT_MODEL_PRIVATE_CIDRS",
     ):
         monkeypatch.delenv(name, raising=False)
 

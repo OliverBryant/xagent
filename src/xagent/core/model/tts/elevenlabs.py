@@ -22,6 +22,11 @@ from ..media_metering import (
     read_billed_stream,
     record_provider_usage,
 )
+from ..public_elevenlabs import (
+    close_public_elevenlabs_http_client,
+    close_public_elevenlabs_sync_http_client,
+    create_public_elevenlabs_client,
+)
 from .base import BaseTTS, TTSResult
 
 logger = logging.getLogger(__name__)
@@ -133,11 +138,15 @@ class ElevenLabsTTS(BaseTTS):
             kwargs["base_url"] = base_url
 
         try:
-            return ElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                ElevenLabs, asynchronous=False, **kwargs
+            )
         except TypeError:
             # Older SDK releases may not accept base_url.
             kwargs.pop("base_url", None)
-            return ElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                ElevenLabs, asynchronous=False, **kwargs
+            )
 
     @staticmethod
     def _create_async_client(
@@ -156,11 +165,15 @@ class ElevenLabsTTS(BaseTTS):
             kwargs["base_url"] = base_url
 
         try:
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
         except TypeError:
             # Older SDK releases may not accept base_url.
             kwargs.pop("base_url", None)
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
 
     def _ensure_client(self) -> Any:
         if not self.api_key:
@@ -278,6 +291,8 @@ class ElevenLabsTTS(BaseTTS):
         if client is None:
             return
 
+        await close_public_elevenlabs_http_client(client)
+
         close = getattr(client, "aclose", None) or getattr(client, "close", None)
         if callable(close):
             result = close()
@@ -288,6 +303,8 @@ class ElevenLabsTTS(BaseTTS):
     def _close_sync_client(client: Any) -> None:
         if client is None:
             return
+
+        close_public_elevenlabs_sync_http_client(client)
 
         close = getattr(client, "close", None)
         if callable(close):

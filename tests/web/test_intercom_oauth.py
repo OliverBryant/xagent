@@ -8,11 +8,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
@@ -386,7 +388,12 @@ def test_hidden_intercom_app_rejects_oauth_login_redirect(hidden_db_session):
     connecting at the provider)."""
     db, user = hidden_db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 

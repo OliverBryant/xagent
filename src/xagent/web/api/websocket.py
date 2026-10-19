@@ -58,6 +58,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ..auth_dependencies import get_current_user
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -197,7 +198,9 @@ from ..utils.db_timezone import safe_timestamp_to_unix
 from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
+    accept_authenticated_websocket,
     get_authenticated_user,
+    revalidate_websocket_session,
     send_websocket_authentication_infrastructure_failure,
 )
 
@@ -373,11 +376,15 @@ def _resolve_legacy_preview_storage_path(raw_path: str) -> Optional[tuple[Path, 
         normalized = candidate.lstrip("/")
         if not normalized:
             continue
-        glob_matches = list(get_uploads_dir().glob(f"user_*/{normalized}"))
-        if glob_matches:
-            resolved_path = glob_matches[0].resolve()
-            relative_path = str(resolved_path.relative_to(get_uploads_dir().resolve()))
-            return resolved_path, relative_path
+        # Only the user-directory prefix is a pattern. Treat the supplied
+        # path literally and reject symlinks/traversal outside the uploads root.
+        root = get_uploads_dir().resolve()
+        for user_dir in root.glob("user_*"):
+            resolved_path = (user_dir / normalized).resolve()
+            if not resolved_path.is_relative_to(user_dir.resolve()):
+                continue
+            if resolved_path.is_file() and resolved_path.is_relative_to(root):
+                return resolved_path, str(resolved_path.relative_to(root))
 
     return None
 
@@ -846,7 +853,7 @@ class _LegacyPreviewRegistrationError(RuntimeError):
     """A legacy preview path cannot be registered for a public redirect."""
 
 
-def _register_legacy_preview_isolated(legacy_path: str) -> str:
+def _register_legacy_preview_isolated(legacy_path: str, requesting_user_id: int) -> str:
     """Register one legacy local preview without overlapping DB and file I/O.
 
     Owner discovery and the final insert each own a short Session. Durable
@@ -868,14 +875,16 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
             .first()
         )
         if existing is not None:
+            if int(existing.user_id) != requesting_user_id:
+                raise _LegacyPreviewRegistrationError("Legacy preview target not found")
             return str(existing.file_id)
 
         owner_info = _infer_owner_from_relative_path(lookup_db, relative_path)
         if owner_info is None:
-            raise _LegacyPreviewRegistrationError(
-                "Cannot infer owner for legacy preview path"
-            )
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
         owner_user_id, task_id = owner_info
+        if owner_user_id != requesting_user_id:
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
 
     generated_file_id = _build_output_file_id(relative_path)
     scope_segments = _scope_segments_for_task(task_id)
@@ -930,6 +939,10 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
                 .first()
             )
             if current is not None:
+                if int(current.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(current.file_id)
 
             if task_id is not None:
@@ -969,6 +982,10 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
                 )
                 if winner is None:
                     raise
+                if int(winner.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(winner.file_id)
             metadata_committed = True
             return applied.snapshot.file_id
@@ -994,7 +1011,9 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
 async def redirect_legacy_preview(
     legacy_path: str,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> Any:
+    requesting_user_id = int(user.id)
     if not release_db_connection_if_clean(db):
         raise RuntimeError(
             "Cannot register a legacy preview while the request database "
@@ -1002,10 +1021,13 @@ async def redirect_legacy_preview(
         )
     try:
         file_id = await run_db_io_cancellation_safe(
-            lambda: _register_legacy_preview_isolated(legacy_path)
+            lambda: _register_legacy_preview_isolated(legacy_path, requesting_user_id)
         )
     except _LegacyPreviewRegistrationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Do not disclose whether an unowned path exists or changed owners.
+        raise HTTPException(
+            status_code=404, detail="Legacy preview target not found"
+        ) from exc
 
     return RedirectResponse(
         url=f"/api/files/public/preview/{file_id}",
@@ -2956,10 +2978,14 @@ async def _run_chat_heartbeat(websocket: WebSocket, task_id: int) -> None:
 
 
 @ws_router.websocket("/ws/chat/{task_id}")
+@revalidate_websocket_session
 async def websocket_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket unified endpoint - handle chat, execution status, and DAG intervention"""
     # Verify user identity
@@ -2974,7 +3000,7 @@ async def websocket_chat_endpoint(
     # Accept before closing an access denial so the fixed close reason survives
     # the WebSocket handshake.  Do not register until ownership has been
     # checked: task broadcasts are an owner-scoped private audience.
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     try:
         access = await run_db_io_cancellation_safe(
             lambda: _private_websocket_task_access_sync(
@@ -3026,6 +3052,8 @@ async def websocket_chat_endpoint(
         while True:
             # Receive client message
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(
                 f"📨 Received WebSocket message for task {task_id}: {data[:200]}"
             )  # Log first 200 chars
@@ -3063,7 +3091,7 @@ async def websocket_chat_endpoint(
                     {"type": "error", "message": "Unknown message type"}, websocket
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         pass
     except DurableObjectIntegrityError:
         # Precedes the parent arm: permanent corruption, already recorded at
@@ -3297,9 +3325,13 @@ async def handle_resume_task(
 
 
 @ws_router.websocket("/ws/build/chat")
+@revalidate_websocket_session
 async def websocket_builder_chat_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for AI Agent Builder Assistant chat."""
     try:
@@ -3310,13 +3342,15 @@ async def websocket_builder_chat_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
     active_chat_task: asyncio.Task[None] | None = None
 
     try:
         while True:
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(f"📨 Received builder chat message: {data[:200]}")
 
             message_data = json.loads(data)
@@ -3330,7 +3364,7 @@ async def websocket_builder_chat_endpoint(
             )
             websocket.state.chat_task = active_chat_task
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         logger.info(f"Builder chat WebSocket disconnected for user {user.id}")
     except (ConnectionError, RuntimeError) as e:
         logger.error(f"Connection error in builder chat WebSocket: {e}")
@@ -3766,9 +3800,13 @@ clarification questions as plain assistant text.
 
 
 @ws_router.websocket("/ws/build/preview")
+@revalidate_websocket_session
 async def websocket_build_preview_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for build page agent preview using normal task execution."""
     # Verify user identity
@@ -3780,13 +3818,15 @@ async def websocket_build_preview_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     logger.info(f"Build preview WebSocket connection established for user {user.id}")
 
     try:
         while True:
             # Receive client message
             data = await websocket.receive_text()
+            if not await get_authenticated_user(websocket, token, revalidate=True):
+                break
             logger.info(f"📨 Received build preview WebSocket message: {data[:200]}")
 
             message_data = json.loads(data)
@@ -3852,7 +3892,7 @@ async def websocket_build_preview_endpoint(
                     )
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         logger.info(f"Build preview WebSocket disconnected for user {user.id}")
     except (ConnectionError, RuntimeError) as e:
         logger.error(f"Connection error in build preview WebSocket: {e}")

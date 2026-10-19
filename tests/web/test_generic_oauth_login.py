@@ -19,12 +19,14 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
     _is_salesforce_provider,
     _resolve_oauth_secret,
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
     verify_token,
 )
@@ -84,7 +86,7 @@ def db_session(tmp_path):
 
 def _token_for(user: User) -> str:
     return create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={"sub": user.username, "user_id": user.id, "type": "access"},
         expires_delta=timedelta(minutes=5),
     )
 

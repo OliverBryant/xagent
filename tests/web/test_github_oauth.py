@@ -9,11 +9,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
@@ -289,7 +291,12 @@ def test_bare_github_login_does_not_disturb_an_existing_scoped_connection(
     # Now attempt the bare login route a malicious/confused re-connect
     # attempt would use.
     login_token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
     login_response = generic_oauth_login(
@@ -925,7 +932,14 @@ def test_github_callback_does_not_leak_token_on_db_commit_failure(
         Mock(return_value=MockResponse({"login": "octocat", "id": 1})),
     )
 
+    original_commit = db.commit
+    commit_count = 0
+
     def failing_commit():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 1:
+            return original_commit()  # Durable state consumption precedes token writes.
         raise RuntimeError(
             "(psycopg2.errors.UniqueViolation) duplicate key value "
             "[parameters: {'access_token': 'secret-token-xyz'}]"
@@ -1052,7 +1066,7 @@ async def test_github_expired_token_refresh_sends_accept_json_header(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1126,7 +1140,7 @@ async def test_github_refresh_falls_back_to_env_credentials(db_session, monkeypa
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1191,7 +1205,7 @@ async def test_github_refresh_surfaces_failure_instead_of_raising_on_form_body(
         async def post(self, url, **kwargs):
             return FormBodyResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1253,7 +1267,7 @@ async def test_github_refresh_treats_bad_provider_credentials_as_transient(
         async def post(self, url, **kwargs):
             return BadCredentialsResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1318,7 +1332,7 @@ async def test_github_refresh_deletes_connection_on_200_bad_refresh_token(
         async def post(self, url, **kwargs):
             return DeadRefreshTokenResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")

@@ -1311,6 +1311,22 @@ class TestGetWebDir:
         assert result == Path("/custom/web")
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, ""),
+        ("", ""),
+        (" auto ", "auto"),
+        (" https://preview.example.test/path ", "https://preview.example.test/path"),
+    ],
+)
+def test_get_html_preview_origin(monkeypatch, value, expected):
+    monkeypatch.delenv(config.HTML_PREVIEW_ORIGIN, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.HTML_PREVIEW_ORIGIN, value)
+    assert config.get_html_preview_origin() == expected
+
+
 class TestGetFrontendDistDir:
     """Test get_frontend_dist_dir() function."""
 
@@ -3992,6 +4008,42 @@ def test_dispatcher_max_inflight_env_parsing(monkeypatch, caplog, raw, expected,
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, 0, False),
+        ("0", 0, False),
+        ("4", 4, False),
+        (" 4 ", 4, False),
+        ("-1", 0, True),
+        ("abc", 0, True),
+        ("", 0, True),
+        ("1.5", 0, True),
+    ],
+)
+def test_dispatcher_interactive_reserve_env_parsing(
+    monkeypatch, caplog, raw, expected, warns
+):
+    env_var = config.DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS
+    assert env_var == "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert config.get_dispatcher_interactive_reserve_per_process() == expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),
@@ -4055,3 +4107,140 @@ def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
     monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
     monkeypatch.setenv("ENVIRONMENT", " production ")
     assert config.get_environment() == "production"
+
+
+@pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
+@pytest.mark.parametrize("length,valid", [(31, False), (32, True)])
+def test_tool_key_alias_and_boundary(monkeypatch, setting, length, valid):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "  ")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv(setting, "s" * length)
+    if valid:
+        assert config.get_tool_credentials_encryption_key() == "s" * length
+    else:
+        with pytest.raises(RuntimeError, match=f"^{setting} must"):
+            config.get_tool_credentials_encryption_key()
+
+
+@pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
+@pytest.mark.parametrize(
+    "value",
+    sorted(value for value in config.KNOWN_INSECURE_SECRETS if len(value) >= 32),
+)
+def test_tool_key_rejects_known_public_values_including_alias(
+    monkeypatch, setting, value
+):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.delenv("XAGENT_SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv(setting, "  " + value.upper() + "  ")
+    with pytest.raises(
+        RuntimeError, match=f"^{setting} must not use a public placeholder"
+    ):
+        config.get_tool_credentials_encryption_key()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        config.DEV_FALLBACK_ENCRYPTION_KEY,
+        config.DEV_FALLBACK_ENCRYPTION_KEY.replace("_", "/"),
+        config.DEV_FALLBACK_ENCRYPTION_KEY + "=",
+        config.DEV_FALLBACK_ENCRYPTION_KEY[:10]
+        + "\n"
+        + config.DEV_FALLBACK_ENCRYPTION_KEY[10:],
+    ],
+)
+def test_deployed_encryption_rejects_published_fernet_key(monkeypatch, key):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
+    with pytest.raises(
+        RuntimeError, match="^ENCRYPTION_KEY must provide a private Fernet key$"
+    ):
+        config.validate_encryption_config()
+
+
+@pytest.mark.parametrize(
+    "setting,getter,default",
+    [
+        (
+            "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS",
+            config.get_auth_rate_limit_window_seconds,
+            900,
+        ),
+        ("XAGENT_AUTH_LOGIN_IP_LIMIT", config.get_auth_login_ip_limit, 200),
+        ("XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT", config.get_auth_login_account_limit, 50),
+        ("XAGENT_AUTH_LOGIN_PAIR_LIMIT", config.get_auth_login_pair_limit, 5),
+        ("XAGENT_AUTH_RECOVERY_IP_LIMIT", config.get_auth_recovery_ip_limit, 200),
+        ("XAGENT_AUTH_RECOVERY_EMAIL_LIMIT", config.get_auth_recovery_email_limit, 50),
+        ("XAGENT_AUTH_RECOVERY_PAIR_LIMIT", config.get_auth_recovery_pair_limit, 5),
+        ("XAGENT_EMAIL_CHANGE_TARGET_LIMIT", config.get_email_change_target_limit, 5),
+        (
+            "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES",
+            config.get_email_confirmation_expire_minutes,
+            15,
+        ),
+        (
+            "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS",
+            config.get_auth_rate_limit_max_local_keys,
+            10000,
+        ),
+    ],
+)
+def test_auth_rate_budget_configuration(monkeypatch, setting, getter, default):
+    monkeypatch.delenv(setting, raising=False)
+    assert getter() == default
+    monkeypatch.setenv(setting, "123")
+    assert getter() == 123
+    for invalid in ("", "0", "-1", "invalid"):
+        monkeypatch.setenv(setting, invalid)
+        assert getter() == default
+
+
+@pytest.mark.parametrize(
+    "kind,default", [("image", 64 * 1024 * 1024), ("video", 512 * 1024 * 1024)]
+)
+def test_media_download_size_defaults_and_overrides(monkeypatch, kind, default):
+    variable = f"XAGENT_{kind.upper()}_DOWNLOAD_MAX_BYTES"
+    monkeypatch.delenv(variable, raising=False)
+    assert config.get_media_download_max_bytes(kind) == default
+    monkeypatch.setenv(variable, "123")
+    assert config.get_media_download_max_bytes(kind) == 123
+    for blank in ("", "  ", "\t"):
+        monkeypatch.setenv(variable, blank)
+        assert config.get_media_download_max_bytes(kind) == default
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5"])
+def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_IMAGE_DOWNLOAD_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_media_download_max_bytes("image")
+
+
+def test_remote_json_download_size_default_and_override(monkeypatch):
+    monkeypatch.delenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", raising=False)
+    assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
+    for value in ("", " "):
+        monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+        assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
+    for value, expected in (("123", 123), ("2K", 2048), ("1.5M", 1572864)):
+        monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+        assert config.get_remote_json_download_max_bytes() == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5", "nan", "inf"])
+def test_remote_json_download_size_rejects_invalid_limits(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_remote_json_download_max_bytes()
+
+
+def test_private_model_config_is_default_empty_and_environment_only(monkeypatch):
+    assert config.get_model_private_endpoints() == []
+    assert config.get_model_private_cidrs() == []
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_ENDPOINTS", " http://localhost:9997, ")
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_CIDRS", " 127.0.0.1/32,::1/128 ")
+    assert config.get_model_private_endpoints() == ["http://localhost:9997"]
+    assert config.get_model_private_cidrs() == ["127.0.0.1/32", "::1/128"]

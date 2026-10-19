@@ -1,5 +1,4 @@
 import html
-import json
 import logging
 import os
 import re
@@ -37,6 +36,9 @@ from xagent.web.schemas.user_channel import (
     UserChannelResponse,
     UserChannelUpdate,
 )
+
+from ..auth_sessions import lock_current_session_epoch, matches_user_session
+from ..utils.script_json import script_safe_json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -224,22 +226,6 @@ def _frontend_origin_for_slack_oauth(request: Request) -> str:
     return f"{request.url.scheme}://{request.url.netloc}"
 
 
-def _script_safe_json(value: Any) -> str:
-    """JSON-encode a value for embedding inside an inline <script> block.
-
-    ``json.dumps`` leaves ``/`` and ``<`` intact, so attacker-controlled data
-    containing ``</script>`` would close the surrounding script element early
-    and execute as injected markup. Escaping ``<``, ``>`` and ``&`` keeps the
-    output inert to the HTML tokenizer while remaining valid JSON.
-    """
-    return (
-        json.dumps(value)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
-
-
 def _slack_oauth_popup_response(
     *,
     success: bool,
@@ -272,8 +258,8 @@ def _slack_oauth_popup_response(
     <script>
       if (window.opener) {{
         window.opener.postMessage(
-          {_script_safe_json(payload)},
-          {_script_safe_json(target_origin)}
+          {script_safe_json(payload)},
+          {script_safe_json(target_origin)}
         );
         window.close();
       }}
@@ -449,6 +435,9 @@ def start_slack_oauth(
     if client_id is None or redirect_uri is None:
         raise HTTPException(status_code=503, detail="Slack OAuth is not configured")
 
+    # Capture the authenticated snapshot before the ledger commit expires ORM
+    # attributes; refreshing it later must not upgrade a revoked session.
+    session_epoch = getattr(current_user, "session_epoch", None)
     nonce = secrets.token_urlsafe(24)
     now = datetime.now(timezone.utc)
     # The signed JWT alone would be valid for its whole lifetime on every
@@ -469,6 +458,7 @@ def start_slack_oauth(
     state = create_access_token(
         data={
             "type": "slack_oauth_state",
+            "session_epoch": session_epoch,
             "user_id": int(current_user.id),
             "nonce": nonce,
             "frontend_origin": _frontend_origin_for_slack_oauth(request),
@@ -516,6 +506,16 @@ async def slack_oauth_callback(
     nonce = str(state_payload.get("nonce") or "")
     raw_state_user_id = state_payload.get("user_id")
     state_user_id = int(raw_state_user_id) if raw_state_user_id is not None else None
+    state_user = (
+        db.query(User).filter(User.id == state_user_id).populate_existing().first()
+    )
+    if state_user is None or not matches_user_session(state_user, state_payload):
+        return _slack_oauth_popup_response(
+            success=False,
+            target_origin=target_origin,
+            message="The Slack authorization request is invalid or expired.",
+            status_code=400,
+        )
     # The browser that completes this callback is NOT verified to be the one
     # that called /oauth/start: an attacker can send their own fresh
     # authorize_url to a victim, and the victim's consent then binds their
@@ -622,6 +622,11 @@ async def slack_oauth_callback(
                 "The Xagent user who started authorization no longer exists"
             )
 
+        if not lock_current_session_epoch(
+            db, user_id, state_payload.get("session_epoch")
+        ):
+            db.rollback()
+            raise ValueError("The Slack authorization request is invalid or expired.")
         channel = _upsert_slack_oauth_channel(
             db,
             user_id=user_id,

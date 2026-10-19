@@ -2,10 +2,12 @@ import React from "react"
 import { Loader2, XIcon } from "lucide-react"
 import { DocxPreviewRenderer } from "@/components/file/docx-preview-renderer"
 import { ExcelPreviewRenderer } from "@/components/file/excel-preview-renderer"
+import { IsolatedHtmlPreview } from "@/components/file/isolated-html-preview"
 import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
 import { useFileAccess } from "@/contexts/file-access-context"
+import { withPreviewReferrerPolicy } from "@/lib/html-preview-document"
 import {
   isHtmlFile,
   isMarkdownFile,
@@ -170,32 +172,52 @@ export function FileViewer({
   const videoMimeType = getVideoMimeType(fileName, mimeType)
   const audioMimeType = getAudioMimeType(fileName, mimeType, content)
   const base64Content = getBase64Payload(content)
-  const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
+  const blobMimeType = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')
+    ? 'application/pdf' : videoMimeType
+  const [mediaObjectUrl, setMediaObjectUrl] = React.useState<string | null>(null)
+  const [preparedHtml, setPreparedHtml] = React.useState<{
+    content: typeof content; fileId: string; fileName: string; policy: typeof fileAccess; html: string
+  } | null>(null)
+  const htmlPreviewContent = preparedHtml?.content === content && preparedHtml.fileId === fileId
+    && preparedHtml.fileName === fileName && preparedHtml.policy === fileAccess ? preparedHtml.html : ""
 
   React.useEffect(() => {
-    if (!videoMimeType || !base64Content) {
-      setVideoObjectUrl(null)
+    if (!blobMimeType || !base64Content) {
+      setMediaObjectUrl(null)
       return
     }
 
     let active = true
     let objectUrl: string | null = null
-
-    fetch(`data:${videoMimeType};base64,${base64Content.replace(/\s/g, "")}`)
-      .then((response) => response.blob())
-      .then((blob) => {
-        objectUrl = URL.createObjectURL(blob)
-        if (!active) {
-          URL.revokeObjectURL(objectUrl)
-          return
+    setMediaObjectUrl(null)
+    async function decode() {
+      try {
+        // Decode locally: fetch(data:) is blocked by connect-src. Keep chunks
+        // aligned to base64 quanta and yield so large previews don't monopolize
+        // the UI thread or allocate one huge intermediate binary string.
+        const source = base64Content!.replace(/\s/g, "")
+        const parts: BlobPart[] = []
+        const chunkSize = 64 * 1024
+        for (let offset = 0; offset < source.length; offset += chunkSize) {
+          if (!active) return
+          const decoded = atob(source.slice(offset, offset + chunkSize))
+          const bytes = new Uint8Array(decoded.length)
+          for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i)
+          parts.push(bytes)
+          if (offset + chunkSize < source.length) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0))
+          }
         }
-        setVideoObjectUrl(objectUrl)
-      })
-      .catch((error) => {
         if (!active) return
-        console.error("Video preview decode error:", error)
-        setVideoObjectUrl(null)
-      })
+        objectUrl = URL.createObjectURL(new Blob(parts, { type: blobMimeType! }))
+        setMediaObjectUrl(objectUrl)
+      } catch (error) {
+        if (!active) return
+        console.error("Media preview decode error:", error)
+        setMediaObjectUrl(null)
+      }
+    }
+    void decode()
 
     return () => {
       active = false
@@ -203,28 +225,40 @@ export function FileViewer({
         URL.revokeObjectURL(objectUrl)
       }
     }
-  }, [base64Content, videoMimeType])
+  }, [base64Content, blobMimeType])
 
-  const processHtmlContent = (htmlContent: string, fileId: string) => {
-    if (!htmlContent || !fileId) return htmlContent
-
-    return htmlContent.replace(
+  const processHtmlContent = React.useCallback((htmlContent: string, fileId: string) => {
+    const rewritten = htmlContent.replace(
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
+        // Root-relative API URLs must remain on the app/API origin when the
+        // HTML is delivered to a separate preview host (default API_URL="").
+        const absolute = (url: string) => new URL(url, window.location.origin).href
         if (path.startsWith("file:")) {
           const fileRef = path.replace(/^file:/, "")
-          return `${attr}="${fileAccess.inlinePreviewUrl(fileRef)}"`
+          return `${attr}="${absolute(fileAccess.inlinePreviewUrl(fileRef))}"`
         }
         if (path.startsWith("/api/files/public/preview/")) {
           const requestedFileId = path.slice("/api/files/public/preview/".length)
-          return `${attr}="${fileAccess.inlinePreviewUrl(requestedFileId)}"`
+          return `${attr}="${absolute(fileAccess.inlinePreviewUrl(requestedFileId))}"`
         }
 
-        return `${attr}="${fileAccess.relativePreviewUrl(fileId, path)}"`
+        return `${attr}="${absolute(fileAccess.relativePreviewUrl(fileId, path))}"`
       }
     )
-  }
+    // srcDoc subresources do not inherit the iframe navigation's
+    // referrerPolicy. Set the document policy before any asset is parsed.
+    return withPreviewReferrerPolicy(rewritten)
+  }, [fileAccess])
+
+  React.useEffect(() => {
+    // Keep the initial SSR/client render blank; prepare before assigning srcDoc.
+    if (isHtmlFile(fileName) && viewMode === "preview") {
+      setPreparedHtml({ content, fileId, fileName, policy: fileAccess,
+        html: content ? processHtmlContent(content, fileId) : "" })
+    }
+  }, [content, fileId, fileName, viewMode, processHtmlContent])
 
   if (isLoading) {
     return (
@@ -273,7 +307,7 @@ export function FileViewer({
       ) : mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf') ? (
         <div className="flex items-center justify-center h-full p-4">
           <iframe
-            src={`data:application/pdf;base64,${base64Content}`}
+            src={mediaObjectUrl || undefined}
             className="w-full h-full border-0"
             title={fileName}
           />
@@ -284,7 +318,7 @@ export function FileViewer({
             controls
             playsInline
             preload="metadata"
-            src={videoObjectUrl || undefined}
+            src={mediaObjectUrl || undefined}
             className="max-h-full max-w-full rounded border border-border/30 bg-black shadow-sm"
             aria-label={fileName}
             title={fileName}
@@ -333,10 +367,9 @@ export function FileViewer({
             {content || t('files.previewDialog.emptyContent')}
           </pre>
         ) : (
-          <iframe
-            srcDoc={processHtmlContent(content || '', fileId)}
+          <IsolatedHtmlPreview
+            html={htmlPreviewContent}
             className="w-full h-full border-0"
-            sandbox="allow-same-origin allow-scripts"
             title={fileName}
           />
         )

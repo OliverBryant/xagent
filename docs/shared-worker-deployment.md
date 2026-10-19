@@ -11,6 +11,12 @@ standalone Agent worker.
 
 ## Combined process launcher
 
+Production web and worker hosts must also share the exact
+`XAGENT_SECRET_ENCRYPTION_KEY` (or legacy `SECRET_KEY`) for tool credentials.
+The image persists a separate tool key in the secrets volume. For existing
+default/short keys, follow [the offline upgrade procedure](tool-credential-key-upgrade.md)
+before starting upgraded replicas; runtime decryption never tries a public key.
+
 Set `XAGENT_TASK_EXECUTION_ROLE=combined` and `XAGENT_WORKER_COUNT=4`, then run
 `python -m xagent.web` (or `xagent-web`) to launch one web process and four
 standalone Agent worker processes. The Docker backend uses this same entrypoint.
@@ -68,8 +74,10 @@ are still registered. `gate_held_s` is the number of seconds in the minute that 
 process was at `XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS`. While a process is at
 the cap it does not claim commands that would start a new execution there. A process that is full with
 nothing queued also reports it, so read it together with `inflight` and
-`started_1m`. The line is not logged when `XAGENT_LOG_LEVEL` is above
-`INFO`.
+`started_1m`. `gate_held_s` counts only the time at the full limit: with
+`XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS` above 0, batch commands are
+held from `limit - reserve` active tasks, and that time is not counted. The
+line is not logged when `XAGENT_LOG_LEVEL` is above `INFO`.
 
 ## Configuration and upgrade
 

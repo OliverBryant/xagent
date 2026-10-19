@@ -27,6 +27,9 @@ held task, including the waiter's own; it is display only (#2700).
 
 from __future__ import annotations
 
+import functools
+import inspect
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -47,13 +50,22 @@ from .task_admission_pacing import (
     startup_eligible,
 )
 from .task_coordinator_service import TaskLease
+from .task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
+    DISPATCH_CLASS_INTERACTIVE,
+    DISPATCH_CLASSES,
+    DispatchClass,
+)
 
 if TYPE_CHECKING:
     from .task_command_transport import ClaimedTaskCommand, SettledTaskCommand
 
+logger = logging.getLogger(__name__)
+
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
 _STOPPED_BEFORE_START = "Task stopped before execution started."
+_CONTROL_STOPPED_COMMAND = "Task command stopped by a control request."
 
 
 @dataclass(frozen=True)
@@ -76,27 +88,228 @@ class AdmissionQueueFull(RuntimeError):
     """The host must translate this retryable refusal at its ingress boundary."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class CommandClassification:
+    """What a deployment decided for one new execution command at acceptance."""
+
+    admission: AdmissionPolicy | None = None
+    dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
+
+    def __post_init__(self) -> None:
+        if self.dispatch_class not in DISPATCH_CLASSES:
+            raise ValueError(f"Unknown dispatch class: {self.dispatch_class!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class TaskClassificationView:
+    """What a classifier may know about the task a new command belongs to.
+
+    ``background`` is true for a command the system stages on its own (the
+    automatic resume sweeper) rather than one a caller asked for.
+    ``previous_dispatch_class`` is the class of the task's latest earlier
+    execution-opening command, or None when there is none. It is read for
+    every background command and is None for any other command.
+    """
+
+    task_id: int
+    source: str | None
+    channel_name: str | None
+    owner_user_id: int
+    background: bool
+    previous_dispatch_class: DispatchClass | None
+
+
+CommandClassifier = Callable[
+    [Session, TaskExecutionCommand, TaskClassificationView], CommandClassification
+]
 AdmissionHook = Callable[[Session, TaskExecutionCommand], AdmissionPolicy | None]
-_hook: AdmissionHook | None = None
+
+_UPSTREAM_INTERACTIVE_SOURCES = frozenset({"internal", "widget", "shared_link"})
+_UPSTREAM_BATCH_SOURCES = frozenset({"sdk", "trigger", "a2a"})
+
+
+def upstream_source_class(source: str | None) -> DispatchClass | None:
+    """The class the upstream rule gives a task source, or None if unrecognized.
+
+    A missing source (None or the empty string) means ``internal``, as it does
+    for ``normalize_interaction_origin`` and automatic recovery. Any other match
+    is exact: no stripping and no case folding.
+    """
+    if not source:
+        return DISPATCH_CLASS_INTERACTIVE
+    if source in _UPSTREAM_INTERACTIVE_SOURCES:
+        return DISPATCH_CLASS_INTERACTIVE
+    if source in _UPSTREAM_BATCH_SOURCES:
+        return DISPATCH_CLASS_BATCH
+    return None
+
+
+def upstream_dispatch_class(view: TaskClassificationView, kind: str) -> DispatchClass:
+    """The upstream default class of one execution-opening command.
+
+    A background command follows its task source; a source the rule does not
+    recognize keeps the interactive class of the task's previous command, and
+    is batch otherwise. Any other command is interactive when it answers a
+    waiting task and otherwise follows its task source, batch if unrecognized.
+    """
+    if view.background:
+        by_source = upstream_source_class(view.source)
+        if by_source is not None:
+            return by_source
+        if view.previous_dispatch_class == DISPATCH_CLASS_INTERACTIVE:
+            return DISPATCH_CLASS_INTERACTIVE
+        return DISPATCH_CLASS_BATCH
+    if kind == "resume_input":
+        return DISPATCH_CLASS_INTERACTIVE
+    return upstream_source_class(view.source) or DISPATCH_CLASS_BATCH
+
+
+def upstream_command_classifier(
+    db: Session, command: TaskExecutionCommand, view: TaskClassificationView
+) -> CommandClassification:
+    return CommandClassification(
+        dispatch_class=upstream_dispatch_class(view, str(command.kind))
+    )
+
+
+@dataclass(frozen=True)
+class _InstalledClassifier:
+    """The classifier and its admission declaration, replaced as one unit."""
+
+    classifier: CommandClassifier
+    admission_enabled: bool
+    legacy: bool = False
+
+
+_UPSTREAM = _InstalledClassifier(upstream_command_classifier, False)
+_installed = _UPSTREAM
+
+
+def _describe(classifier: CommandClassifier) -> str:
+    return getattr(classifier, "__qualname__", None) or repr(classifier)
+
+
+def describe_installed_classifier() -> tuple[str, bool]:
+    """The installed classifier's name and whether it declared admission."""
+    installed = _installed
+    return _describe(installed.classifier), installed.admission_enabled
+
+
+def _install(
+    classifier: CommandClassifier, admission_enabled: bool, *, legacy: bool
+) -> None:
+    global _installed
+    if not callable(classifier):
+        raise TypeError("command classifier must be callable")
+    try:
+        # What is called is the callable itself, not a function it wraps.
+        signature = inspect.signature(classifier, follow_wrapped=False)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(None, None, None)
+        except TypeError:
+            raise TypeError(
+                "command classifier must accept (db, command, view)"
+            ) from None
+    if not isinstance(admission_enabled, bool):
+        raise TypeError("admission_enabled must be a bool")
+    _installed = _InstalledClassifier(classifier, admission_enabled, legacy)
+    logger.info(
+        "Command classifier installed: %s admission_enabled=%s",
+        _describe(classifier),
+        admission_enabled,
+    )
+
+
+def set_command_classifier(
+    classifier: CommandClassifier, *, admission_enabled: bool
+) -> None:
+    """Install the trusted deployment classifier for new execution commands.
+
+    Install it in every process that accepts commands and every process that
+    executes them. It is called once per new execution command, after the
+    command row is flushed and before the acceptance transaction commits.
+    The classifier runs inside the acceptance transaction: it must not commit
+    or roll back, and must not do slow I/O, because under SQLite that
+    transaction holds the database-wide writer lock.
+    It receives the session, the flushed command and a read-only view of its
+    task. Construct every field of its return value by keyword; the
+    ``dispatch_class`` field defaults to batch, so a classifier that only sets
+    ``admission`` makes every command batch. To keep the upstream class it can
+    return ``dispatch_class=upstream_dispatch_class(view, command.kind)``.
+    ``admission_enabled`` (a ``bool``) declares whether it may return an
+    admission policy.
+    """
+    _install(classifier, admission_enabled, legacy=False)
+
+
+def reset_command_classifier() -> None:
+    """Restore the upstream classifier; for tests and for clearing a legacy hook."""
+    global _installed
+    _installed = _UPSTREAM
+    logger.info("Command classifier reset to the upstream default")
 
 
 def set_task_admission_hook(hook: AdmissionHook | None) -> None:
-    """Install the trusted host classifier in both ingress and execution hosts."""
-    global _hook
-    _hook = hook
+    """Legacy entry point: install an admission-only classifier.
+
+    ``None`` clears a classifier installed through this function; a classifier
+    installed with ``set_command_classifier`` is left in place. Otherwise the
+    hook is called with ``(db, command)`` and its policy is staged as the
+    ticket; the command's dispatch class follows the upstream rule.
+    """
+    if hook is None:
+        if _installed.legacy:
+            reset_command_classifier()
+        return
+
+    @functools.wraps(hook)
+    def legacy_admission_hook(
+        db: Session, command: TaskExecutionCommand, view: TaskClassificationView
+    ) -> CommandClassification:
+        return CommandClassification(
+            dispatch_class=upstream_dispatch_class(view, str(command.kind)),
+            admission=hook(db, command),
+        )
+
+    _install(legacy_admission_hook, True, legacy=True)
 
 
 def admission_enabled() -> bool:
-    """Whether this host installed a classifier; without one it stages no ticket."""
-    return _hook is not None
+    """Whether the installed classifier declared that it stages admission tickets."""
+    return _installed.admission_enabled
 
 
-def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
+def classify_command_no_commit(
+    db: Session, command: TaskExecutionCommand, view: TaskClassificationView
+) -> CommandClassification:
+    """Run the installed classifier for one new execution command, exactly once.
+
+    The classifier receives the session, the flushed command and ``view``.
+    Classifier exceptions propagate to the acceptance transaction unchanged.
+    A result of the wrong type, or an admission policy from a classifier that
+    declared ``admission_enabled=False``, is rejected before its admission
+    ticket is staged; the caller's rollback discards the flushed command row.
+    """
+    installed = _installed
+    result = installed.classifier(db, command, view)
+    if not isinstance(result, CommandClassification):
+        raise TypeError("command classifier must return CommandClassification")
+    if not installed.admission_enabled and result.admission is not None:
+        raise TypeError(
+            "command classifier returned an admission policy but was installed "
+            "with admission_enabled=False"
+        )
+    return result
+
+
+def stage_task_admission(
+    db: Session, command: TaskExecutionCommand, policy: AdmissionPolicy | None
+) -> None:
     """Stage a new command's ticket in its acceptance transaction, exactly once."""
-    if _hook is None or command.kind not in _EXECUTION_KINDS:
-        return
-    policy = _hook(db, command)
-    if policy is None:
+    if policy is None or command.kind not in _EXECUTION_KINDS:
         return
     if not get_shared_task_execution_enabled():
         raise RuntimeError("Execution admission requires shared task execution")
@@ -316,7 +529,8 @@ def waiting_for_capacity(db: Session, command_id: int) -> bool:
 
     Ingress uses this to acknowledge durable acceptance instead of holding a
     request until capacity opens; it never predicts the later execution. A
-    host without a classifier staged no ticket, so it has nothing to check.
+    host whose classifier did not declare admission staged no ticket, so it has
+    nothing to check.
     """
     if not admission_enabled():
         return False
@@ -416,7 +630,7 @@ def release_command_admission(db: Session, lease: TaskLease, command_id: int) ->
 
 
 def waiting_admission(command_id: object) -> ColumnElement[bool]:
-    """Only unclaimed capacity-waiting commands may be overtaken by controls."""
+    """An unclaimed command that waits for an admission ticket; controls may pass it."""
     return exists(
         select(1).where(
             TaskAdmissionTicket.command_id == command_id,
@@ -604,7 +818,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .values(
             status="failed",
-            error="Task command stopped by a control request.",
+            error=_CONTROL_STOPPED_COMMAND,
             completed_at=func.now(),
             result={"rejection_reason": "cancelled_before_admission"},
         )
@@ -626,4 +840,106 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
                 resend_safe=False,
                 include_command_identity=scope != "external",
             ),
+        )
+
+
+def cap_held_command_predicates(
+    task_id: int, control_db_id: int
+) -> tuple[ColumnElement[bool], ...]:
+    """Earlier commands of a task that a control may have passed while a
+    dispatch cap held them: pending, never claimed, opening an execution and
+    not waiting for an admission ticket (those stay with
+    ``settle_cancelled_admissions``)."""
+    from .task_dispatch_cap import EXECUTION_OPENING_KINDS
+
+    return (
+        TaskExecutionCommand.task_id == task_id,
+        TaskExecutionCommand.id < control_db_id,
+        TaskExecutionCommand.status == "pending",
+        TaskExecutionCommand.attempt_count == 0,
+        TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+        ~waiting_admission(TaskExecutionCommand.id),
+    )
+
+
+def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> None:
+    """Fail the never-claimed commands a control passed while a cap held them.
+
+    Runs in the control's terminal-write transaction: after
+    ``settle_cancelled_admissions`` when the control completes, and when a
+    pause is rejected because nothing of its task runs. Writes what that
+    function writes: the command row, the START follow-up and one terminal
+    event per row. It does not touch message delivery rows; a held message
+    never ran, so it has none of its own, and its terminal event tells the
+    client. Rows matched: ``cap_held_command_predicates``, and for a cancel
+    only those recorded at a state version other than the task's current
+    one, because a cancel that stopped nothing leaves the version as it was.
+    A pause has no version condition: a pause that finds nothing running
+    leaves the version as it was and still stops what it passed. With the
+    cap open such rows exist only when a command inserted before the control
+    committed after the control was claimed. Only those committed before
+    this UPDATE are failed; a later one stays ``pending`` and is claimed
+    after the control, where a start or a reply is rejected by its
+    state-version check when the control moved the version, and a message
+    is not.
+    """
+    if not get_shared_task_execution_enabled():
+        return
+    from collections import Counter
+
+    from .task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        stage_terminal_event,
+    )
+    from .task_dispatch_cap import CAP_OVERTAKING_CONTROL_KINDS
+    from .task_start_consumer import settle_failed_start_no_commit
+
+    control = db.get(TaskExecutionCommand, control_command_id)
+    if control is None or control.kind not in CAP_OVERTAKING_CONTROL_KINDS:
+        return
+    task = db.get(Task, control.task_id, populate_existing=True)
+    if task is None:
+        return
+    predicates = list(cap_held_command_predicates(int(task.id), control_command_id))
+    if control.kind == "cancel":
+        predicates.append(
+            TaskExecutionCommand.target_state_version != task.state_version
+        )
+    settled = db.scalars(
+        update(TaskExecutionCommand)
+        .where(*predicates)
+        .values(
+            status="failed",
+            error=_CONTROL_STOPPED_COMMAND,
+            completed_at=func.now(),
+            result={"rejection_reason": "cancelled_before_admission"},
+        )
+        .returning(TaskExecutionCommand.id)
+    ).all()
+    kinds: Counter[str] = Counter()
+    for settled_id in settled:
+        row = db.get(TaskExecutionCommand, settled_id, populate_existing=True)
+        assert row is not None
+        kinds[str(row.kind)] += 1
+        scope = row.payload.get("scope") if isinstance(row.payload, dict) else None
+        if row.kind == "start":
+            settle_failed_start_no_commit(db, row)
+        stage_terminal_event(
+            db,
+            command_db_id=settled_id,
+            draft=TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=scope != "external",
+            ),
+        )
+    if settled:
+        logger.info(
+            "task_id=%s component=dispatch-cap control=%s control_command_id=%s "
+            "settled_commands=%s kinds=%s",
+            task.id,
+            control.kind,
+            control_command_id,
+            len(settled),
+            dict(kinds),
         )

@@ -170,6 +170,45 @@ def test_malformed_temporal_claims_are_rejected_before_any_user_query(
     assert db_session.info["user_query_count"] == 0
 
 
+def test_bad_signature_with_malformed_expiry_is_invalid_token(db_session):
+    token = auth_dependencies.jwt.encode(
+        {"sub": "existing-user", "user_id": 1, "type": "access", "exp": None},
+        "wrong-signing-secret-with-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+    assert raised.value.detail == "Invalid token"
+    assert raised.value.headers["Error-Type"] == "InvalidToken"
+    assert db_session.info["user_query_count"] == 0
+
+
+def test_unrelated_jwt_error_context_cannot_change_rejection(db_session, monkeypatch):
+    try:
+        raise TypeError("unrelated internal conversion")
+    except TypeError:
+        error = auth_dependencies.jwt.JWTError("invalid token")
+        try:
+            raise error from None
+        except auth_dependencies.jwt.JWTError:
+            pass
+    assert isinstance(error.__context__, TypeError)
+
+    def reject(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(auth_dependencies.jwt, "decode", reject)
+    token = _access_token()
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), db_session
+        )
+    assert raised.value.detail == "Invalid token"
+    assert raised.value.headers["Error-Type"] == "InvalidToken"
+    assert db_session.info["user_query_count"] == 0
+
+
 @pytest.mark.parametrize(
     "claims",
     (
@@ -232,31 +271,6 @@ def test_numeric_temporal_claims_keep_the_library_accepted_behavior(
 
     assert user.username == "existing-user"
     assert db_session.info["user_query_count"] == 1
-
-
-@pytest.mark.parametrize("exception_type", (TypeError, OverflowError))
-def test_unrelated_decode_type_errors_propagate_by_identity(
-    db_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
-    exception_type: type[Exception],
-) -> None:
-    """Only proven temporal-claim conversion failures are credential rejections."""
-    original = exception_type("unrelated decode failure")
-
-    def raise_original(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise original
-
-    monkeypatch.setattr(auth_dependencies.jwt, "decode", raise_original)
-    monkeypatch.setattr(
-        auth_dependencies.jwt, "get_unverified_claims", lambda _token: {"aud": "x"}
-    )
-    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="token")
-
-    with pytest.raises(exception_type) as raised:
-        get_current_user(credentials, db_session)
-
-    assert raised.value is original
-    assert db_session.info["user_query_count"] == 0
 
 
 @pytest.mark.parametrize(
@@ -574,6 +588,32 @@ def test_valid_access_token_returns_matching_user_across_adapters(
     assert user.username == "existing-user"
 
 
+@pytest.mark.parametrize("epoch", [None, "", 123, [], {}, "old", "é", "\ud800"])
+def test_invalid_session_epoch_is_a_credential_rejection(db_session, epoch):
+    user = db_session.get(User, 1)
+    user.session_epoch = "current-session-generation"
+    db_session.commit()
+    token = _access_token(session_epoch=epoch)
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+    assert raised.value.status_code == 401
+    assert get_current_user_optional(credentials, db_session) is None
+    assert get_user_from_token(token, db_session) is None
+    assert get_user_from_websocket_token(token, db_session) is None
+
+
+def test_current_session_epoch_authenticates(db_session):
+    user = db_session.get(User, 1)
+    user.session_epoch = "current-session-generation"
+    db_session.commit()
+    assert (
+        get_user_from_token(_access_token(session_epoch=user.session_epoch), db_session)
+        is user
+    )
+
+
 def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
     """Pre-query rejection inspects Session binding without acquiring a connection."""
     engine = create_engine(
@@ -603,6 +643,7 @@ def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
 def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
     """Authentication consumers stay within the reviewed ownership topology."""
     tracked = {
+        "_load_websocket_principal_sync",
         "_resolve_access_token_user",
         "get_current_user",
         "get_current_user_optional",
@@ -623,7 +664,12 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             rejected,
         ),
         (auth_file, "get_user_from_token", "_resolve_access_token_user", rejected),
-        (auth_file, "get_user_from_websocket_token", "get_user_from_token", ()),
+        (
+            auth_file,
+            "get_user_from_websocket_token",
+            "_resolve_access_token_user",
+            rejected,
+        ),
         (
             "web/api/websocket_auth.py",
             "_load_websocket_principal_sync",
@@ -660,6 +706,57 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             "get_current_user",
             (),
         ),
+        ("web/api/auth.py", "_generic_oauth_login", "get_user_from_token", ()),
+        (
+            "web/api/websocket_auth.py",
+            "revalidate_websocket_session.guarded.monitor",
+            "_load_websocket_principal_sync",
+            ("OperationalError", "SQLAlchemyTimeoutError", "Exception"),
+        ),
+        (
+            "web/api/websocket_auth.py",
+            "get_authenticated_user",
+            "_load_websocket_principal_sync",
+            ("Exception",),
+        ),
+        (
+            websocket_file,
+            "websocket_chat_endpoint",
+            "get_authenticated_user",
+            (
+                "WebSocketDisconnect",
+                "_WebSocketAuthenticationTerminated",
+                "DurableObjectIntegrityError",
+                "DurableStorageOperationError",
+                "ConnectionError",
+                "RuntimeError",
+                "Exception",
+            ),
+        ),
+        *(
+            (
+                websocket_file,
+                endpoint,
+                "get_authenticated_user",
+                (
+                    "WebSocketDisconnect",
+                    "_WebSocketAuthenticationTerminated",
+                    "ConnectionError",
+                    "RuntimeError",
+                    "Exception",
+                ),
+            )
+            for endpoint in (
+                "websocket_builder_chat_endpoint",
+                "websocket_build_preview_endpoint",
+            )
+        ),
+        (
+            "web/api/progress_ws.py",
+            "progress_websocket_endpoint",
+            "get_authenticated_user",
+            ("WebSocketDisconnect", "_WebSocketAuthenticationTerminated", "Exception"),
+        ),
     )
     modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}
     source_root = Path(auth_dependencies.__file__).parents[1]
@@ -693,7 +790,8 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
         names = {
             node.name
             for node in tree.body
-            if relative_path == "web/auth_dependencies.py"
+            if relative_path
+            in {"web/auth_dependencies.py", "web/api/websocket_auth.py"}
             and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name in tracked
         }

@@ -17,6 +17,10 @@ from ..media_metering import (
     read_billed_stream,
     record_provider_usage,
 )
+from ..public_elevenlabs import (
+    close_public_elevenlabs_http_client,
+    create_public_elevenlabs_client,
+)
 from .base import BaseMusicModel, MusicResult
 
 logger = logging.getLogger(__name__)
@@ -114,10 +118,14 @@ class ElevenLabsMusicModel(BaseMusicModel):
         if base_url:
             kwargs["base_url"] = base_url
         try:
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
         except TypeError:
             kwargs.pop("base_url", None)
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
 
     def _ensure_async_client(self) -> Any:
         if not self.api_key:
@@ -139,6 +147,7 @@ class ElevenLabsMusicModel(BaseMusicModel):
         self._async_client = None
         if client is None:
             return
+        await close_public_elevenlabs_http_client(client)
         close = getattr(client, "aclose", None) or getattr(client, "close", None)
         if callable(close):
             result = close()

@@ -11,19 +11,19 @@ import re
 import secrets
 import threading
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
+from urllib.parse import urlparse
 
 import bcrypt
-import requests
+
+from ...core.utils import public_requests as requests
 
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from jose import JWTError, jwt
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -36,10 +36,21 @@ from pydantic import (
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from ...builtin_identity import owned_catalog_marker
 from ...config import (
     get_app_base_url,
+    get_auth_login_account_limit,
+    get_auth_login_ip_limit,
+    get_auth_login_pair_limit,
+    get_auth_rate_limit_max_local_keys,
+    get_auth_rate_limit_window_seconds,
+    get_auth_recovery_email_limit,
+    get_auth_recovery_ip_limit,
+    get_auth_recovery_pair_limit,
+    get_email_change_target_limit,
+    get_email_confirmation_expire_minutes,
     get_google_restricted_scopes,
     get_password_reset_expire_minutes,
 )
@@ -53,6 +64,7 @@ from ...core.runtime_performance import (
 )
 from ...core.utils.api_key import verify_dummy
 from ...core.utils.security import host_matches_suffix
+from .. import jwt_codec as jwt
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -60,9 +72,17 @@ from ..auth_config import (
     PASSWORD_MIN_LENGTH,
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, get_user_from_token
+from ..auth_sessions import (
+    commit_refresh_credentials,
+    lock_current_session_epoch,
+    matches_user_session,
+    new_session_epoch,
+    user_session_claims,
+)
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
+from ..jwt_codec import JWTError
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
 from ..models.actor_oauth_flow import ActorOAuthFlowState
 from ..models.auth_database import (
@@ -76,7 +96,7 @@ from ..models.database import (
     release_db_connection_if_clean,
 )
 from ..models.system_setting import SystemSetting
-from ..models.user import User
+from ..models.user import User, email_confirmation_clear_values
 from ..models.user_oauth import UserOAuth
 from ..oauth_account_hosts import (
     OAuthAccountError,
@@ -89,8 +109,22 @@ from ..oauth_provider_quirks import (
     requires_pkce,
 )
 from ..services import gmail_provisioning
-from ..services.auth_email import send_password_reset_email
+from ..services.auth_attempts import (
+    AttemptBucket,
+    clear_shared_attempt,
+    refund_local_attempt,
+    refund_shared_attempt,
+    reserve_local_attempts,
+    reserve_shared_attempts,
+)
+from ..services.auth_email import (
+    is_auth_email_configured,
+    send_email_change_confirmation,
+    send_email_changed_notice,
+    send_password_reset_email,
+)
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.oauth_state_claims import claim_oauth_state
 from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
@@ -98,6 +132,7 @@ from ..services.user_oauth import (
     scoped_user_oauth_query,
 )
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
+from ..utils.script_json import script_safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -112,98 +147,118 @@ _ACTOR_OAUTH_COOKIE_PREFIX = "xagent_actor_oauth_"
 _ACTOR_OWNER_CLAIM_VERSION = 1
 _ORDINARY_OAUTH_STATE_COOKIE = "xagent_oauth_state"
 _ORDINARY_OAUTH_STATE_COOKIE_PREFIX = f"{_ORDINARY_OAUTH_STATE_COOKIE}_"
-_LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
-_LOGIN_FAILURE_LIMIT = 5
-_LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS = 60
-_LOGIN_FAILURE_MAX_KEYS = 10_000
 _login_failure_lock = threading.Lock()
-_login_failures: dict[str, deque[float]] = defaultdict(deque)
-_login_failure_last_sweep = 0.0
-_oauth_state_lock = threading.Lock()
-_used_ordinary_oauth_states: dict[str, float] = {}
+_login_failures: dict[str, AttemptBucket] = {}
+_password_recovery_lock = threading.Lock()
+_password_recovery_attempts: dict[str, AttemptBucket] = {}
 
 
-def _login_attempt_key(request: Request | None, identifier: str) -> str:
-    client_host = remote_ip_from_request(request) if request else "unknown"
-    normalized = identifier.strip().lower()
-    return hashlib.sha256(f"{client_host}\0{normalized}".encode()).hexdigest()
+def _budget_key(kind: str, value: str) -> str:
+    return hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
 
 
-def _prune_login_failures(key: str, current: float) -> deque[float]:
-    attempts = _login_failures.get(key)
-    if attempts is None:
-        return deque()
-    while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
-        attempts.popleft()
-    return attempts
-
-
-def _sweep_login_failures(current: float) -> None:
-    """Bound the in-process login limiter's memory footprint.
-
-    Login identifiers are attacker-controlled, so pruning only the key being
-    attempted would let a stream of unique usernames grow the dictionary
-    indefinitely. Sweep expired buckets periodically and evict the oldest
-    remaining buckets if a hard cap is reached.
-    """
-    global _login_failure_last_sweep
-    if (
-        current - _login_failure_last_sweep < _LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS
-        and len(_login_failures) <= _LOGIN_FAILURE_MAX_KEYS
-    ):
-        return
-    for key, attempts in list(_login_failures.items()):
-        if not _prune_login_failures(key, current):
-            _login_failures.pop(key, None)
-    if len(_login_failures) > _LOGIN_FAILURE_MAX_KEYS:
-        oldest = sorted(
-            _login_failures,
-            key=lambda key: _login_failures[key][-1] if _login_failures[key] else 0,
-        )
-        for key in oldest[: len(_login_failures) - _LOGIN_FAILURE_MAX_KEYS]:
-            _login_failures.pop(key, None)
-    _login_failure_last_sweep = current
-
-
-def _login_is_blocked(key: str, now: float | None = None) -> bool:
-    current = time.monotonic() if now is None else now
-    with _login_failure_lock:
-        attempts = _prune_login_failures(key, current)
-        if not attempts:
-            _login_failures.pop(key, None)
-        return len(attempts) >= _LOGIN_FAILURE_LIMIT
-
-
-def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
-    """Atomically admit one attempt, preventing concurrent burst bypasses."""
-    current = time.monotonic() if now is None else now
-    with _login_failure_lock:
-        _sweep_login_failures(current)
-        attempts = _prune_login_failures(key, current)
-        if len(attempts) >= _LOGIN_FAILURE_LIMIT:
-            return False
-        _login_failures[key] = attempts
-        attempts.append(current)
-        return True
+def _reserve_auth_budgets(
+    namespace: str,
+    budgets: tuple[tuple[str, int], ...],
+    *,
+    now: float | None = None,
+    member: str | None = None,
+) -> int:
+    window = get_auth_rate_limit_window_seconds()
+    retry = reserve_shared_attempts(namespace, budgets, window=window, member=member)
+    if retry is not None:
+        return retry
+    store, lock = (
+        (_login_failures, _login_failure_lock)
+        if namespace == "login"
+        else (_password_recovery_attempts, _password_recovery_lock)
+    )
+    return reserve_local_attempts(
+        store,
+        lock,
+        budgets,
+        window=window,
+        max_keys=get_auth_rate_limit_max_local_keys(),
+        now=now,
+        member=member,
+    )
 
 
 def _clear_login_failures(key: str) -> None:
+    if clear_shared_attempt("login", key):
+        return
     with _login_failure_lock:
         _login_failures.pop(key, None)
 
 
-def _claim_ordinary_oauth_state(state: str) -> bool:
-    """Claim a browser-bound OAuth state once per process lifetime window."""
-    now = time.time()
-    digest = hashlib.sha256(state.encode("ascii", "ignore")).hexdigest()
-    with _oauth_state_lock:
-        for key, expires_at in list(_used_ordinary_oauth_states.items()):
-            if expires_at <= now:
-                _used_ordinary_oauth_states.pop(key, None)
-        if digest in _used_ordinary_oauth_states:
-            return False
-        _used_ordinary_oauth_states[digest] = now + 600
-        return True
+def _refund_login_ip(key: str, member: str) -> None:
+    try:
+        refund_shared_attempt("login", key, member)
+    finally:
+        refund_local_attempt(_login_failures, _login_failure_lock, key, member)
+
+
+def _password_recovery_attempt_key(namespace: str, value: str) -> str:
+    return _budget_key("password-recovery:" + namespace, value)
+
+
+def _enforce_budgets(
+    namespace: str, budgets: tuple[tuple[str, int], ...], *, member: str | None = None
+) -> None:
+    retry = _reserve_auth_budgets(namespace, budgets, member=member)
+    if retry:
+        raise HTTPException(
+            429,
+            "Too many authentication attempts. Try again later.",
+            headers={"Retry-After": str(retry)},
+        )
+
+
+async def _enforce_password_recovery_rate_limit(
+    identifiers: tuple[tuple[str, str], ...],
+) -> None:
+    budgets = [
+        (
+            _password_recovery_attempt_key(namespace, value),
+            get_auth_recovery_ip_limit()
+            if namespace == "ip"
+            else get_auth_recovery_email_limit(),
+        )
+        for namespace, value in identifiers
+    ]
+    values = dict(identifiers)
+    if "email" in values:
+        budgets.append(
+            (
+                _password_recovery_attempt_key(
+                    "ip-email", values.get("ip", "unknown") + "\0" + values["email"]
+                ),
+                get_auth_recovery_pair_limit(),
+            )
+        )
+    await asyncio.to_thread(_enforce_budgets, "recovery", tuple(budgets))
+
+
+def _login_ip_budget(client_host: str) -> tuple[str, int]:
+    return _budget_key("ip", client_host), get_auth_login_ip_limit()
+
+
+def _login_budgets(
+    client_host: str, identifier: str, user: User | None
+) -> tuple[tuple[str, int], ...]:
+    identity = (
+        f"user:{user.id}"
+        if user is not None
+        else f"unknown:{identifier.strip().lower()}"
+    )
+    return (
+        _login_ip_budget(client_host),
+        (_budget_key("account", identity), get_auth_login_account_limit()),
+        (
+            _budget_key("ip-account", client_host + "\0" + identity),
+            get_auth_login_pair_limit(),
+        ),
+    )
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -1520,6 +1575,13 @@ class UpdateEmailResponse(BaseModel):
     success: bool
     message: str
     user: Optional[Dict[str, Any]] = None
+    pending_confirmation: bool = False
+    unchanged: bool = False
+    error_code: Optional[str] = None
+
+
+class ConfirmEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
 
 
 # The 5 voice options the onboarding "Launch" step offers - each agent's
@@ -1715,8 +1777,13 @@ def is_valid_email(email: str) -> bool:
     return bool(EMAIL_PATTERN.match(email))
 
 
-def hash_password_reset_token(token: str) -> str:
+def hash_auth_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_password_reset_token(token: str) -> str:
+    """Preserve the invitation adapters' existing password-proof contract."""
+    return hash_auth_token(token)
 
 
 def generate_password_reset_token() -> str:
@@ -1733,7 +1800,10 @@ def build_password_reset_url(token: str) -> str:
         raise RuntimeError(
             "XAGENT_APP_BASE_URL must be configured for password reset emails"
         )
-    return f"{base_url}/reset-password?token={token}"
+    # Keep the one-time token in the URL fragment. Browsers do not send the
+    # fragment in HTTP requests or Referer headers, so it cannot leak through
+    # reverse-proxy access logs or third-party resources loaded by the page.
+    return f"{base_url}/reset-password#token={token}"
 
 
 def has_users(db: Session) -> bool:
@@ -1974,12 +2044,23 @@ def _normalized_preferences(user: User) -> Dict[str, Any]:
 
 
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
+    expires = user.email_confirmation_expires_at
+    if isinstance(expires, datetime) and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    pending = (
+        user.pending_email
+        if isinstance(expires, datetime) and expires > datetime.now(timezone.utc)
+        else None
+    )
     payload: Dict[str, Any] = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
         "has_password": not str(user.password_hash).startswith("!"),
+        "pending_email": pending,
+        "email_change_available": is_auth_email_configured(),
+        "email_confirmation_expire_minutes": get_email_confirmation_expire_minutes(),
         "preferences": _normalized_preferences(user),
     }
     if include_login_time:
@@ -2011,7 +2092,7 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
     if needs_password_rehash(str(user.password_hash)):
         setattr(user, "password_hash", hash_password(request.password))
     with observe_duration("xagent.auth.login.token_creation.duration"):
-        identity = {"sub": user.username, "user_id": user.id}
+        identity = user_session_claims(user)
         access_token = create_access_token(
             data=identity,
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -2037,15 +2118,43 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
 
 
 def _login_in_worker(
-    request: LoginRequest, session_factory: SyncAuthSessionFactory
+    request: LoginRequest,
+    session_factory: SyncAuthSessionFactory,
+    client_host: str = "unknown",
 ) -> Dict[str, Any]:
     # The same thread creates, queries, commits and closes the Session.
     with session_factory() as session:
         with observe_duration("xagent.auth.login.sync_lookup.duration"):
             user = get_user_by_login_identifier(session, request.username)
+        budgets = _login_budgets(client_host, request.username, user)
+        _enforce_budgets("login", budgets[1:])
+        previous_hash = str(user.password_hash) if user is not None else ""
+        previous_epoch = (
+            cast(str | None, user.session_epoch) if user is not None else None
+        )
         response = _prepare_login_response(user, request)
+        assert user is not None  # The response builder rejects missing users.
+        upgraded_hash = str(user.password_hash)
+        expires_at = user.refresh_token_expires_at
+        assert expires_at is not None
         with observe_duration("xagent.auth.login.sync_commit.duration"):
-            session.commit()
+            commit_refresh_credentials(
+                session,
+                user_id=int(response["user_id"]),
+                password_hash=previous_hash,
+                session_epoch=previous_epoch,
+                refresh_token=response["refresh_token"],
+                expires_at=cast(datetime, expires_at),
+                upgraded_password_hash=(
+                    upgraded_hash if upgraded_hash != previous_hash else None
+                ),
+            )
+        # Identity budgets are independent of the pre-DB source-IP admission.
+        for key, _ in budgets[1:]:
+            try:
+                _clear_login_failures(key)
+            except HTTPException:
+                logger.warning("Unable to clear a successful login's attempt budget")
         # Do not access user here: expire_on_commit=True would issue another SELECT.
         return response
 
@@ -2059,19 +2168,23 @@ async def login(
     """Authenticate with a single worker-owned database transaction."""
     started_at = time.perf_counter()
     outcome = "error"
-    attempt_key = _login_attempt_key(http_request, request.username)
-    if not _reserve_login_attempt(attempt_key):
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed login attempts. Try again later.",
-            headers={"Retry-After": str(_LOGIN_FAILURE_WINDOW_SECONDS)},
-        )
+    client_host = remote_ip_from_request(http_request) or "unknown"
+    ip_key, ip_limit = _login_ip_budget(client_host)
+    member = secrets.token_hex(16)
     try:
+        # Reject floods before opening a DB session or occupying its worker.
+        await asyncio.to_thread(
+            _enforce_budgets, "login", ((ip_key, ip_limit),), member=member
+        )
         response = await run_auth_db_worker(
-            "login_database_transaction", lambda: _login_in_worker(request, db)
+            "login_database_transaction",
+            lambda: _login_in_worker(request, db, client_host),
         )
         outcome = "succeeded"
-        _clear_login_failures(attempt_key)
+        try:
+            await asyncio.to_thread(_refund_login_ip, ip_key, member)
+        except HTTPException:
+            logger.warning("Unable to refund a successful login's IP reservation")
         return response
     except HTTPException:
         outcome = "rejected"
@@ -2185,6 +2298,7 @@ async def register(
 async def forgot_password(
     request: ForgotPasswordRequest,
     db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> ForgotPasswordResponse:
     email = normalize_email(request.email)
     if not is_valid_email(email):
@@ -2192,6 +2306,10 @@ async def forgot_password(
             success=False,
             message="Please enter a valid email address",
         )
+
+    await _enforce_password_recovery_rate_limit(
+        (("ip", remote_ip_from_request(http_request) or "unknown"), ("email", email)),
+    )
 
     user = get_user_by_email(db, email)
     if user is None:
@@ -2201,7 +2319,7 @@ async def forgot_password(
         )
 
     reset_token = generate_password_reset_token()
-    reset_token_hash = hash_password_reset_token(reset_token)
+    reset_token_hash = hash_auth_token(reset_token)
     reset_expires_at = datetime.now(timezone.utc) + timedelta(
         minutes=get_password_reset_expire_minutes()
     )
@@ -2234,6 +2352,7 @@ async def forgot_password(
 async def reset_password(
     request: ResetPasswordRequest,
     db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> ResetPasswordResponse:
     if len(request.new_password) < PASSWORD_MIN_LENGTH:
         return ResetPasswordResponse(
@@ -2241,7 +2360,12 @@ async def reset_password(
             message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
         )
 
-    token_hash = hash_password_reset_token(request.token)
+    # Arbitrary token guesses must share the IP budget, not create fresh keys.
+    await _enforce_password_recovery_rate_limit(
+        (("ip", remote_ip_from_request(http_request) or "unknown"),),
+    )
+
+    token_hash = hash_auth_token(request.token)
     user = db.query(User).filter(User.password_reset_token_hash == token_hash).first()
     if user is None:
         return ResetPasswordResponse(success=False, message="Invalid reset token")
@@ -2264,11 +2388,30 @@ async def reset_password(
                 success=False, message="Reset token has expired"
             )
 
-    setattr(user, "password_hash", await hash_password_async(request.new_password))
-    setattr(user, "password_reset_token_hash", None)
-    setattr(user, "password_reset_expires_at", None)
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    new_hash = await hash_password_async(request.new_password)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.password_reset_token_hash == token_hash,
+            User.password_reset_expires_at >= datetime.now(timezone.utc),
+        )
+        .update(
+            {
+                User.password_hash: new_hash,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.refresh_token: None,
+                User.refresh_token_expires_at: None,
+                User.session_epoch: new_session_epoch(),
+                **email_confirmation_clear_values(),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
     db.commit()
 
     return ResetPasswordResponse(
@@ -2300,12 +2443,29 @@ async def change_password(
                 message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
             )
 
-        # Update password
-        setattr(user, "password_hash", await hash_password_async(request.new_password))
-        # A password change invalidates every currently issued refresh
-        # session. Access tokens remain short-lived and will expire normally.
-        setattr(user, "refresh_token", None)
-        setattr(user, "refresh_token_expires_at", None)
+        previous_hash = str(user.password_hash)
+        new_hash = await hash_password_async(request.new_password)
+        changed = (
+            db.query(User)
+            .filter(User.id == user.id, User.password_hash == previous_hash)
+            .update(
+                {
+                    User.password_hash: new_hash,
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                    User.session_epoch: new_session_epoch(),
+                    **email_confirmation_clear_values(),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return ChangePasswordResponse(
+                success=False, message="Password changed; sign in again"
+            )
         db.commit()
 
         return ChangePasswordResponse(
@@ -2338,24 +2498,58 @@ async def get_current_user_profile(
 @auth_router.patch("/email", response_model=UpdateEmailResponse)
 async def update_current_user_email(
     request: UpdateEmailRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
     has_password = not str(user.password_hash).startswith("!")
-    if has_password and not request.current_password:
+    if not has_password:
+        return UpdateEmailResponse(
+            success=False,
+            message="Self-service email changes are unavailable for passwordless accounts; contact your administrator for assistance",
+            error_code="provider_managed",
+        )
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return UpdateEmailResponse(success=False, message="Invalid email address")
+    await asyncio.to_thread(
+        _enforce_budgets,
+        "email-change",
+        (
+            (
+                _budget_key("email-change-user", str(user.id)),
+                get_auth_recovery_pair_limit(),
+            ),
+            (
+                _budget_key("email-change-target", email),
+                get_email_change_target_limit(),
+            ),
+            (
+                _budget_key(
+                    "email-change-ip", remote_ip_from_request(http_request) or "unknown"
+                ),
+                get_auth_recovery_ip_limit(),
+            ),
+        ),
+    )
+    if not request.current_password:
         return UpdateEmailResponse(
             success=False, message="Current password is required"
         )
-    if has_password and not await verify_password_async(
-        request.current_password or "", str(user.password_hash)
+    if not await verify_password_async(
+        request.current_password, str(user.password_hash)
     ):
         return UpdateEmailResponse(
             success=False, message="Current password is incorrect"
         )
 
-    email = normalize_email(request.email)
-    if not is_valid_email(email):
-        return UpdateEmailResponse(success=False, message="Invalid email address")
+    if email == normalize_email(str(user.email or "")):
+        return UpdateEmailResponse(
+            success=True,
+            unchanged=True,
+            message="Email is unchanged; any pending change still requires confirmation",
+            user=serialize_auth_user(user),
+        )
 
     existing_user = get_user_by_email(db, email)
     if existing_user and existing_user.id != user.id:
@@ -2367,14 +2561,143 @@ async def update_current_user_email(
     if email_namespace_error:
         return UpdateEmailResponse(success=False, message=email_namespace_error)
 
-    setattr(user, "email", email)
-    # Email is an account-recovery identifier; changing it revokes the
-    # current refresh session so a stolen token cannot survive the change.
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
-    db.commit()
-    db.refresh(user)
+    if not is_auth_email_configured():
+        return UpdateEmailResponse(
+            success=False,
+            message="Ask your administrator to configure SMTP before changing your email",
+            error_code="smtp_not_configured",
+        )
 
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_auth_token(token)
+    user_id = int(user.id)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user_id,
+            User.password_hash == str(user.password_hash),
+            User.session_epoch == user.session_epoch,
+        )
+        .update(
+            {
+                User.pending_email: email,
+                User.email_confirmation_hash: token_hash,
+                User.email_confirmation_expires_at: datetime.now(timezone.utc)
+                + timedelta(minutes=get_email_confirmation_expire_minutes()),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return UpdateEmailResponse(success=False, message="Please sign in again")
+    db.commit()
+    try:
+        await asyncio.to_thread(
+            send_email_change_confirmation, email, token, get_app_name()
+        )
+    except Exception:
+        db.query(User).filter(
+            User.id == user_id,
+            User.email_confirmation_hash == token_hash,
+        ).update(
+            email_confirmation_clear_values(),
+            synchronize_session=False,
+        )
+        db.commit()
+        # SMTP exceptions may include recipients or provider text; retain the
+        # traceback server-side, never project it into the API response.
+        logger.error(
+            "Unable to deliver email-change confirmation for user %s",
+            user_id,
+            exc_info=True,
+        )
+        return UpdateEmailResponse(
+            success=False, message="Unable to send confirmation email; try again later"
+        )
+    db.refresh(user)
+    return UpdateEmailResponse(
+        success=True,
+        pending_confirmation=True,
+        message="Enter the confirmation code sent to your new email address",
+        user=serialize_auth_user(user),
+    )
+
+
+@auth_router.post("/email/confirm", response_model=UpdateEmailResponse)
+async def confirm_current_user_email(
+    request: ConfirmEmailRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdateEmailResponse:
+    token_hash = hash_auth_token(request.token.strip())
+    now = datetime.now(timezone.utc)
+    candidate = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.email_confirmation_hash == token_hash,
+            User.email_confirmation_expires_at > now,
+        )
+        .populate_existing()
+        .first()
+    )
+    if candidate is None or not candidate.pending_email:
+        return UpdateEmailResponse(
+            success=False, message="Invalid or expired confirmation code"
+        )
+    email = str(candidate.pending_email)
+    previous_email = str(candidate.email or "")
+    conflict = get_user_by_email(db, email)
+    if (
+        conflict is not None and conflict.id != user.id
+    ) or validate_email_for_login_namespace(db, email, current_user_id=int(user.id)):
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    try:
+        changed = (
+            db.query(User)
+            .filter(
+                User.id == user.id,
+                User.email_confirmation_hash == token_hash,
+                User.email_confirmation_expires_at > now,
+            )
+            .update(
+                {
+                    User.email: email,
+                    **email_confirmation_clear_values(),
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return UpdateEmailResponse(
+                success=False, message="Invalid or expired confirmation code"
+            )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    db.refresh(user)
+    if previous_email:
+        try:
+            await asyncio.to_thread(
+                send_email_changed_notice, previous_email, get_app_name()
+            )
+        except Exception:
+            logger.warning(
+                "Unable to notify previous recovery address for user %s",
+                user.id,
+                exc_info=True,
+            )
     return UpdateEmailResponse(
         success=True,
         message="Email updated successfully",
@@ -2589,7 +2912,7 @@ def _prepare_refresh_response(
         now = now.replace(tzinfo=None)
     if expires < now:
         raise HTTPException(status_code=401, detail="Refresh token has expired")
-    identity = {"sub": user.username, "user_id": user.id}
+    identity = user_session_claims(user)
     access_token = create_access_token(
         data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
@@ -2612,6 +2935,8 @@ def _refresh_in_worker(
     with session_factory() as session:
         user = session.query(User).filter(User.id == user_id).first()
         response = _prepare_refresh_response(user, request)
+        assert user is not None
+        previous_epoch = user.session_epoch
         # End the read snapshot before competing for a write. In SQLite this
         # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
         # below, not the preceding SELECT, is the authority on token consumption.
@@ -2623,6 +2948,7 @@ def _refresh_in_worker(
                 User.id == user_id,
                 User.refresh_token == request.refresh_token,
                 User.refresh_token_expires_at >= now,
+                User.session_epoch == previous_epoch,
             )
             .update(
                 {
@@ -3536,6 +3862,7 @@ def _generic_oauth_login(
     resource_owner_key: str | None,
     actor_flow_nonce: str | None,
     account: str | None,
+    trusted_session_epoch: str | None = None,
 ) -> Any:
     """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
@@ -3555,13 +3882,12 @@ def _generic_oauth_login(
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     user_id = trusted_user_id
+    session_epoch: str | None = trusted_session_epoch
     if user_id is None and token:
-        payload = verify_token(token)
-        if payload and payload.get("type") == "access":
-            username = payload.get("sub")
-            user = db.query(User).filter(User.username == username).first()
-            if user:
-                user_id = int(user.id)
+        user = get_user_from_token(token, db)
+        if user:
+            user_id = int(user.id)
+            session_epoch = cast(str | None, user.session_epoch)
 
     if not user_id:
         return HTMLResponse(
@@ -3630,6 +3956,7 @@ def _generic_oauth_login(
         "provider": provider,
         "app_id": app_id,
         "redirect": redirect,
+        "session_epoch": session_epoch,
     }
     if browser_state_nonce is not None:
         browser_nonce_hash = hashlib.sha256(
@@ -3921,18 +4248,27 @@ def _ensure_user_mcp_server(
 
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
     if not mcp_server:
-        mcp_server = MCPServer(
-            name=app_info["name"],
-            description=app_info["description"],
-            managed="external",
-            transport="oauth",
-            auth=_oauth_auth_metadata(),
-        )
-        db.add(mcp_server)
+        # Caller-flush failures are not catalog-insert races to recover from.
+        db.flush()
+        if db.get_bind().dialect.name == "sqlite":
+            # In legacy SQLite mode SELECT/SAVEPOINT do not issue BEGIN. A
+            # zero-row write keeps RELEASE from committing the outer operation.
+            db.execute(text("UPDATE users SET id = id WHERE 1 = 0"))
         try:
-            db.flush()
+            # A competing user's catalog insert must not roll back the caller's
+            # OAuth credential writes or release its session-generation lock.
+            # Add the candidate AFTER begin_nested's mandatory outer flush.
+            with db.begin_nested():
+                mcp_server = MCPServer(
+                    name=app_info["name"],
+                    description=app_info["description"],
+                    managed="external",
+                    transport="oauth",
+                    auth=_oauth_auth_metadata(),
+                )
+                db.add(mcp_server)
+                db.flush()
         except IntegrityError:
-            db.rollback()
             mcp_server = (
                 db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
             )
@@ -4058,6 +4394,18 @@ def generic_oauth_callback(
         )
 
     browser_nonce_hash = payload.get("browser_nonce_hash")
+    is_actor_flow = (
+        payload.get("actor_flow_nonce") is not None
+        or payload.get("resource_owner_key") is not None
+    )
+    if not is_actor_flow and (
+        not isinstance(browser_nonce_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", browser_nonce_hash) is None
+    ):
+        _log_oauth_callback_rejection(provider, "state_browser_binding_required")
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
     if browser_nonce_hash:
         browser_nonce = request.cookies.get(
             _ordinary_oauth_cookie_name(str(browser_nonce_hash))
@@ -4070,8 +4418,21 @@ def generic_oauth_callback(
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
-        if not _claim_ordinary_oauth_state(state):
-            _log_oauth_callback_rejection(provider, "state_replayed")
+        try:
+            claimed = claim_oauth_state(db, state, expires_at=payload.get("exp"))
+        except SQLAlchemyError as exc:
+            # No provider exchange or credential write is allowed if the
+            # durable replay store cannot record this callback's claim.
+            logger.error(
+                "OAuth state replay protection is unavailable (%s)",
+                type(exc).__name__,
+            )
+            return HTMLResponse(
+                content="<h1>Connection temporarily unavailable</h1><p>Please try again.</p>",
+                status_code=503,
+            )
+        if not claimed:
+            _log_oauth_callback_rejection(provider, "state_consumed_or_expired")
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
@@ -4150,6 +4511,21 @@ def generic_oauth_callback(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
     user_id = user_id_claim
+    if not is_actor_flow and user_id is not None:
+        state_user = (
+            db.query(User).filter(User.id == user_id).populate_existing().first()
+        )
+        if state_user is None or not matches_user_session(state_user, payload):
+            _log_oauth_callback_rejection(
+                provider,
+                "state_session_mismatch",
+                app_id=payload.get("app_id"),
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
     app_id = payload.get("app_id")
     if error_response := _google_gmail_error(provider, app_id):
         _log_oauth_callback_rejection(
@@ -5101,6 +5477,26 @@ def generic_oauth_callback(
                 # Serialize replacement in the stable user namespace.
                 db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
+            # Provider I/O happened after the initial generation check. Lock
+            # only now, before credential writes, so a reset wins this race.
+            if (
+                not is_actor_flow
+                and user_id_claim is not None
+                and not lock_current_session_epoch(
+                    db, user_id_claim, payload.get("session_epoch")
+                )
+            ):
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "session_epoch_changed_after_exchange",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                    provider_error=provider_error,
+                )
+                return HTMLResponse(
+                    content="<h1>Error: Invalid or expired state</h1>", status_code=400
+                )
             connector_key = app_id or provider
             oauth_account = _matching_gmail_reconnect_tombstone(
                 db,
@@ -5297,7 +5693,9 @@ def generic_oauth_callback(
             try:
                 parsed = urlparse(redirect_url)
                 if parsed.scheme and parsed.netloc:
-                    target_origin = json.dumps(f"{parsed.scheme}://{parsed.netloc}")
+                    target_origin = script_safe_json(
+                        f"{parsed.scheme}://{parsed.netloc}"
+                    )
             except Exception:
                 pass
 
@@ -5309,8 +5707,8 @@ def generic_oauth_callback(
                 <script>
                     window.opener.postMessage({{
                         type: 'oauth-success',
-                        email: {json.dumps(email)},
-                        provider: {json.dumps(app_id or provider)}
+                        email: {script_safe_json(email)},
+                        provider: {script_safe_json(app_id or provider)}
                     }}, {target_origin});
                     window.close();
                 </script>
@@ -5343,7 +5741,6 @@ def generic_oauth_callback(
 # --- Unified OAuth Routes ---
 
 
-@auth_router.get("/{provider}/login")
 def oauth_login(
     provider: str,
     token: Optional[str] = None,
@@ -5352,7 +5749,7 @@ def oauth_login(
     account: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Any:
-    """Unified entry point for OAuth login"""
+    """In-process adapter; never expose its token argument as an HTTP query."""
     from ..models.oauth_provider import OAuthProvider
 
     db_provider = (
@@ -5360,12 +5757,215 @@ def oauth_login(
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     # But now everything can be routed through generic
     return generic_oauth_login(
         provider, token, app_id, redirect, db, db_provider, account=account
+    )
+
+
+class OAuthLaunchRequest(BaseModel):
+    """Connector options only; authentication belongs in the Bearer header."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: str | None = Field(default=None, max_length=255)
+    redirect: str | None = Field(default=None, max_length=4096)
+    account: str | None = Field(default=None, max_length=255)
+
+
+_OAUTH_LAUNCH_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+_OAUTH_LAUNCH_TTL_SECONDS = 30
+
+
+@auth_router.get("/{provider}/login")
+def redeem_oauth_launch(
+    provider: str,
+    request: Request,
+    ticket: str | None = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Redeem one short-lived proof in a top-level browser navigation.
+
+    Setting the state cookie here avoids depending on third-party cookies in
+    cross-site fetches (for example hitoby.ai calling cloud.xagent.co).
+    """
+    from ..services.oauth_launch import consume_oauth_launch_ticket
+
+    if "token" in request.query_params or "access_token" in request.query_params:
+        return JSONResponse(
+            {
+                "detail": "Start connector authorization with a Bearer-authenticated POST."
+            },
+            status_code=410,
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        payload = verify_token(ticket) if ticket else None
+    except (TypeError, ValueError, OverflowError):
+        payload = None
+    if (
+        not payload
+        or payload.get("type") != "oauth_launch"
+        or payload.get("provider") != provider
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user_id = payload.get("user_id")
+    if type(user_id) is not int or not 0 < user_id <= 2**31 - 1:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        options = OAuthLaunchRequest.model_validate(payload.get("options"))
+    except ValueError:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        ) from None
+    try:
+        consumed = consume_oauth_launch_ticket(db, payload)
+    except SQLAlchemyError:
+        raise HTTPException(
+            503, "Authorization temporarily unavailable", headers=_OAUTH_LAUNCH_HEADERS
+        ) from None
+    if not consumed:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    # Ticket consumption commits before any later work. Re-read after that
+    # boundary so a simultaneous password change cannot restore the old epoch.
+    db.expire_all()
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(400, "Unsupported provider", headers=_OAUTH_LAUNCH_HEADERS)
+    response = _generic_oauth_login(
+        provider,
+        token=None,
+        app_id=options.app_id,
+        redirect=options.redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=int(user.id),
+        trusted_session_epoch=cast(str | None, user.session_epoch),
+        resource_owner_key=None,
+        actor_flow_nonce=None,
+        account=options.account,
+    )
+    response.headers.update(_OAUTH_LAUNCH_HEADERS)
+    return response
+
+
+@auth_router.post("/{provider}/login")
+def start_oauth_authorization(
+    provider: str,
+    request: Request,
+    payload: OAuthLaunchRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Any:
+    """Issue a single-use navigation proof, never a reusable access credential."""
+    from ..models.oauth_provider import OAuthProvider
+
+    private_headers = _OAUTH_LAUNCH_HEADERS
+    if "token" in request.query_params or "access_token" in request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail="Login credentials must not be included in the URL.",
+            headers=private_headers,
+        )
+    # Existing connector manifests put the non-secret app/return options in
+    # the query. Accept those on POST too, without ambiguous body overrides.
+    payload = payload or OAuthLaunchRequest()
+    options = payload.model_dump()
+    for name in ("app_id", "redirect", "account"):
+        if name not in request.query_params:
+            continue
+        value = request.query_params[name]
+        if name in payload.model_fields_set and options[name] != value:
+            raise HTTPException(
+                400, "Conflicting authorization options", headers=private_headers
+            )
+        options[name] = value
+    try:
+        payload = OAuthLaunchRequest.model_validate(options)
+    except ValueError:
+        raise HTTPException(
+            400, "Invalid authorization options", headers=private_headers
+        ) from None
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(
+            status_code=400, detail="Unsupported provider", headers=private_headers
+        )
+    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if (
+        callback.scheme not in {"http", "https"}
+        or not callback.netloc
+        or callback.username
+        or callback.password
+    ):
+        raise HTTPException(
+            400, "Invalid OAuth callback configuration", headers=private_headers
+        )
+    callback_origin = f"{callback.scheme}://{callback.netloc}"
+    from urllib.parse import quote, urlencode
+
+    ticket = create_access_token(
+        {
+            **user_session_claims(user),
+            "type": "oauth_launch",
+            "provider": provider,
+            "jti": secrets.token_urlsafe(24),
+            "options": payload.model_dump(),
+        },
+        expires_delta=timedelta(seconds=_OAUTH_LAUNCH_TTL_SECONDS),
+    )
+    # Relative to the configured API base, resolved by the frontend. Do not
+    # trust arbitrary forwarded Host headers to choose a credential destination.
+    path = f"/api/auth/{quote(provider, safe='')}/login?{urlencode({'ticket': ticket})}"
+    return JSONResponse(
+        {"authorization_url": path, "callback_origin": callback_origin},
+        headers=private_headers,
     )
 
 
@@ -5381,7 +5981,8 @@ def oauth_callback(
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     return generic_oauth_callback(provider, request, db, db_provider)

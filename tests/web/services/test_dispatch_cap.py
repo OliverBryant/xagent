@@ -47,7 +47,8 @@ from xagent.web.services.task_command_transport import (
 from xagent.web.services.task_dispatch_cap import (
     CONTROL_KINDS,
     EXECUTION_OPENING_KINDS,
-    current_dispatch_limit,
+    DispatchPolicy,
+    current_dispatch_policy,
 )
 from xagent.web.services.task_execution import BackgroundTaskManager
 
@@ -56,6 +57,11 @@ LIMIT_ENV = config.DISPATCHER_MAX_INFLIGHT_PER_PROCESS
 
 def set_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> None:
     monkeypatch.setenv(LIMIT_ENV, str(limit))
+
+
+def policy_of(limit: int) -> DispatchPolicy:
+    """A policy with no interactive reserve."""
+    return DispatchPolicy(limit=limit, interactive_reserve=0)
 
 
 # --- limit memo --------------------------------------------------------------
@@ -67,23 +73,23 @@ def test_dispatch_limit_memo_warns_once_per_raw_value(
     logger = Mock()
     monkeypatch.setattr(config, "logger", logger)
     monkeypatch.setenv(LIMIT_ENV, "9")
-    assert current_dispatch_limit() == 9
+    assert current_dispatch_policy().limit == 9
 
     monkeypatch.setenv(LIMIT_ENV, "abc")
     for _ in range(5):
-        assert current_dispatch_limit() == 80
+        assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 1
 
     monkeypatch.setenv(LIMIT_ENV, "xyz")
-    assert current_dispatch_limit() == 80
+    assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 2
 
     monkeypatch.setenv(LIMIT_ENV, "9")
-    assert current_dispatch_limit() == 9
+    assert current_dispatch_policy().limit == 9
     assert logger.warning.call_count == 2
 
     monkeypatch.setenv(LIMIT_ENV, "abc")
-    assert current_dispatch_limit() == 80
+    assert current_dispatch_policy().limit == 80
     assert logger.warning.call_count == 3
 
 
@@ -126,7 +132,7 @@ class CapHost:
             db.commit()
             return int(task.id)
 
-    def enqueue(self, task_id: int, kind: str) -> int:
+    def enqueue(self, task_id: int, kind: str, *, dispatch_class: str = "batch") -> int:
         self._identity += 1
         with self.factory() as db:
             row = TaskExecutionCommand(
@@ -134,6 +140,7 @@ class CapHost:
                 command_id=f"cmd-{self._identity}",
                 kind=kind,
                 payload={},
+                dispatch_class=dispatch_class,
             )
             db.add(row)
             db.commit()
@@ -313,7 +320,13 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
 ) -> None:
     host = cap_host
     set_limit(monkeypatch, 3)
-    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 30.0)
+    # Short enough to stay well inside the waits below. A losing attempt for
+    # the task that just won can hold its reservation until that execution
+    # ends; releasing it signals nothing (see dispatch_one_task_command), so
+    # the slot is taken at the next idle poll. What this test proves is the
+    # cap admitting exactly one, which no idle poll can change;
+    # test_release_wakeups_outcome[1] proves a freed slot wakes the dispatcher.
+    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 1.0)
     for _ in range(2):
         host.live(host.new_task())
     rolling_trials, concurrent_trials = 25, 30
@@ -337,12 +350,25 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
         assert len(host.claimed) == before + 1, trial
     assert max(host.registered_active_sizes) <= 3
     await transport.stop_task_command_dispatcher()
+    # A losing attempt for the task that just won waits in execute_command for
+    # that execution to end. Stopping the dispatcher interrupts it, and the
+    # owner may then close and cancel that execution. Let every owner settle,
+    # then free slots until exactly one is open, whatever the stop freed.
+    await eventually(
+        lambda: all(
+            coordinator.state == runtime.CoordinatorState.ACTIVE
+            and not coordinator._command_tasks
+            for coordinator in host.registry._coordinators.values()
+        )
+    )
+    while len(host.manager._active_task_ids()) >= 3:
+        victim = host.held.pop(next(i for i, h in enumerate(host.held) if not h.done()))
+        victim.cancel()
+        await asyncio.gather(victim, return_exceptions=True)
+    assert len(host.manager._active_task_ids()) == 2
 
     # Four attempts that all saw an open cap and hold different candidates
     # race for the one free slot: exactly one may take it.
-    victim = host.held.pop(next(i for i, h in enumerate(host.held) if not h.done()))
-    victim.cancel()
-    await asyncio.gather(victim, return_exceptions=True)
     real_find = transport._find_command_candidate
     for trial in range(concurrent_trials):
         pending = pending_start_commands(host)[:4]
@@ -354,7 +380,9 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
             with lock:
                 command_id, task_id = next(handed_out)
             barrier.wait(10)
-            return (command_id, task_id, TaskCommandKind.START)
+            return transport.CommandCandidate(
+                command_id, task_id, TaskCommandKind.START, False
+            )
 
         monkeypatch.setattr(transport, "_find_command_candidate", find)
         before = len(host.claimed)
@@ -373,8 +401,8 @@ async def test_dispatch_reservation_tokens_count_per_attempt(
     cap_host: CapHost,
 ) -> None:
     manager = cap_host.manager
-    first = manager.reserve_dispatch_slot(7, limit=5)
-    second = manager.reserve_dispatch_slot(7, limit=5)
+    first = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
+    second = manager.reserve_dispatch_slot(7, policy=policy_of(5), interactive=False)
     assert first is not None and second is not None
     manager.release_dispatch_slot(first)
     assert 7 in manager._active_task_ids()
@@ -795,11 +823,14 @@ def take_last_slot_after_snapshot(
     real_reserve = host.manager.reserve_dispatch_slot
     calls: list[int] = []
 
-    def reserve(task_id: int, *, limit: int) -> Any:
+    def reserve(task_id: int, *, policy: DispatchPolicy, interactive: bool) -> Any:
         if not calls:
             calls.append(task_id)
-            assert real_reserve(other_task_id, limit=limit) is not None
-        return real_reserve(task_id, limit=limit)
+            assert (
+                real_reserve(other_task_id, policy=policy, interactive=interactive)
+                is not None
+            )
+        return real_reserve(task_id, policy=policy, interactive=interactive)
 
     monkeypatch.setattr(host.manager, "reserve_dispatch_slot", reserve)
 
@@ -873,7 +904,7 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
         # An older held start of another task: FIFO would return it first.
         held_start = host.enqueue(host.new_task(), "start")
     command_id = host.enqueue(target, kind)
-    snapshot = host.manager.dispatch_cap_snapshot(1)
+    snapshot = host.manager.dispatch_cap_snapshot(policy_of(1))
     assert snapshot.closed
 
     with host.factory() as db:
@@ -888,9 +919,7 @@ async def test_closed_cap_claims_controls_and_active_task_commands(
 
     if held_start is not None:
         assert transport._find_command_candidate(None, (), snapshot) == (
-            command_id,
-            target,
-            TaskCommandKind(kind),
+            transport.CommandCandidate(command_id, target, TaskCommandKind(kind), False)
         )
     assert await dispatch(host) is True
     assert host.claimed == [(target, TaskCommandKind(kind))]
@@ -955,7 +984,12 @@ async def test_release_wakeups_outcome(
 ) -> None:
     host = cap_host
     attempts = Attempts(monkeypatch)
-    if row != 4:
+    if row == 1:
+        # Idle waits never time out within the test, so only the end of an
+        # execution can wake the dispatcher. That proves the wake-up without a
+        # wall-clock bound, which a loaded CI runner can miss (#3141).
+        monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 3600.0)
+    elif row != 4:
         monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 30.0)
 
     if row == 1:
@@ -963,13 +997,13 @@ async def test_release_wakeups_outcome(
         lives = [host.live(host.new_task()) for _ in range(2)]
         pending = host.enqueue(host.new_task(), "start")
         transport.start_task_command_dispatcher(host.handler)
-        await eventually(lambda: attempts.count >= 1)
+        # Every worker has taken its cap snapshot, so none can see the freed
+        # slot through a first attempt that starts late.
+        await eventually(lambda: attempts.count >= transport.DISPATCHER_CONCURRENCY)
         await asyncio.sleep(0.2)
         assert host.row(pending).status == "pending"
         lives[0][1].set()
-        started = time.monotonic()
-        await eventually(lambda: len(host.claimed) == 1, timeout=1.0)
-        assert time.monotonic() - started < 1.0
+        await eventually(lambda: len(host.claimed) == 1)
     elif row in (2, 3):
         set_limit(monkeypatch, 80)
         if row == 3:
@@ -1044,7 +1078,7 @@ async def test_active_set_reductions_notify_dispatcher(
     elif row == "cancel_with_nothing_registered":
         await manager.cancel_task(4)
     else:
-        token = manager.reserve_dispatch_slot(5, limit=3)
+        token = manager.reserve_dispatch_slot(5, policy=policy_of(3), interactive=False)
         manager.release_dispatch_slot(token)
     for _ in range(3):
         await asyncio.sleep(0)

@@ -105,6 +105,7 @@ from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
 from .auth_config import validate_auth_config
+from .browser_security import is_widget_page
 from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
@@ -1531,7 +1532,7 @@ app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 def _security_header_values(path: str) -> dict[str, str]:
     """Return headers appropriate for an API, preview, upload, or SPA path."""
-    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    widget_page = is_widget_page(path)
     is_upload = path == "/uploads" or path.startswith("/uploads/")
     is_api = path == "/api" or path.startswith("/api/")
     is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
@@ -1541,13 +1542,18 @@ def _security_header_values(path: str) -> dict[str, str]:
     }
     if is_api or is_upload:
         frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        # OAuth callback pages run inline popup feedback. Other API/upload
+        # responses do not need scripts. Never enable eval for either path.
+        script_sources = (
+            "'self' 'unsafe-inline'" if path.startswith("/api/auth/") else "'none'"
+        )
         headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'self'; object-src 'none'; "
             f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
             "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+            f"script-src {script_sources}; connect-src 'self' https: wss:; form-action 'none'"
         )
-    if not is_widget_page and not is_upload and not is_preview:
+    if not widget_page and not is_upload and not is_preview:
         headers["X-Frame-Options"] = "DENY"
     return headers
 
@@ -1582,6 +1588,7 @@ _BLOCKED_UPLOAD_EXTENSIONS = frozenset(
         ".rss",
     }
 )
+_PUBLIC_UPLOAD_PREFIX = "agent_logos/"
 
 
 def _blocked_upload_extension(path: str) -> bool:
@@ -1591,11 +1598,27 @@ def _blocked_upload_extension(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
 
 
+def _is_public_upload_path(path: str) -> bool:
+    """Only agent logos are safe to expose through the legacy static mount."""
+    path = path.replace(os.sep, "/")
+    parts = path.split("/")
+    return (
+        len(parts) == 2
+        and path.startswith(_PUBLIC_UPLOAD_PREFIX)
+        and parts[1] not in {"", ".", ".."}
+        and "\\" not in path
+    )
+
+
 class SafeUploadsStaticFiles(StaticFiles):
-    """Serve only non-active content from the legacy public uploads mount."""
+    """Serve only non-active agent logos from the legacy public mount.
+
+    User files live below the same storage root but must be served through the
+    authenticated file API, which enforces ownership and public-share tokens.
+    """
 
     async def get_response(self, path: str, scope: Scope) -> Any:
-        if _blocked_upload_extension(path):
+        if not _is_public_upload_path(path) or _blocked_upload_extension(path):
             return PlainTextResponse("Not found", status_code=404)
         return await super().get_response(path, scope)
 
@@ -1841,6 +1864,12 @@ async def startup_event() -> None:
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     validate_auth_config()
+    from ..core.model.network_policy import ModelNetworkPolicy
+
+    ModelNetworkPolicy()  # Fail before admitting work if operator policy is invalid.
+    from .services.auth_attempts import validate_auth_attempt_storage
+
+    await asyncio.to_thread(validate_auth_attempt_storage)
     validate_task_execution_host_config()
     if get_task_execution_role() == "worker":
         raise ValueError("Use python -m xagent.web.worker for the worker role")

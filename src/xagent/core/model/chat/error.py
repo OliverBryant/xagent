@@ -1,16 +1,20 @@
 import httpx
 import openai
 
+from ..public_http import is_model_network_policy_error
 from .exceptions import (
     LLMContextLengthError,
     LLMRetryableError,
     LLMToolProtocolError,
 )
 
+ZaiAPIStatusError: "type[_ZaiAPIStatusError] | None"
 try:
-    from zai.core._errors import APIStatusError as ZaiAPIStatusError  # type: ignore
+    from zai.core._errors import APIStatusError as _ZaiAPIStatusError
 except ImportError:
     ZaiAPIStatusError = None
+else:
+    ZaiAPIStatusError = _ZaiAPIStatusError
 
 
 _CONTEXT_LENGTH_ERROR_MARKERS = (
@@ -82,6 +86,8 @@ def _provider_vetoed_retry(error: BaseException) -> bool:
 
 
 def retry_on(e: Exception) -> bool:
+    if is_model_network_policy_error(e):
+        return False
     if is_context_length_error(e):
         return False
 
@@ -140,7 +146,7 @@ def retry_on(e: Exception) -> bool:
 
         # Handle Zai/Zhipu SDK errors
         if (
-            ZaiAPIStatusError
+            ZaiAPIStatusError is not None
             and isinstance(exc, ZaiAPIStatusError)
             and not _provider_vetoed_retry(exc)
         ):

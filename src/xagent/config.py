@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import base64
 import enum
 import json
 import logging
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
+# Shared with the frontend build; runtime value is needed by packaged SPA CSP.
+HTML_PREVIEW_ORIGIN = "NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN"
+IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
+VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
+REMOTE_JSON_DOWNLOAD_MAX_BYTES = "XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
@@ -47,6 +53,7 @@ WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
 TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
+ENCRYPTION_MIGRATION_KEY = "XAGENT_ENCRYPTION_MIGRATION_KEY"
 # Public development fallback; runtime credential storage must reject it.
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
@@ -57,6 +64,7 @@ TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECO
 TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -83,6 +91,9 @@ TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
 )
 # Shared task command dispatcher.
 DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
+DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS = (
+    "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
+)
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -264,6 +275,7 @@ GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+EMAIL_CONFIRMATION_EXPIRE_MINUTES = "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
 SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
 SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
@@ -297,6 +309,8 @@ HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
 HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
+MODEL_PRIVATE_ENDPOINTS = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
+MODEL_PRIVATE_CIDRS = "XAGENT_MODEL_PRIVATE_CIDRS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -560,6 +574,26 @@ def get_task_auto_resume_enabled() -> bool:
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
 
 
+def get_shutdown_handoff_enabled() -> bool:
+    """Whether a shutdown hands eligible running tasks to lease recovery.
+
+    Off, a host shutting down cancels its runs and fails them immediately.
+    On, a run the shutdown cancelled (not one a user cancelled) whose task
+    is eligible for automatic recovery keeps its lease instead: lease
+    recovery pauses it once the lease expires and automatic resume picks it
+    up, exactly as after a crash. Only takes effect while
+    :func:`get_task_auto_resume_enabled` is on. Channel tasks, status-only
+    (SDK) tasks and the sources automatic recovery excludes still fail
+    immediately.
+
+    Priority:
+        1. XAGENT_SHUTDOWN_HANDOFF_ENABLED environment variable
+        2. False
+    """
+
+    return _get_strict_bool_env(SHUTDOWN_HANDOFF_ENABLED, False)
+
+
 def get_task_auto_resume_poll_seconds() -> int:
     """Get the auto-resume sweeper polling interval in seconds (default 5)."""
 
@@ -636,6 +670,14 @@ def get_dispatcher_max_inflight_per_process() -> int:
     """Get the per-process cap on executions the dispatcher admits (default 80)."""
 
     return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
+
+
+def get_dispatcher_interactive_reserve_per_process() -> int:
+    """Get the slots per process kept for interactive commands (default 0)."""
+
+    return _get_positive_int_env(
+        DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, 0, minimum=0
+    )
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:
@@ -818,6 +860,11 @@ def get_password_reset_expire_minutes() -> int:
     return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
 
 
+def get_email_confirmation_expire_minutes() -> int:
+    """Return the recovery-email confirmation expiry window in minutes."""
+    return _get_positive_int_env(EMAIL_CONFIRMATION_EXPIRE_MINUTES, 15)
+
+
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
     return _normalized_env_url(APP_BASE_URL)
@@ -955,6 +1002,20 @@ def get_trusted_egress_proxy_enabled() -> bool:
     policy; leave it disabled unless that is true.
     """
     return _get_bool_env(TRUSTED_EGRESS_PROXY, False)
+
+
+def _csv_env(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
+def get_model_private_endpoints() -> list[str]:
+    """Operator-only exact model origins, including scheme and port; default deny."""
+    return _csv_env(MODEL_PRIVATE_ENDPOINTS)
+
+
+def get_model_private_cidrs() -> list[str]:
+    """Operator-only DNS address constraints for private model origins."""
+    return _csv_env(MODEL_PRIVATE_CIDRS)
 
 
 def get_mcp_oauth_proxy_url() -> str | None:
@@ -2194,6 +2255,124 @@ def get_require_secure_secrets() -> bool:
     return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
+TOOL_CREDENTIALS_ENCRYPTION_KEY = "XAGENT_SECRET_ENCRYPTION_KEY"
+LEGACY_TOOL_CREDENTIALS_KEY_ALIAS = "SECRET_KEY"
+TOOL_CREDENTIALS_MIGRATION_KEY = "XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY"
+DEV_TOOL_CREDENTIALS_KEY = "xagent-dev-key"
+KNOWN_INSECURE_SECRETS = frozenset(
+    {
+        INSECURE_SECRET_PLACEHOLDER,
+        DEV_TOOL_CREDENTIALS_KEY,
+        "change-me",
+        "change-me-to-a-random-session-secret",
+        "replace-with-a-long-random-secret",
+        "secret",
+        "a-separate-private-32-or-more-character-tool-key",
+    }
+)
+
+
+def requires_secure_secrets() -> bool:
+    return get_environment() != "development" or get_require_secure_secrets()
+
+
+def validate_tool_credentials_key(raw: str | None, *, setting: str) -> None:
+    if not raw or len(raw.strip()) < 32:
+        raise RuntimeError(f"{setting} must contain at least 32 secret characters")
+    if raw.strip().lower() in KNOWN_INSECURE_SECRETS:
+        raise RuntimeError(f"{setting} must not use a public placeholder")
+
+
+def get_tool_credentials_encryption_key() -> str:
+    """Keep the historical key derivation while refusing deployed defaults."""
+    setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+    raw = os.getenv(setting)
+    if not raw or not raw.strip():
+        setting = LEGACY_TOOL_CREDENTIALS_KEY_ALIAS
+        raw = os.getenv(setting)
+    if requires_secure_secrets():
+        if not raw or not raw.strip():
+            setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+        validate_tool_credentials_key(raw, setting=setting)
+    # Preserve historical derivation for explicitly configured keys, including
+    # surrounding whitespace; only blank values are ignored when selecting.
+    return raw if raw and raw.strip() else DEV_TOOL_CREDENTIALS_KEY
+
+
+def validate_private_encryption_key(key: str | None) -> None:
+    """Reject the public key by key material, not its Base64 spelling."""
+    from cryptography.fernet import Fernet
+
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+    try:
+        Fernet(key.encode("ascii"))
+    except ValueError as exc:
+        raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
+    # Fernet accepts standard Base64, extra padding and embedded whitespace.
+    # All equivalent encodings of the published key are equally public.
+    if base64.urlsafe_b64decode(key) == base64.urlsafe_b64decode(
+        DEV_FALLBACK_ENCRYPTION_KEY
+    ):
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+
+
+def validate_encryption_config() -> None:
+    """Reject missing, public or malformed encryption keys before admission."""
+    if not requires_secure_secrets():
+        return
+    validate_private_encryption_key(os.getenv(ENCRYPTION_KEY))
+    get_tool_credentials_encryption_key()
+
+
+AUTH_RATE_LIMIT_WINDOW_SECONDS = "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS"
+AUTH_LOGIN_IP_LIMIT = "XAGENT_AUTH_LOGIN_IP_LIMIT"
+AUTH_LOGIN_ACCOUNT_LIMIT = "XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT"
+AUTH_LOGIN_PAIR_LIMIT = "XAGENT_AUTH_LOGIN_PAIR_LIMIT"
+AUTH_RECOVERY_IP_LIMIT = "XAGENT_AUTH_RECOVERY_IP_LIMIT"
+AUTH_RECOVERY_EMAIL_LIMIT = "XAGENT_AUTH_RECOVERY_EMAIL_LIMIT"
+AUTH_RECOVERY_PAIR_LIMIT = "XAGENT_AUTH_RECOVERY_PAIR_LIMIT"
+EMAIL_CHANGE_TARGET_LIMIT = "XAGENT_EMAIL_CHANGE_TARGET_LIMIT"
+AUTH_RATE_LIMIT_MAX_LOCAL_KEYS = "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS"
+
+
+def get_auth_rate_limit_window_seconds() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_WINDOW_SECONDS, 900)
+
+
+def get_auth_login_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_IP_LIMIT, 200)
+
+
+def get_auth_login_account_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_ACCOUNT_LIMIT, 50)
+
+
+def get_auth_login_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_PAIR_LIMIT, 5)
+
+
+def get_auth_recovery_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_IP_LIMIT, 200)
+
+
+def get_auth_recovery_email_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_EMAIL_LIMIT, 50)
+
+
+def get_auth_recovery_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_PAIR_LIMIT, 5)
+
+
+def get_email_change_target_limit() -> int:
+    """Limit confirmation mail to an arbitrary, potentially unregistered target."""
+    return _get_positive_int_env(EMAIL_CHANGE_TARGET_LIMIT, 5)
+
+
+def get_auth_rate_limit_max_local_keys() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_MAX_LOCAL_KEYS, 10_000)
+
+
 def get_oidc_login_ttl_seconds() -> int:
     """Return the short-lived OIDC login transaction TTL."""
     return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)
@@ -2363,6 +2542,11 @@ def get_uploads_dir() -> Path:
     return _require_unambiguous_uploads_dir(uploads_dir)
 
 
+def get_html_preview_origin() -> str:
+    """Preview runner setting; match the value baked into the frontend build."""
+    return os.getenv(HTML_PREVIEW_ORIGIN, "").strip()
+
+
 def get_frontend_dist_dir() -> Path:
     """Get the directory holding the built frontend static export.
 
@@ -2406,6 +2590,34 @@ def get_artifact_validation_timeout_seconds() -> float:
             f"{ARTIFACT_VALIDATION_TIMEOUT_SECONDS} must be positive and finite"
         )
     return value
+
+
+def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
+    """Bound provider downloads; invalid explicit limits fail closed."""
+    variable = (
+        IMAGE_DOWNLOAD_MAX_BYTES if media_kind == "image" else VIDEO_DOWNLOAD_MAX_BYTES
+    )
+    default = 64 * 1024 * 1024 if media_kind == "image" else 512 * 1024 * 1024
+    value = os.getenv(variable)
+    if not value or not value.strip():
+        return default
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {variable} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, variable)
+
+
+def get_remote_json_download_max_bytes() -> int:
+    """Bound remote speech-batch JSON inputs; invalid limits fail closed."""
+    value = os.getenv(REMOTE_JSON_DOWNLOAD_MAX_BYTES)
+    if not value or not value.strip():
+        return 10 * 1024 * 1024
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {REMOTE_JSON_DOWNLOAD_MAX_BYTES} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, REMOTE_JSON_DOWNLOAD_MAX_BYTES)
 
 
 def get_max_upload_size_bytes() -> int:

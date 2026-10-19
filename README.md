@@ -45,6 +45,10 @@ Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R
 
 ## Quick Start
 
+Building the frontend from source (including Docker builds) requires HTTPS
+access to both the npm registry and `cdn.sheetjs.com` for the integrity-pinned
+SheetJS release. See [dependency upgrade notes](docs/sheetjs-security-upgrade.md).
+
 ### Run on your machine
 
 The published package bundles the web UI — no Docker or Node required (Python 3.11+):
@@ -85,6 +89,10 @@ On first startup, Xagent redirects to `/setup` to create the first administrator
 ```bash
 docker compose exec backend python -m xagent.web.reset_admin_password --username <admin_username>
 ```
+
+This also revokes the administrator's existing sign-in sessions, file-stream
+tickets and password-reset links. Sign in again with the new password. Independent
+API keys and existing provider grants must be revoked separately after a compromise.
 
 ---
 

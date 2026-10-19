@@ -731,8 +731,9 @@ class TestToolsAvailableAPI:
         """Test that /api/tools/available requires authentication."""
         response = client.get("/api/tools/available")
 
-        # Unauthenticated requests return 403
-        assert response.status_code == 403
+        # Missing credentials require the standard Bearer challenge.
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
 
     def test_get_available_tools_falls_back_to_other_when_metadata_missing(
         self, monkeypatch
@@ -989,6 +990,62 @@ class TestToolsGovernanceAPI:
         assert payload["fields"]["api_key"]["source"] == "env"
         assert payload["fields"]["api_key"]["is_configured"] is True
         assert "5678" in payload["fields"]["api_key"]["masked"]
+
+    def test_unreadable_credential_remains_visible_and_can_be_replaced(
+        self, monkeypatch
+    ):
+        from xagent.web.models.database import get_session_local
+        from xagent.web.services.tool_credentials import (
+            ToolCredentialUnreadableError,
+            resolve_tool_credential,
+        )
+
+        headers = self._admin_headers()
+        path = "/api/tools/tavily_web_search/credentials"
+        assert (
+            client.put(
+                path,
+                headers=headers,
+                json={
+                    "credentials": {"api_key": {"value": "original-private-tool-key"}}
+                },
+            ).status_code
+            == 200
+        )
+        with get_session_local()() as db:
+            row = db.query(ToolConfig).filter_by(tool_name="tavily_web_search").one()
+            row.config = {
+                "credentials": {
+                    "api_key": {
+                        "secret": True,
+                        "ciphertext": "corrupt-token",
+                        "masked": "***",
+                    }
+                }
+            }
+            db.commit()
+        monkeypatch.setenv("TAVILY_API_KEY", "do-not-fallback-to-this")
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        field = response.json()["fields"]["api_key"]
+        assert field["error"] == "unreadable"
+        assert field["source"] == "db" and field["is_configured"] is False
+        assert response.json()["configured"] is False
+        assert "corrupt-token" not in response.text
+        assert "do-not-fallback-to-this" not in response.text
+        with get_session_local()() as db:
+            with pytest.raises(ToolCredentialUnreadableError):
+                resolve_tool_credential(db, "tavily_web_search", "api_key")
+        repaired = client.put(
+            path,
+            headers=headers,
+            json={
+                "credentials": {"api_key": {"value": "replacement-private-tool-key"}}
+            },
+        )
+        assert repaired.status_code == 200
+        assert repaired.json()["fields"]["api_key"]["error"] is None
+        assert repaired.json()["configured"] is True
 
     def test_sql_connections_crud_and_db_priority_over_env(self, monkeypatch):
         headers = self._admin_headers()

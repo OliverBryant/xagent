@@ -20,10 +20,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.oauth_browser_fixture import create_access_token
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps, oauth_account_hosts
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_login, verify_token
+from xagent.web.api.auth import generic_oauth_login, verify_token
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -290,7 +291,12 @@ def _db_provider(provider_name: str = FAKE_PROVIDER) -> SimpleNamespace:
 
 def _token_for(user: User) -> str:
     return create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -312,6 +318,38 @@ def _state_payload(response) -> dict:
     payload = verify_token(state)
     assert payload is not None
     return payload
+
+
+@pytest.mark.parametrize(
+    "credential", ["current", "missing-id", "wrong-id", "stale-epoch"]
+)
+def test_oauth_login_requires_current_user_bound_credentials(oauth_db, credential):
+    db, user = oauth_db
+    user.session_epoch = "current-generation"
+    db.commit()
+    claims = {
+        "sub": user.username,
+        "user_id": user.id,
+        "session_epoch": user.session_epoch,
+    }
+    if credential == "missing-id":
+        claims.pop("user_id")
+    elif credential == "wrong-id":
+        claims["user_id"] = user.id + 1
+    elif credential == "stale-epoch":
+        claims["session_epoch"] = "revoked-generation"
+    response = generic_oauth_login(
+        FAKE_PROVIDER,
+        token=create_access_token(data=claims),
+        app_id=FAKE_APP_ID,
+        db=db,
+        db_provider=_db_provider(),
+        account="acme",
+    )
+    assert response.status_code == (307 if credential == "current" else 401)
+    if credential != "current":
+        assert "location" not in response.headers
+        assert "set-cookie" not in response.headers
 
 
 def test_login_redirects_to_the_account_authorize_endpoint(oauth_db):
@@ -577,7 +615,9 @@ def _callback(
         query_params={"state": state, "code": "code"},
         cookies=cookies or {},
     )
-    return auth_api.generic_oauth_callback(
+    from tests.shared.oauth_browser_fixture import generic_oauth_callback
+
+    return generic_oauth_callback(
         provider, request, db=db, db_provider=_db_provider(provider)
     )
 
@@ -626,6 +666,9 @@ def test_callback_exchanges_the_code_on_the_account_bound_at_login(
     assert grant is not None
     assert grant.access_token == "new-access"
     assert grant.instance_url == "acme"
+    replay = _callback(db, state + "=", cookies=cookies)
+    assert replay.status_code == 400
+    assert post.call_count == 1
 
 
 def test_callback_keeps_the_bound_account_over_a_token_response_instance_url(
@@ -874,7 +917,7 @@ def _fake_async_client(monkeypatch, response_data: dict | None = None) -> list:
                 or {"access_token": "new-access", "refresh_token": "new-refresh"}
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
     return posted
 
 

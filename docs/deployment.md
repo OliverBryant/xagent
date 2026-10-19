@@ -1,5 +1,91 @@
 # Deployment changes
 
+## 2026-10-17 — PyJWT migration and DeepDoc 0.2.4
+
+This authentication update uses `PyJWT[crypto]>=2.15.1,<3` and pins the released
+`deepdoc-lib==0.2.4`. DeepDoc and the application now share the maintained
+`zai-sdk` dependency; the obsolete `zhipuai` and `python-jose` packages are no
+longer in the core lockfile. No development-only PyJWT dependency override is
+required. Reinstall from the updated lockfile, or install the new application
+wheel, rather than upgrading only the JWT library in an old environment.
+
+DeepDoc model-cache keys have moved to the 0.2.4 namespace; provision and verify
+the model, NLTK and tiktoken resources before serving document ingestion. The
+local parser and optional Xinference routing/fallback remain unchanged. The
+Zhipu vision adapter retains the China endpoint and `ZHIPUAI_BASE_URL` override.
+PR and release workflows resolve the built application wheel without project
+overrides. Passing these checks does not deploy the application or update a
+downstream SaaS repository's core gitlink.
+
+## 2026-10-17 — Recovery email confirmation
+
+Apply the email-confirmation migrations before serving the new authentication
+code. Changing or adding a recovery address now requires configured SMTP
+(`XAGENT_SMTP_HOST` and `XAGENT_SMTP_FROM_EMAIL`), even for an email-less account.
+Without it, Settings explains that an administrator must configure mail; the API
+does not stage a proof or allow an unverified fallback. Passwordless accounts
+cannot change or add their address through Settings; the UI directs them to an
+administrator for assistance. The current Google OIDC integration only fills an
+empty email on login; it does not synchronize later provider email changes.
+There is no administrator email-update endpoint or CLI in this rollout; a
+verified provider reauthentication/update workflow remains future work. Do not
+enable session-only email changes as a workaround. Existing recovery addresses
+remain authoritative until confirmation succeeds. Resubmitting the current
+address is explicitly reported as unchanged and preserves any pending proof;
+it does not cancel a pending change or send another confirmation.
+
+`XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES` defaults to 15 and controls the API,
+email message and Settings hint. Email-change requests share the existing auth
+window and storage backend, with separate email-change buckets: per-user uses
+`XAGENT_AUTH_RECOVERY_PAIR_LIMIT`, per-target uses the independent
+`XAGENT_EMAIL_CHANGE_TARGET_LIMIT` (default: 5 per window)
+and per-source-IP uses `XAGENT_AUTH_RECOVERY_IP_LIMIT`. A successful confirmation
+sends a best-effort notice to the old address; notification failure cannot undo
+the committed change. Refresh credentials and recovery links are cleared;
+existing access sessions keep their current lifecycle (password reset/change
+revokes them).
+
+## 2026-10-17 — Password changes revoke sign-in sessions
+
+Apply migrations through the single Alembic head before serving traffic, and
+roll out the same authentication code to every API worker. Password changes,
+recovery resets and the offline administrator reset rotate `users.session_epoch`
+and revoke all existing access tokens, refresh tokens, file-stream tickets and
+pending OIDC exchange codes. The settings UI clears the current login and asks
+the user to sign in with the new password. Legacy tokens without a generation
+remain valid only until that user's first password reset/change.
+
+Authenticated WebSockets validate token expiry at handshake. Existing connections
+check signature, user existence and session generation, not the connect-time
+token's expiry; a normal access-token refresh must not cancel an active stream.
+Each socket uses a short worker-owned database session and one user query every
+4–6 seconds (jittered around 5 seconds), plus a check before each inbound command.
+Capacity-plan database pools and monitor checkout latency for this added load.
+Revocation closes with 4001 and drains owned streaming work. Handshake and command
+checks fail closed on database errors (503 denial or 1011 close). Background polls
+tolerate at most two consecutive OperationalError/pool-timeout failures; a third
+closes with 1011. Successful checks reset that counter. Unexpected errors close
+immediately. During transient poll failures, existing streams may continue until
+the next successful check or terminal failure: this is bounded retry, not an
+instantaneous revocation guarantee, and database response time adds latency.
+
+Ordinary user-bound connector and Slack-channel OAuth states carry the initiating
+generation and are checked before provider exchange and fenced again when saving
+credentials. Pre-upgrade states without a generation work only for unrotated
+users. Pending remote-MCP OAuth flows (`MCPOAuthFlowState`, handled in `api/mcp.py`)
+are not generation-bound by this rollout and can still complete within their own
+expiry window after a password change. Already-connected provider grants,
+independent actor authorization flows, personal API keys and agent/workforce
+runtime keys also have separate lifecycles and are not revoked by changing the
+login password. After suspected account compromise, explicitly audit/revoke those
+keys and disconnect provider grants, including remote-MCP connections, as well.
+
+Do not downgrade past `20261016_user_session_epoch` on a live installation: dropping
+the column destroys revocation generations and can revalidate previously revoked,
+unexpired tokens if the old JWT secret is retained. A rollback requires stopping
+all workers and invalidating outstanding credentials (including coordinated JWT
+signing-secret rotation), not merely dropping the column or restoring old code.
+
 ## LanceDB memory compatibility
 
 The LanceDB dependency is bounded: `lancedb>=0.32.0,<0.38` in `pyproject.toml`.

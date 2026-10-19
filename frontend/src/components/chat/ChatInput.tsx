@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useId, useMemo } from "react";
-import { createFileChipHTML } from "./FileChip";
+import { renderFileMentionsHtml } from "./FileChip";
+import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -157,10 +158,18 @@ export function ChatInput({
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
+  const mountedRef = useRef(false);
   const { t } = useI18n();
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -177,26 +186,33 @@ export function ChatInput({
     return () => window.cancelAnimationFrame(frameId);
   }, [autoFocus]);
 
-  const escapeHtml = (value: string) =>
-    value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-
-  const replaceFirstOccurrence = (source: string, search: string, replacement: string) => {
-    const index = source.indexOf(search);
-    if (index === -1) return source;
-    return source.slice(0, index) + replacement + source.slice(index + search.length);
-  };
-
   const applyPromptHighlights = (html: string, highlightTerms: string[]) => {
-    return highlightTerms.reduce((currentHtml, term) => {
-      const escapedTerm = escapeHtml(term);
-      const highlightedTerm = `<span data-prompt-highlight="true" class="font-medium" style="color:#3b5cff;text-decoration-line:underline;text-decoration-style:dashed;text-decoration-color:#3b5cff;text-underline-offset:4px;">${escapedTerm}</span>`;
-      return replaceFirstOccurrence(currentHtml, escapedTerm, highlightedTerm);
-    }, html);
+    if (!highlightTerms.length) return html;
+    // Only our escaped text / generated chip HTML reaches this template. Walk
+    // text nodes so a match in a file ID, class or attribute cannot corrupt
+    // the HTML boundary by inserting a new element inside an attribute.
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    for (const term of highlightTerms) {
+      if (!term) continue;
+      const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode as Text;
+        if (node.parentElement?.closest("[data-prompt-highlight], [data-file-path]")) continue;
+        const index = node.data.indexOf(term);
+        if (index < 0) continue;
+        const match = node.splitText(index);
+        match.splitText(term.length);
+        const highlighted = document.createElement("span");
+        highlighted.dataset.promptHighlight = "true";
+        highlighted.className = "font-medium";
+        highlighted.style.cssText = "color:#3b5cff;text-decoration-line:underline;text-decoration-style:dashed;text-decoration-color:#3b5cff;text-underline-offset:4px;";
+        highlighted.textContent = term;
+        match.replaceWith(highlighted);
+        break;
+      }
+    }
+    return template.innerHTML;
   };
 
   const serializeEditorContent = (editor: HTMLElement) => {
@@ -267,6 +283,11 @@ export function ChatInput({
   // Determine if controlled or uncontrolled
   const isControlled = inputValue !== undefined;
   const message = isControlled ? inputValue : internalMessage;
+  // The latest draft, for a send that settles after the user typed again.
+  const messageRef = useRef(message);
+  useEffect(() => {
+    messageRef.current = message;
+  }, [message]);
 
 
   // Handle click on delete button and file chip preview
@@ -888,6 +909,7 @@ export function ChatInput({
           : {}),
       };
 
+      const sentDraft = message;
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
       draftRequestSnapshotRef.current = null;
@@ -897,10 +919,13 @@ export function ChatInput({
       setTaskRuntimeSelection(null);
       fileMention.resetMention();
 
-      if (isControlled) {
-        onInputChange?.("");
-      } else {
-        setInternalMessage("");
+      // A send can wait minutes for a reconnect; keep a draft typed meanwhile.
+      if (messageRef.current === sentDraft) {
+        if (isControlled) {
+          onInputChange?.("");
+        } else {
+          setInternalMessage("");
+        }
       }
     } catch (error) {
       if (
@@ -913,6 +938,10 @@ export function ChatInput({
       // persistent error. Keep retry state, but do not duplicate its notice.
       if (typeof error === "object" && error !== null
         && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
+      // A lost connection's failure can arrive up to a resend wait later, after
+      // the user left; no toast for a gone input. Other failures still notify.
+      if (!mountedRef.current && typeof error === "object" && error !== null
+        && (error as { connectionLost?: unknown }).connectionLost === true) return;
       const errorCode = typeof error === "object" && error !== null
         ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
         : null;
@@ -1038,17 +1067,7 @@ export function ChatInput({
       const currentText = serializeEditorContent(editor);
 
       if (message !== currentText) {
-        let html = escapeHtml(message);
-
-        // Restore canonical and legacy file links.
-        html = html.replace(/\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g, (_match, filename, id) => {
-          // We use the ID as the path since we don't have the real path anymore
-          return createFileChipHTML(id, id, filename);
-        });
-        // Fallback for old backticked messages to not break existing chat history
-        html = html.replace(/`([^`]+)`/g, (_match, path) => {
-          return createFileChipHTML(path);
-        });
+        let html = renderFileMentionsHtml(message, true);
         html = applyPromptHighlights(html, promptHighlightTerms);
         html = html.replace(/\n/g, "<br>");
 

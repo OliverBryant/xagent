@@ -10,48 +10,10 @@ from fastapi import HTTPException
 from xagent.web.api import auth as auth_api
 
 
-def test_login_attempt_key_uses_trusted_client_ip(monkeypatch) -> None:
-    monkeypatch.setattr(
-        auth_api, "remote_ip_from_request", lambda request: "203.0.113.7"
-    )
-    request = SimpleNamespace(client=SimpleNamespace(host="10.0.0.5"))
-
-    assert auth_api._login_attempt_key(
-        request, " Alice "
-    ) == auth_api._login_attempt_key(request, "alice")
-
-
-def test_login_attempt_reservation_is_atomic_and_expires(monkeypatch) -> None:
-    auth_api._login_failures.clear()
-    key = "test-login-key"
-    try:
-        assert all(auth_api._reserve_login_attempt(key, now=float(i)) for i in range(5))
-        assert not auth_api._reserve_login_attempt(key, now=5.0)
-        assert auth_api._reserve_login_attempt(
-            key, now=auth_api._LOGIN_FAILURE_WINDOW_SECONDS + 5.0
-        )
-    finally:
-        auth_api._login_failures.clear()
-
-
-def test_login_attempt_limiter_sweeps_expired_identifier_buckets() -> None:
-    auth_api._login_failures.clear()
-    auth_api._login_failure_last_sweep = 0.0
-    try:
-        assert auth_api._reserve_login_attempt("old-user", now=1.0)
-        assert "old-user" in auth_api._login_failures
-        assert auth_api._reserve_login_attempt(
-            "new-user",
-            now=float(
-                auth_api._LOGIN_FAILURE_WINDOW_SECONDS
-                + auth_api._LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS
-                + 1
-            ),
-        )
-        assert "old-user" not in auth_api._login_failures
-    finally:
-        auth_api._login_failures.clear()
-        auth_api._login_failure_last_sweep = 0.0
+def test_login_budgets_normalize_unknown_identifiers() -> None:
+    assert auth_api._login_budgets(
+        "203.0.113.7", " Alice ", None
+    ) == auth_api._login_budgets("203.0.113.7", "alice", None)
 
 
 def test_unknown_login_pays_bcrypt_timing_floor(monkeypatch) -> None:
@@ -67,7 +29,8 @@ def test_unknown_login_pays_bcrypt_timing_floor(monkeypatch) -> None:
     dummy.assert_called_once_with()
 
 
-def test_oauth_state_cookie_follows_redirect_transport(monkeypatch) -> None:
+@pytest.mark.parametrize("epoch", [None, "current-generation"])
+def test_oauth_state_cookie_follows_redirect_transport(monkeypatch, epoch) -> None:
     db_provider = SimpleNamespace(
         client_id="client-id",
         auth_url="https://provider.example/authorize",
@@ -76,20 +39,29 @@ def test_oauth_state_cookie_follows_redirect_transport(monkeypatch) -> None:
     )
     db = SimpleNamespace()
     monkeypatch.setattr(auth_api, "_resolve_oauth_secret", lambda *args: "client-id")
+    monkeypatch.setattr(
+        auth_api,
+        "get_user_from_token",
+        lambda *args: SimpleNamespace(id=1, session_epoch=epoch),
+    )
 
     response = auth_api._generic_oauth_login(
         "custom",
-        token=None,
+        token="signed",
         app_id=None,
         redirect=None,
         db=db,
         db_provider=db_provider,
-        trusted_user_id=1,
+        trusted_user_id=None,
         resource_owner_key=None,
         actor_flow_nonce=None,
         account=None,
     )
     cookie = SimpleCookie()
+    from urllib.parse import parse_qs, urlparse
+
+    state = parse_qs(urlparse(response.headers["location"]).query)["state"][0]
+    assert auth_api.verify_token(state)["session_epoch"] == epoch
     cookie.load(response.headers["set-cookie"])
     names = [
         name

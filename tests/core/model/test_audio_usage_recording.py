@@ -8,13 +8,17 @@ provider rejected must leave none.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import struct
+import sys
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from xagent.core.model import media_metering
 from xagent.core.model.asr.adapter import get_asr_model_instance
 from xagent.core.model.asr.elevenlabs import ElevenLabsASR
 from xagent.core.model.asr.xinference import XinferenceASR
@@ -470,3 +474,144 @@ def test_db_built_speech_models_carry_the_configured_id(factory, provider):
         base_url="http://x.test",
     )
     assert factory(db_model).model_id == "platform/11"
+
+
+# --- Ogg/Opus output and input --------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+_OPUS_2500MS = (_FIXTURES / "tone_2500ms.opus.ogg").read_bytes()
+
+
+@pytest.mark.parametrize(
+    "cls,section,method,generate,args,length_arg,length", _GENERATORS
+)
+async def test_opus_output_without_a_length_bills_its_measured_seconds(
+    monkeypatch, cls, section, method, generate, args, length_arg, length
+):
+    # Opus is a supported output format; its length sits in the last Ogg page,
+    # which a pipe-fed ffprobe cannot reach. ffprobe is made unavailable so the
+    # native measurement is what bills the call.
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: None)
+    half = len(_OPUS_2500MS) // 2
+    stream = _streaming_section(
+        method, [], chunks=[_OPUS_2500MS[:half], _OPUS_2500MS[half:]]
+    )
+    _install_client(monkeypatch, cls, SimpleNamespace(**{section: stream}))
+
+    with TokenContextManager() as manager:
+        await getattr(cls(api_key="k"), generate)(**args, output_format="opus_48000_64")
+
+    assert [row["quantity"] for row in _rows(manager)] == [pytest.approx(2.5)]
+
+
+async def test_xinference_asr_measures_ogg_voice_input(monkeypatch):
+    # Telegram voice notes are Ogg/Opus; a plain-text transcription reports no
+    # duration, so the input itself is what gets billed.
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: None)
+
+    async def transcriptions(**kwargs):
+        return {"text": "hi"}
+
+    with TokenContextManager() as manager:
+        await _xinference_asr(
+            SimpleNamespace(transcriptions=transcriptions)
+        ).transcribe(_OPUS_2500MS, format="ogg")
+
+    assert [row["quantity"] for row in _rows(manager)] == [pytest.approx(2.5)]
+
+
+@pytest.mark.parametrize("reported", [float("nan"), float("inf"), -1, "bad", 0])
+async def test_xinference_asr_unusable_reported_duration_measures_input(reported):
+    async def transcriptions(**kwargs):
+        return {"text": "hi", "duration": reported}
+
+    with TokenContextManager() as manager:
+        await _xinference_asr(
+            SimpleNamespace(transcriptions=transcriptions)
+        ).transcribe(_wav(2.0), format="wav", verbose=True)
+
+    assert [row["quantity"] for row in _rows(manager)] == [pytest.approx(2.0)]
+
+
+# --- cancellation after the provider accepted the call --------------------------
+
+
+def _block_measurement(monkeypatch, module) -> asyncio.Event:
+    """Make the module's measurement hang until cancelled; return 'entered'."""
+    entered = asyncio.Event()
+
+    async def hang(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module, "measure_audio_seconds_async", hang)
+    return entered
+
+
+async def _cancel_once_entered(coro, entered: asyncio.Event) -> None:
+    task = asyncio.create_task(coro)
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.parametrize(
+    "cls,section,method,generate,args,length_arg,length", _GENERATORS
+)
+async def test_generation_cancelled_while_measuring_bills_once(
+    monkeypatch, cls, section, method, generate, args, length_arg, length
+):
+    calls: list = []
+    stream = _streaming_section(method, calls, chunks=[_MP3_FRAME])
+    _install_client(monkeypatch, cls, SimpleNamespace(**{section: stream}))
+    entered = _block_measurement(monkeypatch, sys.modules[cls.__module__])
+
+    with TokenContextManager() as manager:
+        await _cancel_once_entered(
+            getattr(cls(api_key="k"), generate)(**args, **{length_arg: length}),
+            entered,
+        )
+
+    assert len(calls) == 1
+    assert [row["quantity"] for row in _rows(manager)] == [length]
+
+
+async def test_elevenlabs_asr_cancelled_while_measuring_bills_once(monkeypatch):
+    calls: list = []
+
+    async def convert(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(data=SimpleNamespace(text="hi", words=[]), headers={})
+
+    _install_client(monkeypatch, ElevenLabsASR, _asr_client(convert))
+    entered = _block_measurement(monkeypatch, sys.modules[ElevenLabsASR.__module__])
+
+    with TokenContextManager() as manager:
+        await _cancel_once_entered(
+            ElevenLabsASR(api_key="k").transcribe(_wav(1.0), format="wav"), entered
+        )
+
+    assert len(calls) == 1
+    assert [row["quantity"] for row in _rows(manager)] == [0.0]
+
+
+async def test_xinference_asr_cancelled_while_measuring_bills_once(monkeypatch):
+    calls: list = []
+
+    async def transcriptions(**kwargs):
+        calls.append(kwargs)
+        return {"text": "hi"}
+
+    entered = _block_measurement(monkeypatch, sys.modules[XinferenceASR.__module__])
+
+    with TokenContextManager() as manager:
+        await _cancel_once_entered(
+            _xinference_asr(SimpleNamespace(transcriptions=transcriptions)).transcribe(
+                _wav(1.0), format="wav"
+            ),
+            entered,
+        )
+
+    assert len(calls) == 1
+    assert [row["quantity"] for row in _rows(manager)] == [0.0]

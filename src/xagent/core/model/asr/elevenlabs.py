@@ -19,7 +19,7 @@ from ..media_metering import (
     call_with_headers,
     elevenlabs_billed_units,
     measure_audio_seconds_async,
-    record_provider_usage,
+    record_measured_usage,
 )
 from ..public_elevenlabs import (
     close_public_elevenlabs_http_client,
@@ -370,11 +370,10 @@ class ElevenLabsASR(BaseASR):
             )
         except Exception:  # noqa: BLE001 - metering never breaks the call
             seconds = None
-        if seconds is None:
-            seconds = await _measure_input_seconds(audio, format)
-        record_provider_usage(
+        await record_measured_usage(
             self,
             MediaCallType.ASR,
+            _measure_input_seconds(audio, format) if seconds is None else None,
             seconds,
             provider_billed_units=elevenlabs_billed_units(headers),
         )

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import struct
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,7 @@ from xagent.core.model.media_metering import (
     elevenlabs_billed_units,
     measure_audio_seconds,
     read_billed_stream,
+    record_measured_usage,
     record_provider_usage,
 )
 
@@ -188,19 +191,88 @@ def test_unknown_container_without_ffprobe_is_unmeasured(monkeypatch):
     assert measure_audio_seconds("not bytes", "mp3") is None
 
 
-def test_unknown_container_uses_ffprobe_when_installed(monkeypatch):
+def test_unknown_container_uses_ffprobe_on_a_seekable_file(monkeypatch):
+    # A pipe cannot be seeked, and containers that keep their length at the
+    # end (Ogg's last granule, a trailing MP4 moov) report no duration from it.
     calls = []
 
     def fake_run(argv, **kwargs):
-        calls.append((argv[0], kwargs["input"]))
+        path = argv[-1]
+        with open(path, "rb") as probed:
+            calls.append((argv[0], path, probed.read(), "input" in kwargs))
         return SimpleNamespace(stdout=b"3.25\n")
 
     monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
     monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
-    payload = b"OggS" + bytes(10)
+    payload = b"\x1aE\xdf\xa3" + bytes(10)  # WebM/Matroska magic
 
-    assert measure_audio_seconds(payload, "opus_48000_64") == pytest.approx(3.25)
-    assert calls == [("/x/ffprobe", payload)]
+    assert measure_audio_seconds(payload, "webm") == pytest.approx(3.25)
+    [(binary, path, probed, piped)] = calls
+    assert binary == "/x/ffprobe"
+    assert path != "pipe:0" and probed == payload
+    assert piped is False
+
+
+# --- Ogg -----------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.mark.parametrize(
+    ("name", "seconds"),
+    [("tone_2500ms.opus.ogg", 2.5), ("tone_1500ms.vorbis.ogg", 1.5)],
+)
+def test_measures_real_ogg_files_without_ffprobe(monkeypatch, name, seconds):
+    # Real files encoded by ffmpeg (sine tone, libopus / libvorbis). ffprobe is
+    # made unavailable so the native granule walk is what is measured.
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: None)
+    data = (_FIXTURES / name).read_bytes()
+
+    assert measure_audio_seconds(data, "opus_48000_64") == pytest.approx(seconds)
+
+
+def test_truncated_ogg_without_a_granule_is_unmeasured(monkeypatch):
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: None)
+    data = (_FIXTURES / "tone_2500ms.opus.ogg").read_bytes()
+    first_page_end = data.index(b"OggS", 4)
+
+    assert measure_audio_seconds(data[:first_page_end], "ogg") is None
+
+
+async def test_measured_usage_records_once_when_cancelled_mid_measurement():
+    entered = asyncio.Event()
+
+    async def never_finishes():
+        entered.set()
+        await asyncio.Event().wait()
+        return 99.0
+
+    async def run():
+        await record_measured_usage(
+            SimpleNamespace(model_id="p/1"), MediaCallType.MUSIC, never_finishes(), 30.0
+        )
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(run())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert [row["quantity"] for row in _rows(manager)] == [30.0]
+
+
+async def test_measured_usage_records_the_measurement_once():
+    async def measured():
+        return 12.0
+
+    with TokenContextManager() as manager:
+        await record_measured_usage(
+            SimpleNamespace(), MediaCallType.ASR, measured(), None
+        )
+        await record_measured_usage(SimpleNamespace(), MediaCallType.ASR, None, 4)
+
+    assert [row["quantity"] for row in _rows(manager)] == [12.0, 4.0]
 
 
 # --- ElevenLabs transport helpers ----------------------------------------------

@@ -401,6 +401,28 @@ class ArkVideoModel(BaseVideoModel):
             raise BilledVideoTaskError("Ark did not return a video generation task id")
 
         deadline = time.monotonic() + (timeout or self.timeout)
+        observations: list[dict[str, Any]] = []
+        try:
+            return await self._wait_for_task(
+                str(task_id), deadline, poll_interval, observations
+            )
+        except asyncio.CancelledError:
+            # The task exists and keeps running after the caller gives up, so
+            # it may still be billed. Every other exit from the wait records
+            # its own row before leaving; cancellation is the one that cannot,
+            # so it records here from the last observation and propagates
+            # without submitting anything new.
+            self._record_task_usage(observations[-1] if observations else None)
+            raise
+
+    async def _wait_for_task(
+        self,
+        task_id: str,
+        deadline: float,
+        poll_interval: float,
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Poll a created task to its end, recording its row on every exit."""
         while True:
             try:
                 task_result = await self.get_video_task(str(task_id))
@@ -416,6 +438,7 @@ class ArkVideoModel(BaseVideoModel):
                     ) from exc
                 await asyncio.sleep(max(1.0, poll_interval))
                 continue
+            observations.append(task_result)
             status = task_result.get("status")
             if status == "succeeded":
                 self._record_task_usage(task_result, succeeded=True)

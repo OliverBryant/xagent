@@ -15,7 +15,7 @@ from ..media_metering import (
     elevenlabs_billed_units,
     measure_audio_seconds_async,
     read_billed_stream,
-    record_provider_usage,
+    record_measured_usage,
 )
 from ..public_elevenlabs import (
     close_public_elevenlabs_http_client,
@@ -184,15 +184,15 @@ class ElevenLabsMusicModel(BaseMusicModel):
         -- its bytes undercount what was generated and billed -- and falls back
         to the requested length, then to an unmeasured 0.
         """
-        seconds = (
-            await measure_audio_seconds_async(stream.audio, output_format)
-            if completed
-            else None
-        )
-        record_provider_usage(
+        await record_measured_usage(
             self,
             MediaCallType.MUSIC,
-            seconds if seconds is not None else requested_seconds,
+            (
+                measure_audio_seconds_async(stream.audio, output_format)
+                if completed
+                else None
+            ),
+            requested_seconds,
             provider_billed_units=elevenlabs_billed_units(stream.headers),
         )
 

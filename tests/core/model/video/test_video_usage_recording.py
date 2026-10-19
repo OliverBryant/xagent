@@ -15,6 +15,7 @@ import pytest
 
 from xagent.core.model import VideoModelConfig
 from xagent.core.model.chat.token_context import TokenContextManager
+from xagent.core.model.video import xinference as xinference_video
 from xagent.core.model.video.adapter import create_video_model, get_video_model_instance
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BilledVideoTaskError, BilledVideoTaskTimeout
@@ -310,3 +311,133 @@ async def test_xinference_rejects_batches_before_rendering(monkeypatch):
 
     assert calls["posts"] == 0
     assert _rows(manager) == []
+
+
+# --- cancellation after the provider accepted the call --------------------------
+
+
+async def test_ark_cancelled_while_polling_records_once_and_does_not_resubmit():
+    # One "running" observation (with Ark's token report) lands, then the next
+    # poll hangs until the caller cancels.
+    entered = asyncio.Event()
+    fake = _ArkFake([_succeeded()])
+    model = _ark(fake)
+    polls = 0
+
+    async def get_video_task(task_id):
+        nonlocal polls
+        polls += 1
+        if polls == 1:
+            return {
+                "status": "running",
+                "raw_response": {"usage": {"completion_tokens": 7}},
+            }
+        entered.set()
+        await asyncio.Event().wait()
+
+    model._inner.get_video_task = get_video_task
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(
+            model.generate_video(prompt="a fox", poll_interval=0)
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert fake.creates == 1
+    [row] = _rows(manager)
+    assert row["quantity"] == 0.0
+    assert row["provider_output_tokens"] == 7
+
+
+async def test_ark_cancelled_before_the_first_observation_still_records():
+    entered = asyncio.Event()
+    fake = _ArkFake([_succeeded()])
+    model = _ark(fake)
+
+    async def hanging_get(task_id):
+        entered.set()
+        await asyncio.Event().wait()
+
+    model._inner.get_video_task = hanging_get
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(model.generate_video(prompt="a fox"))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert fake.creates == 1
+    assert [row["quantity"] for row in _rows(manager)] == [0.0]
+
+
+async def test_xinference_cancelled_while_reading_the_billed_body_records_once():
+    entered = asyncio.Event()
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+    class _Request:
+        async def __aenter__(self):
+            return _Response()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    session = SimpleNamespace(request=lambda *a, **k: _Request())
+    model = XinferenceVideoModel(model_name="Wan2.1", base_url="http://x.test")
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(
+            model._request_json(session, "POST", "/v1/video/generations")
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert [row["quantity"] for row in _rows(manager)] == [0.0]
+
+
+async def test_xinference_cancelled_while_closing_after_the_body_records_it(
+    monkeypatch,
+):
+    entered = asyncio.Event()
+    posts = []
+
+    class _ClosingSession:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            entered.set()
+            await asyncio.Event().wait()
+
+    async def post_json(self, session, path, body):
+        posts.append(path)
+        return {"data": [{"url": "https://x.test/v.mp4", "duration": 8}]}
+
+    monkeypatch.setattr(XinferenceVideoModel, "_post_video_json", post_json)
+    monkeypatch.setattr(
+        xinference_video,
+        "create_public_model_aiohttp_session",
+        lambda **_: _ClosingSession(),
+    )
+    model = XinferenceVideoModel(model_name="Wan2.1", base_url="http://x.test")
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(model.generate_video(prompt="a fox", seconds=5))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert posts == ["/v1/video/generations"]
+    assert [row["quantity"] for row in _rows(manager)] == [8.0]

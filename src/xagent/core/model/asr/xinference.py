@@ -9,7 +9,7 @@ from ..chat.token_context import MediaCallType
 from ..media_metering import (
     measure_audio_seconds_async,
     positive_seconds,
-    record_provider_usage,
+    record_measured_usage,
 )
 from ..xinference_base import BaseXinferenceModel
 from .base import ASRResult, ASRSegment, BaseASR
@@ -69,9 +69,16 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
         except Exception:  # noqa: BLE001 - metering never breaks the call
             reported = None
         seconds = positive_seconds(reported)
-        if seconds is None:
-            seconds = await measure_audio_seconds_async(audio_data, format or "")
-        record_provider_usage(self, MediaCallType.ASR, seconds)
+        await record_measured_usage(
+            self,
+            MediaCallType.ASR,
+            (
+                measure_audio_seconds_async(audio_data, format or "")
+                if seconds is None
+                else None
+            ),
+            seconds,
+        )
 
     async def transcribe(
         self,

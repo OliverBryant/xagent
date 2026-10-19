@@ -35,11 +35,13 @@ import io
 import logging
 import math
 import shutil
+import struct
 import subprocess
+import tempfile
 import wave
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from ..tools.core.media_usage import is_usable_model_name
 from .chat.token_context import MediaCallType, add_media_usage
@@ -115,6 +117,34 @@ def record_provider_usage(
         # exc_info: a persisted billing row cannot be repaired afterwards, so a
         # metering bug has to be diagnosable from the log alone.
         logger.warning("Failed to record %s usage: %s", call_type, e, exc_info=True)
+
+
+async def record_measured_usage(
+    provider: Any,
+    call_type: MediaCallType,
+    measure: Optional[Awaitable[Optional[float]]],
+    fallback: Any,
+    **extras: Any,
+) -> None:
+    """Record one accepted call whose quantity still has to be measured.
+
+    Exactly one row, even if the caller is cancelled while the measurement is
+    awaited: the provider has already accepted -- and will bill -- the call,
+    so the row is written in ``finally`` with ``fallback`` standing in for the
+    measurement that never finished, and the cancellation then propagates.
+    ``measure`` is None when there is nothing to measure.
+    """
+    seconds: Optional[float] = None
+    try:
+        if measure is not None:
+            seconds = await measure
+    finally:
+        record_provider_usage(
+            provider,
+            call_type,
+            seconds if seconds is not None else fallback,
+            **extras,
+        )
 
 
 def header_value(headers: Any, name: str) -> Any:
@@ -325,29 +355,88 @@ def _wav_seconds(data: bytes) -> Optional[float]:
         return None
 
 
+_OGG_PAGE_HEADER = struct.Struct("<4sBBqIIIB")
+_OGG_NO_GRANULE = -1
+
+
+def _ogg_seconds(data: bytes) -> Optional[float]:
+    """Duration of an Ogg Opus or Vorbis stream from its last granule position.
+
+    The length of an Ogg stream lives only in its final pages, which is why a
+    probe that cannot seek -- ffprobe reading a pipe -- reports none. The pages
+    are walked forward here instead: the first carries the codec header (sample
+    rate, and Opus' pre-skip), and the last page of that stream with a granule
+    position gives the sample count. Pages of other streams, and anything
+    after the first byte run that is not a page, are ignored.
+    """
+    pos = 0
+    serial: Optional[int] = None
+    rate = 0
+    pre_skip = 0
+    last_granule = _OGG_NO_GRANULE
+    end = len(data)
+    while pos + _OGG_PAGE_HEADER.size <= end:
+        capture, _version, _flags, granule, page_serial, _seq, _crc, segments = (
+            _OGG_PAGE_HEADER.unpack_from(data, pos)
+        )
+        if capture != b"OggS":
+            break
+        table_end = pos + _OGG_PAGE_HEADER.size + segments
+        if table_end > end:
+            break
+        body_start = table_end
+        body_end = body_start + sum(data[pos + _OGG_PAGE_HEADER.size : table_end])
+        if body_end > end:
+            break
+        if serial is None:
+            serial = page_serial
+            body = data[body_start:body_end]
+            if body[:8] == b"OpusHead" and len(body) >= 12:
+                rate = 48000  # Opus granules always count 48 kHz samples
+                pre_skip = int.from_bytes(body[10:12], "little")
+            elif body[:7] == b"\x01vorbis" and len(body) >= 16:
+                rate = int.from_bytes(body[12:16], "little")
+            else:
+                return None
+        elif page_serial == serial and granule != _OGG_NO_GRANULE:
+            last_granule = granule
+        pos = body_end
+    if not rate or last_granule == _OGG_NO_GRANULE:
+        return None
+    return positive_seconds((last_granule - pre_skip) / rate)
+
+
 def _ffprobe_seconds(data: bytes) -> Optional[float]:
-    """Container-reported duration via ffprobe, when it is installed."""
+    """Container-reported duration via ffprobe, when it is installed.
+
+    The bytes go through a temporary file rather than a pipe: several
+    containers keep their length at the end (Ogg's last granule, an MP4
+    ``moov`` atom written last), and ffprobe can only reach it on a seekable
+    input -- from a pipe it reports no duration at all.
+    """
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
     try:
-        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                "-i",
-                "pipe:0",
-            ],
-            input=data,
-            capture_output=True,
-            timeout=_FFPROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
+        with tempfile.NamedTemporaryFile(suffix=".audio") as audio_file:
+            audio_file.write(data)
+            audio_file.flush()
+            completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    "-i",
+                    audio_file.name,
+                ],
+                capture_output=True,
+                timeout=_FFPROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("ffprobe failed to measure audio duration: %s", e)
         return None
@@ -384,8 +473,8 @@ def measure_audio_seconds(data: Any, audio_format: str = "") -> Optional[float]:
     ``audio_format`` is a hint such as ElevenLabs' ``mp3_44100_128`` or
     ``pcm_24000``, or a plain container name. Headerless PCM/µ-law/A-law is
     measured from its byte length, WAV from its header, MPEG audio by walking
-    its frames; anything else (Opus, OGG, WebM, M4A...) goes to ffprobe when it
-    is installed. Never raises.
+    its frames, Ogg (Opus/Vorbis) from its last granule position; anything else
+    (WebM, M4A...) goes to ffprobe when it is installed. Never raises.
     """
     if not isinstance(data, (bytes, bytearray)) or not data:
         return None
@@ -398,6 +487,10 @@ def measure_audio_seconds(data: Any, audio_format: str = "") -> Optional[float]:
             return positive_seconds(len(payload) / (rate * width))
         if payload[:4] == b"RIFF" and payload[8:12] == b"WAVE":
             return positive_seconds(_wav_seconds(payload))
+        if payload[:4] == b"OggS":
+            seconds = _ogg_seconds(payload)
+            if seconds is not None:
+                return seconds
         if (
             fmt.startswith("mp3")
             or payload[:3] == b"ID3"

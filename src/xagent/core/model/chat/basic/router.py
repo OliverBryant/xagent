@@ -301,7 +301,7 @@ class RouterLLM(BaseLLM):
         default_max_tokens: Optional[int] = None,
         timeout: float = 180.0,
         abilities: Optional[List[str]] = None,
-        downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+        downstream_resolver: Optional[Callable[..., BaseLLM]] = None,
         candidate_models: Optional[Sequence[str]] = None,
         fallback_model: Optional[str] = None,
         use_environment_fallback: bool = True,
@@ -311,6 +311,8 @@ class RouterLLM(BaseLLM):
         # Given a chosen routing profile, build the concrete LLM that runs it.
         # Configured Auto injects bindings to saved models; legacy OpenRouter
         # Auto injects a resolver that reuses its own credentials and base URL.
+        # Configured Auto's resolver also takes ``limit_attempts=True`` for a
+        # candidate whose call can still move to the fallback.
         self._downstream_resolver = downstream_resolver
         self._candidate_models = (
             tuple(dict.fromkeys(str(model) for model in candidate_models))
@@ -551,13 +553,44 @@ class RouterLLM(BaseLLM):
             select_kwargs["preferred_input_modalities"] = preferred_input_modalities
         if advisory_input_modalities:
             select_kwargs["advisory_input_modalities"] = advisory_input_modalities
-        model_id = await self._select_model(prompt, **select_kwargs)
-        logger.info("xrouter selected routing profile %s", model_id)
-        return model_id, self._resolve_downstream(model_id)
+        model_id = self._sole_candidate(preferred_input_modalities)
+        if model_id is None:
+            model_id = await self._select_model(prompt, **select_kwargs)
+            logger.info("xrouter selected routing profile %s", model_id)
+        failover_available = (
+            self._failover_model(model_id, preferred_input_modalities) is not None
+        )
+        return model_id, self._resolve_downstream(
+            model_id, failover_available=failover_available
+        )
 
-    def _resolve_downstream(self, model_id: str) -> BaseLLM:
-        """Build the concrete LLM that serves one routing profile."""
+    def _sole_candidate(self, required_input_modalities: tuple[str, ...]) -> str | None:
+        """The only configured candidate, when there is nothing to route between.
+
+        Skips just the routing decision. An excluded candidate, or a request
+        whose content needs modalities that routing enforces, still goes
+        through ``_select_model`` so those rules apply exactly as before.
+        """
+        if self._candidate_models is None or len(self._candidate_models) != 1:
+            return None
+        if required_input_modalities:
+            return None
+        candidate = self._candidate_models[0]
+        if candidate in get_xrouter_excluded_models():
+            return None
+        return candidate
+
+    def _resolve_downstream(
+        self, model_id: str, *, failover_available: bool = False
+    ) -> BaseLLM:
+        """Build the concrete LLM that serves one routing profile.
+
+        ``failover_available`` says this call can move to the fallback, so a
+        configured resolver may give the candidate a shorter retry budget.
+        """
         if self._downstream_resolver is not None:
+            if failover_available and self.uses_configured_candidates:
+                return self._downstream_resolver(model_id, limit_attempts=True)
             return self._downstream_resolver(model_id)
         # Fallback when no downstream resolver was injected: an OpenAI-compatible
         # client using this model's own OpenRouter credentials (or the ambient

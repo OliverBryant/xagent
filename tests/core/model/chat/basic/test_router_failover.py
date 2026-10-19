@@ -94,18 +94,28 @@ def _router(
     fallback: str | None = FALLBACK,
     configured: bool = True,
 ) -> RouterLLM:
+    resolutions: list[tuple[str, bool]] = []
+    selections: list[str] = []
+
+    def resolve(profile: str, *, limit_attempts: bool = False) -> BaseLLM:
+        resolutions.append((profile, limit_attempts))
+        return models[profile]
+
     router = RouterLLM(
-        downstream_resolver=lambda profile: models[profile],
+        downstream_resolver=resolve,
         candidate_models=list(models) if configured else None,
         fallback_model=fallback,
         use_environment_fallback=False,
     )
 
-    async def select_model(_prompt: str, **_kwargs: Any) -> str:
+    async def select_model(prompt: str, **_kwargs: Any) -> str:
+        selections.append(prompt)
         return selected
 
     monkeypatch.setattr(router, "_select_model", select_model)
     monkeypatch.setattr(router, "_profile_context_window", lambda _model: None)
+    router.resolutions = resolutions  # type: ignore[attr-defined]
+    router.selections = selections  # type: ignore[attr-defined]
     return router
 
 
@@ -295,7 +305,7 @@ async def test_fallback_that_cannot_be_built_reports_the_first_error(monkeypatch
     error = openai.APIConnectionError(request=_REQUEST)
     primary = _FakeLLM("saved-deepseek", error=error)
 
-    def resolve(profile: str) -> BaseLLM:
+    def resolve(profile: str, **_kwargs: Any) -> BaseLLM:
         if profile == FALLBACK:
             raise RuntimeError("fallback endpoint is misconfigured")
         return primary
@@ -382,7 +392,7 @@ async def test_cooldown_keeps_the_candidate_when_the_fallback_cannot_be_built(
     primary = _FakeLLM("saved-deepseek")
     router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: primary})
 
-    def resolve(profile: str) -> BaseLLM:
+    def resolve(profile: str, **_kwargs: Any) -> BaseLLM:
         if profile == FALLBACK:
             raise RuntimeError("fallback endpoint is misconfigured")
         return primary
@@ -394,3 +404,97 @@ async def test_cooldown_keeps_the_candidate_when_the_fallback_cannot_be_built(
 
     assert prepared.model_name == PRIMARY
     assert await prepared.chat(MESSAGES) == "saved-deepseek"
+
+
+IMAGE_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+        ],
+    }
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback", [None, PRIMARY])
+async def test_sole_candidate_skips_routing_but_keeps_its_context_window(
+    monkeypatch, fallback
+):
+    only = _FakeLLM("saved-deepseek")
+    router = _router(monkeypatch, {PRIMARY: only}, fallback=fallback)
+    # The saved model has no window, so the profile catalog supplies it, as it
+    # does for a routed call.
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model: 64_000)
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert router.selections == []
+    assert prepared.model_name == PRIMARY
+    assert prepared.context_window == 64_000
+    assert await prepared.chat(MESSAGES) == "saved-deepseek"
+    assert router.resolutions == [(PRIMARY, False)]
+
+
+@pytest.mark.asyncio
+async def test_excluded_sole_candidate_still_goes_through_routing(monkeypatch):
+    monkeypatch.setenv("XAGENT_XROUTER_EXCLUDED_MODELS", PRIMARY)
+    router = _router(monkeypatch, {PRIMARY: _FakeLLM("saved-deepseek")}, fallback=None)
+
+    await router.prepare_for_call(MESSAGES)
+
+    # Routing is where the exclusion is enforced (or the fallback applied).
+    assert router.selections == ["summarize the report"]
+
+
+@pytest.mark.asyncio
+async def test_sole_candidate_with_required_modalities_goes_through_routing(
+    monkeypatch,
+):
+    router = _router(monkeypatch, {PRIMARY: _FakeLLM("saved-deepseek")}, fallback=None)
+    monkeypatch.setattr(router, "_profile_input_modalities", lambda _model: ())
+
+    await router.prepare_for_call(IMAGE_MESSAGES)
+
+    assert len(router.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_retry_budget_is_limited_only_when_the_call_can_fail_over(
+    monkeypatch,
+):
+    primary = _FakeLLM(
+        "saved-deepseek", error=openai.APIConnectionError(request=_REQUEST)
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda model: ("text", "image") if model == PRIMARY else ("text",),
+    )
+
+    # A text call can move to the fallback: the candidate may give up early,
+    # and the fallback it moves to keeps its full budget.
+    assert await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES) == (
+        "saved-gpt"
+    )
+    assert router.resolutions == [(PRIMARY, True), (FALLBACK, False)]
+
+    # The text-only fallback cannot serve an image call, so the candidate
+    # keeps every saved attempt.
+    router_module._CANDIDATE_COOLDOWNS.clear()
+    router.resolutions.clear()
+    await router.prepare_for_call(IMAGE_MESSAGES)
+    assert router.resolutions == [(PRIMARY, False)]
+
+
+@pytest.mark.asyncio
+async def test_candidate_without_a_fallback_keeps_its_retry_budget(monkeypatch):
+    models = {PRIMARY: _FakeLLM("saved-deepseek"), FALLBACK: _FakeLLM("saved-gpt")}
+    router = _router(monkeypatch, models, fallback=None)
+
+    await router.prepare_for_call(MESSAGES)
+
+    assert router.resolutions == [(PRIMARY, False)]

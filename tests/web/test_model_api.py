@@ -775,10 +775,14 @@ class TestModelAPI:
             assert llm._fallback_model == "deepseek/deepseek-v4-flash"
             downstream = llm._downstream_resolver("openai/gpt-5.5")
             assert downstream.model_id == first.json()["model_id"]
-            # With a fallback to move to, a candidate gives up after two
-            # attempts; the fallback keeps the saved model's own budget.
-            assert downstream._retry_wrapper.max_retries == 2
-            fallback_downstream = llm._downstream_resolver("deepseek/deepseek-v4-flash")
+            # A candidate keeps its saved budget unless the router says this
+            # call can move to the fallback; the fallback never gives up early.
+            assert downstream._retry_wrapper.max_retries == 10
+            limited = llm._downstream_resolver("openai/gpt-5.5", limit_attempts=True)
+            assert limited._retry_wrapper.max_retries == 2
+            fallback_downstream = llm._downstream_resolver(
+                "deepseek/deepseek-v4-flash", limit_attempts=True
+            )
             assert fallback_downstream._retry_wrapper.max_retries == 10
 
             first_db_model = db.get(DBModel, first.json()["id"])
@@ -791,10 +795,9 @@ class TestModelAPI:
             degraded_llm = UserAwareModelStorage(db).get_llm_by_id(
                 data["auto_model"]["model_id"], regular_user["id"]
             )
-            # One candidate left: Auto runs it directly, with its own retries.
-            assert not isinstance(degraded_llm, RouterLLM)
-            assert degraded_llm.model_id == second.json()["model_id"]
-            assert degraded_llm._retry_wrapper.max_retries == 10
+            assert isinstance(degraded_llm, RouterLLM)
+            assert degraded_llm._candidate_models == ("deepseek/deepseek-v4-flash",)
+            assert degraded_llm._fallback_model == "deepseek/deepseek-v4-flash"
 
             second_db_model.is_active = False
             db.flush()

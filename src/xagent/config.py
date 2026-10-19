@@ -3458,10 +3458,11 @@ def get_llm_capacity_max_attempts() -> int:
 def get_auto_primary_max_attempts() -> int:
     """Get the attempt budget for an Auto candidate that has a fallback.
 
-    A configured Auto model with a fallback stops retrying the routed
-    candidate after this many attempts and sends the request to the
-    fallback instead, so an outage costs seconds rather than the whole
-    retry deadline. The fallback itself keeps its own ``max_retries``. Only
+    When a configured Auto call can move to its fallback (one is set and
+    supports the request's input), the routed candidate stops after this
+    many attempts and the request goes to the fallback instead, so an
+    outage costs seconds rather than the whole retry deadline. A call that
+    cannot move keeps the candidate's own ``max_retries``. The fallback itself keeps its own ``max_retries``. Only
     ever lowers a candidate's ceiling -- it cannot raise it above that
     candidate's ``max_retries``.
 

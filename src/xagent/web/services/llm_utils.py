@@ -734,11 +734,6 @@ class UserAwareModelStorage:
                     configured_model, resolver = self._build_configured_router_resolver(
                         model_config, db_model
                     )
-                    candidates = configured_model.router_candidate_models or []
-                    if len(candidates) == 1:
-                        # Nothing to choose between: run the only available
-                        # candidate directly instead of routing to it.
-                        return resolver(candidates[0])
                     return self.core_storage.create_llm_instance(
                         configured_model,
                         downstream_resolver=resolver,
@@ -851,12 +846,6 @@ class UserAwareModelStorage:
             raise AutoModelUnavailableError(str(exc)) from exc
 
         profile_ids = list(targets_by_profile)
-        # With a fallback to move to, a failing candidate should give up
-        # quickly instead of spending the whole retry deadline first; the
-        # fallback keeps its own budget because nothing comes after it.
-        primary_max_attempts = (
-            get_auto_primary_max_attempts() if fallback_profile is not None else None
-        )
         configured = router_cfg.model_copy(
             update={
                 "router_config_name": AUTO_ROUTER_CONFIG_NAME,
@@ -865,16 +854,22 @@ class UserAwareModelStorage:
             }
         )
 
-        def _resolve(profile_id: str) -> BaseLLM:
+        def _resolve(profile_id: str, *, limit_attempts: bool = False) -> BaseLLM:
             target_cfg = targets_by_profile.get(profile_id)
             if target_cfg is None:
                 raise RuntimeError(
                     f"xrouter selected unbound Auto profile {profile_id!r}"
                 )
-            if primary_max_attempts is not None and profile_id != fallback_profile:
+            # The router asks for this only when the call can still move to
+            # the fallback, so a failing candidate gives up quickly instead of
+            # spending the whole retry deadline first. The fallback keeps its
+            # own budget because nothing comes after it.
+            if limit_attempts and profile_id != fallback_profile:
                 target_cfg = target_cfg.model_copy(
                     update={
-                        "max_retries": min(target_cfg.max_retries, primary_max_attempts)
+                        "max_retries": min(
+                            target_cfg.max_retries, get_auto_primary_max_attempts()
+                        )
                     }
                 )
             llm = self.core_storage.create_llm_instance(target_cfg)

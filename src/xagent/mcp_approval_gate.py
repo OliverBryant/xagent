@@ -3,9 +3,9 @@
 from .core.tools.adapters.vibe.mcp_approval_gate import (
     ConnectorRef,
     GateClassifier,
+    GatedCall,
     GateDecision,
     GateToolMatcher,
-    GatedCall,
     MCPApprovalGateRegistration,
     MCPApprovalGateResolution,
     MCPApprovalGateResolutionState,

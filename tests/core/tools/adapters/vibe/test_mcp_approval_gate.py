@@ -447,9 +447,7 @@ async def test_approved_resume_waits_through_fence_then_recovers(
 
 
 def test_public_facade_exports_resolution_contract() -> None:
-    from xagent.mcp_approval_gate import (
-        MCPApprovalGateResolution as PublicResolution,
-    )
+    from xagent.mcp_approval_gate import MCPApprovalGateResolution as PublicResolution
     from xagent.mcp_approval_gate import MCPApprovalGateScope as PublicScope
 
     assert PublicResolution is MCPApprovalGateResolution

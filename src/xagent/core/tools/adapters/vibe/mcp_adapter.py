@@ -24,6 +24,7 @@ from typing import (
     Mapping,
     NamedTuple,
     Optional,
+    TYPE_CHECKING,
     Type,
     TypeVar,
     Union,
@@ -85,6 +86,9 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     should_sandbox_mcp_connection,
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateResolution, MCPApprovalGateScope
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
 
@@ -4211,6 +4215,9 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
+    approval_scope: "MCPApprovalGateScope | None" = None,
+    approval_resolution: "MCPApprovalGateResolution | None" = None,
+    approval_supported: bool = True,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -4365,6 +4372,9 @@ async def load_mcp_tools_as_agent_tools(
                     server_tools,
                     connection=connection,
                     connector_ref=(connector_refs or {}).get(server_name),
+                    approval_scope=approval_scope,
+                    approval_resolution=approval_resolution,
+                    approval_supported=approval_supported,
                 )
             )
             if server_tools:

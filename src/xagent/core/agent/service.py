@@ -986,6 +986,10 @@ class AgentService:
         agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
         mcp_failure_policy = _get_conf("get_mcp_failure_policy")
         mcp_failure_policy_value = getattr(mcp_failure_policy, "value", None)
+        approval_resolution = _get_conf("get_mcp_approval_gate_resolution")
+        approval_resolution_identity = getattr(
+            approval_resolution, "signature_identity", None
+        )
 
         return (
             override_items,
@@ -999,6 +1003,7 @@ class AgentService:
             parent_tracer_identity,
             agent_call_stack_items,
             mcp_failure_policy_value,
+            approval_resolution_identity,
         )
 
     def _execution_type(self) -> str:

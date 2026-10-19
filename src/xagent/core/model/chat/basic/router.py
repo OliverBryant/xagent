@@ -64,7 +64,15 @@ import logging
 import os
 import threading
 import time
-from typing import Any, AsyncIterator, Callable, List, Optional, Sequence
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+)
 
 from .....config import (
     get_auto_candidate_cooldown_seconds,
@@ -927,6 +935,11 @@ class _ResolvedRouterLLM(BaseLLM):
     def supports_forced_tool_choice(self) -> bool:
         return getattr(self._downstream, "supports_forced_tool_choice", True)
 
+    def _method(self, name: str) -> Callable[..., Awaitable[str | dict[str, Any]]]:
+        if name == "vision_chat":
+            return self._downstream.vision_chat
+        return self._downstream.chat
+
     async def _call(
         self,
         method: str,
@@ -935,7 +948,7 @@ class _ResolvedRouterLLM(BaseLLM):
         kwargs: dict[str, Any],
     ) -> str | dict[str, Any]:
         try:
-            return await getattr(self._downstream, method)(
+            return await self._method(method)(
                 messages,
                 tool_choice=self.compatible_tool_choice(tool_choice),
                 **kwargs,
@@ -945,7 +958,7 @@ class _ResolvedRouterLLM(BaseLLM):
                 raise
         # Outside the handler, so the fallback's own failure does not carry
         # the first model's error as its context.
-        return await getattr(self._downstream, method)(
+        return await self._method(method)(
             messages,
             tool_choice=self.compatible_tool_choice(tool_choice),
             **kwargs,

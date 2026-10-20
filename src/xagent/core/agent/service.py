@@ -990,6 +990,17 @@ class AgentService:
         approval_resolution_identity = getattr(
             approval_resolution, "signature_identity", None
         )
+        approval_registration_generation = None
+        if getattr(approval_resolution, "state", None) in {"on", "unknown"}:
+            from ..tools.adapters.vibe.mcp_approval_gate import (
+                mcp_approval_gate_registration_generation,
+            )
+
+            approval_registration_generation = (
+                mcp_approval_gate_registration_generation(
+                    approval_resolution.task_source
+                )
+            )
 
         return (
             override_items,
@@ -1004,6 +1015,7 @@ class AgentService:
             agent_call_stack_items,
             mcp_failure_policy_value,
             approval_resolution_identity,
+            approval_registration_generation,
         )
 
     def _execution_type(self) -> str:

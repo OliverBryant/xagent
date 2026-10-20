@@ -90,8 +90,10 @@ from ....tools.adapters.vibe.interaction_types import (
     lacks_required_options,
 )
 from ....tools.adapters.vibe.mcp_approval_gate import (
+    MCPApprovalGateTemporarilyUnavailable,
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
+    is_gate_issued_interaction_id,
 )
 from ....tools.tool_result_spill import (
     SPILL_READ_TOOL_NAME,
@@ -3103,7 +3105,12 @@ class ReActPattern(AgentPattern):
                 tool = self._find_tool(tool_name, tools)
             except ValueError:
                 continue
-            if user_interaction_resume_callable(tool) is None:
+            interaction_id = str(
+                request.get("interaction_id") or request.get("tool_call_id") or ""
+            )
+            if user_interaction_resume_callable(
+                tool
+            ) is None and not is_gate_issued_interaction_id(interaction_id):
                 # Callback-less tools resume through the normal ReAct replan. The
                 # user's answer remains in context with waiting-response metadata.
                 continue
@@ -3113,9 +3120,7 @@ class ReActPattern(AgentPattern):
                 "invocation_id": self._normalized_invocation_id(
                     request.get("invocation_id")
                 ),
-                "interaction_id": str(
-                    request.get("interaction_id") or request.get("tool_call_id") or ""
-                ),
+                "interaction_id": interaction_id,
                 "response": response,
             }
             self.pending_tool_interaction_responses.append(queued)
@@ -3152,6 +3157,16 @@ class ReActPattern(AgentPattern):
                 user_interaction_resume_callable(tool) if tool is not None else None
             )
             if resume is None:
+                if is_gate_issued_interaction_id(
+                    str(pending.get("interaction_id") or "")
+                ):
+                    # A supported UNKNOWN rebuild may expose the raw tool while
+                    # no live matcher can identify fresh protected calls. This
+                    # response still belongs to an earlier gate-issued
+                    # interaction, so retain it until authority recovers.
+                    raise MCPApprovalGateTemporarilyUnavailable(
+                        "MCP approval authority is temporarily unavailable"
+                    )
                 # Legacy checkpoints may contain callback delivery for a tool that
                 # no longer exists or never implemented the optional capability.
                 # The annotated user message is sufficient for the model to replan.

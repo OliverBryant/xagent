@@ -480,6 +480,7 @@ class _RegisteredHooks:
 
 
 _REGISTRATIONS: dict[str, _RegisteredHooks] = {}
+_REGISTRATION_GENERATIONS: dict[str, int] = {}
 _REGISTRATIONS_LOCK = RLock()
 _CURRENT_TOOL_CALL_CONTEXT: ContextVar[ToolCallExecutionContext | None] = ContextVar(
     "xagent_mcp_gate_tool_call_context", default=None
@@ -557,6 +558,9 @@ def register_mcp_approval_gate(
             tool_matcher=tool_matcher,
             classifier=classifier,
         )
+        _REGISTRATION_GENERATIONS[task_source] = (
+            _REGISTRATION_GENERATIONS.get(task_source, 0) + 1
+        )
     return handle
 
 
@@ -589,7 +593,18 @@ def unregister_mcp_approval_gate(handle: MCPApprovalGateRegistration) -> bool:
         if current is None or current.handle != handle:
             return False
         del _REGISTRATIONS[handle.task_source]
+        _REGISTRATION_GENERATIONS[handle.task_source] = (
+            _REGISTRATION_GENERATIONS.get(handle.task_source, 0) + 1
+        )
         return True
+
+
+def mcp_approval_gate_registration_generation(task_source: str) -> int:
+    """Return the monotonic approval-policy generation for one task source."""
+
+    _validate_task_source(task_source)
+    with _REGISTRATIONS_LOCK:
+        return _REGISTRATION_GENERATIONS.get(task_source, 0)
 
 
 def _registration_for(task_source: str | None) -> _RegisteredHooks | None:
@@ -657,11 +672,6 @@ def has_scoped_approval_gate_for_source(task_source: str | None) -> bool:
 def _has_legacy_registrations() -> bool:
     with _REGISTRATIONS_LOCK:
         return any(item.tool_matcher is None for item in _REGISTRATIONS.values())
-
-
-def _has_scoped_registrations() -> bool:
-    with _REGISTRATIONS_LOCK:
-        return any(item.tool_matcher is not None for item in _REGISTRATIONS.values())
 
 
 # Durable marker prefix for an interaction id this wrapper issued. The id is
@@ -1571,12 +1581,11 @@ def gate_mcp_tools(
 
     ref = connector_ref or _connector_ref(connection or {})
     if approval_scope is None:
-        if _has_scoped_registrations() and not _has_legacy_registrations():
-            return list(tools)
         return [
             MCPApprovalGateTool(
                 tool,
                 connector_ref=ref,
+                approval_supported=approval_supported,
                 raw_tool_name=_raw_mcp_tool_name(tool),
             )
             for tool in tools
@@ -1680,15 +1689,7 @@ def gate_mcp_tools(
             )
             continue
         if not matches:
-            wrapped.append(
-                MCPApprovalGateTool(
-                    tool,
-                    connector_ref=ref,
-                    raw_tool_name=raw_tool_name,
-                )
-                if _has_legacy_registrations()
-                else tool
-            )
+            wrapped.append(tool)
             continue
         wrapped.append(
             MCPApprovalGateTool(

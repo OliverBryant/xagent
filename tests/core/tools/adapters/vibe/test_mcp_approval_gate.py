@@ -30,6 +30,7 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     bind_tool_call_execution_context,
     current_mcp_approval_replay_context,
     gate_mcp_tools,
+    mcp_approval_gate_registration_generation,
     mcp_approval_gate_scope,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
@@ -266,6 +267,28 @@ async def test_scoped_matcher_uses_raw_name_and_non_target_passes_through(
     ]
 
 
+def test_scoped_non_target_ignores_unrelated_legacy_registration(
+    registrations: list[Any],
+) -> None:
+    scope = _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+        matcher=lambda _ref, raw_name: raw_name == "create_post",
+    )
+    _register(registrations, lambda _: None, _unused_resume)
+    target = _mcp_target(raw_name="get_profile", concurrency_safe=True)
+
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.on(scope),
+    )
+
+    assert tool is target
+    assert tool.metadata is target.metadata
+    assert tool.metadata.concurrency_safe is True
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad_result", [0, None, "yes"])
 async def test_malformed_classifier_result_fails_closed_without_gate(
@@ -463,6 +486,54 @@ async def test_no_matching_hook_preserves_legacy_execution() -> None:
 
     assert result["success"] is True
     assert target.calls == [{"text": "publish"}]
+
+
+@pytest.mark.asyncio
+async def test_unscoped_tool_observes_late_legacy_registration(
+    registrations: list[Any],
+) -> None:
+    _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+    )
+    target = _mcp_target(raw_name="create_post")
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    async def deny(_: GatedCall) -> GateDecision:
+        return GateDecision.deny(message="late legacy policy")
+
+    _register(registrations, deny, _unused_resume)
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result["status"] == "denied"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_path_preserves_approval_unsupported_capability(
+    registrations: list[Any],
+) -> None:
+    reached: list[GatedCall] = []
+
+    async def allow(call: GatedCall) -> GateDecision:
+        reached.append(call)
+        return GateDecision.allow()
+
+    _register(registrations, allow, _unused_resume)
+    target = _mcp_target(raw_name="create_post")
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_supported=False,
+    )
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result == approval_gate_module._NESTED_APPROVAL_UNAVAILABLE
+    assert reached == []
+    assert target.calls == []
 
 
 @pytest.mark.asyncio
@@ -1894,6 +1965,23 @@ def test_unregister_refuses_a_stale_handle() -> None:
         assert unregister_mcp_approval_gate(handle) is False
     finally:
         assert unregister_mcp_approval_gate(replacement) is True
+
+
+def test_registration_generation_tracks_only_successful_source_changes() -> None:
+    source = "generation-test"
+    before = mcp_approval_gate_registration_generation(source)
+    handle = register_mcp_approval_gate(
+        task_source=source, gate=lambda _: None, resume=lambda **_: None
+    )
+    after_register = mcp_approval_gate_registration_generation(source)
+    assert after_register == before + 1
+
+    assert unregister_mcp_approval_gate(handle) is True
+    after_unregister = mcp_approval_gate_registration_generation(source)
+    assert after_unregister == after_register + 1
+
+    assert unregister_mcp_approval_gate(handle) is False
+    assert mcp_approval_gate_registration_generation(source) == after_unregister
 
 
 def test_execution_context_requires_a_tool_call_id() -> None:

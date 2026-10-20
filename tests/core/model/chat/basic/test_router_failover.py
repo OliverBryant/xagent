@@ -839,3 +839,34 @@ async def test_exhausted_quota_still_fails_over(monkeypatch, exhausted):
         "saved-gpt"
     )
     assert router_module._CANDIDATE_COOLDOWNS.active("saved-deepseek")
+
+
+@pytest.mark.asyncio
+async def test_error_chunk_after_output_still_starts_the_cooldown(monkeypatch):
+    # Claude yields a transport failure that arrives mid-response as an ERROR
+    # chunk carrying the raw exception.
+    error = httpx.RemoteProtocolError("peer closed connection")
+    primary = _FakeLLM(
+        "saved-claude",
+        chunks=[
+            StreamChunk(type=ChunkType.TOKEN, content="partial", delta="partial"),
+            StreamChunk(type=ChunkType.ERROR, content="failed", raw=error),
+        ],
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    chunks = [
+        chunk
+        async for chunk in (await router.prepare_for_call(MESSAGES)).stream_chat(
+            MESSAGES
+        )
+    ]
+
+    # The current response is not replayed: the caller sees what the
+    # candidate produced, error included...
+    assert [chunk.type for chunk in chunks] == [ChunkType.TOKEN, ChunkType.ERROR]
+    assert fallback.calls == 0
+    # ...and the next preparation goes to the fallback.
+    following = await router.prepare_for_call(MESSAGES)
+    assert following.model_name == FALLBACK

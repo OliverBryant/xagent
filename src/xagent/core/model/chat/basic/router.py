@@ -1187,16 +1187,20 @@ class _ResolvedRouterLLM(BaseLLM):
             try:
                 async for chunk in stream:
                     # Some adapters report a failed request as an ERROR chunk
-                    # carrying the exception instead of raising it.
+                    # carrying the exception instead of raising it, also
+                    # after output has started (Claude on a transport error).
                     raw = getattr(chunk, "raw", None)
-                    if (
-                        not started
-                        and getattr(chunk, "type", None) == ChunkType.ERROR
-                        and isinstance(raw, BaseException)
-                        and await self._fail_over(raw)
+                    if getattr(chunk, "type", None) == ChunkType.ERROR and isinstance(
+                        raw, BaseException
                     ):
-                        failed_over = True
-                        break
+                        if not started:
+                            if await self._fail_over(raw):
+                                failed_over = True
+                                break
+                        else:
+                            # Too late to move this call, but later calls
+                            # should still avoid the candidate.
+                            self._record_failure(raw)
                     started = True
                     yield chunk
             except Exception as exc:

@@ -141,10 +141,16 @@ _SAFE_MESSAGES = {
 _CREDENTIAL_ERROR_NAMES = frozenset({"AuthenticationError", "PermissionDeniedError"})
 _RATE_LIMIT_ERROR_NAMES = frozenset({"RateLimitError"})
 _NOT_FOUND_ERROR_NAMES = frozenset({"NotFoundError"})
-_TIMEOUT_ERROR_NAMES = frozenset({"APITimeoutError", "LLMTimeoutError"})
+# botocore's transport errors (Bedrock) are named here too: they subclass
+# neither the builtin ConnectionError/TimeoutError nor httpx's types.
+_TIMEOUT_ERROR_NAMES = frozenset(
+    {"APITimeoutError", "LLMTimeoutError", "ConnectTimeoutError", "ReadTimeoutError"}
+)
 _UNAVAILABLE_ERROR_NAMES = frozenset(
     {
         "APIConnectionError",
+        "ConnectionClosedError",
+        "EndpointConnectionError",
         "InternalServerError",
         "OverloadedError",
         "ServiceUnavailableError",
@@ -224,7 +230,13 @@ def _http_status(exc: BaseException) -> int | None:
     candidates = [
         getattr(exc, name, None) for name in ("status_code", "code", "status")
     ]
-    candidates.append(getattr(getattr(exc, "response", None), "status_code", None))
+    response = getattr(exc, "response", None)
+    candidates.append(getattr(response, "status_code", None))
+    if isinstance(response, dict):
+        # botocore's ClientError keeps the HTTP status in a response dict.
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata.get("HTTPStatusCode"))
     for value in candidates:
         if (
             isinstance(value, int)

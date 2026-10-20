@@ -16,6 +16,12 @@ from typing import Any, AsyncIterator, List
 
 import httpx
 import pytest
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from google.genai import errors as genai_errors
 
 from xagent.core.model.chat.basic import call_boundary as call_boundary_module
@@ -650,6 +656,44 @@ _AFFORDABILITY_402 = _StatusError(
     "This request requires more credits, or fewer max_tokens. "
     "You requested up to 8000 tokens, but can only afford 1500.",
 )
+
+
+class TestBotocoreFailures:
+    """Bedrock surfaces botocore errors, which keep their status in a dict."""
+
+    @pytest.mark.parametrize(
+        ("error", "code"),
+        [
+            (
+                ClientError(
+                    {
+                        "Error": {"Code": "ServiceUnavailableException"},
+                        "ResponseMetadata": {"HTTPStatusCode": 503},
+                    },
+                    "Converse",
+                ),
+                PROVIDER_UNAVAILABLE,
+            ),
+            (
+                ClientError(
+                    {
+                        "Error": {"Code": "ThrottlingException"},
+                        "ResponseMetadata": {"HTTPStatusCode": 429},
+                    },
+                    "Converse",
+                ),
+                RATE_LIMITED,
+            ),
+            (
+                EndpointConnectionError(endpoint_url="https://bedrock"),
+                PROVIDER_UNAVAILABLE,
+            ),
+            (ReadTimeoutError(endpoint_url="https://bedrock"), TIMEOUT),
+            (ConnectTimeoutError(endpoint_url="https://bedrock"), TIMEOUT),
+        ],
+    )
+    def test_botocore_failures_are_classified(self, error, code):
+        assert classify_provider_failure(error) == code
 
 
 class TestBudgetSensitive:

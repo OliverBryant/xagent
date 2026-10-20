@@ -301,6 +301,43 @@ async def test_agent_service_refreshes_unknown_tools_when_matcher_registers(
 
 
 @pytest.mark.asyncio
+async def test_agent_service_publishes_refreshed_approval_resolution_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unknown = MCPApprovalGateResolution.unknown(
+        task_source="external", reason="registration_unavailable"
+    )
+    tool_config = ApprovalResolutionConfig(unknown)
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        return []
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="mcp-approval-resolution-refresh-test",
+        id="mcp-approval-resolution-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+    await service._ensure_tools_initialized()
+    service._execution_adapter = service._build_execution_adapter()
+    first_runner, _ = service._execution_adapter._build_runner()
+    assert first_runner.agent.mcp_approval_resolution is unknown
+
+    off = MCPApprovalGateResolution.off(task_source="external")
+    tool_config.resolution = off
+    await service._ensure_tools_initialized()
+
+    assert service._execution_adapter.config.mcp_approval_resolution is off
+    refreshed_runner, _ = service._execution_adapter._build_runner()
+    assert refreshed_runner.agent.mcp_approval_resolution is off
+
+
+@pytest.mark.asyncio
 async def test_agent_service_refreshes_runtime_prompt_and_modalities_with_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

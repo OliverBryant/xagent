@@ -9874,6 +9874,9 @@ async def test_gate_issued_response_survives_unknown_raw_tool_rebuild() -> None:
             tools=[raw_tool],
             llm=FakeLLM([]),
             runtime=unavailable_runtime,
+            mcp_approval_resolution=MCPApprovalGateResolution.unknown(
+                task_source="external", reason="registration_unavailable"
+            ),
         )
 
     assert len(restored_pattern.pending_tool_interaction_responses) == 1
@@ -9925,6 +9928,151 @@ async def test_gate_issued_response_survives_unknown_raw_tool_rebuild() -> None:
     assert settled.status == "completed"
     assert settled.settlement_status == "succeeded"
     assert restored_pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_policy", ["off", "replacement_non_target"])
+async def test_gate_issued_response_terminates_under_definitive_current_policy(
+    current_policy: str,
+) -> None:
+    target = FakeTool()
+    target.name = "mcp_LinkedIn_create_post"
+    target.metadata.name = target.name
+    target.mcp_tool = SimpleNamespace(name="create_post")
+
+    async def gate(_: GatedCall) -> GateDecision:
+        return GateDecision.require_approval("host-1", message="Publish this?")
+
+    async def resume(**_: Any) -> ToolInteractionSettlement:
+        raise AssertionError("a retired approval interaction must not resume")
+
+    original = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, raw_name: raw_name == "create_post",
+        classifier=lambda _: True,
+        timeout_seconds=30,
+    )
+    original_resolution = MCPApprovalGateResolution.on(
+        mcp_approval_gate_scope(original)
+    )
+    (gated,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=original_resolution,
+    )
+    first_context = ExecutionContext(
+        execution_id=f"gated-{current_policy}-task",
+        metadata={"task_source": "external", "run_id": "run-1"},
+    )
+    first_context.add_user_message("Publish it.", metadata={"turn_id": "turn-1"})
+    first_pattern = ReActPattern(max_iterations=3)
+    first_runtime = PatternRuntime(execution_id=first_context.execution_id)
+    waiting = await first_pattern.run(
+        context=first_context,
+        tools=[gated],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "gated-call-1",
+                            "function": {
+                                "name": target.name,
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=first_runtime,
+        mcp_approval_resolution=original_resolution,
+    )
+    assert waiting["status"] == "waiting_for_user"
+    checkpoint = next(
+        item
+        for item in reversed(first_runtime.checkpoints)
+        if item["label"] == "waiting_for_user"
+    )
+    assert unregister_mcp_approval_gate(original) is True
+
+    replacement = None
+    if current_policy == "off":
+        current_resolution = MCPApprovalGateResolution.off(task_source="external")
+    else:
+        replacement = register_mcp_approval_gate(
+            task_source="external",
+            gate=_never_called_gate,
+            resume=resume,
+            tool_matcher=lambda _ref, raw_name: raw_name == "delete_post",
+            classifier=lambda _: True,
+        )
+        current_resolution = MCPApprovalGateResolution.on(
+            mcp_approval_gate_scope(replacement)
+        )
+    try:
+        (raw_tool,) = gate_mcp_tools(
+            [target],
+            connector_ref=ConnectorRef("mcp", 41),
+            approval_resolution=current_resolution,
+        )
+        assert raw_tool is target
+
+        restored_context = ExecutionContext.from_dict(checkpoint["context"])
+        restored_context.add_user_message("approve")
+        restored_pattern = ReActPattern(max_iterations=3)
+        restored_pattern.load_state(checkpoint["pattern_state"])
+        runtime = PatternRuntime(execution_id=first_context.execution_id)
+        runtime.active_turn_id = "approval-turn"
+        resumed = await restored_pattern.run(
+            context=restored_context,
+            tools=[raw_tool],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "final-call",
+                                "function": {
+                                    "name": "final_answer",
+                                    "arguments": (
+                                        '{"response_language":"English",'
+                                        '"answer":"The pending call was not sent.",'
+                                        '"outcome":"completed"}'
+                                    ),
+                                },
+                            }
+                        ]
+                    }
+                ]
+            ),
+            runtime=runtime,
+            mcp_approval_resolution=current_resolution,
+        )
+    finally:
+        if replacement is not None:
+            unregister_mcp_approval_gate(replacement)
+
+    assert resumed["success"] is True
+    assert target.calls == []
+    assert restored_pattern.pending_tool_interaction_responses == []
+    record = restored_pattern._record_for_tool_call_id("gated-call-1")
+    assert record.status == "failed"
+    assert record.settlement_status == "rejected"
+    assert record.result["success"] is False
+    assert "not dispatched" in record.result["error"]
+    delivered = next(
+        item
+        for item in runtime.checkpoints
+        if item["label"] == "tool_interaction_response_delivered"
+    )
+    assert delivered["metadata"]["reason"] == (
+        "approval_policy_disabled"
+        if current_policy == "off"
+        else "approval_scope_no_longer_matches"
+    )
 
 
 @pytest.mark.asyncio

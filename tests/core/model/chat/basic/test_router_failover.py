@@ -778,3 +778,64 @@ async def test_forced_choice_is_adapted_for_a_fallback_that_cannot_force(
     assert primary.tool_choices == [FORCED]
     assert fallback.tool_choices == ["auto"]
     assert not prepared.supports_forced_tool_choice
+
+
+def _affordability_refusal() -> Exception:
+    # OpenRouter's 402 for a request whose output budget the account cannot
+    # cover; the runtime's compaction ladder recovers by asking for less.
+    return openai.APIStatusError(
+        "This request requires more credits, or fewer max_tokens. "
+        "You requested up to 8000 tokens, but can only afford 1500.",
+        response=httpx.Response(402, request=_REQUEST),
+        body=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        _affordability_refusal(),
+        ProviderCallError("provider_quota", budget_sensitive=True),
+    ],
+    ids=["raw", "guarded"],
+)
+async def test_output_budget_refusal_is_not_hidden_by_an_unavailable_fallback(
+    monkeypatch, refusal
+):
+    primary = _FakeLLM("saved-deepseek", error=refusal)
+    fallback = _FakeLLM("saved-gpt", error=openai.APIConnectionError(request=_REQUEST))
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    with pytest.raises(type(refusal)) as raised:
+        await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES, max_tokens=8000)
+
+    # The caller still sees the budget refusal, so it can retry with less.
+    assert raised.value is refusal
+    assert fallback.calls == 0
+    assert not router_module._CANDIDATE_COOLDOWNS.active("saved-deepseek")
+    assert not router_module.is_auto_failover_failure(refusal)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exhausted",
+    [
+        openai.APIStatusError(
+            "insufficient_quota: you have run out of credits",
+            response=httpx.Response(402, request=_REQUEST),
+            body=None,
+        ),
+        ProviderCallError("provider_quota"),
+    ],
+    ids=["raw", "guarded"],
+)
+async def test_exhausted_quota_still_fails_over(monkeypatch, exhausted):
+    primary = _FakeLLM("saved-deepseek", error=exhausted)
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    assert await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES) == (
+        "saved-gpt"
+    )
+    assert router_module._CANDIDATE_COOLDOWNS.active("saved-deepseek")

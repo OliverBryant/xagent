@@ -21,7 +21,8 @@ after a rate limit -- that configured candidate is skipped in favour of the
 fallback for a cooldown (``XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS``, per
 process). A stream fails over
 only before its first chunk. A failure the request itself caused (context
-length, an invalid request, a tool-protocol violation) never fails over.
+length, an invalid request, a tool-protocol violation, a refusal that names
+the output budget) never fails over.
 
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
@@ -94,6 +95,7 @@ from .call_boundary import (
     TIMEOUT,
     ProviderCallError,
     classify_provider_failure,
+    names_output_budget,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,7 +132,10 @@ class RouterModalityRoutingError(RuntimeError):
 # accepts the credential or the model name -- rather than that this request
 # is wrong. Only these move a call to the Auto fallback: a request the
 # selected model rejected on its merits (context length, an invalid request,
-# a tool-protocol violation) would fail on the fallback too.
+# a tool-protocol violation) would fail on the fallback too. So would a
+# refusal that names the output budget, even under one of these codes (an
+# OpenRouter 402 "fewer max_tokens" is ``provider_quota``): the caller can
+# retry it with a smaller budget, which a fallback's own failure would hide.
 _FAILOVER_FAILURE_CODES = frozenset(
     {
         CREDENTIAL_REJECTED,
@@ -159,7 +164,9 @@ def _failover_code(error: BaseException) -> str | None:
             code = classify_provider_failure(error)
         except Exception:  # noqa: BLE001 - classification must not mask the failure
             return None
-    return code if code in _FAILOVER_FAILURE_CODES else None
+    if code not in _FAILOVER_FAILURE_CODES or names_output_budget(error):
+        return None
+    return code
 
 
 def is_auto_failover_failure(error: BaseException) -> bool:

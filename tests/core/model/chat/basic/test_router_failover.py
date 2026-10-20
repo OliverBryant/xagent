@@ -44,8 +44,11 @@ class _FakeLLM(BaseLLM):
         chunks: list[StreamChunk] | None = None,
         error_after_chunks: bool = False,
         context_window: int | None = None,
+        forced_tool_choice: bool = True,
     ) -> None:
         self._model_id = model_id
+        self.forced_tool_choice = forced_tool_choice
+        self.tool_choices: list[Any] = []
         self.context_window = context_window
         self.stream_closed = False
         self.error = error
@@ -67,8 +70,13 @@ class _FakeLLM(BaseLLM):
     def supports_thinking_mode(self) -> bool:
         return False
 
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return self.forced_tool_choice
+
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        del messages, kwargs
+        del messages
+        self.tool_choices.append(kwargs.get("tool_choice"))
         self.calls += 1
         if self.error is not None:
             raise self.error
@@ -701,3 +709,72 @@ async def test_candidate_keeps_its_retry_budget_when_the_fallback_is_smaller(
     # The call would not move to a smaller fallback, so it must not give up
     # early either.
     assert (PRIMARY, True) not in router.resolutions
+
+
+@pytest.mark.asyncio
+async def test_failure_after_stream_output_still_starts_the_cooldown(monkeypatch):
+    error = openai.APIConnectionError(request=_REQUEST)
+    primary = _FakeLLM("saved-deepseek", error=error, error_after_chunks=True)
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    received: list[str] = []
+    with pytest.raises(openai.APIConnectionError) as raised:
+        async for chunk in (await router.prepare_for_call(MESSAGES)).stream_chat(
+            MESSAGES
+        ):
+            received.append(chunk.content)
+
+    # The partial answer is not replayed and the error stands...
+    assert raised.value is error
+    assert received == ["saved-deepseek"]
+    assert fallback.calls == 0
+    # ...but the next independent call no longer lands on the failing candidate.
+    following = await router.prepare_for_call(MESSAGES)
+    assert following.model_name == FALLBACK
+
+
+FORCED = {"type": "function", "function": {"name": "final_answer"}}
+
+
+@pytest.mark.asyncio
+async def test_forced_choice_support_reflects_every_model_the_call_used(
+    monkeypatch,
+):
+    # The candidate cannot force a tool, so callers send "auto"; after moving
+    # to a fallback that could, the call still did not force one.
+    primary = _FakeLLM(
+        "saved-deepseek",
+        error=openai.APIConnectionError(request=_REQUEST),
+        forced_tool_choice=False,
+    )
+    fallback = _FakeLLM("saved-gpt", forced_tool_choice=True)
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    prepared = await router.prepare_for_call(MESSAGES)
+    assert not prepared.supports_forced_tool_choice
+
+    await prepared.chat(MESSAGES, tool_choice="auto")
+
+    assert fallback.tool_choices == ["auto"]
+    assert not prepared.supports_forced_tool_choice
+
+
+@pytest.mark.asyncio
+async def test_forced_choice_is_adapted_for_a_fallback_that_cannot_force(
+    monkeypatch,
+):
+    primary = _FakeLLM(
+        "saved-deepseek",
+        error=openai.APIConnectionError(request=_REQUEST),
+        forced_tool_choice=True,
+    )
+    fallback = _FakeLLM("saved-gpt", forced_tool_choice=False)
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    prepared = await router.prepare_for_call(MESSAGES)
+    assert prepared.supports_forced_tool_choice
+
+    await prepared.chat(MESSAGES, tool_choice=FORCED)
+
+    assert primary.tool_choices == [FORCED]
+    assert fallback.tool_choices == ["auto"]
+    assert not prepared.supports_forced_tool_choice

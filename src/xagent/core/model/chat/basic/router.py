@@ -485,7 +485,8 @@ class RouterLLM(BaseLLM):
         rejected tool_choice, a thinking/tool_choice conflict, a model that
         mandates reasoning) are that client's own responsibility today, not
         this router's. ``_downstream_resolver`` is typed as
-        ``Callable[[str], BaseLLM]``, not ``OpenRouterLLM``, so this is a
+        ``Callable[..., BaseLLM]`` (it takes the profile id, and configured
+        Auto's also ``limit_attempts``), not ``OpenRouterLLM``, so this is a
         statement about current call sites, not a type-level guarantee.
 
         ``preferred_input_modalities`` supplied by the caller (task runtime
@@ -937,12 +938,21 @@ class _ResolvedRouterLLM(BaseLLM):
         self._input_modalities = input_modalities
         self._fallback_model = fallback_model
         self.context_window = context_window
+        self._forced_tool_choice_supported = True
         self._bind(downstream, selected_model)
 
     def _bind(self, downstream: BaseLLM, selected_model: str) -> None:
         router = self._router
         self._downstream = downstream
         self._selected_model = selected_model
+        # Callers adapt ``tool_choice`` to the model bound when they build the
+        # request and read this again after the call. A forced choice only
+        # survived if every model this call was bound to supports it, so a
+        # move to a fallback can lower this but never raise it.
+        self._forced_tool_choice_supported = (
+            self._forced_tool_choice_supported
+            and bool(getattr(downstream, "supports_forced_tool_choice", True))
+        )
         ability_source = downstream if router.uses_configured_candidates else router
         abilities = list(getattr(ability_source, "abilities", router.abilities))
         if not router.uses_configured_candidates:
@@ -951,6 +961,20 @@ class _ResolvedRouterLLM(BaseLLM):
                 if ability is not None and ability not in abilities:
                     abilities.append(ability)
         self._abilities = abilities
+
+    def _record_failure(self, error: BaseException) -> str | None:
+        """Start the candidate's cooldown after an availability failure.
+
+        Independent of whether this call moves: a failure after output has
+        reached the caller cannot be retried elsewhere, but the next call
+        should still go to the fallback. Returns the failure code, if any.
+        """
+        if self._fallback_model is None:
+            return None
+        failure_code = _failover_code(error)
+        if failure_code is not None:
+            self._router._start_cooldown(self._downstream, failure_code)
+        return failure_code
 
     async def _fail_over(self, error: BaseException) -> bool:
         """Move to the fallback after ``error``; whether the call may go again.
@@ -962,12 +986,11 @@ class _ResolvedRouterLLM(BaseLLM):
         goes to the fallback and is compacted for its window first.
         """
         fallback_model = self._fallback_model
-        failure_code = None if fallback_model is None else _failover_code(error)
+        failure_code = self._record_failure(error)
         if fallback_model is None or failure_code is None:
             return False
         self._fallback_model = None
         failed_model = self._selected_model
-        self._router._start_cooldown(self._downstream, failure_code)
         try:
             fallback = self._router._resolve_downstream(fallback_model)
         except Exception:  # noqa: BLE001 - the original failure is the one to report
@@ -1040,7 +1063,7 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def supports_forced_tool_choice(self) -> bool:
-        return getattr(self._downstream, "supports_forced_tool_choice", True)
+        return self._forced_tool_choice_supported
 
     def _method(self, name: str) -> Callable[..., Awaitable[str | dict[str, Any]]]:
         if name == "vision_chat":
@@ -1170,9 +1193,13 @@ class _ResolvedRouterLLM(BaseLLM):
                     started = True
                     yield chunk
             except Exception as exc:
-                # Once a chunk is out, the caller has part of this model's
-                # answer; a second model cannot continue it.
-                if started or not await self._fail_over(exc):
+                if started:
+                    # Once a chunk is out, the caller has part of this
+                    # model's answer; a second model cannot continue it. The
+                    # error stands, but later calls still avoid the candidate.
+                    self._record_failure(exc)
+                    raise
+                if not await self._fail_over(exc):
                     raise
                 failed_over = True
         finally:

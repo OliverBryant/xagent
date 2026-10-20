@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterator
 
 import httpx
@@ -9,10 +10,14 @@ import openai
 import pytest
 
 from xagent.core.model.chat.basic import router as router_module
+from xagent.core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.call_boundary import ProviderCallError
 from xagent.core.model.chat.basic.router import RouterLLM
-from xagent.core.model.chat.exceptions import LLMToolProtocolError
+from xagent.core.model.chat.exceptions import (
+    LLMEmptyContentError,
+    LLMToolProtocolError,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 PRIMARY = "deepseek/deepseek-v4-flash"
@@ -38,8 +43,11 @@ class _FakeLLM(BaseLLM):
         error: BaseException | None = None,
         chunks: list[StreamChunk] | None = None,
         error_after_chunks: bool = False,
+        context_window: int | None = None,
     ) -> None:
         self._model_id = model_id
+        self.context_window = context_window
+        self.stream_closed = False
         self.error = error
         self.chunks = chunks or [
             StreamChunk(type=ChunkType.TOKEN, content=model_id, delta=model_id)
@@ -66,6 +74,9 @@ class _FakeLLM(BaseLLM):
             raise self.error
         return self._model_id
 
+    async def vision_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        return await self.chat(messages, **kwargs)
+
     async def stream_chat(
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> AsyncIterator[StreamChunk]:
@@ -73,10 +84,13 @@ class _FakeLLM(BaseLLM):
         self.calls += 1
         if self.error is not None and not self.error_after_chunks:
             raise self.error
-        for chunk in self.chunks:
-            yield chunk
-        if self.error is not None:
-            raise self.error
+        try:
+            for chunk in self.chunks:
+                yield chunk
+            if self.error is not None:
+                raise self.error
+        finally:
+            self.stream_closed = True
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +143,8 @@ def _router(
         _status_error(openai.RateLimitError, 429),
         _status_error(openai.AuthenticationError, 401),
         _status_error(openai.NotFoundError, 404),
+        _status_error(openai.PermissionDeniedError, 403),
+        _status_error(openai.APIStatusError, 402),
         RuntimeError("DeepSeek request failed"),
         ProviderCallError("provider_unavailable"),
     ],
@@ -139,6 +155,8 @@ def _router(
         "429",
         "401",
         "404",
+        "403",
+        "402",
         "wrapped-connection",
         "guarded-unavailable",
     ],
@@ -194,7 +212,7 @@ async def test_request_failure_does_not_fail_over(monkeypatch, error):
 @pytest.mark.asyncio
 async def test_failed_candidate_is_skipped_until_its_cooldown_ends(monkeypatch):
     now = [1000.0]
-    monkeypatch.setattr(router_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(router_module, "_now", lambda: now[0])
     monkeypatch.setenv("XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS", "60")
     primary = _FakeLLM(
         "saved-deepseek", error=openai.APIConnectionError(request=_REQUEST)
@@ -391,19 +409,34 @@ async def test_cooldown_keeps_the_candidate_when_the_fallback_cannot_be_built(
 ):
     primary = _FakeLLM("saved-deepseek")
     router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: primary})
+    fallback_builds = [0]
 
     def resolve(profile: str, **_kwargs: Any) -> BaseLLM:
         if profile == FALLBACK:
-            raise RuntimeError("fallback endpoint is misconfigured")
+            fallback_builds[0] += 1
+            # Builds for the early give-up check, then fails when the
+            # cooldown actually needs it.
+            if fallback_builds[0] > 1:
+                raise RuntimeError("fallback endpoint is misconfigured")
         return primary
 
-    router._downstream_resolver = resolve
+    resolutions: list[tuple[str, bool]] = []
+
+    def recording(profile: str, *, limit_attempts: bool = False) -> BaseLLM:
+        resolutions.append((profile, limit_attempts))
+        return resolve(profile)
+
+    router._downstream_resolver = recording
     router_module._CANDIDATE_COOLDOWNS.start("saved-deepseek", 60)
 
     prepared = await router.prepare_for_call(MESSAGES)
 
     assert prepared.model_name == PRIMARY
     assert await prepared.chat(MESSAGES) == "saved-deepseek"
+    # With no fallback to move to after all, the candidate is rebuilt with its
+    # full retry budget.
+    assert (PRIMARY, True) in resolutions
+    assert resolutions[-1] == (PRIMARY, False)
 
 
 IMAGE_MESSAGES = [
@@ -480,14 +513,15 @@ async def test_candidate_retry_budget_is_limited_only_when_the_call_can_fail_ove
     assert await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES) == (
         "saved-gpt"
     )
-    assert router.resolutions == [(PRIMARY, True), (FALLBACK, False)]
+    assert (PRIMARY, True) in router.resolutions
+    assert router.resolutions[-1] == (FALLBACK, False)
 
     # The text-only fallback cannot serve an image call, so the candidate
     # keeps every saved attempt.
     router_module._CANDIDATE_COOLDOWNS.clear()
     router.resolutions.clear()
     await router.prepare_for_call(IMAGE_MESSAGES)
-    assert router.resolutions == [(PRIMARY, False)]
+    assert (PRIMARY, True) not in router.resolutions
 
 
 @pytest.mark.asyncio
@@ -498,3 +532,172 @@ async def test_candidate_without_a_fallback_keeps_its_retry_budget(monkeypatch):
     await router.prepare_for_call(MESSAGES)
 
     assert router.resolutions == [(PRIMARY, False)]
+
+
+@pytest.mark.asyncio
+async def test_vision_call_fails_over_to_fallback(monkeypatch):
+    primary = _FakeLLM(
+        "saved-deepseek", error=_status_error(openai.InternalServerError, 503)
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.vision_chat(MESSAGES) == "saved-gpt"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_not_failed_over(monkeypatch):
+    primary = _FakeLLM("saved-deepseek", error=asyncio.CancelledError())
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    with pytest.raises(asyncio.CancelledError):
+        await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES)
+    assert fallback.calls == 0
+    assert not router_module._CANDIDATE_COOLDOWNS.active("saved-deepseek")
+
+
+@pytest.mark.asyncio
+async def test_failover_adopts_the_fallback_context_window(monkeypatch):
+    primary = _FakeLLM(
+        "saved-deepseek",
+        error=openai.APIConnectionError(request=_REQUEST),
+        context_window=128_000,
+    )
+    fallback = _FakeLLM("saved-gpt", context_window=400_000)
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+    assert prepared.context_window == 128_000
+
+    assert await prepared.chat(MESSAGES) == "saved-gpt"
+    assert prepared.context_window == 400_000
+
+
+@pytest.mark.asyncio
+async def test_smaller_fallback_is_not_used_for_the_call_but_takes_the_next(
+    monkeypatch,
+):
+    error = openai.APIConnectionError(request=_REQUEST)
+    primary = _FakeLLM("saved-deepseek", error=error, context_window=128_000)
+    fallback = _FakeLLM("saved-gpt", context_window=32_000)
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    # The transcript was sized for 128k; a 32k fallback could only end the
+    # task with a context-length failure, so the resumable error stands.
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await prepared.chat(MESSAGES)
+    assert raised.value is error
+    assert fallback.calls == 0
+    assert prepared.model_id == "saved-deepseek"
+
+    # The cooldown still sends the next call to the fallback, where it is
+    # prepared (and compacted) for the fallback's own window.
+    following = await router.prepare_for_call(MESSAGES)
+    assert following.model_name == FALLBACK
+    assert following.context_window == 32_000
+
+
+@pytest.mark.asyncio
+async def test_failed_candidate_stream_is_closed_before_failing_over(monkeypatch):
+    error = openai.APIConnectionError(request=_REQUEST)
+    primary = _FakeLLM(
+        "saved-claude",
+        chunks=[StreamChunk(type=ChunkType.ERROR, content="failed", raw=error)],
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await _collect(prepared.stream_chat(MESSAGES)) == ["saved-gpt"]
+    assert primary.stream_closed
+
+
+class _UnclosableStream:
+    def __init__(self, chunks: list[StreamChunk]) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> "_UnclosableStream":
+        return self
+
+    async def __anext__(self) -> StreamChunk:
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        raise RuntimeError("connection already torn down")
+
+
+@pytest.mark.asyncio
+async def test_stream_close_failure_does_not_abort_the_failover(monkeypatch):
+    error = openai.APIConnectionError(request=_REQUEST)
+    primary = _FakeLLM("saved-claude")
+    monkeypatch.setattr(
+        primary,
+        "stream_chat",
+        lambda *_args, **_kwargs: _UnclosableStream(
+            [StreamChunk(type=ChunkType.ERROR, content="failed", raw=error)]
+        ),
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await _collect(prepared.stream_chat(MESSAGES)) == ["saved-gpt"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_retries_only_failover_failures_briefly(monkeypatch):
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("xagent.core.retry.wrapper.asyncio.sleep", no_sleep)
+
+    class _Flaky(_FakeLLM):
+        def __init__(self, failures: list[BaseException]) -> None:
+            super().__init__("saved-deepseek")
+            self.failures = list(failures)
+
+        async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+            self.calls += 1
+            if self.failures:
+                raise self.failures.pop(0)
+            return "recovered"
+
+    # Failures the fallback would not take over keep the saved budget...
+    flaky = _Flaky([LLMEmptyContentError("empty")] * 3)
+    llm = attach_chat_retry_wrapper(flaky, 5, failover_max_attempts=2)
+    assert await llm.chat(MESSAGES) == "recovered"
+    assert flaky.calls == 4
+
+    # ...while an outage stops after two attempts so the call can move on.
+    down = _Flaky([openai.APIConnectionError(request=_REQUEST)] * 3)
+    llm = attach_chat_retry_wrapper(down, 5, failover_max_attempts=2)
+    with pytest.raises(openai.APIConnectionError):
+        await llm.chat(MESSAGES)
+    assert down.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_keeps_its_retry_budget_when_the_fallback_is_smaller(
+    monkeypatch,
+):
+    models = {
+        PRIMARY: _FakeLLM("saved-deepseek", context_window=128_000),
+        FALLBACK: _FakeLLM("saved-gpt", context_window=32_000),
+    }
+    router = _router(monkeypatch, models)
+
+    await router.prepare_for_call(MESSAGES)
+
+    # The call would not move to a smaller fallback, so it must not give up
+    # early either.
+    assert (PRIMARY, True) not in router.resolutions

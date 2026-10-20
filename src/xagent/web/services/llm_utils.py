@@ -377,7 +377,7 @@ class CoreStorage:
     def create_llm_instance(
         self,
         model_config: ModelConfig,
-        downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+        downstream_resolver: Optional[Callable[..., BaseLLM]] = None,
     ) -> Optional[BaseLLM]:
         """Create LLM instance from ModelConfig.
 
@@ -777,7 +777,7 @@ class UserAwareModelStorage:
 
     def _build_configured_router_resolver(
         self, router_cfg: ChatModelConfig, router_model: Model
-    ) -> tuple[ChatModelConfig, Callable[[str], BaseLLM]]:
+    ) -> tuple[ChatModelConfig, Callable[..., BaseLLM]]:
         """Snapshot the user's Auto bindings into a resolver for this run."""
 
         from .auto_model_service import (
@@ -861,15 +861,14 @@ class UserAwareModelStorage:
                     f"xrouter selected unbound Auto profile {profile_id!r}"
                 )
             # The router asks for this only when the call can still move to
-            # the fallback, so a failing candidate gives up quickly instead of
-            # spending the whole retry deadline first. The fallback keeps its
-            # own budget because nothing comes after it.
+            # the fallback, so a candidate failing in a way the fallback takes
+            # over gives up quickly instead of spending the whole retry
+            # deadline first. Other failures keep the saved budget, and the
+            # fallback keeps its own because nothing comes after it.
             if limit_attempts and profile_id != fallback_profile:
                 target_cfg = target_cfg.model_copy(
                     update={
-                        "max_retries": min(
-                            target_cfg.max_retries, get_auto_primary_max_attempts()
-                        )
+                        "auto_failover_max_attempts": get_auto_primary_max_attempts()
                     }
                 )
             llm = self.core_storage.create_llm_instance(target_cfg)

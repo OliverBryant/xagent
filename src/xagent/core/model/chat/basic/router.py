@@ -25,7 +25,8 @@ length, an invalid request, a tool-protocol violation) never fails over.
 
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
-CallStore, defaulting to ``<storage_root>/xrouter/calls.db``.
+CallStore, defaulting to ``<storage_root>/xrouter/calls.db``. A configured Auto
+model with a single eligible candidate makes no decision and logs nothing.
 
 Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODEL          path to a trained predictor .joblib
@@ -161,6 +162,16 @@ def _failover_code(error: BaseException) -> str | None:
     return code if code in _FAILOVER_FAILURE_CODES else None
 
 
+def is_auto_failover_failure(error: BaseException) -> bool:
+    """Whether a configured Auto call would move to its fallback after ``error``."""
+    return _failover_code(error) is not None
+
+
+def _now() -> float:
+    """The cooldown clock; tests replace this, not the process-wide clock."""
+    return time.monotonic()
+
+
 class _CandidateCooldowns:
     """Configured Auto candidates that recently failed, keyed by saved model.
 
@@ -175,14 +186,14 @@ class _CandidateCooldowns:
 
     def start(self, key: str, seconds: float) -> None:
         with self._lock:
-            self._until[key] = time.monotonic() + seconds
+            self._until[key] = _now() + seconds
 
     def active(self, key: str) -> bool:
         with self._lock:
             until = self._until.get(key)
             if until is None:
                 return False
-            if time.monotonic() < until:
+            if _now() < until:
                 return True
             del self._until[key]
             return False
@@ -511,20 +522,17 @@ class RouterLLM(BaseLLM):
                 downstream = self._resolve_downstream(fallback_model)
             except Exception:  # noqa: BLE001 - the candidate may still answer
                 logger.exception("Could not build Auto fallback %s", fallback_model)
+                # No fallback to move to after all: the candidate gets its
+                # full retry budget back.
+                downstream = self._resolve_downstream(model_id)
             else:
                 model_id = fallback_model
             fallback_model = None
-        # A saved target model describes the endpoint that will actually serve
-        # the request, so its explicit context window wins over catalog data.
-        context_window = getattr(downstream, "context_window", None)
-        if not context_window:
-            context_window = getattr(self, "context_window", None)
-        if not context_window:
-            context_window = await asyncio.to_thread(
-                self._profile_context_window, model_id
-            )
+        context_window = await self._context_window_for(model_id, downstream)
         input_modalities = (
-            self._profile_input_modalities(model_id) if route_input_modalities else ()
+            await asyncio.to_thread(self._profile_input_modalities, model_id)
+            if route_input_modalities
+            else ()
         )
         return _ResolvedRouterLLM(
             router=self,
@@ -534,6 +542,21 @@ class RouterLLM(BaseLLM):
             input_modalities=input_modalities,
             fallback_model=fallback_model,
         )
+
+    async def _context_window_for(
+        self, model_id: str, downstream: BaseLLM
+    ) -> int | None:
+        """The context window of the model that will serve a call."""
+        # A saved target model describes the endpoint that will actually serve
+        # the request, so its explicit context window wins over catalog data.
+        context_window = getattr(downstream, "context_window", None)
+        if not context_window:
+            context_window = getattr(self, "context_window", None)
+        if not context_window:
+            context_window = await asyncio.to_thread(
+                self._profile_context_window, model_id
+            )
+        return context_window if isinstance(context_window, int) else None
 
     async def _resolve_route(
         self,
@@ -557,11 +580,37 @@ class RouterLLM(BaseLLM):
         if model_id is None:
             model_id = await self._select_model(prompt, **select_kwargs)
             logger.info("xrouter selected routing profile %s", model_id)
-        failover_available = (
-            self._failover_model(model_id, preferred_input_modalities) is not None
-        )
-        return model_id, self._resolve_downstream(
-            model_id, failover_available=failover_available
+        downstream = self._resolve_downstream(model_id)
+        if await self._can_fail_over(model_id, downstream, preferred_input_modalities):
+            downstream = self._resolve_downstream(model_id, failover_available=True)
+        return model_id, downstream
+
+    async def _can_fail_over(
+        self,
+        model_id: str,
+        downstream: BaseLLM,
+        required_input_modalities: tuple[str, ...],
+    ) -> bool:
+        """Whether a call on ``model_id`` could move to the fallback.
+
+        Mirrors the in-call checks in ``_ResolvedRouterLLM._fail_over``: the
+        fallback must exist, differ from the selection, accept the request's
+        required modalities, build, and not have a known window smaller than
+        the selection's. Only then may the candidate give up early.
+        """
+        fallback_model = self._failover_model(model_id, required_input_modalities)
+        if fallback_model is None:
+            return False
+        try:
+            fallback = self._resolve_downstream(fallback_model)
+        except Exception:  # noqa: BLE001 - no fallback means no early give-up
+            return False
+        fallback_window = await self._context_window_for(fallback_model, fallback)
+        window = await self._context_window_for(model_id, downstream)
+        return not (
+            fallback_window is not None
+            and window is not None
+            and fallback_window < window
         )
 
     def _sole_candidate(self, required_input_modalities: tuple[str, ...]) -> str | None:
@@ -903,8 +952,15 @@ class _ResolvedRouterLLM(BaseLLM):
                     abilities.append(ability)
         self._abilities = abilities
 
-    def _fail_over(self, error: BaseException) -> bool:
-        """Move to the fallback after ``error``; whether the call may go again."""
+    async def _fail_over(self, error: BaseException) -> bool:
+        """Move to the fallback after ``error``; whether the call may go again.
+
+        A fallback with a known window smaller than the one this call was
+        sized for is not used for it: the transcript may not fit, and a
+        context-length failure ends the task where the original availability
+        failure can be resumed. The cooldown still starts, so the next call
+        goes to the fallback and is compacted for its window first.
+        """
         fallback_model = self._fallback_model
         failure_code = None if fallback_model is None else _failover_code(error)
         if fallback_model is None or failure_code is None:
@@ -921,6 +977,22 @@ class _ResolvedRouterLLM(BaseLLM):
                 failed_model,
             )
             return False
+        fallback_window = await self._router._context_window_for(
+            fallback_model, fallback
+        )
+        if (
+            fallback_window is not None
+            and self.context_window is not None
+            and fallback_window < self.context_window
+        ):
+            logger.warning(
+                "Auto candidate %s failed (%s); fallback %s has a smaller "
+                "context window, so this call is not moved",
+                failed_model,
+                failure_code,
+                fallback_model,
+            )
+            return False
         logger.warning(
             "Auto candidate %s failed (%s); sending the call to fallback %s",
             failed_model,
@@ -928,6 +1000,8 @@ class _ResolvedRouterLLM(BaseLLM):
             fallback_model,
         )
         self._bind(fallback, fallback_model)
+        if fallback_window is not None:
+            self.context_window = fallback_window
         return True
 
     @property
@@ -987,7 +1061,7 @@ class _ResolvedRouterLLM(BaseLLM):
                 **kwargs,
             )
         except Exception as exc:
-            if not self._fail_over(exc):
+            if not await self._fail_over(exc):
                 raise
         # Outside the handler, so the fallback's own failure does not carry
         # the first model's error as its context.
@@ -1084,11 +1158,12 @@ class _ResolvedRouterLLM(BaseLLM):
                 async for chunk in stream:
                     # Some adapters report a failed request as an ERROR chunk
                     # carrying the exception instead of raising it.
+                    raw = getattr(chunk, "raw", None)
                     if (
                         not started
                         and getattr(chunk, "type", None) == ChunkType.ERROR
-                        and isinstance(getattr(chunk, "raw", None), BaseException)
-                        and self._fail_over(chunk.raw)
+                        and isinstance(raw, BaseException)
+                        and await self._fail_over(raw)
                     ):
                         failed_over = True
                         break
@@ -1097,13 +1172,18 @@ class _ResolvedRouterLLM(BaseLLM):
             except Exception as exc:
                 # Once a chunk is out, the caller has part of this model's
                 # answer; a second model cannot continue it.
-                if started or not self._fail_over(exc):
+                if started or not await self._fail_over(exc):
                     raise
                 failed_over = True
         finally:
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:
-                await aclose()
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001 - must not replace the outcome
+                    logger.warning(
+                        "Could not close the Auto candidate stream", exc_info=True
+                    )
         if not failed_over:
             return
         async for chunk in self._downstream.stream_chat(

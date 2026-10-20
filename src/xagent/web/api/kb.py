@@ -3589,7 +3589,7 @@ async def ingest(
         loop = asyncio.get_running_loop()
         # Billed to the member who uploaded, not the storage tenant. The
         # executor does not carry the context, so the scope is handed over.
-        async with usage_scope(int(actor_user.id), source="kb_ingest"):
+        async with usage_scope(int(actor_user.id), usage_source="kb_ingest"):
             api_result = await loop.run_in_executor(
                 None, contextvars.copy_context().run, _run_ingestion
             )
@@ -4456,7 +4456,7 @@ async def ingest_cloud(
 
     # Run all file processings concurrently. Each task copies this context,
     # so every file's embedding usage lands in the one scope.
-    async with usage_scope(actor_user_id, source="kb_ingest_cloud"):
+    async with usage_scope(actor_user_id, usage_source="kb_ingest_cloud"):
         outcomes = await asyncio.gather(
             *[process_file(f) for f in request.files], return_exceptions=True
         )
@@ -4985,7 +4985,7 @@ async def search(
     )
 
     progress_manager = get_progress_manager()
-    async with usage_scope(actor_user_id, source="kb_search"):
+    async with usage_scope(actor_user_id, usage_source="kb_search"):
         result = run_document_search(
             collection=safe_collection,
             query_text=query_text,
@@ -5415,7 +5415,7 @@ async def ingest_web(
 
         # The executor does not carry the context, so the scope is handed
         # over; asyncio.run inside it then carries it into the crawl's tasks.
-        async with usage_scope(int(actor_user.id), source="kb_ingest_web"):
+        async with usage_scope(int(actor_user.id), usage_source="kb_ingest_web"):
             api_result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 contextvars.copy_context().run,

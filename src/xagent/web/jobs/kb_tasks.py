@@ -230,7 +230,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         # Billed to the member who submitted the job (the job's owner), not
         # the storage tenant in payload["user_id"].
         with (
-            usage_scope(_job_billing_user_id(job), source="kb_ingest_job"),
+            usage_scope(_job_billing_user_id(job), usage_source="kb_ingest_job"),
             user_scope_context(
                 user_id=int(payload["user_id"]),
                 is_admin=bool(payload.get("is_admin", False)),
@@ -407,7 +407,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     update_job_progress(db, job, message="Crawling website")
     try:
         with (
-            usage_scope(_job_billing_user_id(job), source="kb_ingest_web_job"),
+            usage_scope(_job_billing_user_id(job), usage_source="kb_ingest_web_job"),
             user_scope_context(user_id=user_id, is_admin=is_admin),
         ):
             # asyncio.run carries this context into the crawl's tasks.

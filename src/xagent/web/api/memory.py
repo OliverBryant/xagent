@@ -179,7 +179,7 @@ class MemoryManagementRouter:
                             if search:
                                 # Embeds the query.
                                 async with usage_scope(
-                                    int(user.id), source="memory_api"
+                                    int(user.id), usage_source="memory_api"
                                 ):
                                     memories = self.memory_store.search(
                                         query=search,
@@ -300,7 +300,7 @@ class MemoryManagementRouter:
                     )
 
                     # Update in store; re-embeds the note.
-                    async with usage_scope(int(user.id), source="memory_api"):
+                    async with usage_scope(int(user.id), usage_source="memory_api"):
                         response = self.memory_store.update(updated_memory)
                     if response.success:
                         return {
@@ -360,7 +360,7 @@ class MemoryManagementRouter:
                     )
 
                     # Embeds the note.
-                    async with usage_scope(int(user.id), source="memory_api"):
+                    async with usage_scope(int(user.id), usage_source="memory_api"):
                         response = store.add(memory_note)
                     if response.success:
                         return {

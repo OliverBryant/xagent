@@ -973,7 +973,7 @@ async def test_model_connection(
             )
             embedding_model = create_embedding_adapter(embedding_config)
             # The probe is a real provider call, recorded for the operator.
-            async with usage_scope(int(user.id), source="model_probe"):
+            async with usage_scope(int(user.id), usage_source="model_probe"):
                 await asyncio.wait_for(
                     asyncio.to_thread(embedding_model.encode, "hello"),
                     timeout=timeout_seconds,
@@ -1153,7 +1153,7 @@ async def test_model_connection(
                     )
                 )
 
-            async with usage_scope(int(user.id), source="model_probe"):
+            async with usage_scope(int(user.id), usage_source="model_probe"):
                 await asyncio.wait_for(
                     asyncio.to_thread(_probe_rerank),
                     timeout=timeout_seconds,
@@ -1224,7 +1224,7 @@ async def transcribe_speech_input(
     try:
         # The provider records the transcription; this delivers it for the
         # requesting user, since no agent run is tracking it.
-        async with usage_scope(int(user.id), source="speech_transcribe"):
+        async with usage_scope(int(user.id), usage_source="speech_transcribe"):
             result = await asyncio.wait_for(
                 asr_model.transcribe(
                     audio_bytes,

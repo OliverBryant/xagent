@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 class UsageScope:
     """One unit of non-run work, metered for one user. See :func:`usage_scope`."""
 
-    def __init__(self, user_id: Optional[int], source: str) -> None:
+    def __init__(self, user_id: Optional[int], usage_source: str) -> None:
         self.user_id = user_id
-        self.source = source
+        self.usage_source = usage_source
         self.usage = TokenUsage()
         self._token: Optional[contextvars.Token[Optional[TokenUsage]]] = None
         self._previous: Optional[TokenUsage] = None
@@ -83,7 +83,7 @@ class UsageScope:
             logger.info(
                 "Delivering %d %s usage rows with no attributable user",
                 len(details),
-                self.source,
+                self.usage_source,
             )
         return details
 
@@ -94,13 +94,13 @@ class UsageScope:
         if hook is None:
             return
         try:
-            hook(self.user_id, details, self.source)
+            hook(self.user_id, details, self.usage_source)
         except Exception as e:  # noqa: BLE001
             # Metering must never fail the work it measured. exc_info: the
             # rows are lost here, so the log is all there is to go on.
             logger.warning(
                 "Standalone usage hook failed for %s (%d rows): %s",
-                self.source,
+                self.usage_source,
                 len(details),
                 e,
                 exc_info=True,
@@ -138,14 +138,14 @@ class UsageScope:
             await asyncio.to_thread(self._deliver, details)
 
 
-def usage_scope(user_id: Optional[int], *, source: str) -> UsageScope:
+def usage_scope(user_id: Optional[int], *, usage_source: str) -> UsageScope:
     """Meter one unit of non-run work for ``user_id``.
 
     ``user_id`` is the user the work is done for; pass ``None`` when there is
-    none to attribute it to, and the usage is still delivered. ``source`` names
+    none to attribute it to, and the usage is still delivered. ``usage_source`` names
     the entry point (``kb_search``, ``speech_transcribe`` ...) for the hook.
 
     Scopes nest: an inner scope's usage is delivered on its own and never
     reaches the outer one.
     """
-    return UsageScope(user_id, source)
+    return UsageScope(user_id, usage_source)

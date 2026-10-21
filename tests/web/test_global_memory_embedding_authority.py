@@ -499,6 +499,20 @@ def test_billing_model_id_round_trips_outside_both_fingerprints(
     assert after.vector_space_fingerprint() == before.vector_space_fingerprint()
 
 
+def test_a_put_without_billing_model_id_keeps_the_stored_one(authority_harness):
+    client, _sessions, _actor, _engine = authority_harness
+    billed = dict(PAYLOAD, billing_model_id="platform/x")
+    assert client.put(URL, json=billed).json()["billing_model_id"] == "platform/x"
+
+    # A client unaware of the field re-saves the authority.
+    assert client.put(URL, json=PAYLOAD).json()["billing_model_id"] == "platform/x"
+    assert client.get(URL).json()["billing_model_id"] == "platform/x"
+
+    cleared = dict(PAYLOAD, billing_model_id=None)
+    assert client.put(URL, json=cleared).json()["billing_model_id"] is None
+    assert client.get(URL).json()["billing_model_id"] is None
+
+
 def test_overlong_billing_model_id_is_rejected(authority_harness):
     client, _sessions, _actor, _engine = authority_harness
     response = client.put(URL, json=dict(PAYLOAD, billing_model_id="x" * 101))

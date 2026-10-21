@@ -78,7 +78,7 @@ from ..services.llm_utils import (
     is_platform_model_id,
 )
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..tracking.standalone_usage import usage_scope
+from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -973,11 +973,17 @@ async def test_model_connection(
             )
             embedding_model = create_embedding_adapter(embedding_config)
             # The probe is a real provider call, recorded for the operator.
-            async with usage_scope(int(user.id), usage_source="model_probe"):
-                await asyncio.wait_for(
-                    asyncio.to_thread(embedding_model.encode, "hello"),
-                    timeout=timeout_seconds,
-                )
+            # The scope lives in the thread, which outlives a timeout.
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_in_usage_scope,
+                    int(user.id),
+                    "model_probe",
+                    embedding_model.encode,
+                    "hello",
+                ),
+                timeout=timeout_seconds,
+            )
 
         elif request.category == "image":
             image_config = ImageModelConfig(
@@ -1153,11 +1159,12 @@ async def test_model_connection(
                     )
                 )
 
-            async with usage_scope(int(user.id), usage_source="model_probe"):
-                await asyncio.wait_for(
-                    asyncio.to_thread(_probe_rerank),
-                    timeout=timeout_seconds,
-                )
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    run_in_usage_scope, int(user.id), "model_probe", _probe_rerank
+                ),
+                timeout=timeout_seconds,
+            )
 
         else:
             raise ValueError(f"Unsupported category for testing: {request.category}")

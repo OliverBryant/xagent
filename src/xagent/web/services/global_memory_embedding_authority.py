@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -101,7 +101,15 @@ class AuthorityConfiguration(BaseModel):
     # usage is still recorded, with an empty model id. Not part of either
     # fingerprint -- it changes no vector and no call -- so a change takes
     # effect when workers next admit the store.
-    billing_model_id: str | None = None
+    billing_model_id: str | None = Field(
+        default=None,
+        description=(
+            "Model id memory embedding usage is billed under. Omit it to keep "
+            "the stored value; send null or an empty string to clear it. A "
+            "change takes effect when workers next admit the memory store, "
+            "e.g. after a restart."
+        ),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -345,6 +353,9 @@ class GlobalMemoryEmbeddingAuthorityService:
     def set(
         self, config: AuthorityConfiguration, *, actor_subject: str
     ) -> GlobalMemoryEmbeddingAuthorityRecord:
+        # A body that omits billing_model_id keeps the stored one, so a client
+        # that predates the field cannot clear it by re-saving the authority.
+        keep_billing_model_id = "billing_model_id" not in config.model_fields_set
         normalized = _canonicalize(config)
         secret = normalized.api_key.get_secret_value()
         try:
@@ -393,12 +404,16 @@ class GlobalMemoryEmbeddingAuthorityService:
         update_values = {
             key: value for key, value in values.items() if key != "authority_key"
         }
+        if keep_billing_model_id:
+            del update_values["billing_model_id"]
         update_values["updated_at"] = func.now()
         table = GlobalMemoryEmbeddingAuthority.__table__
         written = self.db.execute(
             stmt.on_conflict_do_update(
                 index_elements=["authority_key"], set_=update_values
-            ).returning(table.c.created_at, table.c.updated_at)
+            ).returning(
+                table.c.created_at, table.c.updated_at, table.c.billing_model_id
+            )
         ).one()
         # Built before COMMIT: a concurrent delete may win the row the moment
         # the transaction lands, and must not fail this durable write.
@@ -418,7 +433,7 @@ class GlobalMemoryEmbeddingAuthorityService:
             credential_status=CREDENTIAL_CONFIGURED
             if round_trips
             else CREDENTIAL_UNAVAILABLE,
-            billing_model_id=normalized.billing_model_id,
+            billing_model_id=_canonical_billing_model_id(written.billing_model_id),
         )
         self.db.commit()
         return record

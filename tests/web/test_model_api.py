@@ -2673,6 +2673,62 @@ class TestModelAPI:
         # An unsaved model has no configured id: recorded, never priced.
         assert (row["call_type"], row["model_id"]) == (category, "")
 
+    def test_a_timed_out_probe_still_delivers_its_usage(
+        self, test_db, regular_user, regular_headers, standalone_hook
+    ):
+        import threading
+
+        import requests as real_requests
+
+        from xagent.web.api import model as model_module
+
+        release, delivered = threading.Event(), threading.Event()
+
+        def slow_ok(url, json):
+            # The provider answers (and bills) after the probe gave up.
+            release.wait(5)
+            response = real_requests.Response()
+            response.status_code = 200
+            response._content = b'{"data": [{"embedding": [0.1]}]}'
+            return response
+
+        def hook(*args):
+            standalone_hook.calls.append(args)
+            delivered.set()
+
+        from xagent.web.services import quota_hooks
+
+        quota_hooks.set_standalone_usage_hook(hook)
+        session = SimpleNamespace(headers={}, post=slow_ok)
+        with (
+            patch(
+                "xagent.core.model.embedding.openai.OpenAIEmbedding._get_session",
+                lambda _self: session,
+            ),
+            patch.object(model_module, "_CONNECTION_TEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "category": "embedding",
+                    "model_provider": "openai",
+                    "model_name": "text-embedding-3-small",
+                    "api_key": "k",
+                    "base_url": "https://embeddings.test/v1",
+                },
+                headers=regular_headers,
+            )
+            assert response.json()["message"] == "Connection timed out"
+            release.set()
+            assert delivered.wait(5)
+
+        [(user_id, [row], source)] = standalone_hook.calls
+        assert (user_id, source, row["call_type"]) == (
+            regular_user["id"],
+            "model_probe",
+            "embedding",
+        )
+
     def test_reject_asr_only_speech_model_as_tts_default(
         self,
         test_db,

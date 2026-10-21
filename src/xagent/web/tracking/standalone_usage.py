@@ -19,6 +19,11 @@ Use ``async with`` in coroutines and plain ``with`` in synchronous code
 ``asyncio.to_thread`` and ``asyncio.run`` carry it, while
 ``loop.run_in_executor`` and a bare ``ThreadPoolExecutor`` do not, so work
 handed to those must be submitted through ``contextvars.copy_context().run``.
+
+A scope delivers what was recorded when it exits. Blocking work handed to a
+thread from a coroutine outlives the coroutine when the await is cancelled or
+times out, so it runs under :func:`run_in_usage_scope`, which opens the scope
+in the thread and delivers once the work itself has finished.
 """
 
 from __future__ import annotations
@@ -27,17 +32,34 @@ import asyncio
 import contextvars
 import logging
 from types import TracebackType
-from typing import Any, Optional
+from typing import Any, Callable, Literal, Optional, TypeVar
 
 from ...core.model.chat.token_context import TokenUsage, token_context
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
+#: The entry points a scope is opened for, passed to the hook as its third
+#: argument.
+UsageSource = Literal[
+    "kb_search",
+    "kb_ingest",
+    "kb_ingest_cloud",
+    "kb_ingest_web",
+    "kb_ingest_job",
+    "kb_ingest_web_job",
+    "memory_api",
+    "model_probe",
+    "speech_transcribe",
+    "telegram_voice",
+]
+
 
 class UsageScope:
     """One unit of non-run work, metered for one user. See :func:`usage_scope`."""
 
-    def __init__(self, user_id: Optional[int], usage_source: str) -> None:
+    def __init__(self, user_id: Optional[int], usage_source: UsageSource) -> None:
         self.user_id = user_id
         self.usage_source = usage_source
         self.usage = TokenUsage()
@@ -135,17 +157,41 @@ class UsageScope:
             # Off the event loop: the hook writes to the database. If this
             # await is cancelled the thread still runs the hook to the end, so
             # the rows are delivered exactly once either way.
-            await asyncio.to_thread(self._deliver, details)
+            try:
+                await asyncio.to_thread(self._deliver, details)
+            except RuntimeError:
+                # The default executor is already shut down (the loop is
+                # closing): deliver here rather than lose the rows, and keep
+                # the body's own outcome.
+                self._deliver(details)
 
 
-def usage_scope(user_id: Optional[int], *, usage_source: str) -> UsageScope:
+def usage_scope(user_id: Optional[int], *, usage_source: UsageSource) -> UsageScope:
     """Meter one unit of non-run work for ``user_id``.
 
     ``user_id`` is the user the work is done for; pass ``None`` when there is
-    none to attribute it to, and the usage is still delivered. ``usage_source`` names
-    the entry point (``kb_search``, ``speech_transcribe`` ...) for the hook.
+    none to attribute it to, and the usage is still delivered.
+    ``usage_source`` names the entry point for the hook.
 
     Scopes nest: an inner scope's usage is delivered on its own and never
     reaches the outer one.
     """
     return UsageScope(user_id, usage_source)
+
+
+def run_in_usage_scope(
+    user_id: Optional[int],
+    usage_source: UsageSource,
+    fn: Callable[..., _T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Call ``fn(*args, **kwargs)`` inside a synchronous :func:`usage_scope`.
+
+    For submitting blocking work to a thread: the scope lives in the thread,
+    so its rows are delivered when the work finishes, even after the
+    coroutine that awaited it was cancelled or timed out.
+    """
+    with usage_scope(user_id, usage_source=usage_source):
+        return fn(*args, **kwargs)

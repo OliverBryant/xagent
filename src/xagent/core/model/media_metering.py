@@ -460,19 +460,23 @@ _FFPROBE_DEMUXERS = {
     "wav": "wav",
     "webm": "webm",
 }
-# The only demuxers ffprobe may pick when the hint names none. Playlist and
-# indirection formats (HLS, concat, ...) are absent on purpose.
-_FFPROBE_FORMAT_WHITELIST = ",".join(sorted(set(_FFPROBE_DEMUXERS.values())))
+# The only demuxers ffprobe may pick. Playlist and indirection formats (HLS,
+# concat, ...) are absent on purpose.
+_FFPROBE_FORMAT_WHITELIST = ",".join(
+    sorted(
+        {*_FFPROBE_DEMUXERS.values(), "ac3", "aiff", "asf", "caf", "mpegts"},
+    )
+)
 
 
-def _ffprobe_command(ffprobe: str, path: str, audio_format: str) -> list[str]:
+def _ffprobe_command(ffprobe: str, path: str, demuxer: Optional[str]) -> list[str]:
     """The ffprobe argv for measuring the caller-supplied file at ``path``.
 
     The bytes come from the caller, so ffprobe must read that one file and
     nothing else: a playlist upload (HLS, an ffconcat list) would otherwise
     make it open other local files or URLs. ``-protocol_whitelist file``
     keeps it off the network, the format whitelist keeps playlist demuxers
-    out, and a known hint pins the demuxer outright.
+    out, and ``demuxer``, when given, pins the demuxer outright.
     """
     command = [
         ffprobe,
@@ -483,7 +487,6 @@ def _ffprobe_command(ffprobe: str, path: str, audio_format: str) -> list[str]:
         "-format_whitelist",
         _FFPROBE_FORMAT_WHITELIST,
     ]
-    demuxer = _FFPROBE_DEMUXERS.get(audio_format.partition("_")[0])
     if demuxer:
         command += ["-f", demuxer]
     return command + [
@@ -507,20 +510,29 @@ def _ffprobe_seconds(data: bytes, audio_format: str = "") -> Optional[float]:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return None
+    # The hint comes from the caller (an upload's filename or content type),
+    # so a probe pinned to it that measures nothing is retried with the
+    # demuxer detected from the bytes.
+    hinted = _FFPROBE_DEMUXERS.get(audio_format.partition("_")[0])
     try:
         with tempfile.NamedTemporaryFile(suffix=".audio") as audio_file:
             audio_file.write(data)
             audio_file.flush()
-            completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                _ffprobe_command(ffprobe, audio_file.name, audio_format),
-                capture_output=True,
-                timeout=_FFPROBE_TIMEOUT_SECONDS,
-                check=False,
-            )
+            for demuxer in dict.fromkeys((hinted, None)):
+                completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                    _ffprobe_command(ffprobe, audio_file.name, demuxer),
+                    capture_output=True,
+                    timeout=_FFPROBE_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                seconds = positive_seconds(
+                    completed.stdout.decode(errors="ignore").strip()
+                )
+                if seconds is not None:
+                    return seconds
     except (OSError, subprocess.SubprocessError) as e:
         logger.warning("ffprobe failed to measure audio duration: %s", e)
-        return None
-    return positive_seconds(completed.stdout.decode(errors="ignore").strip())
+    return None
 
 
 def _raw_pcm_rate(audio_format: str) -> tuple[int, int] | None:

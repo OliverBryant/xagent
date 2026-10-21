@@ -1,7 +1,6 @@
 """Knowledge base API route handlers"""
 
 import asyncio
-import contextvars
 import functools
 import hashlib
 import inspect
@@ -192,7 +191,7 @@ from ..services.uploaded_file_store import (
     cleanup_superseded_uploaded_file_objects,
     snapshot_uploaded_file_version,
 )
-from ..tracking.standalone_usage import usage_scope
+from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -3587,12 +3586,15 @@ async def ingest(
             )
 
         loop = asyncio.get_running_loop()
-        # Billed to the member who uploaded, not the storage tenant. The
-        # executor does not carry the context, so the scope is handed over.
-        async with usage_scope(int(actor_user.id), usage_source="kb_ingest"):
-            api_result = await loop.run_in_executor(
-                None, contextvars.copy_context().run, _run_ingestion
-            )
+        # Billed to the member who uploaded, not the storage tenant. The scope
+        # lives in the worker, so a cancelled request still delivers it.
+        api_result = await loop.run_in_executor(
+            None,
+            run_in_usage_scope,
+            int(actor_user.id),
+            "kb_ingest",
+            _run_ingestion,
+        )
         result = api_result.result
         result = _with_user_actionable_ingestion_message(
             result,
@@ -4309,7 +4311,12 @@ async def ingest_cloud(
                         file_config = config.model_copy(
                             update={"parse_method": normalized_parse_method}
                         )
+                        # Billed to the requesting member. The scope lives in
+                        # the worker, so a cancelled request still delivers it.
                         api_result = await asyncio.to_thread(
+                            run_in_usage_scope,
+                            actor_user_id,
+                            "kb_ingest_cloud",
                             run_document_ingestion_with_outcome,
                             collection=safe_collection,
                             source_path=str(file_path),
@@ -4454,12 +4461,10 @@ async def ingest_cloud(
                 )
                 return rollback_execution.operation_result
 
-    # Run all file processings concurrently. Each task copies this context,
-    # so every file's embedding usage lands in the one scope.
-    async with usage_scope(actor_user_id, usage_source="kb_ingest_cloud"):
-        outcomes = await asyncio.gather(
-            *[process_file(f) for f in request.files], return_exceptions=True
-        )
+    # Run all file processings concurrently
+    outcomes = await asyncio.gather(
+        *[process_file(f) for f in request.files], return_exceptions=True
+    )
     api_results: List[KBApiOperationResult[IngestionResult]] = []
     for file_info, outcome in zip(request.files, outcomes):
         if isinstance(outcome, BaseException):
@@ -5413,23 +5418,24 @@ async def ingest_web(
             finally:
                 db_session.close()
 
-        # The executor does not carry the context, so the scope is handed
-        # over; asyncio.run inside it then carries it into the crawl's tasks.
-        async with usage_scope(int(actor_user.id), usage_source="kb_ingest_web"):
-            api_result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                contextvars.copy_context().run,
-                lambda: asyncio.run(
-                    run_web_ingestion_with_outcome(
-                        collection=safe_collection,
-                        crawl_config=crawl_config,
-                        ingestion_config=ingestion_config,
-                        user_id=int(_user.id),
-                        is_admin=bool(_user.is_admin),
-                        file_handler=_file_handler_with_db,
-                    )
-                ),
-            )
+        # The scope lives in the worker, so a cancelled request still
+        # delivers it; asyncio.run carries it into the crawl's tasks.
+        api_result = await asyncio.get_running_loop().run_in_executor(
+            None,
+            run_in_usage_scope,
+            int(actor_user.id),
+            "kb_ingest_web",
+            lambda: asyncio.run(
+                run_web_ingestion_with_outcome(
+                    collection=safe_collection,
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                    user_id=int(_user.id),
+                    is_admin=bool(_user.is_admin),
+                    file_handler=_file_handler_with_db,
+                )
+            ),
+        )
         result = api_result.result
         web_updated_message = _build_user_actionable_ingestion_message(
             result.message,

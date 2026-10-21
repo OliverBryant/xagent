@@ -5,7 +5,7 @@ import hashlib
 import logging
 import shutil
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
@@ -61,18 +61,6 @@ def _collection_existed_before(payload: dict[str, Any]) -> bool:
     while a sibling ingest runs.
     """
     return bool(payload.get("collection_existed_before", True))
-
-
-def _job_billing_user_id(job: BackgroundJob) -> Optional[int]:
-    """The member a job's provider usage is billed to: whoever submitted it.
-
-    ``None`` when the job has no usable owner; the usage is then delivered as
-    unattributed rather than charged to a guessed user.
-    """
-    try:
-        return int(job.user_id) if job.user_id is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _get_job_user(
@@ -230,7 +218,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         # Billed to the member who submitted the job (the job's owner), not
         # the storage tenant in payload["user_id"].
         with (
-            usage_scope(_job_billing_user_id(job), usage_source="kb_ingest_job"),
+            usage_scope(int(job.user_id), usage_source="kb_ingest_job"),
             user_scope_context(
                 user_id=int(payload["user_id"]),
                 is_admin=bool(payload.get("is_admin", False)),
@@ -407,7 +395,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     update_job_progress(db, job, message="Crawling website")
     try:
         with (
-            usage_scope(_job_billing_user_id(job), usage_source="kb_ingest_web_job"),
+            usage_scope(int(job.user_id), usage_source="kb_ingest_web_job"),
             user_scope_context(user_id=user_id, is_admin=is_admin),
         ):
             # asyncio.run carries this context into the crawl's tasks.

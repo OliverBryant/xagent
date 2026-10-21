@@ -481,3 +481,19 @@ def test_env_configured_rerank_records_no_model_id(monkeypatch):
     monkeypatch.delenv("DASHSCOPE_RERANK_ENABLED", raising=False)
     rerank = document_search._resolve_dashscope_rerank_from_env()
     assert rerank is not None and rerank.model_id == ""
+
+
+def test_env_configured_models_record_no_model_id(monkeypatch):
+    # The env names a provider model, not a configured id a price table knows,
+    # matching the env-built DashscopeRerank.
+    from xagent.core.tools.core.RAG_tools.utils.model_resolver import (
+        resolve_embedding_from_env,
+        resolve_rerank_from_env,
+    )
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "k")
+    monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "text-embedding-v4")
+    monkeypatch.setenv("DASHSCOPE_RERANK_MODEL", "gte-rerank-v2")
+
+    assert resolve_embedding_from_env().usage_model_id == ""
+    assert resolve_rerank_from_env().usage_model_id == ""

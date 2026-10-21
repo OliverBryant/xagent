@@ -537,6 +537,44 @@ def test_ffprobe_pins_the_demuxer_for_a_known_container(monkeypatch, hint, demux
     assert argv.index("-protocol_whitelist") < argv.index("-i")
 
 
+def test_a_hint_that_does_not_match_the_bytes_is_retried_unpinned(monkeypatch):
+    # The hint comes from the upload's filename: a WebM named x.mp3 fails the
+    # pinned probe, and must still be measured rather than billed as 0 s.
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"" if "-f" in argv else b"4.5\n")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+    webm = b"\x1aE\xdf\xa3" + bytes(64)
+
+    assert measure_audio_seconds(webm, "mp3") == pytest.approx(4.5)
+    pinned, unpinned = argv_seen
+    assert _option(pinned, "-f") == "mp3"
+    assert _option(unpinned, "-f") is None
+    # The retry keeps the same confinement.
+    assert _option(unpinned, "-protocol_whitelist") == "file"
+    assert _option(unpinned, "-format_whitelist") == _option(
+        pinned, "-format_whitelist"
+    )
+
+
+def test_an_unhinted_probe_that_fails_is_not_retried(monkeypatch):
+    argv_seen = []
+
+    def fake_run(argv, **_kwargs):
+        argv_seen.append(argv)
+        return SimpleNamespace(stdout=b"")
+
+    monkeypatch.setattr(media_metering.shutil, "which", lambda _name: "/x/ffprobe")
+    monkeypatch.setattr(media_metering.subprocess, "run", fake_run)
+
+    assert media_metering._ffprobe_seconds(bytes(64), "") is None
+    assert len(argv_seen) == 1
+
+
 def test_ffprobe_on_an_unknown_container_only_allows_audio_demuxers(monkeypatch):
     playlist = b"#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n"
     argv = _probe_argv(monkeypatch, playlist, "")
@@ -546,3 +584,5 @@ def test_ffprobe_on_an_unknown_container_only_allows_audio_demuxers(monkeypatch)
     allowed = set(_option(argv, "-format_whitelist").split(","))
     assert allowed.isdisjoint({"hls", "applehttp", "concat", "m3u8", "tee", "data"})
     assert {"mp3", "ogg", "wav", "webm", "mov"} <= allowed
+    # Audio demuxers ffprobe used to detect on its own still are.
+    assert {"aiff", "caf", "asf", "ac3", "mpegts"} <= allowed

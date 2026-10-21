@@ -19,7 +19,7 @@ from xagent.core.model.chat.token_context import (
     token_context,
 )
 from xagent.web.services import quota_hooks
-from xagent.web.tracking.standalone_usage import usage_scope
+from xagent.web.tracking.standalone_usage import run_in_usage_scope, usage_scope
 
 
 class _Hook:
@@ -191,3 +191,71 @@ def test_pool_threads_do_not_inherit_the_scope(hook):
         with ThreadPoolExecutor(1) as pool:
             pool.submit(_embed).result()
     assert hook.calls == []
+
+
+async def test_a_thread_scope_delivers_after_its_await_timed_out(hook):
+    # A probe's wait_for gives up while the provider call is still running in
+    # its thread; the call bills, so its row must still be delivered.
+    release, done = threading.Event(), threading.Event()
+
+    def slow_call() -> None:
+        release.wait(5)
+        _embed()
+
+    def finish(*args: Any) -> None:
+        hook(*args)
+        done.set()
+
+    quota_hooks.set_standalone_usage_hook(finish)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            asyncio.to_thread(run_in_usage_scope, 4, "model_probe", slow_call),
+            timeout=0.05,
+        )
+    assert hook.calls == []
+
+    release.set()
+    assert await asyncio.to_thread(done.wait, 5)
+    [(user_id, [row], source)] = hook.calls
+    assert (user_id, source, row["quantity"]) == (4, "model_probe", 1.0)
+    assert hook.threads[0] != threading.get_ident()
+
+
+def test_run_in_usage_scope_passes_every_argument_through(hook):
+    def ingest(path: str, *, user_id: int) -> tuple[str, int]:
+        _embed()
+        return path, user_id
+
+    # The work's own user_id (the storage tenant) is not the scope's.
+    assert run_in_usage_scope(5, "kb_ingest_cloud", ingest, "a.txt", user_id=9) == (
+        "a.txt",
+        9,
+    )
+    [(user_id, _rows, source)] = hook.calls
+    assert (user_id, source) == (5, "kb_ingest_cloud")
+
+
+async def test_delivery_after_executor_shutdown_still_delivers(hook, monkeypatch):
+    async def shut_down(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(asyncio, "to_thread", shut_down)
+    # The body's own exception survives, and the rows are delivered once.
+    with pytest.raises(ValueError, match="body failed"):
+        async with usage_scope(3, usage_source="kb_search"):
+            _embed()
+            raise ValueError("body failed")
+
+    assert len(hook.calls) == 1
+
+
+def test_rows_with_nothing_bound_to_report_them_are_logged(caplog):
+    caplog.set_level(logging.DEBUG, logger="xagent.core.model.chat.token_context")
+
+    contextvars.Context().run(_embed)
+    assert "no tracker or usage scope bound" in caplog.text
+
+    caplog.clear()
+    with TokenContextManager():
+        _embed()
+    assert "no tracker or usage scope bound" not in caplog.text

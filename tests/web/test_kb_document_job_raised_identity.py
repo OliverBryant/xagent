@@ -6,7 +6,7 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -525,9 +525,41 @@ def test_document_job_bills_its_submitter_once(test_env, temp_uploads, raises):
     assert (user_id, source, row["quantity"]) == (submitter, "kb_ingest_job", 4.0)
 
 
-def test_job_billing_user_is_the_job_owner_not_the_storage_tenant():
-    from xagent.web.jobs.kb_tasks import _job_billing_user_id
+def test_web_job_bills_its_submitter_not_the_storage_tenant():
+    from xagent.core.model.chat.token_context import MediaCallType, add_media_usage
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.services import quota_hooks
 
-    job = BackgroundJob(user_id=101, payload={"user_id": 999})
-    assert _job_billing_user_id(job) == 101
-    assert _job_billing_user_id(BackgroundJob(user_id=None, payload={})) is None
+    async def _crawl_bills_then_fails(**kwargs: Any) -> Any:
+        assert kwargs["user_id"] == 999  # storage stays with the tenant
+        add_media_usage(call_type=MediaCallType.EMBEDDING, quantity=2, model_id="e")
+        raise RuntimeError("crawl failed")
+
+    job = BackgroundJob(
+        user_id=101,
+        payload={
+            "user_id": 999,
+            "collection": "web_coll",
+            "crawl_config": {"start_url": "https://example.com"},
+            "ingestion_config": {},
+        },
+    )
+    calls: list = []
+    quota_hooks.set_standalone_usage_hook(
+        lambda user_id, details, source: calls.append((user_id, details, source))
+    )
+    try:
+        with (
+            patch.object(kb_tasks, "update_job_progress"),
+            patch.object(kb_tasks, "_cleanup_failed_web_collection_metadata_if_new"),
+            patch.object(
+                kb_tasks, "run_web_ingestion", side_effect=_crawl_bills_then_fails
+            ),
+            pytest.raises(RuntimeError, match="crawl failed"),
+        ):
+            kb_tasks.handle_kb_ingest_web(MagicMock(), job)
+    finally:
+        quota_hooks.set_standalone_usage_hook(None)
+
+    [(user_id, [row], source)] = calls
+    assert (user_id, source, row["quantity"]) == (101, "kb_ingest_web_job", 2.0)

@@ -278,6 +278,9 @@ async def test_nothing_to_fail_over_to_raises(monkeypatch, selected, fallback):
         PRIMARY: _FakeLLM("saved-deepseek", error=error),
         FALLBACK: _FakeLLM("saved-gpt", error=error),
     }
+    if fallback is not None:
+        # Routing only lands on the fallback when it is the last candidate.
+        models = {FALLBACK: models[FALLBACK]}
     router = _router(monkeypatch, models, selected=selected, fallback=fallback)
 
     with pytest.raises(openai.APIConnectionError):
@@ -499,6 +502,90 @@ async def test_sole_candidate_with_required_modalities_goes_through_routing(
     await router.prepare_for_call(IMAGE_MESSAGES)
 
     assert len(router.selections) == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_is_held_out_of_routing_while_other_candidates_remain(
+    monkeypatch,
+):
+    third = "qwen/qwen3.6-plus"
+    models = {
+        PRIMARY: _FakeLLM("saved-deepseek"),
+        FALLBACK: _FakeLLM("saved-gpt"),
+        third: _FakeLLM("saved-qwen"),
+    }
+    router = _router(monkeypatch, models)
+
+    service = type("Service", (), {"configs": {}})()
+    assert router._candidate_pool(service) == [PRIMARY, third]
+
+    # With one candidate besides the fallback there is nothing to route, and
+    # the fallback still guards that candidate.
+    router = _router(
+        monkeypatch, {PRIMARY: models[PRIMARY], FALLBACK: models[FALLBACK]}
+    )
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert router.selections == []
+    assert prepared.model_name == PRIMARY
+    assert await prepared.chat(MESSAGES) == "saved-deepseek"
+    assert (PRIMARY, True) in router.resolutions
+
+
+@pytest.mark.asyncio
+async def test_held_out_fallback_takes_over_an_unavailable_sole_candidate(
+    monkeypatch,
+):
+    primary = _FakeLLM(
+        "saved-deepseek", error=_status_error(openai.InternalServerError, 503)
+    )
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.chat(MESSAGES) == "saved-gpt"
+    assert router.selections == []
+    assert (primary.calls, fallback.calls) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_held_out_fallback_serves_content_no_routed_candidate_accepts(
+    monkeypatch,
+):
+    primary = _FakeLLM("saved-deepseek")
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda model: ("text",) if model == PRIMARY else ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    assert router.selections == []
+    assert prepared.model_name == FALLBACK
+    assert await prepared.chat(IMAGE_MESSAGES) == "saved-gpt"
+    assert primary.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_routed_candidate_that_accepts_the_content_keeps_it(monkeypatch):
+    primary = _FakeLLM("saved-deepseek")
+    fallback = _FakeLLM("saved-gpt")
+    router = _router(monkeypatch, {PRIMARY: primary, FALLBACK: fallback})
+    monkeypatch.setattr(
+        router, "_profile_input_modalities", lambda _model: ("text", "image")
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    # Required modalities still go through routing, over the routed pool only.
+    assert len(router.selections) == 1
+    assert prepared.model_name == PRIMARY
+    assert await prepared.chat(IMAGE_MESSAGES) == "saved-deepseek"
+    assert fallback.calls == 0
 
 
 @pytest.mark.asyncio

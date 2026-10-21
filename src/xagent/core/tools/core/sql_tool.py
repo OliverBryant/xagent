@@ -25,9 +25,10 @@ import csv
 import json
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, Field
@@ -36,6 +37,7 @@ from sqlalchemy.engine import CursorResult, Engine, Row, make_url
 
 from ....config import get_database_url, get_sql_worker_url, requires_secure_secrets
 from ...file_ref import build_workspace_file_ref
+from .sql_result import bound_sql_result
 from .sql_worker_client import execute_sql_query_remote
 
 if TYPE_CHECKING:
@@ -47,6 +49,27 @@ SQLITE_URI_UNSUPPORTED_ERROR = "SQLite URI mode is not supported"
 _OPAQUE_TARGET_QUERY_KEYS = frozenset(
     {"service", "odbc_connect", "dsn", "read_default_file", "read_default_group"}
 )
+_external_database_url_policy: Callable[[URL], None] | None = None
+
+
+def set_external_database_url_policy(policy: Callable[[URL], None] | None) -> None:
+    """Register an application deployment's SQL URL policy (standalone: none).
+
+    The same policy is checked before saving a connection and before runtime
+    execution, including already persisted and environment-provided URLs.
+    """
+    global _external_database_url_policy
+    _external_database_url_policy = policy
+
+
+def validate_external_database_url_policy(candidate: str | URL) -> None:
+    """Apply only the deployment policy, also when reporting saved connections."""
+    if _external_database_url_policy is not None:
+        try:
+            parsed = make_url(candidate)
+        except Exception as exc:
+            raise ValueError("Invalid SQLAlchemy connection URL") from exc
+        _external_database_url_policy(parsed)
 
 
 def _canonical_backend(url: URL) -> str:
@@ -189,7 +212,7 @@ def is_platform_database_url(candidate: str | URL) -> bool:
         # create/drop databases or use server-side links. Database names are
         # therefore not an isolation boundary for the SQL tool.
         return hosts_overlap and candidate_identity[2] == platform_identity[2]
-    except Exception:
+    except Exception:  # noqa: BLE001 - ambiguous platform targets must fail closed
         # This helper protects a security boundary. A malformed platform URL
         # or ambiguous target parameter must disable external SQL rather than
         # silently turning the protection off.
@@ -202,6 +225,7 @@ def validate_external_database_url(candidate: str | URL) -> URL:
         parsed = make_url(candidate)
     except Exception as exc:
         raise ValueError("Invalid SQLAlchemy connection URL") from exc
+    validate_external_database_url_policy(parsed)
     if _canonical_backend(parsed) == "sqlite" and (
         _query_values(parsed, "uri")
         or (parsed.database or "").strip().lower().startswith("file:")
@@ -298,9 +322,7 @@ def _get_connection_url(
     return validate_external_database_url(url)
 
 
-def get_database_type(
-    connection_name: str, connection_url: Optional[str] = None
-) -> str:
+def get_database_type(connection_name: str, connection_url: str | None = None) -> str:
     """Get database type for a connection name.
 
     Returns the database driver/type which helps LLM write appropriate SQL dialect.
@@ -322,12 +344,31 @@ def _row_to_dict(row: Row) -> dict[str, Any]:
     return dict(row._mapping)
 
 
+def _can_stream_query(query: str) -> bool:
+    """Conservatively select reads eligible for a server-side cursor.
+
+    This is only an optimization, not SQL validation or authorization. Unknown
+    forms, comments, write CTEs, SELECT INTO, and multi-statements still execute
+    unchanged through an ordinary cursor; none are retried after execution.
+    """
+    statement = query.strip().removesuffix(";").rstrip()
+    return bool(
+        re.match(r"(?:SELECT|WITH|VALUES)\b", statement, re.IGNORECASE)
+    ) and not bool(
+        re.search(
+            r";|\b(?:INSERT|UPDATE|DELETE|MERGE|INTO|CREATE|ALTER|DROP|TRUNCATE|COPY|CALL|DO)\b",
+            statement,
+            re.IGNORECASE,
+        )
+    )
+
+
 def execute_sql_query(
     connection_name: str,
     query: str,
-    output_file: Optional[str] = None,
+    output_file: str | None = None,
     workspace: Optional["TaskWorkspace"] = None,
-    connection_url: Optional[str] = None,
+    connection_url: str | None = None,
 ) -> dict[str, Any]:
     """Execute SQL queries on databases and return structured results.
 
@@ -382,7 +423,7 @@ def execute_sql_query(
 def _execute_sql_query_local(
     connection_name: str,
     query: str,
-    output_file: Optional[str] = None,
+    output_file: str | None = None,
     workspace: Optional["TaskWorkspace"] = None,
     connection_url: str | URL | None = None,
     *,
@@ -477,13 +518,16 @@ def _execute_sql_query_local(
             # Original behavior: return data in response
             execution_connection = (
                 conn.execution_options(stream_results=True)
-                if max_rows is not None
+                if max_rows is not None and _can_stream_query(query)
                 else conn
             )
             result = execution_connection.execute(stmt)
 
             # Get column names from result
             if result.returns_rows:
+                # Cursor metadata exists even when the query returns no rows.
+                # Keep it for the response and worker-side export handoff.
+                columns = list(result.keys())
                 if max_rows is None:
                     rows = result.all()
                 else:
@@ -494,9 +538,6 @@ def _execute_sql_query_local(
                         )
                 row_list = [_row_to_dict(row) for row in rows]
 
-                # Extract column names from first row
-                columns = list(row_list[0].keys()) if row_list else []
-
                 payload = SQLQueryResult(
                     success=True,
                     rows=row_list,
@@ -504,29 +545,30 @@ def _execute_sql_query_local(
                     columns=columns,
                     message=f"Query executed successfully on '{connection_name}', returned {len(row_list)} row(s)",
                 ).model_dump()
-                if max_result_bytes is not None:
-                    encoded = json.dumps(
-                        payload, ensure_ascii=False, default=str
-                    ).encode("utf-8")
-                    if len(encoded) > max_result_bytes:
-                        raise ValueError(
-                            "SQL query result exceeded the configured byte limit"
-                        )
+                payload = bound_sql_result(payload, max_result_bytes)
+                # RETURNING and data-modifying CTEs also return rows. Settle
+                # their transaction only after limits pass, closing any named
+                # cursor before commit. No automatic retry is safe for writes.
+                result.close()
+                conn.commit()
                 return payload
             else:
                 # For INSERT, UPDATE, DELETE operations
                 rowcount = result.rowcount if hasattr(result, "rowcount") else 0
 
-                # Commit the transaction for non-SELECT queries
+                payload = bound_sql_result(
+                    SQLQueryResult(
+                        success=True,
+                        rows=[],
+                        row_count=rowcount,
+                        columns=[],
+                        message=f"Query executed successfully on '{connection_name}', affected {rowcount} row(s)",
+                    ).model_dump(),
+                    max_result_bytes,
+                )
+                result.close()
                 conn.commit()
-
-                return SQLQueryResult(
-                    success=True,
-                    rows=[],
-                    row_count=rowcount,
-                    columns=[],
-                    message=f"Query executed successfully on '{connection_name}', affected {rowcount} row(s)",
-                ).model_dump()
+                return payload
     finally:
         engine.dispose()
 

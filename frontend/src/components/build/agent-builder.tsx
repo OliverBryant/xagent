@@ -56,12 +56,21 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
+import {
+  draftsFromDeclarations,
+  promptContextFieldsKey,
+  toPromptContextFieldsPayload,
+  validatePromptContextFields,
+  type PromptContextFieldDraft,
+} from "@/lib/prompt-context-fields"
 import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
 import { isMcpSelectionConnected, needsReconnect } from "@/lib/mcp-connection-status"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
+import { getAgentTaskHref } from "@/lib/agent-ui-access"
+import { PromptContextFieldsEditor } from "./prompt-context-fields-editor"
 import { AgentFlowView } from "./agent-flow-view"
 import { useBuilderCatalog, type AgentModelConfig, type Model } from "./use-builder-catalog"
 import { BuilderListStatus } from "./builder-list-status"
@@ -252,6 +261,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [instructions, setInstructions] = useState("")
   const [executionMode, setExecutionMode] = useState("balanced") // "flash", "balanced", "think"
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([])
+  const [promptContextFields, setPromptContextFields] = useState<PromptContextFieldDraft[]>([])
+  const [promptContextSaveAttempted, setPromptContextSaveAttempted] = useState(false)
+  // The assistant's create_agent stores no declarations, so rows typed on the new-agent page survive
+  // the created agent's first load. Refs: the chat socket keeps the onUpdateConfig closure it opened with.
+  const keepPromptContextForAgentRef = useRef<string | null>(null)
+  const localAgentIdRef = useRef(localAgentId)
+  useEffect(() => {
+    localAgentIdRef.current = localAgentId
+  }, [localAgentId])
   const [visibility, setVisibility] = useState<"team" | "admins">("team")
   // Agent ownership: personal (team_id NULL) is the default; "team" reveals the
   // visibility sub-option and drives promote/demote calls on save.
@@ -858,6 +876,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setInstructions(agent.instructions || "")
           setExecutionMode(agent.execution_mode || "balanced")
           setSuggestedPrompts(agent.suggested_prompts || [])
+          const keepRows = keepPromptContextForAgentRef.current === localAgentId
+          if (keepRows) keepPromptContextForAgentRef.current = null
+          const loadedPromptContext = draftsFromDeclarations(agent.prompt_context_fields)
+          setPromptContextFields(prev => (keepRows ? prev : loadedPromptContext))
+          setPromptContextSaveAttempted(false)
           setVisibility(agent.visibility === "admins" ? "admins" : "team")
           setOwnership(agent.team_id == null ? "personal" : "team")
           setSelectedKbs(agent.knowledge_bases || [])
@@ -1385,6 +1408,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
     // Compare arrays
     if (normalizePrompts(suggestedPrompts) !== normalizePrompts(originalData.suggested_prompts)) return true
+    if (promptContextFieldsKey(promptContextFields) !== promptContextFieldsKey(draftsFromDeclarations(originalData.prompt_context_fields))) return true
     if (normalize(selectedKbs) !== normalize(originalData.knowledge_bases)) return true
     if (normalize(selectedSkills) !== normalize(originalData.skills)) return true
 
@@ -1406,7 +1430,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     if ((modelConfig.compact || null) !== (origModels.compact || null)) return true
 
     return false
-  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
+  }, [name, description, instructions, executionMode, ownership, visibility, logoFile, logoRemoved, suggestedPrompts, promptContextFields, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, originalData])
 
   const generalModelDiffers =
     (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
@@ -1568,6 +1592,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       return
     }
 
+    if (!validatePromptContextFields(promptContextFields).valid) {
+      setPromptContextSaveAttempted(true)
+      toast.error(t("builds.configForm.promptContextFields.invalid"))
+      return
+    }
+    const promptContextPayload = toPromptContextFieldsPayload(promptContextFields)
+
     const finalToolCategories = buildToolCategories()
 
     setIsCreating(true)
@@ -1599,6 +1630,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           instructions: instructions.trim() || undefined,
           execution_mode: executionMode,
           suggested_prompts: suggestedPrompts.filter(p => p.trim()),
+          prompt_context_fields: promptContextPayload,
           models: modelConfig,
           knowledge_bases: selectedKbs,
           skills: selectedSkills,
@@ -1612,6 +1644,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       })
 
       if (response.ok) {
+        setPromptContextFields(draftsFromDeclarations(promptContextPayload))
+        setPromptContextSaveAttempted(false)
         if (isEditMode) {
           const updatedAgent = await response.json()
           const trimmedName = name.trim()
@@ -1638,6 +1672,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             instructions: trimmedInstr || undefined,
             execution_mode: executionMode,
             suggested_prompts: trimmedPrompts,
+            prompt_context_fields: promptContextPayload,
             models: modelConfig,
             knowledge_bases: selectedKbs,
             skills: selectedSkills,
@@ -1692,7 +1727,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // branch above, which sources both originalData and the reseed
           // below from the same local value rather than mixing a server
           // response with a local one.
-          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, ...(ownershipResult ?? {}) })
+          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
           // Same re-seed as the edit-mode branch above, and for the same
           // reason: selectedMcpServers must hold the resolved selectors
           // this request submitted, not the possibly-unresolved values it
@@ -2103,7 +2138,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               {isEditMode && originalData?.status === "published" && (
                 <Button
                   variant="secondary"
-                  onClick={() => router.push(`/agent/${localAgentId}`)}
+                  onClick={() => router.push(getAgentTaskHref(localAgentId))}
                   disabled={isCreating || loadingAgent || publishBlockedByEdits || failedStagedTriggers.length > 0 || createdWebhookSecrets.length > 0}
                   title={publishBlockedByEdits ? t("builds.editor.header.saveBeforeChat") : undefined}
                 >
@@ -2935,6 +2970,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         </div>
 
+        <PromptContextFieldsEditor
+          value={promptContextFields}
+          onChange={setPromptContextFields}
+          revealEmpty={promptContextSaveAttempted}
+        />
+
         {/* Ownership + team visibility (SaaS team context only) */}
         {inTeam && (
           <div className="space-y-2">
@@ -3118,7 +3159,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             onUpdateConfig={(updates) => {
               if (updates.id !== undefined) {
                 if (!localAgentId) void bindPreviewTask(updates.id)
-                setLocalAgentId(updates.id.toString())
+                const id = updates.id.toString()
+                if (id !== localAgentIdRef.current) {
+                  keepPromptContextForAgentRef.current =
+                    updates.created && localAgentIdRef.current === undefined ? id : null
+                  localAgentIdRef.current = id
+                }
+                setLocalAgentId(id)
               }
               if (updates.name !== undefined) setName(updates.name);
               if (updates.description !== undefined) setDescription(updates.description);

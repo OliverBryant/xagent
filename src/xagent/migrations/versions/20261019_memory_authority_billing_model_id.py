@@ -5,7 +5,7 @@ default: an existing authority keeps recording its usage with an empty model
 id until an operator sets one. The table holds at most one row.
 
 Revision ID: 20261019_memory_authority_billing
-Revises: 20261017_task_cmd_dispatch_class
+Revises: 20261018_agent_prompt_context_fields
 Create Date: 2026-10-19
 
 """
@@ -17,7 +17,7 @@ from alembic import op
 from sqlalchemy.engine.reflection import Inspector
 
 revision: str = "20261019_memory_authority_billing"
-down_revision: Union[str, None] = "20261017_task_cmd_dispatch_class"
+down_revision: Union[str, None] = "20261018_agent_prompt_context_fields"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

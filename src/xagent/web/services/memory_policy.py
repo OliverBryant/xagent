@@ -5,6 +5,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Mapping
+
+from ...core.execution_scope import ExecutionScope
+from ...core.memory.scope_columns import strict_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +34,36 @@ class MemoryPolicyDecision:
     enabled: bool
     available: bool
     reason: str | None = None
+    memory_access_scope: MemoryAccessScope | None = None
+
+
+@dataclass(frozen=True)
+class MemoryAccessScope:
+    """Trusted, immutable memory identity independent of task identity.
+
+    ``owner_user_id`` uses the same owner domain as memory metadata's
+    ``user_id``: it must be a real platform ``users.id`` whose lifecycle and
+    authorization are managed by the trusted host.  Arbitrary external
+    principal integers are not supported because they could collide with a
+    platform user.  Dimensions are mandatory so an override can never widen
+    access to every memory owned by that user.
+    """
+
+    owner_user_id: int
+    memory_dimensions: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if type(self.owner_user_id) is not int:
+            raise TypeError("memory owner_user_id must be an integer")
+        owner_user_id = strict_user_id(self.owner_user_id)
+        if owner_user_id is None or owner_user_id <= 0:
+            raise ValueError("memory owner_user_id must be a positive signed int64")
+        dimensions = dict(self.memory_dimensions)
+        if not dimensions:
+            raise ValueError("memory access scope requires memory_dimensions")
+        validated = ExecutionScope(memory_dimensions=dimensions).memory_dimensions
+        object.__setattr__(self, "owner_user_id", owner_user_id)
+        object.__setattr__(self, "memory_dimensions", MappingProxyType(dict(validated)))
 
 
 MemoryPolicyResolver = Callable[[MemoryPolicyRequest], MemoryPolicyDecision]
@@ -82,3 +117,10 @@ def _validate_decision(decision: object) -> None:
         raise TypeError("memory policy decision reason must be a non-empty string")
     if not decision.available and decision.reason is None:
         raise ValueError("unavailable memory requires a reason")
+    if decision.memory_access_scope is not None:
+        if not isinstance(decision.memory_access_scope, MemoryAccessScope):
+            raise TypeError("memory access scope has an invalid type")
+        if not decision.enabled or not decision.available:
+            raise ValueError(
+                "memory access scope requires enabled and available memory"
+            )

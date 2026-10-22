@@ -66,7 +66,7 @@ from ..sandbox_keys import (
     parse_user_sandbox_key,
 )
 from ..tracing import create_task_tracer
-from ..user_isolated_memory import UserContext
+from ..user_isolated_memory import UserContext, bind_memory_access_scope
 from .agent_access import list_accessible_published_agents
 from .agent_team_scope import (
     get_agent_team_scope,
@@ -108,6 +108,7 @@ from .memory_availability import (
     public_memory_availability_reason,
 )
 from .memory_policy import (
+    MEMORY_POLICY_RESOLVER_FAILURE_REASON,
     MemoryPolicyRequest,
     resolve_trusted_memory_policy,
 )
@@ -302,7 +303,7 @@ def resolve_agent_service_memory_policy(
         )
 
     try:
-        memory = get_memory_store()
+        memory: MemoryStore = get_memory_store()
     except MemoryUnavailableError as error:
         # Persistent memory is fenced off -- blocked on repair, awaiting a
         # restart, or transiently unavailable. The task still starts; it simply
@@ -318,6 +319,18 @@ def resolve_agent_service_memory_policy(
             memory_available=False,
             memory_availability_reason=error.status.state.value,
         )
+
+    if override is not None and override.memory_access_scope is not None:
+        try:
+            memory = bind_memory_access_scope(memory, override.memory_access_scope)
+        except Exception:
+            logger.exception("Trusted memory access scope could not be bound")
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=MEMORY_POLICY_RESOLVER_FAILURE_REASON,
+            )
 
     return AgentServiceMemoryPolicy(
         memory=memory,
@@ -3186,15 +3199,11 @@ class AgentServiceManager:
         path: ``RevocableMemoryStore._live()`` stays lock-free and never
         touches the database.
 
-        Reconciliation is one-directional and atomic with respect to the turn.
-        One-directional, because this path does not carry every input that
-        decided enablement when the service was built -- a preview or an
-        agent-backed task runs with memory off by configuration, not by
-        lifecycle -- so a policy that now reports memory as available never
-        turns memory back on. Atomic, because the policy is resolved first and
-        then applied without awaiting in between, under the per-task build
-        lock: the turn either runs with memory or runs disabled with a
-        recorded reason, never half-reconciled.
+        Reconciliation is atomic with respect to the turn.  The policy is
+        resolved first and then its store, enablement and availability are
+        applied without awaiting in between, under the per-task build lock.
+        This also replaces a trusted fixed memory scope on every cache hit, so
+        a resume cannot retain authority from an earlier resolver decision.
 
         An operation already past its ``_live()`` check completes. That is
         inherent to any revocation boundary -- the check cannot un-issue a
@@ -3203,29 +3212,27 @@ class AgentServiceManager:
         nothing here tries to abort work in flight.
         """
         agent = self._agents.get(task_id)
-        if agent is None or not getattr(agent, "memory_enabled", False):
-            # Already running without memory. Nothing to reconcile, and this
-            # path never re-enables, so there is no reason to read anything.
+        if agent is None:
             return
 
         policy = await resolve_agent_service_memory_policy_async(
             task=task,
             agent_config=agent_config,
         )
-        if policy.memory_available:
-            return
-
-        agent.revoke_memory(
-            inert_store=policy.memory,
+        agent.apply_memory_policy(
+            memory_store=policy.memory,
+            enabled=policy.memory_enabled,
+            available=policy.memory_available,
             availability_reason=policy.public_availability_reason,
             execution_metadata=policy.execution_metadata(),
         )
-        logger.warning(
-            "Reconciled cached AgentService for task %s onto an inert memory "
-            "store (%s); this turn runs with memory disabled",
-            task_id,
-            policy.memory_availability_reason,
-        )
+        if not policy.memory_available:
+            logger.warning(
+                "Reconciled cached AgentService for task %s onto an inert memory "
+                "store (%s); this turn runs with memory disabled",
+                task_id,
+                policy.memory_availability_reason,
+            )
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]

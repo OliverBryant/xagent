@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import pathlib
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -10,8 +10,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from xagent.core.agent.service import AgentService
 from xagent.core.agent.context.enrichment import enrich_context_with_memory
+from xagent.core.agent.service import AgentService
 from xagent.core.execution_scope import (
     ExecutionScope,
     ExecutionScopeContext,

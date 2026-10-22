@@ -29,8 +29,8 @@ from xagent.core.memory.scope_columns import (
     SCOPE_EXCLUSIVE_FILTER_KEY,
     encode_scope_dims,
 )
-from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 from xagent.web.services.memory_policy import MemoryAccessScope
+from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 SCOPE_A = ExecutionScope(memory_dimensions={"tenant": "a"})
 SCOPE_B = ExecutionScope(memory_dimensions={"tenant": "b"})

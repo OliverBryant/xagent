@@ -24,16 +24,16 @@ from xagent.core.agent.checkpoint import (
     CheckpointPersistenceError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     tool_evidence_state,
-)
-from xagent.core.agent.context.enrichment import (
-    MEMORY_CONTEXT_METADATA_KEY,
-    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
-    RETRIEVED_MEMORIES_METADATA_KEY,
 )
 from xagent.core.agent.interruption import InterruptionReason
 from xagent.core.agent.language import (

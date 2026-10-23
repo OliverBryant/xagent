@@ -17,10 +17,10 @@ from ...config import (
     get_external_upload_dirs,
     get_shared_task_execution_enabled,
 )
-from ...core.agent.service import AgentService
 from ...core.agent.context.enrichment import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
+from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,

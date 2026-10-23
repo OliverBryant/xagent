@@ -28,11 +28,11 @@ from ..tools.adapters.vibe.config import (
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .budget import BudgetPolicyProvider
+from .context.enrichment import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
-from .context.enrichment import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 

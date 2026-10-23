@@ -46,6 +46,11 @@ from .checkpoint import (
     read_latest_checkpoint_payload,
 )
 from .context import ContextManager, ExecutionContext
+from .context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 from .context.execution import (
     ACCEPTED_TURN_IDS_METADATA_KEY,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -53,11 +58,6 @@ from .context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     context_checkpoint_gate,
     derive_compact_threshold,
-)
-from .context.enrichment import (
-    MEMORY_CONTEXT_METADATA_KEY,
-    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
-    RETRIEVED_MEMORIES_METADATA_KEY,
 )
 from .interruption import (
     INTERRUPTION_REASON_KEY,

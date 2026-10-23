@@ -27,7 +27,6 @@ from xagent.web.user_isolated_memory import (
     current_user_id,
 )
 
-
 SCOPE_A = MemoryAccessScope(
     owner_user_id=700,
     memory_dimensions={"principal": "person-1", "tenant": "acme"},

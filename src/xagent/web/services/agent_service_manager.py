@@ -2249,97 +2249,43 @@ class AgentServiceManager:
         # then checking out another connection for the full snapshot.
         task_setup_snapshot_load_attempted = task_setup_snapshot is not None
 
-        # Normalize every invocation onto the detached snapshot before the
-        # legacy request Session performs owner/task reads. This keeps its
+        # A task-lifetime actor binding is already trusted manager state. Reject
+        # missing or conflicting authorization before doing any database work:
+        # neither request can use the cached service, and a snapshot outage must
+        # not weaken this boundary or replace the intended policy error.
+        bound_actor_policy = self._mcp_actor_policies.get(task_id)
+        if bound_actor_policy is not None:
+            if mcp_runtime_authorization_policy is None:
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} requires an MCP runtime authorization policy; "
+                    "generic reuse and reconstruction are unsupported"
+                )
+            if bound_actor_policy != mcp_runtime_authorization_policy:
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its "
+                    "task-lifetime binding"
+                )
+
+        # Normalize every cache miss (and every actor-bound cache hit) onto the
+        # detached snapshot before the legacy request Session performs
+        # owner/task reads. Ordinary cache hits defer this refresh until after
+        # owner/scope invariants: a wrong-owner entry must be evicted before a
+        # failing snapshot refresh can divert its safe reconstruction path.
+        # This keeps its
         # synchronous QueuePool waits off the event loop and makes one snapshot
         # the SSOT for existence, owner, runtime identity, configuration, and
         # reconstruction state. Cache hits need the same trusted task fields to
         # re-evaluate memory eligibility; a missing row retains the legacy
         # auto-create fallback below but fails cached memory closed.
-        if task_setup_snapshot is None:
+        if task_setup_snapshot is None and (
+            task_id not in self._agents or bound_actor_policy is not None
+        ):
             task_setup_snapshot_load_attempted = True
             task_setup_snapshot = await _load_task_setup_snapshot_for_agent(
                 task_id,
                 task_owner_user_id,
                 db,
             )
-
-        persisted_agent_config = (
-            task_setup_snapshot.task.agent_config
-            if task_setup_snapshot is not None
-            else None
-        )
-        actor_marked = (
-            task_id in self._mcp_actor_policies
-            or mcp_runtime_authorization_policy_required(persisted_agent_config)
-        )
-        persisted_policy_identity = mcp_runtime_authorization_policy_identity(
-            persisted_agent_config
-        )
-        if actor_marked and mcp_runtime_authorization_policy is None:
-            raise MCPBuiltinOAuthActorPolicyRequiredError(
-                f"Task {task_id} requires an MCP runtime authorization policy; "
-                "generic reuse and reconstruction are unsupported"
-            )
-        if mcp_runtime_authorization_policy is not None:
-            if not actor_marked:
-                raise MCPBuiltinOAuthActorPolicyRequiredError(
-                    f"Task {task_id} is not marked for MCP actor execution"
-                )
-            if (
-                persisted_policy_identity is not None
-                and persisted_policy_identity
-                != mcp_runtime_authorization_policy.resource_owner_key
-            ):
-                raise MCPBuiltinOAuthActorPolicyMismatchError(
-                    f"Task {task_id} MCP actor policy does not match its durable identity"
-                )
-            if (
-                task_mode is ChannelTaskMode.ACTOR_INTERACTION
-                and persisted_policy_identity is None
-            ):
-                raise MCPBuiltinOAuthActorPolicyRequiredError(
-                    f"Task {task_id} has no durable MCP actor policy identity"
-                )
-
-            bound_policy = self._mcp_actor_policies.get(task_id)
-            if (
-                bound_policy is not None
-                and bound_policy != mcp_runtime_authorization_policy
-            ):
-                raise MCPBuiltinOAuthActorPolicyMismatchError(
-                    f"Task {task_id} MCP actor policy does not match its "
-                    "task-lifetime binding"
-                )
-            if bound_policy is None:
-                self._mcp_actor_policies[task_id] = mcp_runtime_authorization_policy
-
-        if actor_marked and task_setup_snapshot is not None:
-            if (
-                task_mode is ChannelTaskMode.ACTOR_INTERACTION
-                and task_setup_snapshot.task.agent_id is not None
-                and task_setup_snapshot.agent is None
-            ):
-                raise MCPBuiltinOAuthActorPolicyRequiredError(
-                    f"Task {task_id} claimed agent is unavailable"
-                )
-
-            marked_status = task_setup_snapshot.task.status
-            fresh_direct_build = marked_status in {
-                TaskStatus.PENDING,
-                TaskStatus.RUNNING,
-            } and not (
-                marked_status == TaskStatus.RUNNING
-                and task_setup_snapshot.has_reconstructable_history
-            )
-            actor_interaction_reconstruction = (
-                task_mode is ChannelTaskMode.ACTOR_INTERACTION
-                and marked_status == TaskStatus.RUNNING
-            )
-            if not (fresh_direct_build or actor_interaction_reconstruction):
-                raise MCPBuiltinOAuthActorPolicyRequiredError(
-                    f"Task {task_id} actor-marked reuse or reconstruction is unsupported"
-                )
 
         # Resolve the runtime identity (OWNER). Everything below — snapshot
         # load, model resolution, tool config, UserContext — runs as this
@@ -2493,6 +2439,96 @@ class AgentServiceManager:
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
             self._agent_model_overrides.pop(task_id, None)
+
+        # A surviving ordinary cache hit still needs a fresh trusted snapshot
+        # for model and memory eligibility. Loader failures propagate: using a
+        # cached service without current persisted authority is not allowed.
+        # Wrong-owner/scope entries were already evicted above and therefore
+        # retain the existing safe reconstruction fallback below.
+        if task_setup_snapshot is None and task_id in self._agents:
+            task_setup_snapshot_load_attempted = True
+            task_setup_snapshot = await _load_task_setup_snapshot_for_agent(
+                task_id,
+                runtime_user_id,
+                db,
+            )
+
+        persisted_agent_config = (
+            task_setup_snapshot.task.agent_config
+            if task_setup_snapshot is not None
+            else None
+        )
+        actor_marked = (
+            task_id in self._mcp_actor_policies
+            or mcp_runtime_authorization_policy_required(persisted_agent_config)
+        )
+        persisted_policy_identity = mcp_runtime_authorization_policy_identity(
+            persisted_agent_config
+        )
+        if actor_marked and mcp_runtime_authorization_policy is None:
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} requires an MCP runtime authorization policy; "
+                "generic reuse and reconstruction are unsupported"
+            )
+        if mcp_runtime_authorization_policy is not None:
+            if not actor_marked:
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} is not marked for MCP actor execution"
+                )
+            if (
+                persisted_policy_identity is not None
+                and persisted_policy_identity
+                != mcp_runtime_authorization_policy.resource_owner_key
+            ):
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its durable identity"
+                )
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and persisted_policy_identity is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} has no durable MCP actor policy identity"
+                )
+
+            bound_policy = self._mcp_actor_policies.get(task_id)
+            if (
+                bound_policy is not None
+                and bound_policy != mcp_runtime_authorization_policy
+            ):
+                raise MCPBuiltinOAuthActorPolicyMismatchError(
+                    f"Task {task_id} MCP actor policy does not match its "
+                    "task-lifetime binding"
+                )
+            if bound_policy is None:
+                self._mcp_actor_policies[task_id] = mcp_runtime_authorization_policy
+
+        if actor_marked and task_setup_snapshot is not None:
+            if (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and task_setup_snapshot.task.agent_id is not None
+                and task_setup_snapshot.agent is None
+            ):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} claimed agent is unavailable"
+                )
+
+            marked_status = task_setup_snapshot.task.status
+            fresh_direct_build = marked_status in {
+                TaskStatus.PENDING,
+                TaskStatus.RUNNING,
+            } and not (
+                marked_status == TaskStatus.RUNNING
+                and task_setup_snapshot.has_reconstructable_history
+            )
+            actor_interaction_reconstruction = (
+                task_mode is ChannelTaskMode.ACTOR_INTERACTION
+                and marked_status == TaskStatus.RUNNING
+            )
+            if not (fresh_direct_build or actor_interaction_reconstruction):
+                raise MCPBuiltinOAuthActorPolicyRequiredError(
+                    f"Task {task_id} actor-marked reuse or reconstruction is unsupported"
+                )
 
         # Model override invariant: the cached instance holds the models it
         # was built with, in its slots and in its tools. A request carrying a

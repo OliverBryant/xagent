@@ -193,8 +193,10 @@ class AgentExecutionAdapter:
             )
         else:
             # AgentService may have rebuilt the tool objects after a connection
-            # or policy change. A paused runner still holds the previous list.
+            # or policy change. A paused runner still holds the previous list
+            # and memory capability, so refresh both before it can resume.
             handle.runner.agent.tools = self.config.tools
+            handle.runner.agent.memory_store = self.config.memory_store
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()

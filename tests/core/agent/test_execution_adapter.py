@@ -15,6 +15,7 @@ from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -46,6 +47,7 @@ class BlockingLLM:
 class TracerCheckpointStore:
     def __init__(self) -> None:
         self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.events: list[dict[str, Any]] = []
 
     async def checkpoint(self, **payload: Any) -> None:
         self.by_execution_id[str(payload["execution_id"])] = dict(payload)
@@ -53,6 +55,10 @@ class TracerCheckpointStore:
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
         payload = self.by_execution_id.get(execution_id)
         return dict(payload) if payload is not None else None
+
+    async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+        self.events.append({"event_type": event_type, **kwargs})
+        return f"event-{len(self.events)}"
 
 
 class RecordingTracer:
@@ -1913,6 +1919,76 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     assert handle.runner.agent.tools == adapter.config.tools
     resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
     assert ("noop" in resumed_names) is not remove_tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_enabled", [True, False])
+async def test_execution_adapter_resume_rebinds_retained_runner_memory(
+    replacement_enabled: bool,
+) -> None:
+    old_store = InMemoryMemoryStore()
+    replacement_store = InMemoryMemoryStore() if replacement_enabled else None
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {"message": "Confirm before continuing."},
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="refresh-memory",
+            pattern="react",
+            llm=llm,
+            tracer=TracerCheckpointStore(),
+            memory_store=old_store,
+            skill_manager=NoSkillManager(),
+        )
+    )
+    waiting = await adapter.execute(task="Remember the answer", task_id="memory-exec")
+    assert waiting["status"] == "waiting_for_user"
+    handle = adapter.registry.get("memory-exec")
+    assert handle is not None
+    assert handle.runner.agent.memory_store is old_store
+
+    await adapter.post_user_message(
+        "memory-exec", "Confirmed.", request_interrupt=False
+    )
+    adapter.config.memory_store = replacement_store
+    llm.responses.extend(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-store",
+                        "name": "store_memory",
+                        "args": {
+                            "content": "The retained runner used current policy.",
+                            "kind": "domain_insight",
+                        },
+                    }
+                ]
+            },
+            "done",
+        ]
+    )
+
+    resumed = await adapter.resume("memory-exec")
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    assert old_store.list_all() == []
+    assert handle.runner.agent.memory_store is replacement_store
+    if replacement_store is not None:
+        assert [note.content for note in replacement_store.list_all()] == [
+            "The retained runner used current policy."
+        ]
 
 
 @pytest.mark.asyncio

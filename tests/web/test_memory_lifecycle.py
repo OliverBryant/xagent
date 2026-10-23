@@ -19,6 +19,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import lancedb  # type: ignore
@@ -794,6 +795,19 @@ async def _turn(agents, *, task_id=7, owner_id=3):
         task_id,
         task_owner_user_id=owner_id,
         resolved_execution_scope=None,
+        task_setup_snapshot=SimpleNamespace(
+            task=SimpleNamespace(
+                id=task_id,
+                user_id=owner_id,
+                agent_id=None,
+                source=None,
+                agent_config={},
+                run_id=None,
+            ),
+            runtime_user=None,
+            agent_config={},
+            model_override=None,
+        ),
     )
 
 

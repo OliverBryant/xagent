@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +16,38 @@ from ...core.memory.scope_columns import strict_user_id
 logger = logging.getLogger(__name__)
 
 MEMORY_POLICY_RESOLVER_FAILURE_REASON = "resolver_failed"
+
+
+def memory_retrieval_scope_fingerprint(
+    *,
+    enabled: bool,
+    access_scope: MemoryAccessScope | None,
+    ambient_owner_user_id: int | None = None,
+    ambient_execution_scope: ExecutionScope | None = None,
+) -> str:
+    """Return a stable, non-reversible identity for automatic retrieval scope."""
+
+    payload: dict[str, object] = {"enabled": enabled}
+    if enabled and access_scope is not None:
+        payload["owner_user_id"] = access_scope.owner_user_id
+        payload["memory_dimensions"] = sorted(access_scope.memory_dimensions.items())
+    elif enabled:
+        payload["owner_user_id"] = strict_user_id(ambient_owner_user_id)
+        payload["memory_dimensions"] = sorted(
+            (
+                ambient_execution_scope.memory_dimensions
+                if ambient_execution_scope
+                else {}
+            ).items()
+        )
+        payload["strict_memory_isolation"] = bool(
+            ambient_execution_scope and ambient_execution_scope.strict_memory_isolation
+        )
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(
+        b"xagent-memory-retrieval-scope:v1\0" + canonical.encode()
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 
 @dataclass(frozen=True)

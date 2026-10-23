@@ -32,6 +32,7 @@ from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
+from .context.enrichment import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -461,6 +462,10 @@ class AgentService:
         self.memory_availability_reason = availability_reason
         self.execution_metadata.pop("memory_available", None)
         self.execution_metadata.pop("memory_availability_reason", None)
+        self.execution_metadata.pop(
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+            None,
+        )
         if execution_metadata:
             self.execution_metadata.update(execution_metadata)
         if self._execution_adapter is not None:

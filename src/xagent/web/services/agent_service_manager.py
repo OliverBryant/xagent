@@ -18,6 +18,9 @@ from ...config import (
     get_shared_task_execution_enabled,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.context.enrichment import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -109,7 +112,9 @@ from .memory_availability import (
 )
 from .memory_policy import (
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
+    MemoryAccessScope,
     MemoryPolicyRequest,
+    memory_retrieval_scope_fingerprint,
     resolve_trusted_memory_policy,
 )
 from .task_execution_context_service import (
@@ -232,27 +237,47 @@ class AgentServiceMemoryPolicy:
     memory_enabled: bool
     memory_available: bool = True
     memory_availability_reason: str | None = None
+    memory_access_scope: MemoryAccessScope | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
         """The reason as a caller may see it."""
         return public_memory_availability_reason(self.memory_availability_reason)
 
-    def execution_metadata(self) -> dict[str, Any]:
-        """Caller-safe availability for checkpoints and task trace metadata.
+    def execution_metadata(
+        self,
+        *,
+        ambient_owner_user_id: int | None = None,
+        ambient_execution_scope: ExecutionScope | None = None,
+    ) -> dict[str, Any]:
+        """Caller-safe memory policy for checkpoints and task trace metadata.
 
-        Empty while memory is available, so an ordinary task's trace is
-        unchanged. Execution metadata is checkpointed and can later reach
-        owner-facing trace APIs, so a trusted host's arbitrary diagnostic must
-        be folded before persistence. The raw reason remains available on this
-        policy object for operator logging only.
+        The stable retrieval-scope digest lets resume discard only cached
+        automatic retrieval when authority changes. Execution metadata is
+        checkpointed and can later reach owner-facing trace APIs, so neither
+        raw scope dimensions nor a trusted host's arbitrary diagnostic is
+        persisted. The raw reason remains on this policy for operator logs.
         """
-        if self.memory_available:
-            return {}
-        return {
-            MEMORY_AVAILABLE_METADATA_KEY: False,
-            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
+        metadata: dict[str, Any] = {
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: (
+                memory_retrieval_scope_fingerprint(
+                    enabled=self.memory_enabled,
+                    access_scope=self.memory_access_scope,
+                    ambient_owner_user_id=ambient_owner_user_id,
+                    ambient_execution_scope=ambient_execution_scope,
+                )
+            )
         }
+        if not self.memory_available:
+            metadata.update(
+                {
+                    MEMORY_AVAILABLE_METADATA_KEY: False,
+                    MEMORY_AVAILABILITY_REASON_METADATA_KEY: (
+                        self.public_availability_reason
+                    ),
+                }
+            )
+        return metadata
 
 
 def _optional_task_int(task: Any, field: str) -> int | None:
@@ -337,6 +362,9 @@ def resolve_agent_service_memory_policy(
         memory_enabled=enabled,
         memory_available=True if override is None else override.available,
         memory_availability_reason=None if override is None else override.reason,
+        memory_access_scope=(
+            override.memory_access_scope if override is not None else None
+        ),
     )
 
 
@@ -2221,13 +2249,14 @@ class AgentServiceManager:
         # then checking out another connection for the full snapshot.
         task_setup_snapshot_load_attempted = task_setup_snapshot is not None
 
-        # Normalize every cache-miss onto the detached snapshot before the
+        # Normalize every invocation onto the detached snapshot before the
         # legacy request Session performs owner/task reads. This keeps its
         # synchronous QueuePool waits off the event loop and makes one snapshot
         # the SSOT for existence, owner, runtime identity, configuration, and
-        # reconstruction state. A missing row retains the legacy auto-create
-        # fallback below.
-        if task_setup_snapshot is None and task_id not in self._agents:
+        # reconstruction state. Cache hits need the same trusted task fields to
+        # re-evaluate memory eligibility; a missing row retains the legacy
+        # auto-create fallback below but fails cached memory closed.
+        if task_setup_snapshot is None:
             task_setup_snapshot_load_attempted = True
             task_setup_snapshot = await _load_task_setup_snapshot_for_agent(
                 task_id,
@@ -3063,7 +3092,10 @@ class AgentServiceManager:
                         memory_enabled=memory_policy.memory_enabled,
                         memory_available=memory_policy.memory_available,
                         memory_availability_reason=memory_policy.public_availability_reason,
-                        execution_metadata=memory_policy.execution_metadata(),
+                        execution_metadata=memory_policy.execution_metadata(
+                            ambient_owner_user_id=runtime_user_id,
+                            ambient_execution_scope=scope,
+                        ),
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
 
@@ -3131,7 +3163,13 @@ class AgentServiceManager:
                     if task_setup_snapshot is not None
                     else None
                 ),
-                agent_config=persisted_agent_config,
+                agent_config=(
+                    task_setup_snapshot.agent_config
+                    if task_setup_snapshot is not None
+                    else persisted_agent_config
+                ),
+                ambient_owner_user_id=runtime_user_id,
+                ambient_execution_scope=scope,
             )
 
         self._agent_owner_ids[task_id] = runtime_user_id
@@ -3175,6 +3213,8 @@ class AgentServiceManager:
         *,
         task: Optional[Any],
         agent_config: Optional[Mapping[str, Any]],
+        ambient_owner_user_id: int | None,
+        ambient_execution_scope: ExecutionScope | None,
     ) -> None:
         """Re-resolve memory policy for a cached AgentService before its turn.
 
@@ -3215,16 +3255,27 @@ class AgentServiceManager:
         if agent is None:
             return
 
-        policy = await resolve_agent_service_memory_policy_async(
-            task=task,
-            agent_config=agent_config,
-        )
+        if task is None:
+            policy = AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=MEMORY_POLICY_RESOLVER_FAILURE_REASON,
+            )
+        else:
+            policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
         agent.apply_memory_policy(
             memory_store=policy.memory,
             enabled=policy.memory_enabled,
             available=policy.memory_available,
             availability_reason=policy.public_availability_reason,
-            execution_metadata=policy.execution_metadata(),
+            execution_metadata=policy.execution_metadata(
+                ambient_owner_user_id=ambient_owner_user_id,
+                ambient_execution_scope=ambient_execution_scope,
+            ),
         )
         if not policy.memory_available:
             logger.warning(
@@ -4223,7 +4274,10 @@ class AgentServiceManager:
                     memory_enabled=memory_policy.memory_enabled,
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
-                    execution_metadata=memory_policy.execution_metadata(),
+                    execution_metadata=memory_policy.execution_metadata(
+                        ambient_owner_user_id=user_id,
+                        ambient_execution_scope=scope,
+                    ),
                 )
 
             agent_service = self._agents[task_id]

@@ -175,7 +175,10 @@ class AgentExecutionAdapter:
         kwargs.setdefault(
             "outbound_message_handler", self.config.outbound_message_handler
         )
-        resume_metadata = dict(kwargs.get("metadata") or {})
+        resume_metadata = {
+            **dict(kwargs.get("metadata") or {}),
+            **self.config.execution_metadata,
+        }
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )

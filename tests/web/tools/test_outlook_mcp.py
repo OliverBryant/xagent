@@ -141,9 +141,7 @@ async def test_list_messages_success_with_error_field_stays_successful(monkeypat
     )
     handler = outlook.mcp._mcp_server.request_handlers[types.CallToolRequest]
     request = types.CallToolRequest(
-        params=types.CallToolRequestParams(
-            name="outlook_list_messages", arguments={}
-        )
+        params=types.CallToolRequestParams(name="outlook_list_messages", arguments={})
     )
 
     result = await handler(request)

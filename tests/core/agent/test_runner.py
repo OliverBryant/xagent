@@ -14,8 +14,11 @@ import pytest
 from xagent.core.agent import (
     Agent,
     ContextManager,
+    DAGPattern,
     ExecutionContext,
+    ExecutionPlan,
     PatternRuntime,
+    PlanStep,
     TraceEventCallback,
 )
 from xagent.core.agent import runtime as runtime_module
@@ -42,6 +45,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     reset_output_language_to_request_context,
 )
+from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.model.chat.exceptions import (
@@ -2672,6 +2676,90 @@ async def test_resume_reconciles_root_and_active_dag_memory_before_prompt(
         assert metadata.get(MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY) == (
             expected_scope
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trusted_scope", "expect_private_memory"),
+    [
+        ("scope-b", False),
+        (None, False),
+        ("scope-a", True),
+    ],
+)
+async def test_resume_reconciles_real_dag_child_before_step_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trusted_scope: str | None,
+    expect_private_memory: bool,
+) -> None:
+    root = ExecutionContext(
+        execution_id="real-dag-memory-resume",
+        metadata={
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a",
+            MEMORY_CONTEXT_METADATA_KEY: "SCOPE_A_PRIVATE_NOTE",
+            RETRIEVED_MEMORIES_METADATA_KEY: {
+                "react": [{"content": "SCOPE_A_PRIVATE_NOTE"}]
+            },
+        },
+    )
+    root.add_user_message("Continue the waiting step")
+    step = PlanStep(id="step_1", task="Finish the private-memory task")
+    child = root.create_child_context(
+        metadata={"dag_step_id": step.id, "dag_step_name": step.task}
+    )
+    checkpoint_pattern = DAGPattern(lambda **_: None)
+    checkpoint_pattern.status = "waiting_for_user"
+    checkpoint_pattern.plan = ExecutionPlan(steps=[step])
+    step.status = "running"
+    checkpoint_pattern.active_step_ids = [step.id]
+    checkpoint_pattern.active_step_contexts[step.id] = child.to_dict()
+    checkpoint_pattern.active_step_pattern_states[step.id] = {}
+    checkpoint_pattern.planned_user_message_count = 1
+
+    captured_prompts: list[str] = []
+
+    class CapturingReAct:
+        def __init__(self, **_: Any) -> None:
+            self.state: dict[str, Any] = {}
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
+
+        def load_state(self, state: dict[str, Any]) -> None:
+            self.state = dict(state)
+
+        def get_state(self) -> dict[str, Any]:
+            return dict(self.state)
+
+        async def run(self, *, context: ExecutionContext, **_: Any) -> dict[str, Any]:
+            captured_prompts.append(context._system_context())
+            return {"success": False, "status": "waiting_for_user"}
+
+    monkeypatch.setattr(dag_module, "ReActPattern", CapturingReAct)
+    resumed_pattern = DAGPattern(lambda **_: None)
+    runner = AgentRunner(
+        agent=Agent(
+            name="real-dag-memory-resume",
+            patterns=[resumed_pattern],
+            llm=MagicMock(),
+        ),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id=root.execution_id,
+        checkpoint={
+            "context": root.to_dict(),
+            "pattern_state": checkpoint_pattern.get_state(),
+        },
+        metadata={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: trusted_scope},
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert len(captured_prompts) == 1
+    assert ("SCOPE_A_PRIVATE_NOTE" in captured_prompts[0]) is expect_private_memory
 
 
 @pytest.mark.asyncio

@@ -692,10 +692,20 @@ class TestModelAPI:
         assert data["auto_model"]["model_name"] == "auto"
         assert data["auto_model"]["can_delete"] is False
         assert "vision" not in data["auto_model"]["abilities"]
-        assert {candidate["routing_model_id"] for candidate in data["candidates"]} == {
+        assert [candidate["routing_model_id"] for candidate in data["candidates"]] == [
             "openai/gpt-5.5",
             "deepseek/deepseek-v4-flash",
-        }
+        ]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "routing"
+            assert [candidate.position for candidate in config.candidates] == [0, 1]
+        finally:
+            db.close()
 
         get_response = client.get("/api/models/auto-config", headers=regular_headers)
         assert get_response.status_code == 200
@@ -902,6 +912,7 @@ class TestModelAPI:
                     config_id=config.id,
                     routing_model_id="openai/gpt-5.5",
                     target_model_id=target.id,
+                    position=0,
                 )
             )
             db.commit()
@@ -1958,6 +1969,7 @@ class TestModelAPI:
                 config_id=config.id,
                 routing_model_id="openai/gpt-5.5",
                 target_model_id=target.id,
+                position=0,
             )
             db.add(candidate)
             db.commit()

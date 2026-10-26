@@ -2957,7 +2957,7 @@ def google_calendar_respond_to_event(
             )
         except HttpError as exc:
             if exc.resp.status in (404, 410):
-                raise ValueError(
+                raise ToolError(
                     f"Event {event_id!r} was not found on the user's primary "
                     "calendar. Nothing was written; use "
                     "google_calendar_search_events to find its id."
@@ -3053,6 +3053,8 @@ def google_calendar_respond_to_event(
         )
         return _event_response(updated_event)
 
+    except ToolError:
+        raise
     except ValueError as e:
         logger.error("Invalid calendar RSVP request: %s", e)
         return json.dumps({"status": "error", "message": str(e)})

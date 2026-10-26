@@ -8957,6 +8957,8 @@ def test_respond_to_event_rejects_the_organizer(
 
 @pytest.mark.parametrize("status", [404, 410])
 def test_respond_to_event_reports_an_unknown_event_id(monkeypatch, status):
+    from mcp.server.fastmcp.exceptions import ToolError
+
     service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
     content = f'{{"error":{{"code":{status},"message":"Not Found"}}}}'.encode()
     service.events.return_value.get.return_value.execute.side_effect = HttpError(
@@ -8964,13 +8966,11 @@ def test_respond_to_event_reports_an_unknown_event_id(monkeypatch, status):
     )
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
-    result = json.loads(
+    with pytest.raises(ToolError) as excinfo:
         calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
-    )
 
-    assert result["status"] == "error"
-    assert "evt1" in result["message"]
-    assert "not found" in result["message"].lower()
+    assert "evt1" in str(excinfo.value)
+    assert "not found" in str(excinfo.value).lower()
     _assert_respond_wrote_nothing(service)
 
 
@@ -9178,6 +9178,31 @@ async def test_respond_to_event_provider_failure_is_a_safe_failed_mcp_call(
         _assert_respond_wrote_nothing(service)
     else:
         service.events.return_value.patch.assert_called_once()
+
+
+@pytest.mark.parametrize("status", [404, 410])
+async def test_respond_to_event_not_found_is_a_failed_mcp_call(monkeypatch, status):
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    content = f'{{"error":{{"code":{status},"message":"Not Found"}}}}'.encode()
+    service.events.return_value.get.return_value.execute.side_effect = HttpError(
+        _HttpResponse(status), content
+    )
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = await _call_respond_to_event_over_mcp(
+        {"event_id": "evt1", "response": "accepted"}
+    )
+
+    assert result.isError is True
+    assert "evt1" in result.content[0].text
+    assert "not found" in result.content[0].text.lower()
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
+    _assert_respond_wrote_nothing(service)
 
 
 async def test_respond_to_event_duplicate_reply_is_a_successful_mcp_noop(monkeypatch):

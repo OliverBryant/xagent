@@ -18,10 +18,10 @@ from ...config import (
     get_external_upload_dirs,
     get_shared_task_execution_enabled,
 )
-from ...core.agent.service import AgentService
 from ...core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
+from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -31,11 +31,11 @@ from ...core.execution_scope import (
     resolve_execution_scope,
     scope_fingerprint,
 )
-from ...core.memory.base import MemoryStore
 from ...core.memory.access_scope import (
     MemoryAccessScope,
     bind_memory_access_scope,
 )
+from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from ...core.model.chat.basic.base import BaseLLM
@@ -155,8 +155,8 @@ from .task_setup_snapshot import (
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     detach_runtime_user_fields,
-    load_task_setup_snapshot_sync,
     load_memory_policy_task_fields_sync,
+    load_task_setup_snapshot_sync,
 )
 from .task_workspace_cleanup import (
     WorkspaceCleanupTarget,

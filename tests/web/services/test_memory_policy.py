@@ -9,12 +9,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from xagent.core.agent.service import AgentService
 from xagent.core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
-from xagent.core.execution_scope import ExecutionScope
-from xagent.core.execution_scope import scope_fingerprint
+from xagent.core.agent.service import AgentService
+from xagent.core.execution_scope import ExecutionScope, scope_fingerprint
 from xagent.core.memory.access_scope import MemoryAccessScope
 from xagent.core.memory.core import MemoryNote
 from xagent.core.memory.in_memory import InMemoryMemoryStore
@@ -24,7 +23,6 @@ from xagent.web.memory_lifecycle import (
     MemoryUnavailableError,
 )
 from xagent.web.services import agent_service_manager as agent_runtime_service
-from xagent.web.services.task_setup_snapshot import MemoryPolicyTaskFields
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_BINDING_FAILURE_REASON,
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
@@ -32,6 +30,7 @@ from xagent.web.services.memory_policy import (
     MemoryPolicyRequest,
     set_trusted_memory_policy_resolver,
 )
+from xagent.web.services.task_setup_snapshot import MemoryPolicyTaskFields
 from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 
 

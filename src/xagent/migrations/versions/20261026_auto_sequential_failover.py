@@ -1,7 +1,13 @@
 """Persist Auto routing mode and candidate order.
 
+Downgrade is lossless only while every config remains in ``routing`` mode and
+each config maps a routing profile at most once. It refuses the downgrade
+before any DDL when either condition is false. A successful downgrade removes
+the explicit positions, so legacy readers return candidates in id order rather
+than preserving a custom order, and removes the redundant ``routing`` mode.
+
 Revision ID: 20261026_auto_sequential_failover
-Revises: 20261023_add_mcp_signed_uploads
+Revises: 20261026_task_requested_dispatch_class
 Create Date: 2026-10-26 00:00:00.000000
 """
 
@@ -12,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261026_auto_sequential_failover"
-down_revision: Union[str, None] = "20261023_add_mcp_signed_uploads"
+down_revision: Union[str, None] = "20261026_task_requested_dispatch_class"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -118,6 +124,24 @@ def _duplicate_profile() -> tuple[int, str, int] | None:
     return int(row[0]), str(row[1]), int(row[2])
 
 
+def _non_routing_config() -> tuple[int, str] | None:
+    if CONFIG_TABLE not in _tables() or "mode" not in _columns(CONFIG_TABLE):
+        return None
+    row = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"SELECT id, mode FROM {CONFIG_TABLE} "
+                "WHERE mode <> 'routing' ORDER BY id"
+            )
+        )
+        .first()
+    )
+    if row is None:
+        return None
+    return int(row[0]), str(row[1])
+
+
 def upgrade() -> None:
     if CONFIG_TABLE not in _tables():
         return
@@ -160,18 +184,26 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if CANDIDATE_TABLE in _tables():
-        # The old schema cannot represent repeated profiles. Refuse before any
-        # DDL so a failed downgrade leaves both schema and bindings untouched.
-        duplicate = _duplicate_profile()
-        if duplicate is not None:
-            config_id, routing_model_id, binding_count = duplicate
-            raise RuntimeError(
-                "Cannot downgrade ordered Auto bindings without losing data: "
-                f"config {config_id} maps profile {routing_model_id!r} "
-                f"{binding_count} times"
-            )
+    # Validate every lossy condition before the first DDL statement. A refused
+    # downgrade must leave mode, positions, constraints, and bindings intact.
+    non_routing = _non_routing_config()
+    if non_routing is not None:
+        config_id, mode = non_routing
+        raise RuntimeError(
+            "Cannot downgrade ordered Auto bindings without losing data: "
+            f"config {config_id} uses mode {mode!r}"
+        )
 
+    duplicate = _duplicate_profile()
+    if duplicate is not None:
+        config_id, routing_model_id, binding_count = duplicate
+        raise RuntimeError(
+            "Cannot downgrade ordered Auto bindings without losing data: "
+            f"config {config_id} maps profile {routing_model_id!r} "
+            f"{binding_count} times"
+        )
+
+    if CANDIDATE_TABLE in _tables():
         _drop_unique_if_present(CANDIDATE_TABLE, POSITION_CONSTRAINT)
         if "position" in _columns(CANDIDATE_TABLE):
             with op.batch_alter_table(CANDIDATE_TABLE) as batch_op:

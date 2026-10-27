@@ -17,7 +17,7 @@ MIGRATION_PATH = (
     / "src/xagent/migrations/versions/20261026_auto_sequential_failover.py"
 )
 REVISION = "20261026_auto_sequential_failover"
-DOWN_REVISION = "20261023_add_mcp_signed_uploads"
+DOWN_REVISION = "20261026_task_requested_dispatch_class"
 CONFIG_TABLE = "auto_model_configs"
 CANDIDATE_TABLE = "auto_model_candidates"
 PROFILE_CONSTRAINT = "uq_auto_candidate_routing_model"
@@ -30,27 +30,126 @@ def _migration():
 
 
 def _old_schema(metadata: sa.MetaData) -> tuple[sa.Table, sa.Table]:
+    users = sa.Table(
+        "users",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
+    models = sa.Table(
+        "models",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+    )
     configs = sa.Table(
         CONFIG_TABLE,
         metadata,
-        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("id", sa.Integer, primary_key=True, index=True),
+        sa.Column(
+            "user_id",
+            sa.Integer,
+            sa.ForeignKey(users.c.id, ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        sa.Column(
+            "router_model_id",
+            sa.Integer,
+            sa.ForeignKey(models.c.id, ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("strategy", sa.String(20), nullable=False),
+        sa.Column(
+            "fallback_model_id",
+            sa.Integer,
+            sa.ForeignKey(models.c.id, ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=True,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=True,
+        ),
+        sa.UniqueConstraint(
+            "router_model_id", name="uq_auto_model_config_router_model"
+        ),
+        sa.UniqueConstraint("user_id", name="uq_auto_model_config_user"),
     )
     candidates = sa.Table(
         CANDIDATE_TABLE,
         metadata,
-        sa.Column("id", sa.Integer, primary_key=True),
-        sa.Column("config_id", sa.Integer, nullable=False),
+        sa.Column("id", sa.Integer, primary_key=True, index=True),
+        sa.Column(
+            "config_id",
+            sa.Integer,
+            sa.ForeignKey(configs.c.id, ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
         sa.Column("routing_model_id", sa.String(200), nullable=False),
-        sa.Column("target_model_id", sa.Integer, nullable=False),
+        sa.Column(
+            "target_model_id",
+            sa.Integer,
+            sa.ForeignKey(models.c.id, ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+            nullable=True,
+        ),
         sa.UniqueConstraint("config_id", "routing_model_id", name=PROFILE_CONSTRAINT),
         sa.UniqueConstraint("config_id", "target_model_id", name=TARGET_CONSTRAINT),
     )
     return configs, candidates
 
 
-def _constraint_names(connection) -> set[str]:
+def _insert_configs(connection, configs: sa.Table, *config_ids: int) -> None:
+    users = configs.metadata.tables["users"]
+    models = configs.metadata.tables["models"]
+    connection.execute(
+        users.insert(), [{"id": 10_000 + config_id} for config_id in config_ids]
+    )
+    connection.execute(
+        models.insert(),
+        [
+            {"id": model_id}
+            for config_id in config_ids
+            for model_id in (20_000 + config_id, 30_000 + config_id)
+        ],
+    )
+    connection.execute(
+        configs.insert(),
+        [
+            {
+                "id": config_id,
+                "user_id": 10_000 + config_id,
+                "router_model_id": 20_000 + config_id,
+                "strategy": "balanced",
+                "fallback_model_id": 30_000 + config_id,
+            }
+            for config_id in config_ids
+        ],
+    )
+
+
+def _insert_target_models(table: sa.Table, connection, *model_ids: int) -> None:
+    connection.execute(
+        table.metadata.tables["models"].insert(),
+        [{"id": model_id} for model_id in model_ids],
+    )
+
+
+def _constraints(connection) -> dict[str, tuple[str, ...]]:
     return {
-        str(constraint["name"])
+        str(constraint["name"]): tuple(constraint["column_names"])
         for constraint in sa.inspect(connection).get_unique_constraints(CANDIDATE_TABLE)
         if constraint.get("name")
     }
@@ -59,6 +158,69 @@ def _constraint_names(connection) -> set[str]:
 def _column_names(connection, table_name: str) -> set[str]:
     return {
         str(column["name"]) for column in sa.inspect(connection).get_columns(table_name)
+    }
+
+
+def _candidate_foreign_keys(
+    connection,
+) -> set[tuple[tuple[str, ...], str, tuple[str, ...], str | None]]:
+    return {
+        (
+            tuple(foreign_key["constrained_columns"]),
+            str(foreign_key["referred_table"]),
+            tuple(foreign_key["referred_columns"]),
+            (foreign_key.get("options") or {}).get("ondelete"),
+        )
+        for foreign_key in sa.inspect(connection).get_foreign_keys(CANDIDATE_TABLE)
+    }
+
+
+def _candidate_indexes(connection) -> dict[str, tuple[str, ...]]:
+    return {
+        str(index["name"]): tuple(index["column_names"])
+        for index in sa.inspect(connection).get_indexes(CANDIDATE_TABLE)
+        if not index.get("duplicates_constraint")
+    }
+
+
+def _assert_real_table_shape(connection, *, upgraded: bool) -> None:
+    config_columns = {
+        "id",
+        "user_id",
+        "router_model_id",
+        "strategy",
+        "fallback_model_id",
+        "created_at",
+        "updated_at",
+    }
+    candidate_columns = {
+        "id",
+        "config_id",
+        "routing_model_id",
+        "target_model_id",
+        "created_at",
+    }
+    constraints = {
+        TARGET_CONSTRAINT: ("config_id", "target_model_id"),
+        (POSITION_CONSTRAINT if upgraded else PROFILE_CONSTRAINT): (
+            "config_id",
+            "position" if upgraded else "routing_model_id",
+        ),
+    }
+    if upgraded:
+        config_columns.add("mode")
+        candidate_columns.add("position")
+
+    assert _column_names(connection, CONFIG_TABLE) == config_columns
+    assert _column_names(connection, CANDIDATE_TABLE) == candidate_columns
+    assert _constraints(connection) == constraints
+    assert _candidate_foreign_keys(connection) == {
+        (("config_id",), CONFIG_TABLE, ("id",), "CASCADE"),
+        (("target_model_id",), "models", ("id",), "RESTRICT"),
+    }
+    assert _candidate_indexes(connection) == {
+        "ix_auto_model_candidates_config_id": ("config_id",),
+        "ix_auto_model_candidates_id": ("id",),
     }
 
 
@@ -79,7 +241,9 @@ def _exercise_upgrade_and_reentry(engine) -> None:
     metadata.create_all(engine)
 
     with engine.begin() as connection:
-        connection.execute(configs.insert(), [{"id": 1}, {"id": 2}])
+        _assert_real_table_shape(connection, upgraded=False)
+        _insert_configs(connection, configs, 1, 2)
+        _insert_target_models(candidates, connection, 100, 110, 120, 200)
         connection.execute(
             candidates.insert(),
             [
@@ -130,10 +294,7 @@ def _exercise_upgrade_and_reentry(engine) -> None:
             (2, 20, "openai/gpt-5.5", 0),
         ]
 
-        assert _constraint_names(connection) == {
-            TARGET_CONSTRAINT,
-            POSITION_CONSTRAINT,
-        }
+        _assert_real_table_shape(connection, upgraded=True)
         assert "mode" in _column_names(connection, CONFIG_TABLE)
         modes = connection.execute(
             sa.text(f"SELECT id, mode FROM {CONFIG_TABLE} ORDER BY id")
@@ -158,10 +319,7 @@ def _exercise_upgrade_and_reentry(engine) -> None:
             ).order_by(reflected.c.config_id, reflected.c.position)
         ).all()
         assert rows_after_reentry == rows_before_reentry
-        assert _constraint_names(connection) == {
-            TARGET_CONSTRAINT,
-            POSITION_CONSTRAINT,
-        }
+        _assert_real_table_shape(connection, upgraded=True)
 
 
 def _exercise_partial_position_repair(engine) -> None:
@@ -223,9 +381,9 @@ def _exercise_partial_position_repair(engine) -> None:
             if column["name"] == "position"
         )
         assert position_column["nullable"] is False
-        assert _constraint_names(connection) == {
-            TARGET_CONSTRAINT,
-            POSITION_CONSTRAINT,
+        assert _constraints(connection) == {
+            TARGET_CONSTRAINT: ("config_id", "target_model_id"),
+            POSITION_CONSTRAINT: ("config_id", "position"),
         }
 
 
@@ -236,7 +394,8 @@ def _exercise_safe_and_refused_downgrades(engine) -> None:
     metadata.create_all(engine)
 
     with engine.begin() as connection:
-        connection.execute(configs.insert().values(id=1))
+        _insert_configs(connection, configs, 1)
+        _insert_target_models(candidates, connection, 10)
         connection.execute(
             candidates.insert().values(
                 id=1,
@@ -251,10 +410,16 @@ def _exercise_safe_and_refused_downgrades(engine) -> None:
 
         assert "position" not in _column_names(connection, CANDIDATE_TABLE)
         assert "mode" not in _column_names(connection, CONFIG_TABLE)
-        assert _constraint_names(connection) == {
-            PROFILE_CONSTRAINT,
-            TARGET_CONSTRAINT,
-        }
+        _assert_real_table_shape(connection, upgraded=False)
+        restored = sa.Table(CANDIDATE_TABLE, sa.MetaData(), autoload_with=connection)
+        assert connection.execute(
+            sa.select(
+                restored.c.id,
+                restored.c.config_id,
+                restored.c.routing_model_id,
+                restored.c.target_model_id,
+            )
+        ).all() == [(1, 1, "profile-a", 10)]
 
     # Use a fresh database because the successful downgrade restored the old
     # profile constraint, which correctly cannot represent the conflict case.
@@ -263,7 +428,8 @@ def _exercise_safe_and_refused_downgrades(engine) -> None:
     conflict_metadata.drop_all(engine)
     conflict_metadata.create_all(engine)
     with engine.begin() as connection:
-        connection.execute(conflict_configs.insert().values(id=1))
+        _insert_configs(connection, conflict_configs, 1)
+        _insert_target_models(conflict_candidates, connection, 10, 20)
         connection.execute(
             conflict_candidates.insert().values(
                 id=1,
@@ -296,10 +462,49 @@ def _exercise_safe_and_refused_downgrades(engine) -> None:
             ).scalar_one()
             == 2
         )
-        assert _constraint_names(connection) == {
-            TARGET_CONSTRAINT,
-            POSITION_CONSTRAINT,
+        assert _constraints(connection) == {
+            TARGET_CONSTRAINT: ("config_id", "target_model_id"),
+            POSITION_CONSTRAINT: ("config_id", "position"),
         }
+        _assert_real_table_shape(connection, upgraded=True)
+
+    mode_metadata = sa.MetaData()
+    mode_configs, mode_candidates = _old_schema(mode_metadata)
+    conflict_metadata.drop_all(engine)
+    mode_metadata.create_all(engine)
+    with engine.begin() as connection:
+        _insert_configs(connection, mode_configs, 1)
+        _insert_target_models(mode_candidates, connection, 10)
+        connection.execute(
+            mode_candidates.insert().values(
+                id=1,
+                config_id=1,
+                routing_model_id="profile-a",
+                target_model_id=10,
+            )
+        )
+        _upgrade(migration, connection)
+        connection.execute(
+            sa.text(
+                f"UPDATE {CONFIG_TABLE} SET mode = 'sequential_failover' WHERE id = 1"
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="uses mode 'sequential_failover'"):
+            _downgrade(migration, connection)
+
+        _assert_real_table_shape(connection, upgraded=True)
+        assert connection.execute(
+            sa.text(f"SELECT id, mode FROM {CONFIG_TABLE}")
+        ).all() == [(1, "sequential_failover")]
+        protected = sa.Table(CANDIDATE_TABLE, sa.MetaData(), autoload_with=connection)
+        assert connection.execute(
+            sa.select(
+                protected.c.id,
+                protected.c.routing_model_id,
+                protected.c.position,
+            )
+        ).all() == [(1, "profile-a", 0)]
 
 
 def test_revision_metadata() -> None:

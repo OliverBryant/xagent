@@ -447,7 +447,8 @@ def _is_site_blocked_response(response: httpx.Response) -> bool:
         return True
     # Cloudflare marks its bot challenge pages, which can use other statuses
     # such as 503, with this header.
-    return response.headers.get("cf-mitigated", "").strip().lower() == "challenge"
+    mitigated = str(response.headers.get("cf-mitigated", ""))
+    return mitigated.strip().lower() == "challenge"
 
 
 async def fetch_web_content(

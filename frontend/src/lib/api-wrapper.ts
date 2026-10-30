@@ -21,7 +21,7 @@ import {
 import { withAuthCoordination } from "@/lib/auth-coordination"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
-const AUTH_REFRESH_RECONCILE_MS = 1_000
+const AUTH_REFRESH_RECONCILE_MS = AUTH_REFRESH_TIMEOUT_MS
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
   | { status: "refreshed" | "advanced"; accessToken: string; session: AuthSessionSnapshot }

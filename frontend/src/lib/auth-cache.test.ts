@@ -56,6 +56,17 @@ describe("auth cache lineage", () => {
     expect(["superseded", "unavailable"]).toContain((await createAuthSession({ user, access_token: "access" })).status)
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", reason: "storage_unavailable", credentialsCleared: false })
   })
+  it("fails a conditional mutation when auth storage cannot be snapshotted", async () => {
+    const originalGetItem = localStorage.getItem.bind(localStorage)
+    let reads = 0
+    vi.spyOn(localStorage, "getItem").mockImplementation(key => {
+      reads += 1
+      if (reads > 1) throw new Error("snapshot read failed")
+      return originalGetItem(key)
+    })
+
+    await expect(claimAuthLoginIntent()).resolves.toEqual({ status: "unavailable", reason: "storage_unavailable" })
+  })
   it("does not create a bearer session without the login intent that authorized it", async () => {
     expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
     expect(inspectAuthSession().status).toBe("absent")
@@ -454,6 +465,18 @@ describe("auth cache lineage", () => {
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
     expect(inspectAuthSession().status).toBe("absent")
+  })
+  it("allows explicit logout when no coordination primitive is available", async () => {
+    await created()
+    const indexedDbDescriptor = Object.getOwnPropertyDescriptor(globalThis, "indexedDB")
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined })
+    try {
+      await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+      expect(inspectAuthSession().status).toBe("absent")
+    } finally {
+      if (indexedDbDescriptor) Object.defineProperty(globalThis, "indexedDB", indexedDbDescriptor)
+    }
   })
   it("removes credentials and invalidates the old login intent when barrier persistence fails", async () => {
     const claim = await claimAuthLoginIntent()

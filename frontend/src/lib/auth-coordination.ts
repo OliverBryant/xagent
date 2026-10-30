@@ -60,8 +60,10 @@ async function withIndexedDbTransaction<T>(name: string, action: () => Promise<T
 
   return new Promise(resolve => {
     let actionResult: AuthCoordinationAttempt<T> | null = null
+    let actionStarted = false
     let keepAlive = true
     let settled = false
+    let transactionEnded = false
     let transaction: IDBTransaction
     try {
       transaction = database.transaction(lockStore(name), "readwrite")
@@ -72,7 +74,7 @@ async function withIndexedDbTransaction<T>(name: string, action: () => Promise<T
     const store = transaction.objectStore(lockStore(name))
 
     const finish = (fallback: AuthCoordinationAttempt<T>) => {
-      if (settled) return
+      if (settled || !transactionEnded || (actionStarted && !actionResult)) return
       settled = true
       resolve(actionResult ?? fallback)
     }
@@ -88,18 +90,28 @@ async function withIndexedDbTransaction<T>(name: string, action: () => Promise<T
 
     const acquired = store.put(name, KEEPALIVE_KEY)
     acquired.onsuccess = () => {
+      actionStarted = true
       pump()
       void action().then(
         value => { actionResult = { status: "completed", value } },
         () => { actionResult = { status: "unavailable", reason: "operation_failed" } },
-      ).finally(() => { keepAlive = false })
+      ).finally(() => {
+        keepAlive = false
+        finish({ status: "unavailable", reason: "operation_failed" })
+      })
     }
     acquired.onerror = () => {
       keepAlive = false
       try { transaction.abort() } catch { /* The transaction may already be inactive. */ }
     }
-    transaction.oncomplete = () => finish({ status: "unavailable", reason: "operation_failed" })
-    transaction.onabort = () => finish({ status: "unavailable", reason: "operation_failed" })
+    transaction.oncomplete = () => {
+      transactionEnded = true
+      finish({ status: "unavailable", reason: "operation_failed" })
+    }
+    transaction.onabort = () => {
+      transactionEnded = true
+      finish({ status: "unavailable", reason: "operation_failed" })
+    }
     transaction.onerror = () => { /* onabort reports the transaction failure */ }
   })
 }

@@ -429,7 +429,7 @@ async function withMutationLock<T>(conditional: boolean, action: (context: AuthM
     return coordinated.status === "completed" ? coordinated.value : coordinated
   } finally {
     // A same-tab observer may synchronously read storage, so publication must
-    // happen only after the Web Lock callback has returned successfully.
+    // happen only after the coordination callback has returned successfully.
     if (shouldDispatch) dispatchAuthTokenUpdated()
   }
 }

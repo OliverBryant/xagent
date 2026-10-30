@@ -9,6 +9,8 @@ import {
 import {
   type AuthSessionSnapshot,
   type AuthMutationUnavailableReason,
+  AUTH_CACHE_KEY,
+  AUTH_TOKEN_UPDATED_EVENT,
   clearAuthSessionIfCurrent,
   compareAuthSession, compareCredentialSession,
   commitAuthSessionRefresh,
@@ -19,6 +21,7 @@ import {
 import { withAuthCoordination } from "@/lib/auth-coordination"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
+const AUTH_REFRESH_RECONCILE_MS = 1_000
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
   | { status: "refreshed" | "advanced"; accessToken: string; session: AuthSessionSnapshot }
@@ -80,6 +83,43 @@ function parseStrictRefreshResponse(value: unknown): StrictRefreshResponse | nul
     ? payload as StrictRefreshResponse
     : null
 }
+function refreshResultAfterCredentialChange(session: AuthSessionSnapshot): AuthRefreshResult | null {
+  const comparison = compareCredentialSession(session)
+  if (comparison.status === "credentials_advanced") {
+    return {
+      status: "advanced",
+      accessToken: comparison.projection.snapshot.accessToken!,
+      session: comparison.projection.snapshot,
+    }
+  }
+  return comparison.status === "exact_credentials" ? null : { status: "not_current", accessToken: null }
+}
+async function reconcileRejectedFallbackRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
+  const current = refreshResultAfterCredentialChange(session)
+  if (current) return current
+  if (typeof navigator !== "undefined" && navigator.locks) return { status: "rejected", accessToken: null }
+  await new Promise<void>(resolve => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, finishIfChanged)
+      window.removeEventListener("storage", storageChanged)
+      resolve()
+    }
+    const finishIfChanged = () => {
+      if (refreshResultAfterCredentialChange(session)) finish()
+    }
+    const storageChanged = (event: StorageEvent) => {
+      if (event.key === AUTH_CACHE_KEY) finishIfChanged()
+    }
+    const timeout = setTimeout(finish, AUTH_REFRESH_RECONCILE_MS)
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, finishIfChanged)
+    window.addEventListener("storage", storageChanged)
+  })
+  return refreshResultAfterCredentialChange(session) ?? { status: "rejected", accessToken: null }
+}
 async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
   const result = await withRefreshLock(session, async () => {
     const before = compareCredentialSession(session)
@@ -99,7 +139,7 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
         body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
       if (!response.ok) return response.status === 401 || response.status === 403
-        ? { status: "rejected", accessToken: null } satisfies AuthRefreshResult
+        ? reconcileRejectedFallbackRefresh(session)
         : { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
       const payload = parseStrictRefreshResponse(await response.json())
       if (!payload) return { status: "invalid_response", accessToken: null } satisfies AuthRefreshResult

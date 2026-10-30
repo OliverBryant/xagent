@@ -16,6 +16,7 @@ import {
   isSafeAuthExpirySeconds,
   readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
+import { withAuthCoordination } from "@/lib/auth-coordination"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
@@ -58,14 +59,9 @@ type RefreshLockAttempt<T> =
   | { status: "unavailable"; reason: AuthMutationUnavailableReason }
 async function withRefreshLock<T>(session: AuthSessionSnapshot, action: () => Promise<T>): Promise<RefreshLockAttempt<T>> {
   const lockName = refreshLockName(session)
-  const locks = typeof navigator === "undefined" ? undefined : navigator.locks
   if (!lockName) return { status: "unavailable", reason: "operation_failed" }
-  if (!locks) return { status: "unavailable", reason: "coordination_unavailable" }
-  try {
-    return { status: "completed", value: await locks.request(lockName, action) }
-  } catch {
-    return { status: "unavailable", reason: "operation_failed" }
-  }
+  const coordinated = await withAuthCoordination(lockName, action)
+  return coordinated.status === "completed" ? { status: "completed", value: coordinated.value } : coordinated
 }
 type StrictRefreshResponse = {
   success: true

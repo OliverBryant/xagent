@@ -141,6 +141,22 @@ def interruption_pause_result() -> dict[str, Any]:
 # ``task_auto_resume.status_only_terminal_view``), so that wait returns.
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
+# ``Task.agent_config`` key a host sets (to ``True``) on a channel task whose
+# reply it can deliver after the run is resumed by the successor.
+HANDOVER_DELIVERY_AGENT_CONFIG_KEY = "release_handover_delivery"
+
+
+def host_marked_channel_reply(task: Task) -> bool:
+    """Whether ``task`` is a channel task whose host promised to deliver its resumed reply."""
+
+    config = task.agent_config
+    return (
+        task.channel_id is not None
+        and isinstance(config, dict)
+        and config.get(HANDOVER_DELIVERY_AGENT_CONFIG_KEY) is True
+    )
+
+
 # Callers that only ever read a task's status. A settlement interruption of
 # one of their runs is paused only while automatic resume is on: pausing is
 # worth it only when something will resume the run, and when automatic resume
@@ -190,7 +206,10 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
 
     Rules apply in order and the first match wins:
 
-    1. A2A, external, widget and shared-link tasks are ineligible.
+    1. A2A, external, widget and shared-link tasks are ineligible, except an
+       external channel task whose host marked its reply for delivery
+       (:func:`host_marked_channel_reply`): the host owns the reply protocol
+       and keeps its target, so it falls through to the channel rule below.
     2. Workforce tasks are eligible unless their run is a preview (or the
        run row is gone, so it cannot be shown not to be one).
     3. Trigger tasks are eligible.
@@ -202,7 +221,9 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
     """
 
     source = str(task.source or "internal")
-    if source in _INELIGIBLE_SOURCES:
+    if source in _INELIGIBLE_SOURCES and not (
+        source == "external" and host_marked_channel_reply(task)
+    ):
         return _ineligible(f"source_{source}")
 
     workforce_run_id = extract_workforce_run_id(task)

@@ -67,6 +67,7 @@ from ..models.task_command import TaskExecutionCommand
 from .release_hold import release_hold
 from .task_auto_recovery import (
     auto_recovery_eligibility,
+    host_marked_channel_reply,
     record_interruption_no_commit,
     resolution_progress_marker,
     resolution_tool_call_in_flight,
@@ -88,21 +89,10 @@ from .task_lease_service import (
 
 logger = logging.getLogger(__name__)
 
-# ``Task.agent_config`` key a host sets (to ``True``) on a channel task whose
-# reply it can deliver after the run is resumed by the successor. Without it
-# a channel task is never handed over.
-HANDOVER_DELIVERY_AGENT_CONFIG_KEY = "release_handover_delivery"
-
 
 def _channel_task_may_hand_over(task: Task) -> bool:
     """Whether ``task`` is not a channel task, or its host marked its reply."""
-    if task.channel_id is None:
-        return True
-    config = task.agent_config
-    return (
-        isinstance(config, dict)
-        and config.get(HANDOVER_DELIVERY_AGENT_CONFIG_KEY) is True
-    )
+    return task.channel_id is None or host_marked_channel_reply(task)
 
 
 class HandoverOrderError(RuntimeError):

@@ -28,13 +28,13 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import release_handover, task_auto_resume
 from xagent.web.services.release_handover import (
-    HANDOVER_DELIVERY_AGENT_CONFIG_KEY,
     HandoverOrderError,
     begin_handover_sync,
     handover_command_id,
     settle_handover_sync,
 )
 from xagent.web.services.release_hold import release_hold
+from xagent.web.services.task_auto_recovery import HANDOVER_DELIVERY_AGENT_CONFIG_KEY
 from xagent.web.services.task_auto_resume import (
     cancel_pending_auto_resume_no_commit,
     run_auto_resume_tick,

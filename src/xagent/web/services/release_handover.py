@@ -66,7 +66,6 @@ from ..models.task_auto_recovery import TaskAutoRecovery
 from ..models.task_command import TaskExecutionCommand
 from .release_hold import release_hold
 from .task_auto_recovery import (
-    HANDOVER_DELIVERY_AGENT_CONFIG_KEY,  # noqa: F401 - the host-facing name lives here
     auto_recovery_eligibility,
     host_marked_channel_reply,
     record_interruption_no_commit,

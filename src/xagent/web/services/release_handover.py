@@ -23,10 +23,14 @@ This module is the engine half and adds no new execution path:
   (``release_hold``) leaves the resume command pending, where the successor
   claims it after it activates.
 
-Only runs automatic recovery would resume are touched, and channel tasks stay
-on the host's drain: a channel reader that finds the run PAUSED before its
-recovery row exists would answer "interrupted" although the successor will
-resume it. Runs whose user already asked for a pause, or whose handover
+Only runs automatic recovery would resume are touched. Channel tasks stay on
+the host's drain unless the host marked the task with
+``HANDOVER_DELIVERY_AGENT_CONFIG_KEY``: a channel reader that finds the run
+PAUSED before its recovery row exists would answer "interrupted" although the
+successor will resume it, and nothing would post the resumed run's reply. The
+mark is the host's promise that it holds the reply target durably, stays
+silent for a handed-over run and posts the resumed run's result itself. Runs
+whose user already asked for a pause, or whose handover
 pause a user pause or cancel followed, are the user's and are left alone.
 Nothing here cancels, times out or queues work.
 
@@ -83,6 +87,22 @@ from .task_lease_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ``Task.agent_config`` key a host sets (to ``True``) on a channel task whose
+# reply it can deliver after the run is resumed by the successor. Without it
+# a channel task is never handed over.
+HANDOVER_DELIVERY_AGENT_CONFIG_KEY = "release_handover_delivery"
+
+
+def _channel_task_may_hand_over(task: Task) -> bool:
+    """Whether ``task`` is not a channel task, or its host marked its reply."""
+    if task.channel_id is None:
+        return True
+    config = task.agent_config
+    return (
+        isinstance(config, dict)
+        and config.get(HANDOVER_DELIVERY_AGENT_CONFIG_KEY) is True
+    )
 
 
 class HandoverOrderError(RuntimeError):
@@ -182,7 +202,7 @@ def begin_handover_sync(
                     continue
                 if (
                     task.control_state != TaskControlState.RUNNING.value
-                    or task.channel_id is not None
+                    or not _channel_task_may_hand_over(task)
                     or not auto_recovery_eligibility(db, task).eligible
                 ):
                     # A pause (the user's) already moves it, or it is not a run

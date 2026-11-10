@@ -145,6 +145,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .services.writer_workers import drain_workers, run_tracked
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -257,6 +258,10 @@ app = FastAPI(
 
 # Track background migration task for graceful shutdown cleanup.
 _migration_task: asyncio.Task[None] | None = None
+_uploaded_file_reconcile_task: asyncio.Task[None] | None = None
+# How long a retire waits for detached writer threads and admitted socket
+# writes to settle before it fails and leaves the host to its fallback.
+RETIRE_SETTLE_SECONDS = 30.0
 _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
@@ -291,7 +296,7 @@ async def _run_file_storage_startup_sync_with_retries(
 ) -> None:
     while True:
         try:
-            await asyncio.to_thread(run_startup_file_storage_sync)
+            await run_tracked(run_startup_file_storage_sync)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -459,15 +464,13 @@ async def _run_trigger_dispatcher(
             if now >= next_gmail_watch_scan_at:
                 try:
                     if get_gmail_watch_enabled():
-                        renewed = await asyncio.to_thread(
-                            _scan_due_gmail_watch_renewals_tick
-                        )
+                        renewed = await run_tracked(_scan_due_gmail_watch_renewals_tick)
                         if renewed:
                             logger.info(
                                 "Trigger dispatcher renewed %s Gmail watch(es)",
                                 renewed,
                             )
-                        swept = await asyncio.to_thread(_sweep_gmail_provisioning_tick)
+                        swept = await run_tracked(_sweep_gmail_provisioning_tick)
                         if swept:
                             logger.info(
                                 "Trigger dispatcher retried %s Gmail registration(s)",
@@ -479,7 +482,7 @@ async def _run_trigger_dispatcher(
                     )
 
             if tick is not None:
-                processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
+                processed = await run_tracked(_scan_due_scheduled_triggers_tick)
                 if processed:
                     logger.info(
                         "Trigger dispatcher processed %s due schedule(s)", processed
@@ -493,7 +496,7 @@ async def _run_trigger_dispatcher(
             # seconds) is unnecessary load with no corresponding benefit.
             if now >= next_preview_run_reap_at:
                 try:
-                    reaped_pause_targets = await asyncio.to_thread(
+                    reaped_pause_targets = await run_tracked(
                         _reap_stale_preview_workforce_runs_tick
                     )
                     if reaped_pause_targets:
@@ -1143,7 +1146,7 @@ def start_temp_file_cleanup_task(
         started = time.monotonic()
         logger.info("Background orphaned temp-file cleanup started")
         try:
-            cleaned_count = await asyncio.to_thread(
+            cleaned_count = await run_tracked(
                 cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
             )
         except Exception:  # noqa: BLE001
@@ -2000,7 +2003,7 @@ def _lancedb_auto_migrate() -> bool:
 
 async def _admit_memory_and_lancedb() -> None:
     """Memory admission, LanceDB migrations and the background reconciles."""
-    global _migration_task
+    global _migration_task, _uploaded_file_reconcile_task
     # Admit persistent memory storage before anything is allowed to use it.
     # Startup is the only moment at which this process is guaranteed to have no
     # memory writers, and no store is published unless admission succeeds.
@@ -2085,7 +2088,7 @@ async def _admit_memory_and_lancedb() -> None:
                     from ..migrations.lancedb.backfill_user_id import backfill_all
 
                     try:
-                        result = await asyncio.to_thread(backfill_all, dry_run=False)
+                        result = await run_tracked(backfill_all, dry_run=False)
                         logger.info("=" * 60)
                         logger.info("BACKGROUND LANCEDB MIGRATION COMPLETED")
                         logger.info("=" * 60)
@@ -2200,7 +2203,7 @@ async def _admit_memory_and_lancedb() -> None:
                         )
 
                         try:
-                            result = await asyncio.to_thread(
+                            result = await run_tracked(
                                 backfill_all, dry_run=False, conn=conn
                             )
                             logger.info("=" * 60)
@@ -2311,7 +2314,7 @@ async def _admit_memory_and_lancedb() -> None:
                     backfill_all as backfill_uploaded_file_links,
                 )
 
-                link_result = await asyncio.to_thread(
+                link_result = await run_tracked(
                     backfill_uploaded_file_links, dry_run=False
                 )
                 logger.info("Uploaded file links backfill completed: %s", link_result)
@@ -2340,12 +2343,14 @@ async def _admit_memory_and_lancedb() -> None:
                     db.close()
 
             try:
-                await asyncio.to_thread(_run_uploaded_file_reconcile)
+                await run_tracked(_run_uploaded_file_reconcile)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Uploaded files reconcile failed: %s", e)
 
         # Start background task without awaiting
-        asyncio.create_task(run_uploaded_file_reconcile_background())
+        _uploaded_file_reconcile_task = asyncio.create_task(
+            run_uploaded_file_reconcile_background()
+        )
         logger.info("Started background uploaded files reconcile task")
 
 
@@ -2448,6 +2453,7 @@ async def _stop_runtime_loops() -> None:
     global \
         _file_storage_startup_sync_task, \
         _migration_task, \
+        _uploaded_file_reconcile_task, \
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
@@ -2493,6 +2499,13 @@ async def _stop_runtime_loops() -> None:
         with suppress(asyncio.CancelledError):
             await _migration_task
     _migration_task = None
+
+    if _uploaded_file_reconcile_task and not _uploaded_file_reconcile_task.done():
+        logger.info("Cancelling uploaded files reconcile task...")
+        _uploaded_file_reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _uploaded_file_reconcile_task
+    _uploaded_file_reconcile_task = None
 
     # Cancel metadata rebuild background task
     if hasattr(app.state, "metadata_rebuild_task"):
@@ -2566,6 +2579,11 @@ async def _abort_standby_activation() -> None:
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
+    global _uploaded_file_reconcile_task, _writers_retired
+    # A new lifespan starts new writers; the next retire must stop them.
+    _writers_retired = False
+    _uploaded_file_reconcile_task = None
+    release_hold.reset_writers_retired()
     from ..config import (
         get_standby_enabled,
         get_task_execution_role,
@@ -2693,6 +2711,62 @@ async def startup_event() -> None:
     start_app_process_diagnostics(app)
 
 
+_writers_retired = False
+_retire_writers_lock: asyncio.Lock | None = None
+
+
+async def retire_writers() -> None:
+    """Stop every background writer and singleton; the web server keeps serving.
+
+    The producers of the shutdown sequence -- command dispatcher, upload,
+    retention, cleanup and recovery loops, auto-resume and lease recovery,
+    sandbox sweep, trigger dispatcher, chat channels -- and nothing else:
+    sockets, requests, execution drain and database runtime stay as they are,
+    so a host that replaces this process on purpose (the SaaS thin Gate) can
+    quiet the old writers while the old process still answers until the
+    switch. The later ``shutdown_event`` calls this too and skips it.
+
+    Success is published only once the writers have really settled: the
+    fence goes up first (no socket write is admitted after it), and after the
+    stops this waits for the worker threads cancelled tasks left behind and
+    for every socket write admitted before the fence. If either does not
+    settle in time the function raises, so the host takes its fallback
+    instead of starting migrations beside a live writer.
+
+    Idempotent and safe to call concurrently: the first caller does the work,
+    later ones wait for it and return. A step that raises leaves the function
+    unfinished (the caller sees the error) and every step is itself a no-op
+    once done, so calling again continues where it stopped.
+    """
+    global _retire_writers_lock, _writers_retired
+
+    if _retire_writers_lock is None:
+        _retire_writers_lock = asyncio.Lock()
+    async with _retire_writers_lock:
+        if _writers_retired:
+            return
+        # Fence first: no socket write is admitted from here on, and the ones
+        # already admitted are asked to wind down. They are waited for below.
+        release_hold.mark_writers_retired()
+        await _stop_runtime_loops()
+        # Chat channels stop before task finalizers drain.
+        await _stop_chat_channels()
+
+        # Cancelling a task that awaits a worker thread does not stop the
+        # thread, and an admitted socket write is not a task this function
+        # owns.
+        if not await drain_workers(RETIRE_SETTLE_SECONDS):
+            raise RuntimeError("background writer threads did not settle")
+        if not await release_hold.drain_socket_writes(RETIRE_SETTLE_SECONDS):
+            raise RuntimeError("socket writes did not settle")
+        _writers_retired = True
+
+
+def writers_retired() -> bool:
+    """Whether :func:`retire_writers` has completed in this process."""
+    return _writers_retired
+
+
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     # A standby that never activated owns nothing shared: it must not clean up
@@ -2724,10 +2798,8 @@ async def shutdown_event() -> None:
 
     flush_langfuse()
 
-    await _stop_runtime_loops()
-
-    # Shutdown chat channels before draining task finalizers.
-    await _stop_chat_channels()
+    # Stops the writers (the same step a host may run earlier, then skipped).
+    await retire_writers()
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

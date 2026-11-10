@@ -40,6 +40,7 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.model_service import _passes_model_visibility_hook
+from ..services.release_hold import WritersRetired, release_hold
 from ..tracking.standalone_usage import (
     STANDALONE_USAGE_REFUSED,
     StandaloneUsageRefused,
@@ -249,6 +250,18 @@ async def stream_asr(
         await _close_asr_socket(websocket, 4001, "Authentication required")
         return
     await accept_authenticated_websocket(websocket)
+    # Transcription meters usage when it ends, so a session is a socket write
+    # the host's retire waits for (and winds down when the fence goes up). A
+    # retired process cannot write, so the client reconnects to the new one;
+    # the close frame needs the handshake accepted first.
+    session_task = asyncio.current_task()
+    try:
+        write_token = release_hold.acquire_socket_write(
+            session_task.cancel if session_task is not None else None
+        )
+    except WritersRetired:
+        await _close_asr_socket(websocket, 1012, "Service restart")
+        return
     model: BaseASR | None = None
     config: SimpleNamespace | None = None
     model_closed = False
@@ -328,9 +341,12 @@ async def stream_asr(
         _log_provider_error(model or config, exc)
         await _send_asr_error(websocket, "stream_failed", "Speech stream failed", 1011)
     finally:
-        if model is not None and not model_closed:
-            await _close_model(model)
-        await _close_asr_socket(websocket)
+        try:
+            if model is not None and not model_closed:
+                await _close_model(model)
+            await _close_asr_socket(websocket)
+        finally:
+            write_token.release()
 
 
 class _TTSAudioResponse(StreamingResponse):

@@ -287,6 +287,98 @@ def test_begin_hands_over_a_channel_task_only_when_its_host_marked_the_reply(
     assert len(_commands(factory, task_id)) == staged
 
 
+_MARK = {HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True}
+
+
+@pytest.mark.parametrize(
+    ("fields", "staged"),
+    [
+        ({"channel": True, "source": "external", "agent_config": _MARK}, 1),
+        ({"channel": True, "source": "external"}, 0),
+        (
+            {
+                "channel": True,
+                "source": "external",
+                "agent_config": {HANDOVER_DELIVERY_AGENT_CONFIG_KEY: "true"},
+            },
+            0,
+        ),
+        # The mark lifts only the external source, and only for a channel task.
+        ({"source": "external", "agent_config": _MARK}, 0),
+        ({"channel": True, "source": "a2a", "agent_config": _MARK}, 0),
+        (
+            {
+                "channel": True,
+                "source": "external",
+                "agent_config": _MARK,
+                "control_state": "pause_requested",
+            },
+            0,
+        ),
+    ],
+    ids=[
+        "marked-external-channel",
+        "unmarked-external-channel",
+        "not-a-bool",
+        "marked-external-without-channel",
+        "marked-a2a-channel",
+        "marked-external-user-paused",
+    ],
+)
+def test_a_marked_external_channel_task_is_handed_over_and_nothing_else_changes(
+    factory, monkeypatch, fields, staged
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, **fields)
+        db.commit()
+
+    assert begin_handover_sync(RELEASE, {RUNNER}).staged == staged
+    assert len(_commands(factory, task_id)) == staged
+
+
+def test_a_marked_external_channel_task_needs_shared_execution(factory, monkeypatch):
+    monkeypatch.delenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", raising=False)
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external", agent_config=_MARK)
+        db.commit()
+
+    assert begin_handover_sync(RELEASE, {RUNNER}).staged == 0
+    assert _commands(factory, task_id) == []
+
+
+def test_the_successor_resumes_a_marked_external_channel_run_exactly_once(
+    factory, checkpoint, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external", agent_config=_MARK)
+        db.commit()
+    _handed_over(factory, task_id)
+    assert settle_handover_sync(RELEASE).recorded == 1
+
+    now = utc_now() + timedelta(seconds=30)
+    assert run_auto_resume_tick(now=now).staged_commands == 1
+    assert run_auto_resume_tick(now=now).staged_commands == 0
+    resumes = [c for c in _commands(factory, task_id) if c.kind == "resume"]
+    assert len(resumes) == 1
+
+
+def test_an_unmarked_external_channel_run_is_never_resumed(
+    factory, checkpoint, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external")
+        db.commit()
+    _handed_over(factory, task_id)
+    settle_handover_sync(RELEASE)
+
+    now = utc_now() + timedelta(seconds=30)
+    assert run_auto_resume_tick(now=now).staged_commands == 0
+    assert [c for c in _commands(factory, task_id) if c.kind == "resume"] == []
+
+
 def test_a_marked_non_channel_task_is_handed_over_as_before(factory):
     with factory() as db:
         task_id = _task(db, agent_config={HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True})

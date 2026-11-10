@@ -28,6 +28,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import release_handover, task_auto_resume
 from xagent.web.services.release_handover import (
+    HANDOVER_DELIVERY_AGENT_CONFIG_KEY,
     HandoverOrderError,
     begin_handover_sync,
     handover_command_id,
@@ -250,7 +251,7 @@ def test_begin_leaves_runs_the_successor_would_not_resume_to_the_drain(
     factory, fields, monkeypatch
 ):
     # Shared execution makes a channel task eligible for automatic recovery;
-    # the hand-over still leaves it to the drain.
+    # without its host's delivery mark the hand-over still leaves it to the drain.
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     with factory() as db:
         task_id = _task(db, **fields)
@@ -260,6 +261,39 @@ def test_begin_leaves_runs_the_successor_would_not_resume_to_the_drain(
 
     assert (report.staged, report.kept) == (0, 1)
     assert _commands(factory, task_id) == []
+
+
+@pytest.mark.parametrize(
+    ("agent_config", "staged"),
+    [
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True}, 1),
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: False}, 0),
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: "true"}, 0),
+        ({}, 0),
+    ],
+    ids=["marked", "false", "not-a-bool", "unmarked"],
+)
+def test_begin_hands_over_a_channel_task_only_when_its_host_marked_the_reply(
+    factory, monkeypatch, agent_config, staged
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, agent_config=agent_config)
+        db.commit()
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (staged, 1 - staged)
+    assert len(_commands(factory, task_id)) == staged
+
+
+def test_a_marked_non_channel_task_is_handed_over_as_before(factory):
+    with factory() as db:
+        task_id = _task(db, agent_config={HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True})
+        db.commit()
+
+    assert begin_handover_sync(RELEASE, {RUNNER}).staged == 1
+    assert len(_commands(factory, task_id)) == 1
 
 
 def test_begin_stages_nothing_when_automatic_resume_is_off(factory, monkeypatch):
